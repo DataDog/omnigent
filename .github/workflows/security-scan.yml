@@ -87,12 +87,15 @@ jobs:
       - name: Fetch PR diff
         if: ${{ steps.gate.outputs.scan == 'true' }}
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          gh pr diff "$PR" --repo "$REPO" > "$GITHUB_WORKSPACE/pr.diff"
-          gh pr diff "$PR" --repo "$REPO" --name-only > "$GITHUB_WORKSPACE/changed.txt"
+          # GitHub's PR diff API rejects changesets over 300 files. Fetch the
+          # two immutable PR commits and compute the same tree-to-tree diff
+          # locally so large upstream-sync PRs receive the full security scan.
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" "$HEAD_SHA"
+          git --no-pager diff --no-ext-diff "$BASE_SHA" "$HEAD_SHA" > "$GITHUB_WORKSPACE/pr.diff"
+          git --no-pager diff --no-ext-diff --name-only "$BASE_SHA" "$HEAD_SHA" > "$GITHUB_WORKSPACE/changed.txt"
           echo "Changed files:"; cat "$GITHUB_WORKSPACE/changed.txt"
 
       - name: Secret scan (added lines)
