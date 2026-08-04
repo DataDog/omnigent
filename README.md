@@ -122,10 +122,10 @@ uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git
 - **`uv`** (required). https://docs.astral.sh/uv/getting-started/installation/
   The installer offers to set this up for you.
 - **`git`** (required).
-- **Node.js 22 LTS or newer** with **`npm`**, for the npm-installed coding
-  harnesses (Claude, Codex, OpenCode, Pi). `omnigent run` installs the
-  harness CLI you pick.
-  https://docs.npmjs.com/downloading-and-installing-node-js-and-npm
+- **Node.js 22 LTS or newer** with **`npm`** (for the coding-harness CLIs
+  installed by `omnigent run`) and **`pnpm`** (for the web UI). You can get
+  both from a single Node install; pnpm is available via
+  `corepack enable` or `npm install -g pnpm`.
 - **Kiro CLI** (optional), for `omnigent kiro`: install with
   `curl -fsSL https://cli.kiro.dev/install | bash`, then sign in with Kiro.
   Kiro tool approvals stay answerable in the embedded Terminal; supported
@@ -267,6 +267,9 @@ omnigent hermes                      # Hermes Agent (Nous Research)
 omnigent pi                          # Pi
 ```
 
+Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
+its coding agents or drive a live OpenClaw Gateway session over ACP.
+
 #### 🐙 Polly and 🟠🔵 Debby
 
 Two example agents ship with the repo, and they make good first sessions:
@@ -294,7 +297,7 @@ see step 3.)
 **Prefer the browser?** Start a server and register your machine as a host:
 
 ```bash
-omnigent server start   # start the local server and web UI in the background
+omnigent server --background   # start the local server and web UI in the background
 omnigent host           # (separate terminal) register this machine as a host
 ```
 
@@ -374,7 +377,7 @@ Omnigent supports **multi-user accounts**, controlled by one environment
 variable:
 
 ```bash
-OMNIGENT_AUTH_ENABLED=1 omnigent server start
+OMNIGENT_AUTH_ENABLED=1 omnigent server --background
 ```
 
 The **Docker deploy in [step 4](#4-deploy-a-server-and-use-it-from-your-phone)
@@ -413,6 +416,11 @@ and they're in. Signup is invite-only.
   ```bash
   omnigent run --fork <session_id>
   ```
+
+Shared sessions identify model-visible messages with `[account]:` labels by
+default. Set `OMNIGENT_SHARED_MESSAGE_ATTRIBUTION_ENABLED=0` to hide those
+labels. This does not change stored authors, UI avatars, or who may approve or
+run privileged actions.
 
 > [!TIP]
 > Want your team to sign in with the logins they already have (**Google,
@@ -461,52 +469,6 @@ See the [policy guide](https://github.com/omnigent-ai/omnigent/blob/main/docs/PO
 
 ---
 
-## Configuration
-
-Global config lives in `~/.omnigent/config.yaml` (user) or
-`.omnigent/config.yaml` (project, takes precedence). View it with
-`omnigent config list`; set a key with `omnigent config set <key>=<value>`.
-
-### `harness:` — default harness & per-harness startup overrides
-
-Selects the default harness for `omnigent run` and can override the
-executable (`command`) and base launch args (`args`) for each harness.
-
-```yaml
-# Legacy scalar (deprecated, still honored — auto-migrates on next write):
-harness: claude-sdk
-
-# Mapping form — a default plus per-harness overrides:
-harness:
-  default: claude-sdk
-  codex-native:
-    command: /usr/local/bin/codex
-    args: [--config, approval_policy=on-request]
-  pi-native:
-    command: /opt/bin/pi
-```
-
-- `default` (optional str): default harness id for `omnigent run`.
-- `command` (optional str): overrides the vendor CLI executable.
-- `args` (optional list[str]): base args; CLI pass-through args append after.
-
-**Precedence** (first non-empty wins): `OMNIGENT_<NAME>_PATH` env var >
-config `harness.<id>.command` > built-in default. `args` follow the same
-precedence with config `args` as the base and CLI pass-through args appended.
-
-The env var is `OMNIGENT_<NAME>_PATH` where `<NAME>` is the harness's base id
-(`-native` suffix stripped, so `pi` and `pi-native` share `OMNIGENT_PI_PATH` —
-one var per binary). The legacy `HARNESS_<NAME>_PATH` (codex/pi/kimi/goose/
-qwen/hermes) is still read as a deprecated fallback (warns on use) and will be
-removed in **v0.8.0**.
-
-The pre-existing `omnigent claude --command` flag is deprecated (warns,
-pointing to `OMNIGENT_CLAUDE_PATH` / config) and will be removed in a future
-release. No other native command has a `--command` flag — override via env
-or config.
-
----
-
 ## Write your own agent
 
 An agent is a short YAML file: your prompt, your tools — local Python
@@ -551,6 +513,17 @@ omnigent run path/to/my_agent.yaml
 The same file can declare sub-agents and reviewers. For a fuller example, see
 Polly at [`examples/polly/`](https://github.com/omnigent-ai/omnigent/tree/main/examples/polly/), and the
 [Agent YAML spec](https://github.com/omnigent-ai/omnigent/blob/main/docs/AGENT_YAML_SPEC.md) for the full schema.
+
+---
+
+## Telemetry
+
+Omnigent collects anonymized usage data (telemetry) by default. This data
+contains no sensitive or personally identifiable information. If you're using
+Omnigent through a managed service or distribution, please consult your managed
+service agreement to determine any data collection that may impact your use of
+the service. To opt out, follow our instructions in
+[Usage Telemetry](https://omnigent.ai/docs/deploy/telemetry).
 
 ---
 
