@@ -9648,7 +9648,7 @@ def login(server_url: str) -> None:
             result = poll_resp.json()
             token = result["token"]
             user_id = result["user_id"]
-            expires_in = result.get("expires_in", 8 * 3600)
+            expires_in = result.get("expires_in", 168 * 3600)
             store_token(
                 server_url=server,
                 token=token,
@@ -9724,7 +9724,7 @@ def _accounts_login(server: str) -> None:
     body = resp.json()
     token = body["token"]
     user_id = body["user"]["id"]
-    expires_in = body.get("expires_in", 8 * 3600)
+    expires_in = body.get("expires_in", 168 * 3600)
 
     import time as _time
 

@@ -210,7 +210,7 @@ def _mint_loopback_cli_token(
     :param base_url: This spawn's server URL, e.g.
         ``"http://127.0.0.1:54312"``.
     :param cookie_secret: HMAC key for the HS256 session JWT.
-    :param session_ttl_hours: Token lifetime in hours, e.g. ``8``.
+    :param session_ttl_hours: Token lifetime in hours, e.g. ``168``.
     :returns: ``True`` if the token was written, ``False`` otherwise.
     """
     try:
@@ -245,7 +245,7 @@ def bootstrap_admin(
     *,
     init_admin_password: str | None = None,
     base_url: str | None = None,
-    session_ttl_hours: int = 8,
+    session_ttl_hours: int = 168,
     cookie_secret: bytes | None = None,
 ) -> BootstrapResult:
     """Ensure an ``admin`` user exists; create + announce on first boot.

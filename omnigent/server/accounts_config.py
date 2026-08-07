@@ -23,7 +23,7 @@ Env vars (all start with ``OMNIGENT_ACCOUNTS_``):
 - ``COOKIE_SECRET`` — required, 64+ hex chars. HMAC key for HS256
   session cookies. Generate with ``openssl rand -hex 32`` (or
   ``deploy/docker/bootstrap.sh`` mints one alongside POSTGRES_PASSWORD).
-- ``SESSION_TTL_HOURS`` — optional, default 8. How long a
+- ``SESSION_TTL_HOURS`` — optional, default 168 (7 days). How long a
   ``/auth/login`` cookie stays valid.
 - ``BASE_URL`` — required. The user-facing base URL of the
   deployment, e.g. ``"https://omnigent.example.com"`` or
@@ -135,7 +135,7 @@ class AccountsConfig:
                 f"OMNIGENT_ACCOUNTS_BASE_URL must start with http:// or https://; got {base_url!r}"
             )
 
-        session_ttl_hours = int(os.environ.get("OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS", "8"))
+        session_ttl_hours = int(os.environ.get("OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS", "168"))
         invite_ttl_seconds = int(os.environ.get("OMNIGENT_ACCOUNTS_INVITE_TTL_HOURS", "72")) * 3600
         magic_ttl_seconds = int(os.environ.get("OMNIGENT_ACCOUNTS_MAGIC_TTL_MINUTES", "10")) * 60
 
