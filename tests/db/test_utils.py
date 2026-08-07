@@ -26,6 +26,7 @@ from omnigent.db.utils import (
     extract_search_text,
     generate_agent_id,
     generate_item_id,
+    get_alembic_version_table,
     get_or_create_engine,
     set_lakebase_token_provider,
     strip_nul_bytes,
@@ -457,6 +458,92 @@ def test_initialize_or_verify_schema_reports_manual_retry_when_auto_migration_fa
         f"Error message must include the database URL so the "
         f"command is copy-pastable. Got: {msg!r}"
     )
+
+
+# ── Alembic version-table override ───────────────────
+
+
+def test_alembic_version_table_defaults_to_alembic_version() -> None:
+    """
+    With ``OMNIGENT_ALEMBIC_VERSION_TABLE`` unset, the resolver returns
+    Alembic's built-in default so existing deployments are unaffected.
+    """
+    import os
+
+    assert os.environ.get("OMNIGENT_ALEMBIC_VERSION_TABLE") is None
+    assert get_alembic_version_table() == "alembic_version"
+
+
+def test_initialize_or_verify_schema_uses_custom_version_table(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Setting ``OMNIGENT_ALEMBIC_VERSION_TABLE`` makes the migration runner
+    track applied revisions in that table instead of ``alembic_version``, and
+    ``_get_current_db_revision`` reads from the same table. This is the
+    shared-schema scenario: two Alembic-managed apps in one DB must not
+    collide on the default version table.
+    """
+    custom_table = "omnigent_alembic_version"
+    monkeypatch.setenv("OMNIGENT_ALEMBIC_VERSION_TABLE", custom_table)
+
+    db_path = tmp_path / "shared.db"
+    uri = f"sqlite:///{db_path}"
+    engine = create_engine(uri)
+    try:
+        # Sanity: nothing migrated yet, under either name.
+        assert _get_current_db_revision(engine) is None
+
+        _initialize_or_verify_schema(engine, uri)
+
+        head = _get_head_db_revision(uri)
+        assert _get_current_db_revision(engine) == head
+
+        # The custom table exists and the default one does not. If the
+        # default appeared, env.py did not honor ``version_table``; if the
+        # custom table is missing, _build_alembic_config didn't surface it.
+        from sqlalchemy import inspect as _inspect
+
+        tables = set(_inspect(engine).get_table_names())
+        assert custom_table in tables
+        assert "alembic_version" not in tables
+    finally:
+        engine.dispose()
+
+
+def test_get_current_db_revision_ignores_default_table_when_overridden(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When overridden, ``_get_current_db_revision`` must not consult the
+    default ``alembic_version`` table even if one happens to exist. A stale
+    default table left by a previous (un-overridden) install must not be
+    mistaken for this deployment's revision history.
+    """
+    custom_table = "omnigent_alembic_version"
+    monkeypatch.setenv("OMNIGENT_ALEMBIC_VERSION_TABLE", custom_table)
+
+    db_path = tmp_path / "mixed.db"
+    uri = f"sqlite:///{db_path}"
+    engine = create_engine(uri)
+    try:
+        # Plant a decoy default table with a bogus revision.
+        with engine.begin() as conn:
+            conn.exec_driver_sql("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL)")
+            conn.exec_driver_sql("INSERT INTO alembic_version VALUES ('deadbeef')")
+
+        # No custom table yet → None, regardless of the decoy default table.
+        assert _get_current_db_revision(engine) is None
+
+        # Migrate using the custom table.
+        _initialize_or_verify_schema(engine, uri)
+        head = _get_head_db_revision(uri)
+        assert _get_current_db_revision(engine) == head
+        assert head != "deadbeef"
+    finally:
+        engine.dispose()
 
 
 # ── slash_command persistence path ────────────────────
