@@ -22,7 +22,9 @@ jobs:
   record:
     # Approvals flip the check green; dismissals and changes-requested flip
     # it red. Skip COMMENTED reviews (they don't change review state).
-    if: github.event.review.state != 'commented'
+    if: >-
+      github.repository == 'omnigent-ai/omnigent'
+      && github.event.review.state != 'commented'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
