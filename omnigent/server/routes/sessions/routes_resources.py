@@ -42,8 +42,8 @@ from omnigent.server._elicitation_registry import (
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_READ,
-    AuthProvider,
     RESERVED_USER_LOCAL,
+    AuthProvider,
 )
 from omnigent.server.feature_usage_metrics import (
     classify_feature_usage_exception,

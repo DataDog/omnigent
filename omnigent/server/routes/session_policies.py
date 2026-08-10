@@ -29,7 +29,7 @@ from omnigent.policies.registry import (
 )
 from omnigent.runtime import get_caps
 from omnigent.runtime.policies.builder import invalidate_session_policy_specs_cache
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider, RESERVED_USER_LOCAL
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.feature_usage_metrics import (
     classify_feature_usage_exception,
     get_feature_usage_recorder,

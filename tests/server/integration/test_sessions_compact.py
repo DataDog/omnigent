@@ -539,11 +539,7 @@ async def test_external_compaction_terminal_status_records_once(
                 "omnigent.feature.operation": "compact",
                 "omnigent.feature.outcome": expected_outcome,
                 "omnigent.actor.user_id": "local",
-                **(
-                    {"omnigent.failure.reason": "backend"}
-                    if expected_outcome == "failed"
-                    else {}
-                ),
+                **({"omnigent.failure.reason": "backend"} if expected_outcome == "failed" else {}),
             }
         ]
     finally:

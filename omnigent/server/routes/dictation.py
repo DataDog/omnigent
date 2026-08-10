@@ -64,7 +64,7 @@ import anyio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, WebSocketException
 from starlette import status
 
-from omnigent.server.auth import AuthProvider, RESERVED_USER_LOCAL
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.dictation import (
     DictationEngine,
     DictationStreamHandle,
@@ -139,7 +139,7 @@ def create_dictation_router(
                     usage.set_attribute(
                         "omnigent.dictation.engine", _dictation_engine_name(engine)
                     )
-                except Exception:  # noqa: BLE001
+                except Exception:
                     usage.fail("backend")
                     _logger.exception("dictation engine failed to initialize")
                     with contextlib.suppress(RuntimeError):
@@ -163,7 +163,7 @@ def create_dictation_router(
                         usage.abandon()
                     else:
                         usage.fail("backend")
-                except Exception:  # noqa: BLE001
+                except Exception:
                     usage.fail("backend")
                     raise
                 finally:

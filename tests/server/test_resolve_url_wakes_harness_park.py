@@ -225,10 +225,14 @@ async def test_owner_lookup_failure_does_not_claim_approval_request() -> None:
     set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
     try:
         await O._record_approval_request(
-            "conv_flaky_owner", "elicit_flaky_owner", owner_store  # type: ignore[arg-type]
+            "conv_flaky_owner",
+            "elicit_flaky_owner",
+            owner_store,  # type: ignore[arg-type]
         )
         await O._record_approval_request(
-            "conv_flaky_owner", "elicit_flaky_owner", owner_store  # type: ignore[arg-type]
+            "conv_flaky_owner",
+            "elicit_flaky_owner",
+            owner_store,  # type: ignore[arg-type]
         )
         assert meter.counter.records == [
             {

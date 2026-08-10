@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable, Mapping
 from threading import Lock
-from typing import Callable, Literal, Mapping, Protocol
+from typing import Literal, Protocol
 
 from opentelemetry import metrics as otel_metrics
 from opentelemetry.util.types import Attributes

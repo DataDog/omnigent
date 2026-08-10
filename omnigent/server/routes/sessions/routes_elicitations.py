@@ -138,9 +138,7 @@ def register_elicitations_routes(
             raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
         try:
-            owner_id = await asyncio.to_thread(
-                _get_session_owner_id, session_id, permission_store
-            )
+            owner_id = await asyncio.to_thread(_get_session_owner_id, session_id, permission_store)
         except Exception:
             owner_id = None
         await _resolve_elicitation(

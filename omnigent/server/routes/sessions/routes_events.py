@@ -157,9 +157,7 @@ def register_events_routes(
     async def _usage_identity(session_id: str, user_id: str | None) -> tuple[str, str | None]:
         """Return metric actor plus owner without treating missing multi-user auth as local."""
         try:
-            owner_id = await asyncio.to_thread(
-                _get_session_owner_id, session_id, permission_store
-            )
+            owner_id = await asyncio.to_thread(_get_session_owner_id, session_id, permission_store)
         except Exception:
             owner_id = None
         # Every authenticated route has a real ``user_id``.  ``None`` is the

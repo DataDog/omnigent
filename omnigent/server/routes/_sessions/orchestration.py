@@ -174,7 +174,6 @@ from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedE
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.telemetry.surface import classify_surface as _classify_surface
 
-
 _APPROVAL_USAGE_DEDUPLICATION_CAPACITY = 4096
 # Elicitation IDs are the operation correlation key, but must never become a
 # metric attribute. Keep only a bounded in-process record so retries through
@@ -209,9 +208,7 @@ async def _record_approval_request(
             if conversation_store is not None
             else None
         )
-        if not _claim_approval_usage(
-            _approval_usage_requests_seen, session_id, elicitation_id
-        ):
+        if not _claim_approval_usage(_approval_usage_requests_seen, session_id, elicitation_id):
             return
         usage = get_feature_usage_recorder().operation(
             feature_name="approval",
@@ -238,9 +235,7 @@ async def _record_approval_timeout(
             if conversation_store is not None
             else None
         )
-        if not _claim_approval_usage(
-            _approval_usage_resolutions_seen, session_id, elicitation_id
-        ):
+        if not _claim_approval_usage(_approval_usage_resolutions_seen, session_id, elicitation_id):
             return
         usage = get_feature_usage_recorder().operation(
             feature_name="approval",
@@ -1562,9 +1557,7 @@ async def _resolve_elicitation(
     if (
         pending
         and action in {"accept", "decline", "cancel", "timeout"}
-        and _claim_approval_usage(
-            _approval_usage_resolutions_seen, session_id, elicitation_id
-        )
+        and _claim_approval_usage(_approval_usage_resolutions_seen, session_id, elicitation_id)
     ):
         try:
             usage = get_feature_usage_recorder().operation(
@@ -4969,9 +4962,7 @@ async def _register_policy_elicitation(
     _elicit_event = build_elicitation_request_event(
         elicitation_id, elicitation, session_id=session_id
     )
-    await _record_approval_request(
-        session_id, elicitation_id, conversation_store, actor_user_id
-    )
+    await _record_approval_request(session_id, elicitation_id, conversation_store, actor_user_id)
     session_stream.publish(session_id, _elicit_event)
     await asyncio.to_thread(
         _publish_elicitation_request_to_ancestors,

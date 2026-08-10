@@ -28,7 +28,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.registry import is_registered_handler, validate_factory_params
 from omnigent.runtime import get_caps
 from omnigent.runtime.policies.builder import invalidate_default_policy_specs_cache
-from omnigent.server.auth import AuthProvider, RESERVED_USER_LOCAL
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.feature_usage_metrics import (
     classify_feature_usage_exception,
     get_feature_usage_recorder,
@@ -187,9 +187,7 @@ def create_default_policies_router(
                 ) as usage:
                     usage.set_attribute("omnigent.policy.scope", "admin")
                     body = kwargs.get("body")
-                    usage.set_attribute(
-                        "omnigent.policy.type", getattr(body, "type", "unknown")
-                    )
+                    usage.set_attribute("omnigent.policy.type", getattr(body, "type", "unknown"))
                     try:
                         return await handler(request, *args, **kwargs)
                     except OmnigentError as exc:

@@ -707,6 +707,7 @@ async def test_input_ask_approved_falls_through_to_allow():
         result: PolicyResult,
         conversation_store: Any,
         elicitation_id: str | None = None,
+        actor_user_id: str | None = None,
     ) -> bool:
         """Stand in for the server-side approval park; simulate approve.
 
@@ -784,6 +785,7 @@ async def test_input_ask_declined_denies():
         result: PolicyResult,
         conversation_store: Any,
         elicitation_id: str | None = None,
+        actor_user_id: str | None = None,
     ) -> bool:
         """Stand in for the server-side approval park; simulate decline.
 

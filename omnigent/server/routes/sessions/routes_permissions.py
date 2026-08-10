@@ -31,8 +31,8 @@ from omnigent.server.auth import (
     LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
-    RESERVED_USER_PUBLIC,
     RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
     AuthProvider,
     SharingMode,
     workspace_sharing_blocked,
@@ -108,9 +108,11 @@ def register_permissions_routes(
             actor = _require_user(request, auth_provider) or RESERVED_USER_LOCAL
             operation = "grant"
             try:
-                if permission_store is not None and await asyncio.to_thread(
-                    permission_store.get, body.user_id, session_id
-                ) is not None:
+                if (
+                    permission_store is not None
+                    and await asyncio.to_thread(permission_store.get, body.user_id, session_id)
+                    is not None
+                ):
                     operation = "update"
             except Exception:
                 pass

@@ -459,9 +459,7 @@ async def test_fork_records_bounded_usage() -> None:
     meter = RecordingMeter()
     set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
     try:
-        response = TestClient(_build_app(store)).post(
-            f"/v1/sessions/{source_id}/fork", json={}
-        )
+        response = TestClient(_build_app(store)).post(f"/v1/sessions/{source_id}/fork", json={})
     finally:
         set_feature_usage_recorder_for_testing(None)
 

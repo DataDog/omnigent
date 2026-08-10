@@ -67,8 +67,8 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
-    AuthProvider,
     RESERVED_USER_LOCAL,
+    AuthProvider,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
