@@ -40,6 +40,17 @@ db_url = os.environ.get("OMNIGENT_DB_URL")
 if db_url:
     config.set_main_option("sqlalchemy.url", db_url)
 
+# Resolve the Alembic version-tracking table name. ``_build_alembic_config``
+# (omnigent/db/utils.py) sets the ``version_table`` main option from the
+# ``OMNIGENT_ALEMBIC_VERSION_TABLE`` env var; when env.py is driven directly by
+# the standalone ``alembic`` CLI that option is unset, so fall back to the env
+# var itself. ``None`` lets Alembic use its built-in default (``alembic_version``).
+# Deployments sharing a schema with another Alembic-managed app override this to
+# avoid colliding on the default version table.
+version_table = config.get_main_option("version_table") or os.environ.get(
+    "OMNIGENT_ALEMBIC_VERSION_TABLE"
+)
+
 
 def run_migrations_offline() -> None:
     """
@@ -52,6 +63,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        version_table=version_table,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -85,6 +97,7 @@ def _run_with_connection(connection: Connection) -> None:
         connection=connection,
         target_metadata=target_metadata,
         render_as_batch=True,  # required for SQLite ALTER TABLE support
+        version_table=version_table,
     )
     with context.begin_transaction():
         context.run_migrations()

@@ -57,6 +57,33 @@ _LAKEBASE_INSTANCE_ENV = "OMNIGENT_LAKEBASE_INSTANCE"
 _SERVER_POOL_RECYCLE_SECONDS = 1800
 _LAKEBASE_POOL_RECYCLE_SECONDS = 600
 
+# ── Alembic version-table name ─────────────────────────
+#
+# Alembic tracks applied migrations in a single table (default
+# ``alembic_version``). Deployments that share one physical database / schema
+# with *another* Alembic-managed application collide on that default table, so
+# the name is overridable via ``OMNIGENT_ALEMBIC_VERSION_TABLE``. The value
+# here must stay in lock-step with ``migrations/env.py`` (which passes it to
+# ``context.configure(version_table=...)``); both read this same env var via
+# :func:`get_alembic_version_table`, so they cannot drift.
+_ALEMBIC_VERSION_TABLE_ENV = "OMNIGENT_ALEMBIC_VERSION_TABLE"
+_DEFAULT_ALEMBIC_VERSION_TABLE = "alembic_version"
+
+
+def get_alembic_version_table() -> str:
+    """
+    Return the configured Alembic version-tracking table name.
+
+    Defaults to ``alembic_version`` (Alembic's own default); override with the
+    ``OMNIGENT_ALEMBIC_VERSION_TABLE`` env var when sharing a schema with
+    another Alembic-managed application. Read by both :func:`_build_alembic_config`
+    (which surfaces it to ``migrations/env.py`` via the ``version_table`` main
+    option) and :func:`_get_current_db_revision` (which looks the table up by
+    name), so the migration runner and the revision probe always agree.
+    """
+    return os.environ.get(_ALEMBIC_VERSION_TABLE_ENV) or _DEFAULT_ALEMBIC_VERSION_TABLE
+
+
 # Process-wide override, primarily for tests and for callers that want to plug
 # in their own token source (e.g. a non-default Databricks auth flow) without
 # the env-var path. ``None`` means "not overridden".
@@ -369,6 +396,12 @@ def _build_alembic_config(db_uri: str) -> Config:
     config = Config(str(alembic_ini))
     config.set_main_option("sqlalchemy.url", db_uri)
     config.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
+    # Surface the configured version-table name so ``migrations/env.py`` can
+    # pass it to ``context.configure(version_table=...)``. Reading it here (rather
+    # than in env.py alone) keeps the env var's single source of truth in this
+    # module and ensures the standalone ``alembic`` CLI path still works when the
+    # env var is set but no main option was injected.
+    config.set_main_option("version_table", get_alembic_version_table())
     return config
 
 
@@ -420,22 +453,26 @@ def _get_current_db_revision(engine: Engine) -> str | None:
     """
     Return the database's current Alembic revision, or ``None``.
 
-    ``None`` means the database has no ``alembic_version`` table at
+    ``None`` means the database has no Alembic version-tracking table at
     all — i.e. nothing has ever been migrated against this database.
     A database that exists at some revision (even if not head) returns
-    that revision string.
+    that revision string. The table name is resolved by
+    :func:`get_alembic_version_table` (overridable via
+    ``OMNIGENT_ALEMBIC_VERSION_TABLE``), so this probe agrees with the
+    table the migration runner actually writes to.
 
     :param engine: SQLAlchemy engine bound to the target database.
     :returns: The current revision hash (e.g. ``"c9d3a1f2e4b5"``) or
-        ``None`` if the ``alembic_version`` table is absent.
+        ``None`` if the version-tracking table is absent.
     """
     from alembic.runtime.migration import MigrationContext
 
+    version_table = get_alembic_version_table()
     inspector = inspect(engine)
-    if "alembic_version" not in inspector.get_table_names():
+    if version_table not in inspector.get_table_names():
         return None
     with engine.connect() as connection:
-        ctx = MigrationContext.configure(connection)
+        ctx = MigrationContext.configure(connection, opts={"version_table": version_table})
         return ctx.get_current_revision()
 
 
