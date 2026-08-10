@@ -31,6 +31,11 @@ import httpx
 import pytest
 
 from omnigent.runtime.compaction import CompactionResult
+from omnigent.server.feature_usage_metrics import (
+    FeatureUsageRecorder,
+    set_feature_usage_recorder_for_testing,
+)
+from tests.server.feature_usage_helpers import RecordingMeter
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -505,6 +510,106 @@ async def test_external_compaction_status_publishes_compaction_sse(
         assert "total_tokens" not in published[0][1], (
             f"completed from the hook path must omit total_tokens; got {published[0][1]!r}."
         )
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_outcome"),
+    [("completed", "success"), ("failed", "failed")],
+)
+async def test_external_compaction_terminal_status_records_once(
+    client: httpx.AsyncClient,
+    terminal_status: str,
+    expected_outcome: str,
+) -> None:
+    """A retransmitted native terminal frame does not double-count compaction."""
+    meter = RecordingMeter()
+    set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
+    try:
+        agent = await create_test_agent(client)
+        sid = await _create_session(client, agent["id"])
+        for status in ("in_progress", terminal_status, terminal_status):
+            response = await client.post(
+                f"/v1/sessions/{sid}/events",
+                json={"type": "external_compaction_status", "data": {"status": status}},
+            )
+            assert response.status_code == 202, response.text
+        assert meter.counter.records == [
+            {
+                "omnigent.feature.name": "context",
+                "omnigent.feature.operation": "compact",
+                "omnigent.feature.outcome": expected_outcome,
+                "omnigent.actor.user_id": "local",
+                **(
+                    {"omnigent.failure.reason": "backend"}
+                    if expected_outcome == "failed"
+                    else {}
+                ),
+            }
+        ]
+    finally:
+        set_feature_usage_recorder_for_testing(None)
+
+
+async def test_external_compaction_new_attempt_after_terminal_records_again(
+    client: httpx.AsyncClient,
+) -> None:
+    """An in-progress frame resets only that session's terminal-frame claim."""
+    meter = RecordingMeter()
+    set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
+    try:
+        agent = await create_test_agent(client)
+        sid = await _create_session(client, agent["id"])
+        for status in ("in_progress", "completed", "completed", "in_progress", "completed"):
+            response = await client.post(
+                f"/v1/sessions/{sid}/events",
+                json={"type": "external_compaction_status", "data": {"status": status}},
+            )
+            assert response.status_code == 202, response.text
+        assert [record["omnigent.feature.outcome"] for record in meter.counter.records] == [
+            "success",
+            "success",
+        ]
+    finally:
+        set_feature_usage_recorder_for_testing(None)
+
+
+@pytest.mark.parametrize(
+    ("raises", "expected_outcome"),
+    [(False, "success"), (True, "failed")],
+)
+async def test_server_compaction_records_its_terminal_outcome(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    raises: bool,
+    expected_outcome: str,
+) -> None:
+    """Server-owned compaction emits only after its actual terminal result."""
+    from omnigent.runtime import set_runner_client
+
+    async def _compact(**_: Any) -> CompactionResult:
+        if raises:
+            raise RuntimeError("summary provider unavailable")
+        return CompactionResult(messages=[], summary_metadata=None, total_tokens=1234)
+
+    monkeypatch.setattr("omnigent.runtime.workflow.compact_conversation_now", _compact)
+    meter = RecordingMeter()
+    runner, _captured = _fake_runner_returning(204)
+    set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
+    set_runner_client(runner)
+    try:
+        agent = await create_test_agent(client)
+        sid = await _create_session(client, agent["id"])
+        response = await client.post(
+            f"/v1/sessions/{sid}/events", json={"type": "compact", "data": {}}
+        )
+        assert response.status_code == (202 if not raises else 500), response.text
+        assert meter.counter.records[0]["omnigent.feature.outcome"] == expected_outcome
+        assert meter.counter.records[0]["omnigent.feature.name"] == "context"
+        assert meter.counter.records[0]["omnigent.feature.operation"] == "compact"
+    finally:
+        set_feature_usage_recorder_for_testing(None)
+        await runner.aclose()
+        set_runner_client(None)
 
 
 async def test_external_compaction_status_rejects_unknown_status(

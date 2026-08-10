@@ -10,8 +10,11 @@ view. Spec policies have ``id=None`` and cannot be patched or deleted.
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import re
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -26,8 +29,12 @@ from omnigent.policies.registry import (
 )
 from omnigent.runtime import get_caps
 from omnigent.runtime.policies.builder import invalidate_session_policy_specs_cache
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
-from omnigent.server.routes._auth_helpers import get_user_id, require_access
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider, RESERVED_USER_LOCAL
+from omnigent.server.feature_usage_metrics import (
+    classify_feature_usage_exception,
+    get_feature_usage_recorder,
+)
+from omnigent.server.routes._auth_helpers import get_session_owner_id, get_user_id, require_access
 from omnigent.server.routes._errors import session_not_found
 from omnigent.server.schemas import (
     _DOTTED_PATH_RE,
@@ -140,6 +147,41 @@ def create_session_policies_router(
     """
     router = APIRouter()
 
+    async def _owner_id(session_id: str) -> str | None:
+        try:
+            return await asyncio.to_thread(get_session_owner_id, session_id, permission_store)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _instrument_policy(operation: str, policy_type: str | None = None) -> Callable:
+        def decorate(handler: Callable) -> Callable:
+            @functools.wraps(handler)
+            async def wrapped(request: Request, session_id: str, *args: Any, **kwargs: Any) -> Any:
+                user_id = get_user_id(request, auth_provider)
+                if user_id is None and auth_provider is not None:
+                    return await handler(request, session_id, *args, **kwargs)
+                async with get_feature_usage_recorder().operation(
+                    feature_name="policy",
+                    operation=operation,
+                    actor_user_id=user_id or RESERVED_USER_LOCAL,
+                    session_owner_id=await _owner_id(session_id),
+                ) as usage:
+                    usage.set_attribute("omnigent.policy.scope", "session")
+                    body = kwargs.get("body")
+                    usage.set_attribute(
+                        "omnigent.policy.type", policy_type or getattr(body, "type", "unknown")
+                    )
+                    try:
+                        return await handler(request, session_id, *args, **kwargs)
+                    except OmnigentError as exc:
+                        outcome, reason = classify_feature_usage_exception(exc)
+                        usage.finish(outcome, failure_reason=reason)
+                        raise
+
+            return wrapped
+
+        return decorate
+
     def _require_session_exists(session_id: str) -> None:
         """Raise 404 if the session does not exist.
 
@@ -152,6 +194,7 @@ def create_session_policies_router(
             raise session_not_found()
 
     @router.post("/sessions/{session_id}/policies")
+    @_instrument_policy("register")
     async def create_policy(
         request: Request,
         session_id: str,
@@ -376,6 +419,7 @@ def create_session_policies_router(
         return _entity_to_response(policy)
 
     @router.delete("/sessions/{session_id}/policies/{policy_id}")
+    @_instrument_policy("delete")
     async def delete_policy(
         request: Request,
         session_id: str,

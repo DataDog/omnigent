@@ -17,6 +17,10 @@ from fastapi import FastAPI
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
+from omnigent.server.feature_usage_metrics import (
+    FeatureUsageRecorder,
+    set_feature_usage_recorder_for_testing,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -24,6 +28,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 from tests.server.conftest import ControllableMockClient
+from tests.server.feature_usage_helpers import RecordingMeter
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -152,6 +157,38 @@ async def test_create_policy(
     assert len(body["id"]) == 32
     assert body["created_at"] > 0
     assert body["updated_at"] is None
+
+
+async def test_create_policy_records_session_usage(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Session policy registration keeps the actor and bounded policy fields."""
+    session_id = _seed_session_with_grants(db_uri, {"alice@example.com": LEVEL_EDIT})
+    meter = RecordingMeter()
+    set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
+    try:
+        response = await auth_client.post(
+            f"/v1/sessions/{session_id}/policies",
+            json={
+                "name": "metric_policy",
+                "type": "python",
+                "handler": "omnigent.policies.builtins.safety.ask_on_os_tools",
+            },
+            headers={"X-Forwarded-Email": "alice@example.com"},
+        )
+    finally:
+        set_feature_usage_recorder_for_testing(None)
+
+    assert response.status_code == 200
+    assert meter.counter.records[0] == {
+        "omnigent.feature.name": "policy",
+        "omnigent.feature.operation": "register",
+        "omnigent.feature.outcome": "success",
+        "omnigent.actor.user_id": "alice@example.com",
+        "omnigent.policy.scope": "session",
+        "omnigent.policy.type": "python",
+    }
 
 
 async def test_list_policies(

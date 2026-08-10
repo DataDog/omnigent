@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
 
@@ -51,9 +52,18 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     prepare_background_session_title,
 )
+from omnigent.server.feature_usage_metrics import (
+    FailureReason,
+    UsageOutcome,
+    classify_feature_usage_exception,
+    get_feature_usage_recorder,
+)
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
+)
+from omnigent.server.routes._auth_helpers import (
+    get_session_owner_id as _get_session_owner_id,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -119,6 +129,22 @@ def register_events_routes(
 ) -> None:
     """Register the events, stream, and delete routes on router."""
 
+    # Native harness status frames have no compaction correlation ID.  The
+    # protocol does bracket each real attempt with ``in_progress``; retaining
+    # the last terminal edge prevents retransmitted terminal frames from
+    # incrementing usage twice while allowing the next bracketed attempt.
+    external_compaction_terminal_seen: OrderedDict[str, None] = OrderedDict()
+    external_compaction_terminal_capacity = 4096
+
+    def _claim_external_compaction_terminal(session_id: str) -> bool:
+        """Claim one terminal native frame and retain bounded retry state."""
+        if session_id in external_compaction_terminal_seen:
+            return False
+        external_compaction_terminal_seen[session_id] = None
+        if len(external_compaction_terminal_seen) > external_compaction_terminal_capacity:
+            external_compaction_terminal_seen.popitem(last=False)
+        return True
+
     def _has_runner_created_by_authority(request: Request, conv: Any) -> bool:
         token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
         if not token:
@@ -127,6 +153,43 @@ def register_events_routes(
             return True
         runner_id = getattr(conv, "runner_id", None)
         return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
+
+    async def _usage_identity(session_id: str, user_id: str | None) -> tuple[str, str | None]:
+        """Return metric actor plus owner without treating missing multi-user auth as local."""
+        try:
+            owner_id = await asyncio.to_thread(
+                _get_session_owner_id, session_id, permission_store
+            )
+        except Exception:
+            owner_id = None
+        # Every authenticated route has a real ``user_id``.  ``None`` is the
+        # auth-disabled deployment case, where ``local`` is the canonical ID.
+        return user_id or owner_id or "local", owner_id
+
+    def _record_terminal_usage(
+        *,
+        feature_name: str,
+        operation: str,
+        actor_user_id: str,
+        session_owner_id: str | None,
+        outcome: UsageOutcome,
+        failure_reason: FailureReason | None = None,
+        attributes: dict[str, str] | None = None,
+    ) -> None:
+        """Best-effort one-shot metric for a terminal asynchronous edge."""
+        try:
+            usage = get_feature_usage_recorder().operation(
+                feature_name=feature_name,
+                operation=operation,
+                actor_user_id=actor_user_id,
+                session_owner_id=session_owner_id,
+            )
+            for key, value in (attributes or {}).items():
+                usage.set_attribute(key, value)
+            usage.finish(outcome, failure_reason=failure_reason)
+        except Exception:
+            # Metrics cannot affect the event-control path.
+            return
 
     @router.post(
         "/sessions/{session_id}/events",
@@ -591,7 +654,15 @@ def register_events_routes(
             # to the runner for runner-side (policy) elicitations.
             # The dedicated URL endpoint (``.../elicitations/{eid}/
             # resolve``) routes through the same helper.
-            await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
+            metric_actor, metric_owner = await _usage_identity(session_id, user_id)
+            await _resolve_elicitation(
+                session_id,
+                body.data,
+                runner_router,
+                conversation_store,
+                actor_user_id=metric_actor,
+                session_owner_id=metric_owner,
+            )
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
             await _apply_pending_policy_ask_writes(
@@ -624,6 +695,14 @@ def register_events_routes(
             from omnigent.server.routes import sessions as _sessions_facade
 
             _sessions_facade.session_stream.publish(session_id, _mcp_elicit_payload)
+            metric_actor, metric_owner = await _usage_identity(session_id, user_id)
+            _record_terminal_usage(
+                feature_name="approval",
+                operation="request",
+                actor_user_id=metric_actor,
+                session_owner_id=metric_owner,
+                outcome="success",
+            )
             # Mirror the prompt into ancestor streams so a sub-agent MCP
             # elicitation surfaces in the parent (polly) chat with a
             # ``target_session_id`` pointing back at this child. The
@@ -659,16 +738,38 @@ def register_events_routes(
             if runner_result is not None and runner_result.status_code == 200:
                 return {"queued": False}
             if runner_result is not None and runner_result.status_code != 204:
+                metric_actor, metric_owner = await _usage_identity(session_id, user_id)
+                _record_terminal_usage(
+                    feature_name="context",
+                    operation="compact",
+                    actor_user_id=metric_actor,
+                    session_owner_id=metric_owner,
+                    outcome="failed",
+                    failure_reason="backend",
+                )
                 raise OmnigentError(
                     f"Compaction failed: runner returned {runner_result.status_code}",
                     code=ErrorCode.INTERNAL_ERROR,
                 )
-            await _run_compact_locked(
-                session_id,
-                conv,
-                agent_store,
-                agent_cache,
+            metric_actor, metric_owner = await _usage_identity(session_id, user_id)
+            usage = get_feature_usage_recorder().operation(
+                feature_name="context",
+                operation="compact",
+                actor_user_id=metric_actor,
+                session_owner_id=metric_owner,
             )
+            try:
+                await _run_compact_locked(
+                    session_id,
+                    conv,
+                    agent_store,
+                    agent_cache,
+                )
+            except Exception as exc:
+                outcome, reason = classify_feature_usage_exception(exc)
+                usage.finish(outcome, failure_reason=reason)
+                raise
+            usage.succeed()
             return {"queued": False}
         if body.type == "compaction":
             import uuid as _uuid
@@ -855,11 +956,31 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             if compaction_status == "in_progress":
+                external_compaction_terminal_seen.pop(session_id, None)
                 _publish_compaction_in_progress(session_id)
             elif compaction_status == "completed":
                 _publish_compaction_completed(session_id, None)
+                if _claim_external_compaction_terminal(session_id):
+                    metric_actor, metric_owner = await _usage_identity(session_id, user_id)
+                    _record_terminal_usage(
+                        feature_name="context",
+                        operation="compact",
+                        actor_user_id=metric_actor,
+                        session_owner_id=metric_owner,
+                        outcome="success",
+                    )
             else:
                 _publish_compaction_failed(session_id)
+                if _claim_external_compaction_terminal(session_id):
+                    metric_actor, metric_owner = await _usage_identity(session_id, user_id)
+                    _record_terminal_usage(
+                        feature_name="context",
+                        operation="compact",
+                        actor_user_id=metric_actor,
+                        session_owner_id=metric_owner,
+                        outcome="failed",
+                        failure_reason="backend",
+                    )
             return {"queued": False}
         if body.type == _EXTERNAL_MCP_STARTUP_TYPE:
             # Harness MCP-server startup progress (codex-native forwarder):
