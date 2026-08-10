@@ -17,6 +17,10 @@ from fastapi import FastAPI
 
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.feature_usage_metrics import (
+    FeatureUsageRecorder,
+    set_feature_usage_recorder_for_testing,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -24,6 +28,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 from tests.server.conftest import ControllableMockClient
+from tests.server.feature_usage_helpers import RecordingMeter
 
 pytestmark = pytest.mark.asyncio
 
@@ -173,6 +178,40 @@ async def test_admin_create_unregistered_handler_rejected(
     )
     assert resp.status_code == 400
     assert "not registered" in resp.json()["error"]["message"]
+
+
+async def test_admin_policy_registration_records_admin_usage(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Default-policy registration is labeled with the admin scope."""
+    _make_admin(db_uri)
+    meter = RecordingMeter()
+    set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
+    try:
+        response = await auth_client.post(
+            "/v1/policies",
+            json={
+                "name": "metric_policy",
+                "type": "python",
+                "handler": "omnigent.policies.builtins.safety.ask_on_os_tools",
+            },
+            headers=_admin_headers(),
+        )
+    finally:
+        set_feature_usage_recorder_for_testing(None)
+
+    assert response.status_code == 200
+    assert meter.counter.records == [
+        {
+            "omnigent.feature.name": "policy",
+            "omnigent.feature.operation": "register",
+            "omnigent.feature.outcome": "success",
+            "omnigent.actor.user_id": "admin@example.com",
+            "omnigent.policy.scope": "admin",
+            "omnigent.policy.type": "python",
+        }
+    ]
 
 
 async def test_list_default_policies(

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Any
 
 import httpx
 import pytest
@@ -20,11 +21,48 @@ from starlette.websockets import WebSocketDisconnect
 
 from omnigent.server import dictation as dictation_engine
 from omnigent.server.dictation import FAKE_SCRIPT, MAX_STREAMS_ENV, FakeDictationEngine
+from omnigent.server.feature_usage_metrics import (
+    FeatureUsageRecorder,
+    set_feature_usage_recorder_for_testing,
+)
 from omnigent.server.routes.dictation import create_dictation_router
 
 # One fake-engine "word" of audio: 100 ms of 16 kHz mono s16le.
 _WORD_BYTES = b"\x00" * (16000 * 2 // 10)
 _SCRIPT_WORDS = FAKE_SCRIPT.split()
+
+
+class _UsageCounter:
+    """Minimal metric counter for route instrumentation tests."""
+
+    def __init__(self) -> None:
+        self.records: list[dict[str, Any]] = []
+
+    def add(self, amount: int | float, attributes: dict[str, Any] | None = None) -> None:
+        assert amount == 1
+        self.records.append(dict(attributes or {}))
+
+
+class _UsageHistogram:
+    """Minimal histogram required by the recorder."""
+
+    def record(self, amount: int | float, attributes: dict[str, Any] | None = None) -> None:
+        del amount, attributes
+
+
+class _UsageMeter:
+    """Metric meter exposing a recording usage counter."""
+
+    def __init__(self) -> None:
+        self.counter = _UsageCounter()
+
+    def create_counter(self, *args: Any, **kwargs: Any) -> _UsageCounter:
+        del args, kwargs
+        return self.counter
+
+    def create_histogram(self, *args: Any, **kwargs: Any) -> _UsageHistogram:
+        del args, kwargs
+        return _UsageHistogram()
 
 
 class _NoIdentityAuthProvider:
@@ -99,6 +137,29 @@ def test_stream_stop_flushes_tail() -> None:
         assert stopped == {"type": "stopped", "text": " ".join(_SCRIPT_WORDS[:3])}
 
 
+def test_stream_stop_records_one_feature_usage_metric() -> None:
+    """A normal take emits exactly one bounded feature-usage measurement."""
+    meter = _UsageMeter()
+    set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
+    try:
+        with TestClient(_fake_app()) as tc, tc.websocket_connect("/v1/dictation/stream") as ws:
+            assert json.loads(ws.receive_text())["type"] == "ready"
+            ws.send_text(json.dumps({"type": "stop"}))
+            assert json.loads(ws.receive_text())["type"] == "stopped"
+    finally:
+        set_feature_usage_recorder_for_testing(None)
+
+    assert meter.counter.records == [
+        {
+            "omnigent.feature.name": "dictation",
+            "omnigent.feature.operation": "take",
+            "omnigent.feature.outcome": "success",
+            "omnigent.actor.user_id": "local",
+            "omnigent.dictation.engine": "other",
+        }
+    ]
+
+
 def test_stream_ignores_unknown_control_messages() -> None:
     """Unknown text frames are ignored for forward compatibility."""
     with TestClient(_fake_app()) as tc, tc.websocket_connect("/v1/dictation/stream") as ws:
@@ -137,10 +198,17 @@ def test_stream_closes_take_on_abrupt_disconnect() -> None:
 def test_stream_rejects_unauthenticated_handshake() -> None:
     """With an auth provider and no identity, the handshake is refused."""
     app = _fake_app(auth_provider=_NoIdentityAuthProvider())
-    with TestClient(app) as tc:
-        with pytest.raises(WebSocketDisconnect):
-            with tc.websocket_connect("/v1/dictation/stream") as ws:
-                ws.receive_text()
+    meter = _UsageMeter()
+    set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
+    try:
+        with TestClient(app) as tc:
+            with pytest.raises(WebSocketDisconnect):
+                with tc.websocket_connect("/v1/dictation/stream") as ws:
+                    ws.receive_text()
+    finally:
+        set_feature_usage_recorder_for_testing(None)
+
+    assert meter.counter.records == []
 
 
 def test_stream_capacity_cap(monkeypatch: pytest.MonkeyPatch) -> None:

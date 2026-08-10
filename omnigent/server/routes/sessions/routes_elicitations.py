@@ -28,6 +28,9 @@ from omnigent.server.auth import (
     AuthProvider,
 )
 from omnigent.server.routes._auth_helpers import (
+    get_session_owner_id as _get_session_owner_id,
+)
+from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -134,7 +137,18 @@ def register_elicitations_routes(
         if conv is None:
             raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
-        await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
+        try:
+            owner_id = await asyncio.to_thread(_get_session_owner_id, session_id, permission_store)
+        except Exception:
+            owner_id = None
+        await _resolve_elicitation(
+            session_id,
+            _resolve_data,
+            runner_router,
+            conversation_store,
+            actor_user_id=user_id or owner_id or "local",
+            session_owner_id=owner_id,
+        )
         # Apply any policy writes deferred by the relay tool-call ASK gate
         # (e.g. a cost-budget checkpoint) now that the verdict is in.
         await _apply_pending_policy_ask_writes(

@@ -267,6 +267,7 @@ def register_hooks_routes(
             params=params,
             timeout_s=_sf._CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
             conversation_store=conversation_store,
+            actor_user_id=user_id,
             # Client-minted stable id so a retry re-parks the same elicitation.
             elicitation_id=elicitation_id,
             # Tool identity lets a mirrored tool result for this gated
@@ -794,6 +795,7 @@ def register_hooks_routes(
                                 result=result,
                                 conversation_store=conversation_store,
                                 elicitation_id=hook_elicitation_id,
+                                actor_user_id=user_id,
                             )
                         except ElicitationDeclinedError as exc:
                             # Explicit user decline: interrupt the native
@@ -923,6 +925,7 @@ def register_hooks_routes(
             params=codex_request.params,
             timeout_s=_sf._CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S,
             conversation_store=conversation_store,
+            actor_user_id=user_id,
             elicitation_id=codex_elicitation_id(
                 session_id,
                 codex_request.method,
@@ -1033,6 +1036,7 @@ def register_hooks_routes(
             params=params,
             timeout_s=_sf._ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S,
             conversation_store=conversation_store,
+            actor_user_id=user_id,
             elicitation_id=elicitation_id,
         )
         if result is None:
@@ -1149,6 +1153,7 @@ def register_hooks_routes(
             params=params,
             timeout_s=_sf._CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
             conversation_store=conversation_store,
+            actor_user_id=user_id,
             elicitation_id=elicitation_id,
             tool_name=f"Cursor({operation_type})",
         )
@@ -1259,6 +1264,7 @@ def register_hooks_routes(
             params=params,
             timeout_s=_sf._NATIVE_PERMISSION_HOOK_TIMEOUT_S,
             conversation_store=conversation_store,
+            actor_user_id=user_id,
             elicitation_id=elicitation_id,
             tool_name=f"{agent}({operation_type})",
         )

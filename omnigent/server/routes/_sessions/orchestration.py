@@ -11,6 +11,7 @@ import asyncio
 import json
 import secrets
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any, Literal, cast
 
@@ -89,6 +90,7 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
+from omnigent.server.feature_usage_metrics import get_feature_usage_recorder
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     ManagedHostLaunch,
@@ -100,6 +102,9 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
+)
+from omnigent.server.routes._auth_helpers import (
+    get_session_owner_id as _get_session_owner_id,
 )
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
@@ -169,6 +174,80 @@ from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedE
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.telemetry.surface import classify_surface as _classify_surface
 
+_APPROVAL_USAGE_DEDUPLICATION_CAPACITY = 4096
+# Elicitation IDs are the operation correlation key, but must never become a
+# metric attribute. Keep only a bounded in-process record so retries through
+# alternate delivery paths do not re-count the same approval lifecycle.
+_approval_usage_requests_seen: OrderedDict[tuple[str, str], None] = OrderedDict()
+_approval_usage_resolutions_seen: OrderedDict[tuple[str, str], None] = OrderedDict()
+
+
+def _claim_approval_usage(
+    seen: OrderedDict[tuple[str, str], None], session_id: str, elicitation_id: str
+) -> bool:
+    """Claim one approval lifecycle edge, evicting the oldest claim when full."""
+    key = (session_id, elicitation_id)
+    if key in seen:
+        return False
+    seen[key] = None
+    if len(seen) > _APPROVAL_USAGE_DEDUPLICATION_CAPACITY:
+        seen.popitem(last=False)
+    return True
+
+
+async def _record_approval_request(
+    session_id: str,
+    elicitation_id: str,
+    conversation_store: ConversationStore | None,
+    actor_user_id: str | None = None,
+) -> None:
+    """Record a newly published approval card, never a re-published retry."""
+    try:
+        owner_id = (
+            await asyncio.to_thread(conversation_store.get_session_owner, session_id)
+            if conversation_store is not None
+            else None
+        )
+        if not _claim_approval_usage(_approval_usage_requests_seen, session_id, elicitation_id):
+            return
+        usage = get_feature_usage_recorder().operation(
+            feature_name="approval",
+            operation="request",
+            actor_user_id=actor_user_id or owner_id or "local",
+            session_owner_id=owner_id,
+        )
+        usage.succeed()
+    except Exception:  # noqa: BLE001
+        # Publishing the approval card remains authoritative.
+        return
+
+
+async def _record_approval_timeout(
+    session_id: str,
+    elicitation_id: str,
+    conversation_store: ConversationStore | None,
+    actor_user_id: str | None = None,
+) -> None:
+    """Record the timeout where a parked server-side approval actually ends."""
+    try:
+        owner_id = (
+            await asyncio.to_thread(conversation_store.get_session_owner, session_id)
+            if conversation_store is not None
+            else None
+        )
+        if not _claim_approval_usage(_approval_usage_resolutions_seen, session_id, elicitation_id):
+            return
+        usage = get_feature_usage_recorder().operation(
+            feature_name="approval",
+            operation="resolve",
+            actor_user_id=actor_user_id or owner_id or "local",
+            session_owner_id=owner_id,
+        )
+        usage.set_attribute("omnigent.approval.decision", "timeout")
+        usage.succeed()
+    except Exception:  # noqa: BLE001
+        return
+
 
 async def _publish_and_wait_for_harness_elicitation(
     request: Request,
@@ -177,6 +256,7 @@ async def _publish_and_wait_for_harness_elicitation(
     params: ElicitationRequestParams,
     timeout_s: float,
     conversation_store: ConversationStore | None = None,
+    actor_user_id: str | None = None,
     elicitation_id: str | None = None,
     tool_name: str | None = None,
     tool_input: dict[str, Any] | None = None,
@@ -213,6 +293,8 @@ async def _publish_and_wait_for_harness_elicitation(
     :param conversation_store: Optional store used to mirror
         child-session prompts into ancestor streams. ``None`` keeps
         the prompt scoped to ``session_id`` only.
+    :param actor_user_id: Authenticated initiator when the calling route has
+        one. Background callers leave this unset and use owner/local fallback.
     :param elicitation_id: Optional precomputed correlation id, e.g.
         ``"elicit_codex_abc123"``. ``None`` mints a random id.
     :param tool_name: Gated tool name, e.g. ``"Bash"``, used to
@@ -248,6 +330,7 @@ async def _publish_and_wait_for_harness_elicitation(
     # severed wait instead defers the clear so a hook retry can re-park.
     published_request = False
     settled = False
+    timed_out = False
     try:
         tombstone = _consume_pre_resolved_harness_elicitation(session_id, elicitation_id)
         if tombstone is not None:
@@ -259,6 +342,12 @@ async def _publish_and_wait_for_harness_elicitation(
             params=params,
         )
         event_payload = event.model_dump()
+        await _record_approval_request(
+            session_id,
+            elicitation_id,
+            conversation_store,
+            actor_user_id,
+        )
         session_stream.publish(session_id, event_payload)
         published_request = True
         if conversation_store is not None:
@@ -279,6 +368,7 @@ async def _publish_and_wait_for_harness_elicitation(
                 timeout=timeout_s,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            timed_out = not done
         finally:
             for race_task in race_tasks:
                 if not race_task.done():
@@ -323,6 +413,10 @@ async def _publish_and_wait_for_harness_elicitation(
         if _harness_parked_elicitations.get(elicitation_id) is parked:
             _harness_parked_elicitations.pop(elicitation_id, None)
         if published_request and not settled:
+            if timed_out:
+                await _record_approval_timeout(
+                    session_id, elicitation_id, conversation_store, actor_user_id
+                )
             # Severed without an answer — defer the clear (scheduled
             # before any await so handler cancellation can't skip it).
             _schedule_deferred_elicitation_clear(
@@ -1338,6 +1432,9 @@ async def _resolve_elicitation(
     data: dict[str, Any],
     runner_router: RunnerRouter | None,
     conversation_store: ConversationStore | None = None,
+    *,
+    actor_user_id: str | None = None,
+    session_owner_id: str | None = None,
 ) -> None:
     """
     Resolve one outstanding elicitation from an approval payload.
@@ -1382,6 +1479,10 @@ async def _resolve_elicitation(
     :param conversation_store: Optional store used to mirror the
         resolved signal into ancestor streams when ``session_id`` is
         a child session. ``None`` keeps the signal scoped locally.
+    :param actor_user_id: Authenticated resolver, when this resolution came
+        from a request. ``None`` leaves the owner/local fallback in place for
+        runner-originated terminal resolution.
+    :param session_owner_id: Owner used for background-resolution attribution.
     """
     # Empty-string default is intentional, NOT a fail-loud miss: the
     # resolve-URL caller always supplies the id (it comes from the URL
@@ -1390,6 +1491,12 @@ async def _resolve_elicitation(
     # matches, no resolved event published) rather than 500-ing the
     # client — the runner forward still fires so the runner can reject.
     elicitation_id = data.get("elicitation_id", "")
+    action = data.get("action")
+    pending = (
+        isinstance(elicitation_id, str)
+        and bool(elicitation_id)
+        and (pending_elicitations.lookup(elicitation_id) or (None,))[0] == session_id
+    )
     harness_future = _harness_elicitation_registry.get(elicitation_id)
     if harness_future is not None and not harness_future.done():
         # Only the session that owns this elicitation
@@ -1447,6 +1554,23 @@ async def _resolve_elicitation(
             )
     # Runner-side elicitations (policy approvals, scaffold dispatch)
     # resolve when the canonical approval event reaches the runner.
+    if (
+        pending
+        and action in {"accept", "decline", "cancel", "timeout"}
+        and _claim_approval_usage(_approval_usage_resolutions_seen, session_id, elicitation_id)
+    ):
+        try:
+            usage = get_feature_usage_recorder().operation(
+                feature_name="approval",
+                operation="resolve",
+                actor_user_id=actor_user_id or session_owner_id or "local",
+                session_owner_id=session_owner_id,
+            )
+            usage.set_attribute("omnigent.approval.decision", action)
+            usage.succeed()
+        except Exception:  # noqa: BLE001
+            # Approval delivery is authoritative; metrics are observational.
+            pass
     await _forward_approval_to_runner(session_id, data, runner_router)
 
 
@@ -1551,6 +1675,7 @@ async def _hold_native_ask_gate_impl(
     result: PolicyResult,
     conversation_store: ConversationStore,
     elicitation_id: str | None = None,
+    actor_user_id: str | None = None,
 ) -> bool:
     """
     Hold a server-side ASK gate until a human resolves it.
@@ -1600,6 +1725,7 @@ async def _hold_native_ask_gate_impl(
         used by ``POST /policies/evaluate`` retries so a hook retry after
         a transient 5xx / connect-drop does not prompt the human twice.
         ``None`` mints a fresh id (the default for non-retry callers).
+    :param actor_user_id: Authenticated initiator when available.
     :returns: ``True`` iff a human accepted; ``False`` on cancel /
         timeout / disconnect (fail closed).
     :raises ElicitationDeclinedError: when the human explicitly
@@ -1633,6 +1759,7 @@ async def _hold_native_ask_gate_impl(
         timeout_s=timeout_s,
         elicitation_id=elicitation_id,
         conversation_store=conversation_store,
+        actor_user_id=actor_user_id,
         tool_name=tool_name if isinstance(tool_name, str) else None,
         tool_input=tool_input if isinstance(tool_input, dict) else None,
     )
@@ -4563,6 +4690,13 @@ async def _relay_runner_stream(
                                 },
                             }
                     if evt_type == "response.elicitation_request":
+                        _relay_elicitation_id = event.get("elicitation_id")
+                        if isinstance(_relay_elicitation_id, str) and _relay_elicitation_id:
+                            await _record_approval_request(
+                                session_id,
+                                _relay_elicitation_id,
+                                conversation_store,
+                            )
                         session_stream.publish(session_id, event)
                         await asyncio.to_thread(
                             _publish_elicitation_request_to_ancestors,
@@ -4789,6 +4923,7 @@ async def _register_policy_elicitation(
     result: PolicyResult,
     arguments_preview: str,
     conversation_store: ConversationStore,
+    actor_user_id: str | None = None,
 ) -> str:
     """
     Publish an elicitation request event on the session stream.
@@ -4827,6 +4962,7 @@ async def _register_policy_elicitation(
     _elicit_event = build_elicitation_request_event(
         elicitation_id, elicitation, session_id=session_id
     )
+    await _record_approval_request(session_id, elicitation_id, conversation_store, actor_user_id)
     session_stream.publish(session_id, _elicit_event)
     await asyncio.to_thread(
         _publish_elicitation_request_to_ancestors,
@@ -4919,6 +5055,7 @@ async def _evaluate_tool_call_policy(
         result=result,
         arguments_preview=arguments_str,
         conversation_store=conversation_store,
+        actor_user_id=actor.get("run_as") if actor is not None else None,
     )
     # The deciding policy's writes (e.g. a cost-budget checkpoint via
     # ``state_updates``) must land ONLY on approve. This relay path returns
@@ -5076,6 +5213,7 @@ async def _evaluate_input_policy(
             engine=engine,
             result=result,
             conversation_store=conversation_store,
+            actor_user_id=actor.get("run_as") if actor is not None else None,
         )
     except ElicitationDeclinedError as exc:
         return {
@@ -5570,6 +5708,25 @@ async def _create_session_from_existing_agent(
                 reason="create-rollback",
             )
         raise
+
+    if body.parent_session_id is not None:
+        # A parent link is the durable sub-agent creation boundary.  Do not
+        # instrument ordinary root-session creates or later child dispatches.
+        try:
+            parent_owner_id = await asyncio.to_thread(
+                _get_session_owner_id, body.parent_session_id, permission_store
+            )
+            usage = get_feature_usage_recorder().operation(
+                feature_name="sub_agent",
+                operation="spawn",
+                actor_user_id=user_id or parent_owner_id or "local",
+                session_owner_id=parent_owner_id,
+            )
+            usage.succeed()
+        except Exception:  # noqa: BLE001
+            # The session has been created successfully; usage emission must
+            # not alter that result.
+            pass
 
     # The create request has no conv id in its URL, so the path-based
     # FastAPI hook can't tag it — stamp the minted id so the create span
@@ -6084,6 +6241,7 @@ async def _handle_mcp_tools_call(
                 call_result,
                 json.dumps(arguments)[:1024],
                 conversation_store,
+                actor.get("run_as") if actor is not None else None,
             )
             # Defer the deciding policy's writes (label mutations AND
             # state_updates such as a cost-budget checkpoint) to the
@@ -6205,6 +6363,7 @@ async def _handle_mcp_tools_call(
                 params=elicit_params,
                 timeout_s=300.0,
                 conversation_store=conversation_store,
+                actor_user_id=actor.get("run_as") if actor is not None else None,
             )
             if elicit_result is None:
                 input_responses[eid] = {"action": "decline"}

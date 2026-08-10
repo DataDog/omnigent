@@ -16,7 +16,12 @@ from starlette.testclient import TestClient
 
 from omnigent.entities import Agent, Conversation, ConversationItem, MessageData, PagedList
 from omnigent.errors import OmnigentError
+from omnigent.server.feature_usage_metrics import (
+    FeatureUsageRecorder,
+    set_feature_usage_recorder_for_testing,
+)
 from omnigent.server.routes.sessions import create_sessions_router
+from tests.server.feature_usage_helpers import RecordingMeter
 
 # ── Minimal store stubs ──────────────────────────────────────────
 
@@ -444,6 +449,30 @@ async def test_fork_session_happy_path() -> None:
     assert fork_call["agent_id"] == body["agent_id"], (
         "Fork must bind the same cloned agent id it asked the store to create"
     )
+
+
+@pytest.mark.asyncio
+async def test_fork_records_bounded_usage() -> None:
+    """A route-authoritative fork emits one full-history usage measurement."""
+    source_id = "e9f8f58523cec9a57d3bdf93be543e8c"
+    store = _ConversationStore(conversations={source_id: _make_conversation()})
+    meter = RecordingMeter()
+    set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
+    try:
+        response = TestClient(_build_app(store)).post(f"/v1/sessions/{source_id}/fork", json={})
+    finally:
+        set_feature_usage_recorder_for_testing(None)
+
+    assert response.status_code == 201
+    assert meter.counter.records == [
+        {
+            "omnigent.feature.name": "fork",
+            "omnigent.feature.operation": "fork",
+            "omnigent.feature.outcome": "success",
+            "omnigent.actor.user_id": "local",
+            "omnigent.fork.history_scope": "full",
+        }
+    ]
 
 
 @pytest.mark.asyncio

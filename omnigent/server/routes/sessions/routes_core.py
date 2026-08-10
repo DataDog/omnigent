@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import secrets
 import time
@@ -66,10 +67,15 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     AuthProvider,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
+)
+from omnigent.server.feature_usage_metrics import (
+    classify_feature_usage_exception,
+    get_feature_usage_recorder,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
@@ -78,6 +84,9 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
+)
+from omnigent.server.routes._auth_helpers import (
+    get_session_owner_id as _get_session_owner_id,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -157,6 +166,77 @@ def register_core_routes(
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
 ) -> None:
     """Register the core session routes on router."""
+
+    async def _owner_id(session_id: str) -> str | None:
+        try:
+            return await asyncio.to_thread(_get_session_owner_id, session_id, permission_store)
+        except Exception:
+            return None
+
+    def _instrument_fork(handler: Callable) -> Callable:
+        @functools.wraps(handler)
+        async def wrapped(
+            request: Request,
+            source_id: str,
+            body: SessionForkRequest,
+        ) -> SessionResponse:
+            user_id = _get_user_id(request, auth_provider)
+            if user_id is None and auth_provider is not None:
+                return await handler(request, source_id, body)
+            async with get_feature_usage_recorder().operation(
+                feature_name="fork",
+                operation="fork",
+                actor_user_id=user_id or RESERVED_USER_LOCAL,
+                session_owner_id=await _owner_id(source_id),
+            ) as usage:
+                usage.set_attribute(
+                    "omnigent.fork.history_scope",
+                    "partial" if body.up_to_response_id is not None else "full",
+                )
+                try:
+                    return await handler(request, source_id, body)
+                except OmnigentError as exc:
+                    outcome, reason = classify_feature_usage_exception(exc)
+                    usage.finish(outcome, failure_reason=reason)
+                    raise
+
+        return wrapped
+
+    def _instrument_model_switch(handler: Callable) -> Callable:
+        @functools.wraps(handler)
+        async def wrapped(
+            request: Request,
+            session_id: str,
+            body: UpdateSessionRequest,
+        ) -> SessionResponse:
+            if "model_override" not in body.model_fields_set or body.silent:
+                return await handler(request, session_id, body)
+            user_id = _get_user_id(request, auth_provider)
+            if user_id is None and auth_provider is not None:
+                return await handler(request, session_id, body)
+            try:
+                before = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            except Exception:
+                before = None
+            async with get_feature_usage_recorder().operation(
+                feature_name="model",
+                operation="switch",
+                actor_user_id=user_id or RESERVED_USER_LOCAL,
+                session_owner_id=await _owner_id(session_id),
+            ) as usage:
+                try:
+                    result = await handler(request, session_id, body)
+                    if before is not None and before.model_override == result.model_override:
+                        usage.finish("no_change")
+                    else:
+                        usage.succeed()
+                    return result
+                except OmnigentError as exc:
+                    outcome, reason = classify_feature_usage_exception(exc)
+                    usage.finish(outcome, failure_reason=reason)
+                    raise
+
+        return wrapped
 
     @router.post(
         "/sessions",
@@ -1409,6 +1489,7 @@ def register_core_routes(
         response_model=None,
         responses={200: {"model": SessionResponse}},
     )
+    @_instrument_model_switch
     async def update_session(
         request: Request,
         session_id: str,
@@ -1869,6 +1950,7 @@ def register_core_routes(
         response_model=None,
         responses={201: {"model": SessionResponse}},
     )
+    @_instrument_fork
     async def fork_session(
         request: Request,
         source_id: str,

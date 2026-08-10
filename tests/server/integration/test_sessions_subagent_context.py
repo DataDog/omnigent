@@ -28,9 +28,14 @@ import httpx
 import pytest
 
 from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.server.feature_usage_metrics import (
+    FeatureUsageRecorder,
+    set_feature_usage_recorder_for_testing,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from tests.server.feature_usage_helpers import RecordingMeter
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -95,6 +100,28 @@ async def _create_child_session(
     resp = await client.post("/v1/sessions", json=payload)
     assert resp.status_code == 201, f"child session create failed: {resp.text}"
     return resp.json()
+
+
+async def test_only_child_session_creation_records_subagent_spawn(
+    client: httpx.AsyncClient,
+) -> None:
+    """A root session is not a spawn; a parent-linked child is exactly one."""
+    meter = RecordingMeter()
+    set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
+    try:
+        parent = await _create_parent_session(client, agent_name="metrics-parent")
+        await _create_child_session(
+            client,
+            parent_session_id=parent["id"],
+            agent_name="metrics-child",
+        )
+        assert [record["omnigent.feature.operation"] for record in meter.counter.records] == [
+            "spawn"
+        ]
+        assert meter.counter.records[0]["omnigent.feature.name"] == "sub_agent"
+        assert meter.counter.records[0]["omnigent.feature.outcome"] == "success"
+    finally:
+        set_feature_usage_recorder_for_testing(None)
 
 
 # ── Runner co-location (shared workspace) ────────────────

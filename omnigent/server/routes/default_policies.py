@@ -15,6 +15,7 @@ session policies, with ``session_id IS NULL``.
 from __future__ import annotations
 
 import asyncio
+import functools
 import re
 import uuid
 from typing import Any
@@ -27,7 +28,11 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.registry import is_registered_handler, validate_factory_params
 from omnigent.runtime import get_caps
 from omnigent.runtime.policies.builder import invalidate_default_policy_specs_cache
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.feature_usage_metrics import (
+    classify_feature_usage_exception,
+    get_feature_usage_recorder,
+)
 from omnigent.server.routes._auth_helpers import get_user_id
 from omnigent.server.schemas import (
     _DOTTED_PATH_RE,
@@ -168,7 +173,34 @@ def create_default_policies_router(
     """
     router = APIRouter()
 
+    def _instrument_policy(operation: str):
+        def decorate(handler):
+            @functools.wraps(handler)
+            async def wrapped(request: Request, *args: Any, **kwargs: Any) -> Any:
+                user_id = get_user_id(request, auth_provider)
+                if user_id is None and auth_provider is not None:
+                    return await handler(request, *args, **kwargs)
+                async with get_feature_usage_recorder().operation(
+                    feature_name="policy",
+                    operation=operation,
+                    actor_user_id=user_id or RESERVED_USER_LOCAL,
+                ) as usage:
+                    usage.set_attribute("omnigent.policy.scope", "admin")
+                    body = kwargs.get("body")
+                    usage.set_attribute("omnigent.policy.type", getattr(body, "type", "unknown"))
+                    try:
+                        return await handler(request, *args, **kwargs)
+                    except OmnigentError as exc:
+                        outcome, reason = classify_feature_usage_exception(exc)
+                        usage.finish(outcome, failure_reason=reason)
+                        raise
+
+            return wrapped
+
+        return decorate
+
     @router.post("/policies")
+    @_instrument_policy("register")
     async def create_policy(
         request: Request,
         body: CreateDefaultPolicyRequest,
@@ -365,6 +397,7 @@ def create_default_policies_router(
         return _entity_to_response(policy)
 
     @router.delete("/policies/{policy_id}")
+    @_instrument_policy("delete")
     async def delete_policy(
         request: Request,
         policy_id: str,

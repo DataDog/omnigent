@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import mimetypes
 import urllib.parse
 from typing import Annotated, Any
@@ -41,9 +42,17 @@ from omnigent.server._elicitation_registry import (
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     AuthProvider,
 )
+from omnigent.server.feature_usage_metrics import (
+    classify_feature_usage_exception,
+    get_feature_usage_recorder,
+)
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.routes._auth_helpers import (
+    get_session_owner_id as _get_session_owner_id,
+)
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
@@ -89,6 +98,72 @@ def register_resources_routes(
     host_registry: HostRegistry | None = None,
 ) -> None:
     """Register the resources routes on router."""
+
+    def _normalized_attachment_type(file: UploadFile) -> str:
+        from omnigent.runtime.content_resolver import (
+            _resolve_content_type,
+            attachment_text_type_for_extension,
+            attachment_upload_limit,
+        )
+
+        content_type = _resolve_content_type(file.content_type, file.filename)
+        if attachment_upload_limit(content_type) is None:
+            content_type = attachment_text_type_for_extension(file.filename) or content_type
+        return content_type
+
+    def _upload_category(content_type: str) -> str:
+        from omnigent.runtime.content_resolver import attachment_upload_limit
+
+        if content_type.startswith("image/"):
+            return "image"
+        if content_type == "application/pdf":
+            return "pdf"
+        if attachment_upload_limit(content_type) is not None:
+            return "text"
+        return "unknown"
+
+    def _upload_size_bucket(size: int | None) -> str:
+        if size is None or size < 0:
+            return "unknown"
+        if size < 1 * 1024 * 1024:
+            return "lt_1mib"
+        if size < 10 * 1024 * 1024:
+            return "1mib_to_10mib"
+        return "gte_10mib"
+
+    async def _owner_id(session_id: str) -> str | None:
+        try:
+            return await asyncio.to_thread(_get_session_owner_id, session_id, permission_store)
+        except Exception:
+            return None
+
+    def _instrument_upload(handler: Any) -> Any:
+        @functools.wraps(handler)
+        async def wrapped(request: Request, session_id: str, file: UploadFile) -> Any:
+            user_id = _get_user_id(request, auth_provider)
+            if user_id is None and auth_provider is not None:
+                return await handler(request, session_id, file)
+            async with get_feature_usage_recorder().operation(
+                feature_name="attachment",
+                operation="upload",
+                actor_user_id=user_id or RESERVED_USER_LOCAL,
+                session_owner_id=await _owner_id(session_id),
+            ) as usage:
+                usage.set_attribute(
+                    "omnigent.attachment.category",
+                    _upload_category(_normalized_attachment_type(file)),
+                )
+                usage.set_attribute(
+                    "omnigent.attachment.size_bucket", _upload_size_bucket(file.size)
+                )
+                try:
+                    return await handler(request, session_id, file)
+                except (HTTPException, OmnigentError) as exc:
+                    outcome, reason = classify_feature_usage_exception(exc)
+                    usage.finish(outcome, failure_reason=reason)
+                    raise
+
+        return wrapped
 
     @router.get(
         "/sessions/{session_id}/resources",
@@ -899,6 +974,7 @@ def register_resources_routes(
         # Origin must be loopback).
         dependencies=[Depends(require_trusted_origin)],
     )
+    @_instrument_upload
     async def upload_session_file(
         request: Request,
         session_id: str,
@@ -927,8 +1003,6 @@ def register_resources_routes(
             )
         from omnigent.runtime.content_resolver import (
             MAX_ATTACHMENT_UPLOAD_BYTES,
-            _resolve_content_type,
-            attachment_text_type_for_extension,
             attachment_upload_limit,
         )
 
@@ -938,20 +1012,8 @@ def register_resources_routes(
         # base64 (see content_resolver.resolve_content_references); only
         # images, PDF, and text/code files are usable — others (pptx, docx,
         # zip, …) would be garbled or blow the request size, so reject them.
-        content_type = _resolve_content_type(
-            file.content_type,
-            file.filename,
-        )
+        content_type = _normalized_attachment_type(file)
         type_limit = attachment_upload_limit(content_type)
-        if type_limit is None:
-            # The browser/OS can mislabel a text/code file as binary (e.g. a
-            # .csv reported as application/vnd.ms-excel on Windows). Fall back
-            # to the extension — matching the web client's allowlist — and
-            # normalize the type so the resolver inlines it as text.
-            ext_type = attachment_text_type_for_extension(file.filename)
-            if ext_type is not None:
-                content_type = ext_type
-                type_limit = attachment_upload_limit(content_type)
         if type_limit is None:
             raise HTTPException(
                 status_code=415,
