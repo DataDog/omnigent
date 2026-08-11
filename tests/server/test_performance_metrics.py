@@ -803,6 +803,7 @@ def test_otel_publisher_records_request_duration_histogram() -> None:
                 "http.request.method": "POST",
                 "http.route": "/v1/sessions/{session_id}",
                 "http.response.status_code": 500,
+                "omnigent.actor.user_id": "anonymous",
             },
         ),
     ]
@@ -966,3 +967,75 @@ async def test_create_app_websocket_metrics_count_accepted_connections(
 
     after = app.state.server_metrics.snapshot()
     assert after.active_websockets == before.active_websockets
+
+
+def test_record_request_duration_with_actor_user_id() -> None:
+    """The actor user ID appears as a metric attribute when provided."""
+    meter = _FakeMeter()
+    publisher = ServerMetricsOtelPublisher(meter=meter)
+
+    publisher.record_request_duration(
+        duration_seconds=0.1,
+        failed=False,
+        method="GET",
+        route="/v1/sessions/{session_id}",
+        status_code=200,
+        actor_user_id="user@example.com",
+    )
+
+    record = meter.histograms["omnigent.server.http.request.duration"].records[-1]
+    assert record.attributes["omnigent.actor.user_id"] == "user@example.com"
+
+
+def test_record_request_duration_actor_user_id_fallback_to_anonymous() -> None:
+    """When actor_user_id is None, the attribute falls back to 'anonymous'."""
+    meter = _FakeMeter()
+    publisher = ServerMetricsOtelPublisher(meter=meter)
+
+    publisher.record_request_duration(
+        duration_seconds=0.1,
+        failed=False,
+        method="GET",
+        route="/v1/sessions/{session_id}",
+        status_code=200,
+        actor_user_id=None,
+    )
+
+    record = meter.histograms["omnigent.server.http.request.duration"].records[-1]
+    assert record.attributes["omnigent.actor.user_id"] == "anonymous"
+
+
+def test_record_request_duration_health_route_excludes_user_tag() -> None:
+    """The /health route does not carry the actor user ID attribute."""
+    meter = _FakeMeter()
+    publisher = ServerMetricsOtelPublisher(meter=meter)
+
+    publisher.record_request_duration(
+        duration_seconds=0.01,
+        failed=False,
+        method="GET",
+        route="/health",
+        status_code=200,
+        actor_user_id="user@example.com",
+    )
+
+    record = meter.histograms["omnigent.server.http.request.duration"].records[-1]
+    assert "omnigent.actor.user_id" not in record.attributes
+
+
+def test_record_request_duration_actor_user_id_empty_string_falls_back() -> None:
+    """An empty-string actor_user_id falls back to 'anonymous'."""
+    meter = _FakeMeter()
+    publisher = ServerMetricsOtelPublisher(meter=meter)
+
+    publisher.record_request_duration(
+        duration_seconds=0.1,
+        failed=False,
+        method="GET",
+        route="/v1/sessions/{session_id}",
+        status_code=200,
+        actor_user_id="",
+    )
+
+    record = meter.histograms["omnigent.server.http.request.duration"].records[-1]
+    assert record.attributes["omnigent.actor.user_id"] == "anonymous"
