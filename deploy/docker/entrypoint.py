@@ -319,7 +319,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     from omnigent.runtime import telemetry
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.runtime.caps import RuntimeCaps
-    from omnigent.server.managed_hosts import parse_sandbox_config
+    from omnigent.server.managed_hosts import load_sandbox_config
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.comment_store.sqlalchemy_store import (
         SqlAlchemyCommentStore,
@@ -349,10 +349,13 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     policy_store = SqlAlchemyPolicyStore(database_url)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(database_url)
     project_store = SqlAlchemyProjectStore(database_url)
-    # Fail startup loud on a malformed `sandbox:` section (an operator
-    # typo should not surface as a runtime 502 on the first managed
-    # session); the startup catch-all below logs it.
-    sandbox_config = parse_sandbox_config(cfg.get("sandbox"))
+    # Fail startup loud on a malformed `sandbox:` section or a broken
+    # external provider module (an operator typo should not surface as a
+    # runtime 502 on the first managed session); the startup catch-all
+    # below logs it.  When OMNIGENT_SANDBOX_PROVIDER_MODULE is set, the
+    # named module supplies the config; otherwise the YAML `sandbox:`
+    # section is parsed as before.
+    sandbox_config = load_sandbox_config(cfg)
     artifact_store = _select_artifact_store(resolved_config)
 
     agent_cache = AgentCache(

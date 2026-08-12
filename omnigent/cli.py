@@ -3809,14 +3809,17 @@ def server(
 
     host_store = HostStore(db_uri)
 
-    # Managed sandbox hosts (host_type="managed" sessions): parse the
-    # config's `sandbox:` section up front so an operator typo stops
-    # startup instead of 502-ing the first managed session.
-    from omnigent.server.managed_hosts import parse_sandbox_config
+    # Managed sandbox hosts (host_type="managed" sessions): resolve
+    # the sandbox config up front so an operator typo or a broken
+    # external provider module stops startup instead of 502-ing the
+    # first managed session.  When OMNIGENT_SANDBOX_PROVIDER_MODULE is
+    # set, the named module supplies the config; otherwise the YAML
+    # `sandbox:` section is parsed as before.
+    from omnigent.server.managed_hosts import load_sandbox_config
 
     try:
-        sandbox_config = parse_sandbox_config(cfg.get("sandbox"))
-    except ValueError as exc:
+        sandbox_config = load_sandbox_config(cfg)
+    except (ValueError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
 
     # Accounts mode ergonomics: when accounts mode is selected
