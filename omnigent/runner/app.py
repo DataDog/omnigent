@@ -2145,11 +2145,15 @@ def create_runner_app(
 
     resource_registry.set_terminal_activity_publisher(_publish_terminal_activity)
 
-    def _publish_session_status(session_id: str, status: str) -> None:
-        _publish_event(
-            session_id,
-            {"type": "session.status", "status": status},
-        )
+    def _publish_session_status(
+        session_id: str,
+        status: str,
+        blocked_on: str | None = None,
+    ) -> None:
+        event: dict[str, object] = {"type": "session.status", "status": status}
+        if blocked_on is not None:
+            event["blocked_on"] = blocked_on
+        _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
 
