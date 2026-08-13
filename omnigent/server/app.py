@@ -82,6 +82,7 @@ from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.scheduled import ScheduledTaskScheduler
+from omnigent.server.websocket_metrics import WebSocketMetricsOtelPublisher, ws_route_template
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -190,19 +191,30 @@ class _WebSocketMetricsMiddleware:
     """
     ASGI middleware that tracks accepted WebSocket connections.
 
+    Records per-connection duration, message counts, and close reason
+    through :class:`WebSocketMetricsOtelPublisher` when an OTEL
+    publisher is wired.  The in-process ``ServerPerformanceMetrics``
+    counter is always maintained for backward compatibility.
+
     :param app: Downstream ASGI app.
     :param metrics: Process-local server metrics tracker.
+    :param ws_otel: Optional OTEL publisher for WebSocket metrics.
+    :param auth_provider: Optional auth provider for user attribution.
     """
 
-    def __init__(self, app: ASGIApp, metrics: ServerPerformanceMetrics) -> None:
-        """
-        Initialize the middleware.
-
-        :param app: Downstream ASGI app.
-        :param metrics: Process-local server metrics tracker.
-        """
+    def __init__(
+        self,
+        app: ASGIApp,
+        metrics: ServerPerformanceMetrics,
+        *,
+        ws_otel: WebSocketMetricsOtelPublisher | None = None,
+        auth_provider: AuthProvider | None = None,
+    ) -> None:
+        """Initialize the middleware."""
         self._app = app
         self._metrics = metrics
+        self._ws_otel = ws_otel
+        self._auth_provider = auth_provider
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """
@@ -216,26 +228,69 @@ class _WebSocketMetricsMiddleware:
             await self._app(scope, receive, send)
             return
 
+        route = ws_route_template(scope)
+        actor_user_id: str | None = None
+        if self._auth_provider is not None:
+            try:
+                from starlette.requests import HTTPConnection
+
+                actor_user_id = self._auth_provider.get_user_id(
+                    HTTPConnection(scope),
+                )
+            except Exception:  # noqa: BLE001
+                actor_user_id = None
+
+        started_at = time.monotonic()
         counted = False
+        close_code: int | None = None
 
         async def send_with_metrics(message: Message) -> None:
             """
-            Count the connection when the route accepts the handshake.
+            Count the connection on accept and track outbound messages.
 
-            :param message: ASGI message emitted by the downstream app,
-                e.g. ``{"type": "websocket.accept"}``.
+            :param message: ASGI message emitted by the downstream app.
             """
-            nonlocal counted
+            nonlocal counted, close_code
             if not counted and message["type"] == "websocket.accept":
                 self._metrics.websocket_connected()
                 counted = True
+            if message["type"] == "websocket.close":
+                close_code = message.get("code", 1000)
+            if message["type"] == "websocket.send" and self._ws_otel is not None:
+                self._ws_otel.record_message_sent(route=route, actor_user_id=actor_user_id)
             await send(message)
 
+        async def receive_with_metrics() -> Message:
+            """
+            Track inbound WebSocket messages.
+
+            :returns: The next ASGI message from the client.
+            """
+            message = await receive()
+            if message["type"] == "websocket.receive" and self._ws_otel is not None:
+                self._ws_otel.record_message_received(route=route, actor_user_id=actor_user_id)
+            return message
+
+        outcome = "closed"
         try:
-            await self._app(scope, receive, send_with_metrics)
+            await self._app(scope, receive_with_metrics, send_with_metrics)
+        except Exception:
+            outcome = "error"
+            raise
+        else:
+            outcome = "disconnected" if close_code in (1001, 1006) else "closed"
         finally:
             if counted:
                 self._metrics.websocket_disconnected()
+                if self._ws_otel is not None:
+                    duration = time.monotonic() - started_at
+                    self._ws_otel.record_connection(
+                        route=route,
+                        actor_user_id=actor_user_id,
+                        duration_seconds=duration,
+                        close_code=close_code,
+                        outcome=outcome,
+                    )
 
 
 def request_route_template_for_metrics(request: Request) -> str:
@@ -1238,7 +1293,12 @@ def create_app(
     app.state.managed_launches = ManagedLaunchTracker()
     app.state.server_metrics = server_metrics
     app.state.server_metrics_otel = server_metrics_otel
-    app.add_middleware(_WebSocketMetricsMiddleware, metrics=server_metrics)
+    app.add_middleware(
+        _WebSocketMetricsMiddleware,
+        metrics=server_metrics,
+        ws_otel=WebSocketMetricsOtelPublisher(),
+        auth_provider=auth_provider,
+    )
     # CSWSH guard: reject cross-origin WebSocket handshakes before any
     # route accepts them. Added after the metrics middleware so it is the
     # outermost WS middleware — a forbidden origin is closed without even
@@ -1290,6 +1350,13 @@ def create_app(
             session_match.group(1) if session_match else None,
         )
 
+        actor_user_id = None
+        if auth_provider is not None:
+            try:
+                actor_user_id = auth_provider.get_user_id(request)
+            except Exception:  # noqa: BLE001
+                actor_user_id = None
+
         failed = False
         status_code: int | None = None
         started_at = server_metrics.request_started()
@@ -1323,6 +1390,7 @@ def create_app(
                 method=request.method,
                 route=route,
                 status_code=metrics_status_code,
+                actor_user_id=actor_user_id,
             )
 
     @app.exception_handler(OmnigentError)
