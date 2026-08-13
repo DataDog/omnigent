@@ -12,7 +12,7 @@ import json
 import secrets
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, Literal, cast
 
 import httpx
@@ -579,7 +579,7 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
 def _build_session_list_item(
     conv: Conversation,
     *,
-    agent_names_by_id: dict[str, str | None],
+    agent_names_by_id: Mapping[str, str | None],
     grants: list[SessionPermission],
     user_id: str | None,
     user_is_admin: bool,
