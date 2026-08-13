@@ -1625,6 +1625,132 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
 
 
 @pytest.mark.parametrize(
+    "interrupt_text",
+    ["[Request interrupted by user]", "[Request interrupted by user for tool use]"],
+)
+async def test_external_interrupt_record_leaves_pending_input_for_real_message(
+    client: httpx.AsyncClient,
+    interrupt_text: str,
+) -> None:
+    """
+    Regression: steering with an upload must not feed it to the interrupt marker.
+
+    Interrupting a turn to steer makes Claude write its own ``[Request
+    interrupted by user...]`` record into the transcript BEFORE the steering
+    message. The forwarder mirrors both back as user items. The interrupt
+    record has no pending-input entry of its own, so a FIFO drain for it
+    shifts the queue by a slot: the marker absorbs the queued message's
+    uploads and the real message persists with none. In the web UI that
+    renders as the raw marker text next to the screenshots, followed by a
+    blank bubble (the real message's ``[Attached:]`` markers are stripped and
+    its file blocks are gone). Assert the marker persists bare and the
+    steering message keeps the image.
+    """
+    from omnigent.runtime import pending_inputs
+
+    pending_inputs.reset_for_tests()
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    # The optimistic entry for the steering message: an image-only upload.
+    pid = pending_inputs.record(
+        session["id"],
+        [{"type": "input_image", "file_id": "file_shot1", "filename": "shot.png"}],
+    )
+    try:
+        for text in (
+            interrupt_text,
+            "[Attached: /tmp/uploads/shot.png]",
+        ):
+            resp = await client.post(
+                f"/v1/sessions/{session['id']}/events",
+                json={
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "message",
+                        "item_data": {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": text}],
+                        },
+                        "response_id": "native_turn_1",
+                    },
+                },
+            )
+            assert resp.status_code == 202, resp.text
+
+        items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+        messages = [item for item in items if item["type"] == "message"]
+        assert len(messages) == 2, messages
+        marker, steered = messages
+        # The marker stays text-only, so the UI still classifies it as a
+        # system marker instead of rendering it as user text beside an image.
+        assert marker["content"] == [{"type": "input_text", "text": interrupt_text}]
+        # The upload landed on the message that actually queued it.
+        assert steered["content"][0] == {
+            "type": "input_image",
+            "file_id": "file_shot1",
+            "filename": "shot.png",
+        }
+        assert steered["content"][1]["text"] == "[Attached: /tmp/uploads/shot.png]"
+        # The real message drained the entry (the marker must not have).
+        assert pending_inputs.snapshot_for(session["id"]) == []
+        assert pid
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+async def test_external_interrupt_lookalike_still_drains_pending_input(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    The interrupt-record exemption must not swallow real user messages.
+
+    A user can type a message that merely resembles the marker. Over-matching
+    would skip the drain for it, stranding the pending entry and dropping the
+    upload it carries — the same class of bug from the other direction. The
+    regex is anchored, so a bracketed question is a normal message.
+    """
+    from omnigent.runtime import pending_inputs
+
+    pending_inputs.reset_for_tests()
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    pending_inputs.record(
+        session["id"],
+        [{"type": "input_image", "file_id": "file_shot2", "filename": "shot.png"}],
+    )
+    try:
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "[Request interrupted by user?]"}
+                        ],
+                    },
+                    "response_id": "native_turn_1",
+                },
+            },
+        )
+        assert resp.status_code == 202, resp.text
+
+        items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+        user_msg = next(item for item in items if item["type"] == "message")
+        assert user_msg["content"][0] == {
+            "type": "input_image",
+            "file_id": "file_shot2",
+            "filename": "shot.png",
+        }
+        assert pending_inputs.snapshot_for(session["id"]) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.parametrize(
     ("created_by", "mirrored_text"),
     [
         ("alice@example.com", "[alice@example.com]: hello"),

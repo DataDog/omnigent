@@ -212,6 +212,7 @@ from omnigent.server.routes._sessions.helpers import (
     _invalidate_runner_backed_snapshot_state,
     _is_codex_native_subagent,
     _is_kiro_native_session,
+    _is_native_interrupt_record,
     _last_task_error_from_labels,
     _latest_assistant_text_from_store,
     _latest_message_preview,
@@ -2115,6 +2116,9 @@ async def _persist_external_conversation_item(
     # entry's file blocks (image / file) into the item BEFORE persisting.
     # The transcript is text-only, so without this the image is dropped
     # from durable history and disappears on every reload / navigation.
+    # The vendor CLI's own interrupt record is exempt: it is synthesized by
+    # Claude (not a queued web message) and has no pending entry, so
+    # draining for it would hand the queued message's uploads to the marker.
     cleared_pending_id: str | None = None
     skipped_kiro_pending: list[pending_inputs.DrainedInput] = []
     if (
@@ -2122,6 +2126,7 @@ async def _persist_external_conversation_item(
         and isinstance(item.data, MessageData)
         and item.data.role == "user"
         and not item.data.is_meta
+        and not _is_native_interrupt_record(item.data)
     ):
         if _is_kiro_native_session(conv):
             text = _message_text(item.data.content) or ""

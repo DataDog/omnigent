@@ -103,6 +103,7 @@ import { isClaudeNativeModel } from "@/lib/claudeNativeModels";
 import { isCodexNativeModel } from "@/lib/codexNativeModels";
 import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { isSystemUserContent } from "@/lib/systemMessage";
 import { isNativeWrapper } from "@/lib/nativeCodingAgents";
 
 export interface SendOptions {
@@ -4482,12 +4483,14 @@ export function handleSessionEvent(event: StreamEvent): void {
       //   2. FIFO head — for an optimistic bubble whose POST hasn't
       //      returned the id to adopt yet (consumed raced ahead), or a
       //      cross-client send. Per-session SSE ordering makes the head
-      //      the right entry. Unconditional (no text match): the native
-      //      transcript reformats text (reply-quote `>` blockquotes,
-      //      `[Attached:]` markers), so a text guard would wrongly skip
-      //      the drop and strand the bubble as a duplicate.
+      //      the right entry. No text match: the native transcript
+      //      reformats text (reply-quote `>` blockquotes, `[Attached:]`
+      //      markers), so a text guard would wrongly skip the drop and
+      //      strand the bubble as a duplicate. Only system markers, which
+      //      never had a bubble here, are held back.
       //   3. No pending entry — render the event payload as a fresh
-      //      committed bubble (TUI-typed message, or another client).
+      //      committed bubble (TUI-typed message, marker, or another
+      //      client).
       useChatStore.setState((s) => {
         if (hasCommittedItem(s.blocks, event.itemId)) return {};
 
@@ -4520,7 +4523,18 @@ export function handleSessionEvent(event: StreamEvent): void {
         }
 
         // 2. FIFO head fallback (id not adopted yet / cross-client).
-        const head = s.pendingUserMessages[0];
+        //    Skipped for a mirrored system marker (the vendor CLI's own
+        //    interrupt record): it is synthesized by the CLI, never queued
+        //    here, so popping the head would hand the queued message's
+        //    uploads to the marker and leave the real message empty. A
+        //    `[System: …]` notice DOES have a pending entry, but the server
+        //    drains it and names it via `clearedPendingId`, so it lands on
+        //    branch 1 and never reaches this fallback.
+        const eventContent = userContentFromEvent(event);
+        const head =
+          eventContent !== null && isSystemUserContent(eventContent)
+            ? undefined
+            : s.pendingUserMessages[0];
         if (head) {
           const content = committedContentFor(event, head.content);
           if (content === null) return {};
@@ -4540,13 +4554,13 @@ export function handleSessionEvent(event: StreamEvent): void {
           };
         }
 
-        // 3. Nothing pending — render the event payload fresh.
-        const content = userContentFromEvent(event);
-        if (content === null) return {};
+        // 3. Nothing pending (or a marker that owns no bubble) — render the
+        //    event payload fresh.
+        if (eventContent === null) return {};
         return {
           blocks: [
             ...s.blocks,
-            committedUserBlock(event.itemId, content, undefined, event.createdBy),
+            committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
           ],
         };
       });
