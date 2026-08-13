@@ -170,6 +170,12 @@ import {
   moveConversationToProject,
   PROJECT_LABEL_KEY,
 } from "@/hooks/useConversations";
+import {
+  collectConversationIds,
+  type ConversationsInfiniteData,
+  type SessionListWireItem,
+} from "@/lib/sessionListCache";
+import { nextPushedSession } from "@/lib/sessionUpdatesSocket";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
@@ -3374,7 +3380,33 @@ export function NewChatLandingScreen() {
         setPendingAgent(null);
       } else {
         // Normal path: bind to an existing registered agent.
-        const res = await authenticatedFetch("/v1/sessions", {
+        // Which pushed row is ours: the one this tab has never seen, bound
+        // to the agent and host we're about to ask for. Sub-agent children
+        // are never a create's result. Snapshotting the known ids BEFORE
+        // the POST is what makes "never seen" mean "created by this call".
+        const knownSessionIds = new Set(
+          collectConversationIds(
+            [
+              ...queryClient.getQueriesData<ConversationsInfiniteData>({
+                queryKey: ["conversations"],
+              }),
+              ...queryClient.getQueriesData<ConversationsInfiniteData>({
+                queryKey: ["project-sessions"],
+              }),
+            ].map(([, cached]) => cached),
+          ),
+        );
+        // A sandbox create has no host to match on until the sandbox
+        // registers one, so it waits for the response like before.
+        const matchOwnCreate =
+          sandboxSelected || !selectedHostId
+            ? null
+            : (item: SessionListWireItem) =>
+                !knownSessionIds.has(item.id) &&
+                item.parent_session_id == null &&
+                item.agent_id === effectiveAgentId &&
+                item.host_id === selectedHostId;
+        const createRequest = authenticatedFetch("/v1/sessions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -3446,11 +3478,40 @@ export function NewChatLandingScreen() {
             smart_routing_message: smartRoutingHarnessSelected ? initialPrompt : undefined,
           }),
         });
-        if (!res.ok) {
-          setCreateError(await describeCreateError(res));
+        // The create doesn't answer until the host has spawned a runner — a
+        // process boot, seconds of it — but the session row exists (and is
+        // announced on the updates stream) almost immediately. Open the chat
+        // on whichever id lands first: the pushed row typically wins by
+        // seconds, and the chat page renders from the id alone, showing its
+        // own starting spinner while the runner comes up.
+        const abortPush = new AbortController();
+        const pushedRow =
+          matchOwnCreate === null
+            ? Promise.resolve(null)
+            : nextPushedSession(matchOwnCreate, abortPush.signal);
+        const confirmed = (async (): Promise<{ id: string } | { error: string }> => {
+          const response = await createRequest;
+          if (!response.ok) return { error: await describeCreateError(response) };
+          return { id: ((await response.json()) as { id: string }).id };
+        })();
+        // Once the create answers, its id is authoritative — stop listening.
+        void confirmed.finally(() => abortPush.abort()).catch(() => {});
+        const created = await new Promise<{ id: string } | { error: string }>((resolve, reject) => {
+          // Only a match settles this; an abort resolves null and leaves the
+          // response to decide.
+          void pushedRow.then((row) => {
+            if (row !== null) resolve({ id: row.id });
+          });
+          confirmed.then(resolve, reject);
+        });
+        // A row is only written (and announced) after the create has validated
+        // the workspace and agent, so winning on the push can't skip past an
+        // error the user needed to see on this screen.
+        if ("error" in created) {
+          setCreateError(created.error);
           return;
         }
-        data = (await res.json()) as { id: string };
+        data = { id: created.id };
       }
       // Promote the born-filed session to first-class project membership. The
       // create above already stamped the `omni_project` label (so the row
