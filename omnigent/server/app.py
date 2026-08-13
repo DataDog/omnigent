@@ -2181,6 +2181,7 @@ def create_app(
         from omnigent.server.routes.sessions import (
             _ensure_runner_relay,
             _publish_runner_recovered_status,
+            prefetch_session_routing_catalogs,
         )
 
         # Stamp liveness immediately so other replicas see the runner
@@ -2247,6 +2248,12 @@ def create_app(
                 routed.client,
                 conversation_store,
             )
+            # The session's terminal exists as of the handshake above, so its
+            # model catalogs are answerable now. Warming them here is what
+            # keeps the first routed message off the runner round trip. The
+            # helper self-gates on routing state, so the plain sessions in this
+            # loop (and any archived row) cost nothing.
+            prefetch_session_routing_catalogs(conv.id, conv, routed.client)
             # Reconcile the persisted pending-elicitation count with this
             # pod's live index. A runner that crashed with prompts parked
             # leaves a stale row (no decrement is ever written on a crash),
