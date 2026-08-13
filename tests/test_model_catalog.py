@@ -12,6 +12,7 @@ Databricks credential mint is stubbed with the real
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,17 +22,19 @@ import pytest
 from cachetools import TTLCache
 
 import omnigent.model_catalog as model_catalog
+from omnigent.codex_model_vocabulary import codex_spawn_model
 from omnigent.model_catalog import (
     ModelEntry,
     ModelListing,
     catalog_for_spec,
     catalog_model_entries,
     list_models_for_worker,
+    model_family_token,
     resolve_catalog_model,
     resolve_model_provider,
     spec_harness,
 )
-from omnigent.model_fallbacks import static_model_fallback
+from omnigent.model_fallbacks import CODEX_DEFAULT_MODEL, static_model_fallback
 from omnigent.model_metadata import (
     ModelCapability,
     ModelCostTier,
@@ -675,6 +678,85 @@ def test_family_filter_per_harness(
     assert {m.id for m in listing.models} == expected_ids
 
 
+@pytest.mark.parametrize(
+    ("model_id", "expected"),
+    [
+        ("databricks-claude-opus-4-8", "claude"),
+        ("claude-sonnet-5", "claude"),
+        ("databricks-gpt-5-5", "openai"),
+        ("gpt-5.1-codex", "openai"),
+        # GLM / Kimi are codex-runnable, so they carry the codex-compatible
+        # token — a candidate filter keyed on it must not strip them.
+        ("glm-5-2", "openai"),
+        ("databricks-glm-5-2", "openai"),
+        ("system.ai.glm-5-2", "openai"),
+        ("kimi-k2", "openai"),
+        ("databricks-kimi-k2-6", "openai"),
+        ("system.ai.kimi-k2-instruct", "openai"),
+        ("kimi-for-coding", "openai"),
+        ("databricks-meta-llama-3.3-70b-instruct", "other"),
+        ("gemini-3.5-flash", "other"),
+        # Segment matching, not substring: an unrelated endpoint name that
+        # happens to contain the letters is not the GLM family.
+        ("glmqlfit-eval", "other"),
+    ],
+)
+def test_model_family_token_tags_codex_compatible_families(model_id: str, expected: str) -> None:
+    """The family token names the harness family that can serve the id.
+
+    :param model_id: Model id under test.
+    :param expected: The family token it must carry.
+    """
+    assert model_family_token(model_id) == expected
+
+
+def test_codex_worker_listing_keeps_glm_and_kimi_endpoints(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A codex worker's list keeps the GLM/Kimi endpoints it can serve.
+
+    The workspace serves these over the same Responses wire codex speaks,
+    so filtering them out would hide runnable models from the router while
+    the dispatch gate would have accepted them.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, _DATABRICKS_DEFAULT_CONFIG)
+    _stub_workspace_creds(monkeypatch)
+    page = {
+        "endpoints": [
+            {
+                "name": name,
+                "creator": "system",
+                "task": "llm/v1/chat",
+                "state": {"ready": "READY"},
+            }
+            for name in (
+                "databricks-gpt-5-5",
+                "databricks-glm-5-2",
+                "databricks-kimi-k2-6",
+                "databricks-claude-sonnet-4-6",
+                "databricks-meta-llama-3-3-70b-instruct",
+            )
+        ]
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Serve the serving-endpoints page for the codex worker."""
+        return httpx.Response(200, json=page)
+
+    listing = list_models_for_worker(
+        _worker_spec("codex-native"), "codex-native", transport=httpx.MockTransport(_handler)
+    )
+
+    assert {m.id for m in listing.models} == {
+        "databricks-gpt-5-5",
+        "databricks-glm-5-2",
+        "databricks-kimi-k2-6",
+    }
+
+
 def test_openai_compatible_listing_maps_ids_and_context_window(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -730,9 +812,13 @@ def test_openai_compatible_listing_maps_ids_and_context_window(
     assert requests_seen[0].headers["authorization"] == "Bearer sk-or-test"
     assert listing.source == "openai-compatible"
     assert listing.verified is True
-    # codex-native keeps only the GPT-family id; the provider-reported
-    # context window rides along.
-    assert [(m.id, m.context_window) for m in listing.models] == [("openai/gpt-5.4", 400000)]
+    # codex-native keeps the codex-compatible ids (GPT plus the Kimi family
+    # it serves over the same wire); the provider-reported context window
+    # rides along.
+    assert [(m.id, m.context_window) for m in listing.models] == [
+        ("openai/gpt-5.4", 400000),
+        ("moonshotai/kimi-k2.6", 262144),
+    ]
 
 
 def test_anthropic_api_listing_uses_api_key_headers(
@@ -869,10 +955,10 @@ def test_cli_config_listing_is_static_and_unverified(
     assert listing.source == "static"
     assert listing.verified is False
     assert [m.id for m in listing.models] == [
-        "gpt-5-6-sol",
-        "gpt-5-6-luna",
-        "gpt-5-6-terra",
-        "gpt-5-5",
+        "gpt-5.6-sol",
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "gpt-5.5",
     ]
     # The note must say the CLI resolves the credential itself — this row
     # is a working worker, not a credentials preflight failure.
@@ -902,6 +988,39 @@ def test_static_model_fallbacks_document_ownership(
     assert fallback.owner
     assert fallback.provenance
     assert fallback.discovery_gap
+
+
+@pytest.mark.parametrize("provider_kind", ["subscription", "cli-config"])
+def test_codex_catalog_ids_are_spelled_the_way_codex_accepts(provider_kind: str) -> None:
+    """Codex's catalogs carry its dotted slugs, not the hyphenated serving ids.
+
+    Codex's own backend 400s on ``gpt-5-6-sol``; only ``gpt-5.6-sol`` reaches a
+    ChatGPT-account login. The two spellings still compare equal, so a routed
+    arm keeps matching either way.
+
+    :param provider_kind: The registered provider kind under test.
+    """
+    fallback = static_model_fallback(provider_kind, "codex")
+    assert fallback is not None
+    for model_id in fallback.model_ids:
+        assert not model_id.startswith("databricks-"), model_id
+        assert codex_spawn_model(model_id) == model_id, (
+            f"{model_id!r} is not codex's own spelling for itself"
+        )
+
+
+def test_codex_default_model_names_a_concrete_variant() -> None:
+    """The codex launch default is a tiered model, not a bare family alias.
+
+    The bundled OpenAI catalog's newest row is ``gpt-5.6``, which codex rejects
+    as a family name; a default must name a variant its backend serves.
+    """
+    fallback = static_model_fallback("subscription", "codex")
+    assert fallback is not None
+    assert CODEX_DEFAULT_MODEL in fallback.model_ids
+    assert codex_spawn_model(CODEX_DEFAULT_MODEL) == CODEX_DEFAULT_MODEL
+    # A bare family alias has no tier segment after the dotted version.
+    assert re.fullmatch(r"gpt-\d+\.\d+", CODEX_DEFAULT_MODEL) is None
 
 
 def test_cursor_listing_uses_live_cli_base_models(
