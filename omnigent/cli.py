@@ -1375,6 +1375,12 @@ _HARNESS_COMMANDS: frozenset[str] = frozenset(
 # module just to draw ``--help``).
 _ACCENT_RGB = (244, 59, 166)
 
+# Command names that are pure aliases of another command (the same Click
+# object registered under a second name, e.g. ``update`` -> ``upgrade``).
+# Kept runnable/registered but omitted from the ``--help`` listing so the
+# alias isn't shown as a duplicate line.
+_ALIAS_COMMANDS: frozenset[str] = frozenset({"update"})
+
 
 def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
     """Map extras-gated harness commands to their SDK-installed predicate.
@@ -1450,6 +1456,10 @@ class _OmnigentCLI(click.Group):
         for subcommand in self.list_commands(ctx):
             cmd = self.get_command(ctx, subcommand)
             if cmd is None or cmd.hidden:
+                continue
+            # Skip pure aliases (e.g. ``update`` -> ``upgrade``) so the
+            # listing doesn't show a duplicate line; still runnable.
+            if subcommand in _ALIAS_COMMANDS:
                 continue
             if subcommand in _HARNESS_COMMANDS:
                 # Hide extras-gated harnesses whose SDK isn't installed;
@@ -4101,7 +4111,7 @@ def uninstall(
     no_backup: bool,
     assume_inferred: bool,
 ) -> None:
-    """Uninstall Omnigent while preserving user data unless --purge is set."""
+    """Uninstall Omnigent from this machine."""
     from omnigent.install_ledger import resolve_uninstall_ledger
 
     ledger = resolve_uninstall_ledger()
@@ -4410,7 +4420,7 @@ def upgrade(
     target_version: str | None,
     dry_run: bool,
 ) -> None:
-    """Upgrade the omnigent CLI to the latest release on PyPI.
+    """Upgrade Omnigent to the latest release.
 
     Detects how omnigent was installed (uv tool / pipx), checks the
     configured index for a newer release and — unless ``--check`` — drains
@@ -5326,7 +5336,7 @@ def _render_usage(report: dict[str, Any], limit: int) -> None:  # type: ignore[e
     help="Emit the raw usage report as JSON instead of the table.",
 )
 def usage(limit: int, server: str | None, as_json: bool) -> None:
-    """Show your Omnigent LLM cost for today / the last 7 / 30 days.
+    """Show your Omnigent usage and costs.
 
     The summary is sourced from the per-user daily cost rollup, which
     attributes spend to the UTC calendar day it occurred on — so the
@@ -6618,7 +6628,7 @@ def attach(
     tools: str | None,
     debug_events: bool,
 ) -> None:
-    """Attach the REPL to a LIVE session — never starts anything.
+    """Attach the REPL to a live session.
 
     ``attach`` is a thin client: it joins an already-running conversation
     on a server and streams its I/O. It never spawns a server, runner, or
@@ -8757,7 +8767,7 @@ if _sandbox_providers():
 
 @cli.group("debug")
 def debug() -> None:
-    """Internal maintenance commands (advanced — not needed for normal use).
+    """Internal maintenance commands.
 
     Houses operator-only database and accounts maintenance: tracking-DB
     schema upgrades (``db-upgrade``) and the accounts→OIDC identity remap
