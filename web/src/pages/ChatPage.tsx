@@ -6028,23 +6028,35 @@ function useResolvedComposerModel(
   // the live ``setModel``; a TUI ``/model`` pick posts external_model_change),
   // so like cursor/kiro/opencode the live model is the session override, never
   // the cross-session sticky ``selectedModel``.
+  // The sticky is this session's model only when the session itself advertises
+  // it. `switchTo` clears the session-scoped fields but deliberately keeps
+  // `selectedModel`, so until the incoming snapshot lands the catalog is empty
+  // and the sticky still holds the OUTGOING session's pick — surfacing it paints
+  // e.g. a Codex gpt-5.5 on a Claude session for the whole bind round trip.
+  // Gating on the session's own catalog mirrors the compatibility rule bindStream
+  // applies a moment later, so the label never advertises a model this session
+  // would reject. Post-bind this is a no-op: the store only ever leaves a
+  // catalog-compatible sticky (or the override) in `selectedModel`.
+  const sessionStickyModel =
+    findNativeModelOption(codexModelOptions, selectedModel) !== null ? selectedModel : null;
   const pickerSelectedModel =
     modelPickerKind === "cursor" ||
     modelPickerKind === "kiro" ||
     modelPickerKind === "opencode" ||
     modelPickerKind === "pi"
       ? sessionModelOverride
-      : (sessionModelOverride ?? selectedModel);
+      : (sessionModelOverride ?? sessionStickyModel);
   // SDK/bundle agents (no native picker) never have the cross-session sticky
   // applied to them, so their live model is the session's own — the applied
   // override or the bound default — never `selectedModel` (a pick carried over
   // from an unrelated session, e.g. a gpt-5.5 left from a Codex session showing
-  // on a Claude-SDK agent like Polly). claude-/codex-native keep `selectedModel`:
-  // there the sticky IS the applied model.
+  // on a Claude-SDK agent like Polly). claude-/codex-native keep the sticky —
+  // there it IS the applied model — but only once this session's catalog vouches
+  // for it (see `sessionStickyModel`).
   const nonNativeModel =
     modelPickerKind === null
       ? (sessionModelOverride ?? llmModel)
-      : (sessionModelOverride ?? selectedModel ?? llmModel);
+      : (sessionModelOverride ?? sessionStickyModel ?? llmModel);
   const effectiveModel = nativeVendorOwnsModel
     ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
       ? // cursor mirrors its live TUI model into ``model_override``; kiro sets it
