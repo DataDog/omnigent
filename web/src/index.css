@@ -943,6 +943,27 @@ html:not(.dark) .conversations-sidebar {
   font-size: 0.875em;
 }
 
+/* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);
+ * hide the native one so both don't show. */
+.transcript-hide-native-scrollbar {
+  scrollbar-width: none;
+}
+.transcript-hide-native-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Streamdown hard-codes `content-visibility: auto` with a flat 200px intrinsic
+ * size on every code block, so offscreen blocks lay out at 200px and snap to
+ * their real height (100–1700px) as they scroll in — shifting the transcript
+ * under the reader and resizing the scrollbar on every snap. Blocks under
+ * content-visibility are also skipped when the browser picks a scroll anchor,
+ * so this has to go for anchoring to hold across a history prepend. Scoped to
+ * the transcript so the file viewer keeps skipping offscreen blocks in big
+ * files. Overrides an inline style, hence !important. */
+[role="log"] [data-streamdown="code-block"] {
+  content-visibility: visible !important;
+}
+
 /* Streamdown pins `text-sm` on table cells and h6. That tier is the caption
  * step, so inside chat prose those read as a shrink rather than body text —
  * pin them back to the surrounding size. sub/sup keep the caption step, where
