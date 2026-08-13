@@ -222,7 +222,7 @@ def _create_engine(db_uri: str) -> Engine:
 
     :param db_uri: SQLAlchemy database connection string, e.g.
         ``"sqlite:///mydb.db"`` or
-        ``"postgresql://user:pass@host/dbname"``.
+        ``"postgresql://<user>:<password>@host/dbname"``.
     :returns: A configured :class:`~sqlalchemy.engine.Engine`.
     """
     is_sqlite = db_uri.startswith("sqlite")
@@ -303,7 +303,7 @@ def get_or_create_engine(db_uri: str) -> Engine:
 
     :param db_uri: SQLAlchemy database connection string, e.g.
         ``"sqlite:///mydb.db"`` or
-        ``"postgresql://user:pass@host/dbname"``.
+        ``"postgresql://<user>:<password>@host/dbname"``.
     :returns: A :class:`~sqlalchemy.engine.Engine` for the given URI.
     :raises RuntimeError: If automatic schema migration fails.
     """

@@ -42,7 +42,7 @@ class SqlAlchemyAgentStore(AgentStore):
 
         :param storage_location: SQLAlchemy database URI for the Omnigent DB,
             e.g. ``"sqlite:///agents.db"`` or
-            ``"postgresql://user:pass@host/db"``.
+            ``"postgresql://<user>:<password>@host/db"``.
         :param conversation_storage_location: Optional URI for the Agent
             Platform DB. The ``conversations`` table lives there, and
             resolving a session-scoped agent's ``session_id`` requires a
