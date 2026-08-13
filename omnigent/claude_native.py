@@ -606,6 +606,40 @@ def _managed_claude_model_config() -> ClaudeNativeUcodeConfig | None:
     return None
 
 
+def managed_claude_gateway_signal() -> tuple[str | None, bool]:
+    """Read the AI-Gateway backing Claude Code applies from managed settings.
+
+    Managed settings win at Claude Code's actual launch, so an enterprise file
+    can pin all inference through an AI Gateway even when omnigent's own
+    provider config resolves nothing (a ``subscription`` login). This reports
+    that backing: the managed ``env.ANTHROPIC_BASE_URL`` and whether a
+    credential is delivered, either through a top-level ``apiKeyHelper`` or a
+    truthy ``env.CLAUDE_CODE_USE_GATEWAY``.
+
+    :returns: ``(base_url, has_credential)`` from the first readable managed
+        settings file, or ``(None, False)`` when none is present or parseable.
+    """
+    for path in _CLAUDE_CODE_MANAGED_SETTINGS_PATHS:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_env = payload.get("env")
+        env = raw_env if isinstance(raw_env, dict) else {}
+        raw_base_url = env.get("ANTHROPIC_BASE_URL")
+        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
+        has_helper = bool(payload.get("apiKeyHelper"))
+        use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
+            "",
+            "0",
+            "false",
+        )
+        return base_url or None, has_helper or use_gateway
+    return None, False
+
+
 def claude_native_model_options(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> list[dict[str, object]]:
@@ -1891,15 +1925,18 @@ def _ucode_config_for_profile(
     env: dict[str, str] = {
         _UCODE_CLAUDE_BASE_URL_ENV: base_url,
         _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV: str(refresh_interval_ms),
+        # This path always launches in gateway mode (CLAUDE_CODE_USE_GATEWAY=1),
+        # in which Claude Code negotiates the anthropic-beta set with the gateway
+        # rather than sending every flag blindly — so we do NOT disable
+        # experimental betas here. Disabling them also turns off MCP tool search
+        # (it rides on ``advanced-tool-use``), which reloads every MCP tool
+        # schema eagerly and inflates the context window. The Databricks gateway
+        # now accepts the flags Claude Code sends under CLAUDE_CODE_USE_GATEWAY=1
+        # (advanced-tool-use / prompt-caching-scope / advisor-tool), so the
+        # earlier ``CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`` workaround for
+        # 400 "invalid beta flag" is no longer needed on this path.
         _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
         _CLAUDE_CODE_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
-        # The gateway allowlists beta flags and 400s the whole request
-        # ("invalid beta flag") on one it does not know, failing the turn
-        # rather than the feature. This env var is the only client-side way to
-        # drop them: the CLI computes ``anthropic-beta`` itself and ignores
-        # ANTHROPIC_CUSTOM_HEADERS. Tool search rides on a rejected flag
-        # (``advanced-tool-use``), so it was never reachable here anyway.
-        _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1",
     }
     # Pin each Claude Code model-tier alias to the corresponding Databricks
     # gateway model ID so that the /model picker natively shows gateway model
@@ -2160,7 +2197,13 @@ def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcode
             _ANTHROPIC_BEDROCK_BASE_URL_ENV: family.base_url,
             _AWS_BEARER_TOKEN_BEDROCK_ENV: token,
             _CLAUDE_CODE_USE_BEDROCK_ENV: "1",
-            _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1",
+            # Disable beta flags gateways reject (400 "invalid beta flag");
+            # skip when CLAUDE_CODE_USE_GATEWAY=1 to keep tool search enabled.
+            **(
+                {_CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1"}
+                if os.environ.get("CLAUDE_CODE_USE_GATEWAY") != "1"
+                else {}
+            ),
         },
         # No apiKeyHelper: Bedrock mode authenticates from the env token above.
         model=family.default_model,
