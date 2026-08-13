@@ -2625,7 +2625,9 @@ class HostProcess:
 
         Sends the ``host.hello`` frame, prints the success banner, then
         loops dispatching launch/stop/stat/list_dir/worktree requests and
-        answering runner pings until the connection closes.
+        answering runner pings until the connection closes. Harness-readiness
+        updates run in a separate task (:meth:`_harness_readiness_loop`) so a
+        slow probe can never stall this receive loop.
 
         :param ws: The open tunnel connection returned by the websockets
             client.
@@ -2679,44 +2681,68 @@ class HostProcess:
             flush=True,
         )
 
+        # Readiness refresh runs in its own task, never on this receive loop:
+        # a harness probe that blocks (a hung CLI ``--version`` / ``auth
+        # status``) must not delay ``ws.recv()`` or the inline keepalive pong
+        # the server's watchdog counts as liveness, or it closes the tunnel
+        # with ``4003 ping timeout``.
+        readiness_task = asyncio.create_task(
+            self._harness_readiness_loop(ws, configured_harnesses)
+        )
+        try:
+            while True:
+                raw = await ws.recv()
+                if isinstance(raw, str):
+                    await self._handle_raw_message(ws, raw)
+        finally:
+            readiness_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await readiness_task
+
+    async def _harness_readiness_loop(
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+        initial: dict[str, HarnessAvailability],
+    ) -> None:
+        """
+        Push harness-readiness updates on a timer, off the receive loop.
+
+        Runs as its own task so a slow readiness probe (a harness CLI whose
+        ``--version`` / ``auth status`` subprocess hangs) can never delay
+        ``ws.recv()`` or the inline keepalive pong — the cause of spurious
+        ``4003 ping timeout`` disconnects. Recomputes the map on the quick
+        cadence gated by a cheap "did an unavailable harness just become ready"
+        check and on the full cadence unconditionally, sending a
+        :class:`HostHarnessReadinessFrame` only when the map changes.
+
+        :param ws: The open tunnel connection used to send update frames.
+        :param initial: The readiness map already reported in ``host.hello``;
+            the baseline the first update diffs against.
+        :returns: None. Runs until cancelled when the connection ends.
+        """
+        configured = initial
         loop = asyncio.get_running_loop()
-        next_quick_refresh = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
-        next_full_refresh = loop.time() + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
+        next_quick = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
+        next_full = loop.time() + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
         while True:
-            raw: object | None = None
-            with contextlib.suppress(asyncio.TimeoutError):
-                raw = await asyncio.wait_for(
-                    ws.recv(),
-                    timeout=max(
-                        0.0,
-                        min(next_quick_refresh, next_full_refresh) - loop.time(),
-                    ),
-                )
-
+            await asyncio.sleep(max(0.0, min(next_quick, next_full) - loop.time()))
             now = loop.time()
-            refresh_full_map = now >= next_full_refresh
-            if now >= next_quick_refresh:
-                next_quick_refresh = now + HARNESS_READINESS_REFRESH_INTERVAL_S
-                if not refresh_full_map:
-                    refresh_full_map = await asyncio.to_thread(
-                        _unavailable_harness_became_ready,
-                        configured_harnesses,
+            refresh_full = now >= next_full
+            if now >= next_quick:
+                next_quick = now + HARNESS_READINESS_REFRESH_INTERVAL_S
+                if not refresh_full:
+                    refresh_full = await asyncio.to_thread(
+                        _unavailable_harness_became_ready, configured
                     )
-
-            if refresh_full_map:
-                latest_harnesses = await asyncio.to_thread(configured_harness_map)
-                next_full_refresh = now + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
-                if latest_harnesses != configured_harnesses:
-                    await ws.send(
-                        encode_host_frame(
-                            HostHarnessReadinessFrame(
-                                configured_harnesses=latest_harnesses,
-                            )
-                        )
-                    )
-                    configured_harnesses = latest_harnesses
-            if isinstance(raw, str):
-                await self._handle_raw_message(ws, raw)
+            if not refresh_full:
+                continue
+            latest = await asyncio.to_thread(configured_harness_map)
+            next_full = now + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
+            if latest != configured:
+                await ws.send(
+                    encode_host_frame(HostHarnessReadinessFrame(configured_harnesses=latest))
+                )
+                configured = latest
 
     async def _handle_raw_message(
         self, ws: websockets.asyncio.client.ClientConnection, raw: str
