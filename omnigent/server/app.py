@@ -2067,22 +2067,22 @@ def create_app(
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───
     async def _on_runner_disconnect(runner_id: str) -> None:
-        """Mark sessions pinned to *this* runner as offline.
+        """Mark the turns *this* runner interrupted as offline.
 
         Filters by ``runner_id`` against ``conversation_store`` so a
         disconnect on one runner does not flip every cached session
         (e.g. sessions owned by other runners on the same server, or
         sessions left in the module-level cache by earlier tests on
-        the same xdist worker) to ``"failed"``. The cache is updated
-        in lockstep with the publish so the list endpoint stays
-        coherent.
+        the same xdist worker) to ``"failed"``.
+        :func:`_mark_runner_sessions_offline` then narrows that set to
+        the sessions actually mid-turn and stamps the disconnect cause
+        on them, so idle sub-agents keep their finished state and the
+        interrupted ones read as a recoverable disconnect.
 
         :param runner_id: The disconnected runner's id.
         """
-        from omnigent.server.routes.sessions import (
-            _publish_status,
-            _session_status_cache,
-        )
+        from omnigent.server.routes.sessions import _mark_runner_sessions_offline
+        from omnigent.server.schemas import ErrorDetail
 
         # Newest-wins guard: a superseded tunnel's teardown fires this
         # hook after a fresh tunnel for the same ``runner_id`` already
@@ -2114,20 +2114,22 @@ def create_app(
         # Archived sessions are included by construction — an archived
         # session can still be runner-bound, and skipping it here would
         # leave it stuck "running" forever.
-        affected = [
-            c.id
-            for c in await asyncio.to_thread(
-                conversation_store.list_conversations_by_runner_id, runner_id
-            )
-        ]
+        affected = await asyncio.to_thread(
+            conversation_store.list_conversations_by_runner_id, runner_id
+        )
         _logger.warning(
-            "Runner %s disconnected; marking %d session(s) offline",
+            "Runner %s disconnected; reconciling %d bound session(s)",
             runner_id,
             len(affected),
         )
-        for session_id in affected:
-            _session_status_cache[session_id] = "failed"
-            _publish_status(session_id, "failed")
+        await _mark_runner_sessions_offline(
+            affected,
+            ErrorDetail(
+                code="runner_disconnected",
+                message="Runner disconnected unexpectedly.",
+            ),
+            conversation_store,
+        )
 
     async def _on_runner_exited(runner_id: str, error: str) -> None:
         """Mark a crashed runner's session(s) failed and push the cause.
@@ -2138,34 +2140,33 @@ def create_app(
         never fires for it). Mirrors that callback's by-runner lookup,
         but carries the daemon-composed error onto the ``session.status:
         failed`` event so the open view surfaces the cause immediately
-        instead of spinning on "starting" until a timeout.
+        instead of spinning on "starting" until a timeout. An idle
+        top-level session is included for exactly that reason; an idle
+        sub-agent is not, since its work finished on a runner that was
+        already live.
 
         :param runner_id: The crashed runner's id.
         :param error: Human-readable cause from the daemon (exit code +
             log tail), e.g. ``"runner process exited with code 1 ..."``.
         """
-        from omnigent.server.routes.sessions import (
-            _publish_status,
-            _session_status_cache,
-        )
+        from omnigent.server.routes.sessions import _mark_runner_sessions_offline
         from omnigent.server.schemas import ErrorDetail
 
-        affected = [
-            c.id
-            for c in await asyncio.to_thread(
-                conversation_store.list_conversations_by_runner_id, runner_id
-            )
-        ]
+        affected = await asyncio.to_thread(
+            conversation_store.list_conversations_by_runner_id, runner_id
+        )
         _logger.warning(
-            "Runner %s reported crashed; marking %d session(s) failed: %s",
+            "Runner %s reported crashed; reconciling %d bound session(s): %s",
             runner_id,
             len(affected),
             error,
         )
-        detail = ErrorDetail(code="runner_failed_to_start", message=error)
-        for session_id in affected:
-            _session_status_cache[session_id] = "failed"
-            _publish_status(session_id, "failed", error=detail)
+        await _mark_runner_sessions_offline(
+            affected,
+            ErrorDetail(code="runner_failed_to_start", message=error),
+            conversation_store,
+            fail_idle_top_level=True,
+        )
 
     async def _on_runner_connect(runner_id: str) -> None:
         """Re-assign sessions and restart SSE relays on reconnect.
