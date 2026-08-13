@@ -7,15 +7,15 @@ include:
 sync:
   paths:
     - .
-    - ../../.github/areas.json
-    - ../../.github/MAINTAINER
-    - ../../.github/issue-prioritization-labels.json
+    - ../areas.json
+    - ../MAINTAINER
+    - ../issue-prioritization-labels.json
 
 artifacts:
   default:
     type: whl
     path: .
-    build: uv build --wheel
+    build: uv build --wheel --out-dir dist
 
 variables:
   catalog:
