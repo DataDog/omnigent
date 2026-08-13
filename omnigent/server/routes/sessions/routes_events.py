@@ -6,7 +6,7 @@ import asyncio
 import secrets
 from collections import OrderedDict
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx
 from fastapi import (
@@ -942,7 +942,7 @@ def register_events_routes(
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_STATUS_TYPE:
             status = body.data.get("status")
-            if status not in _EXTERNAL_SESSION_STATUS_VALUES:
+            if not isinstance(status, str) or status not in _EXTERNAL_SESSION_STATUS_VALUES:
                 raise OmnigentError(
                     f"external_session_status requires data.status in "
                     f"{sorted(_EXTERNAL_SESSION_STATUS_VALUES)}; got {status!r}",
@@ -1102,6 +1102,7 @@ def register_events_routes(
                 if not (
                     isinstance(server_name, str)
                     and server_name
+                    and isinstance(record_status, str)
                     and record_status in _EXTERNAL_MCP_STARTUP_STATUS_VALUES
                 ):
                     raise OmnigentError(
@@ -1112,7 +1113,10 @@ def register_events_routes(
                     )
                 record_error = record.get("error")
                 mcp_servers[server_name] = McpServerStartup(
-                    status=record_status,
+                    status=cast(
+                        Literal["starting", "ready", "failed", "cancelled"],
+                        record_status,
+                    ),
                     error=record_error if isinstance(record_error, str) and record_error else None,
                 )
             _publish_mcp_startup(session_id, mcp_servers)
