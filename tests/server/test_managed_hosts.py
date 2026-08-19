@@ -33,6 +33,7 @@ from omnigent.server.managed_hosts import (
     RepoWorkspace,
     host_resume_supported,
     launch_managed_host,
+    load_sandbox_config,
     parse_repo_workspace,
     parse_sandbox_config,
     relaunch_managed_host,
@@ -3114,3 +3115,159 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
     assert engaged == [True, True]
     assert len(calls) == 1
     assert calls[0]["agent_id"] == builtin.id
+
+
+# ── load_sandbox_config (external provider seam) ─────────────
+
+
+def test_load_sandbox_config_no_env_falls_through_to_yaml(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without OMNIGENT_SANDBOX_PROVIDER_MODULE the YAML path is used."""
+    monkeypatch.delenv("OMNIGENT_SANDBOX_PROVIDER_MODULE", raising=False)
+    cfg = {"sandbox": {"provider": "modal", "server_url": "https://s.example.com"}}
+    result = load_sandbox_config(cfg)
+    assert result is not None
+    assert result.provider == "modal"
+    assert result.server_url == "https://s.example.com"
+
+
+def test_load_sandbox_config_no_env_no_section_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No env var and no sandbox section → None (managed hosts disabled)."""
+    monkeypatch.delenv("OMNIGENT_SANDBOX_PROVIDER_MODULE", raising=False)
+    assert load_sandbox_config({}) is None
+
+
+def test_load_sandbox_config_external_provider_loaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the env var names a valid module, its factory supplies the config."""
+    from tests.server.helpers import FakeSandboxLauncher
+
+    fake = FakeSandboxLauncher()
+    expected = ManagedSandboxConfig(
+        server_url="https://hab.example.com",
+        launcher_factory=lambda: fake,
+        token_ttl_s=3600,
+        provider="hab",
+    )
+
+    # Match the public import path and factory exposed by the installed
+    # omnigent_hab_launcher wheel without making that internal wheel a test
+    # dependency of the public Omnigent repository.
+    import sys
+    import types
+
+    mod = types.ModuleType("omnigent_hab_launcher")
+    mod.create_sandbox_config = lambda cfg: expected  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "omnigent_hab_launcher", mod)
+    monkeypatch.setenv("OMNIGENT_SANDBOX_PROVIDER_MODULE", "omnigent_hab_launcher")
+
+    result = load_sandbox_config({})
+    assert result is expected
+
+
+def test_load_sandbox_config_external_provider_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An external provider may return None to disable managed hosts."""
+    import sys
+    import types
+
+    mod = types.ModuleType("_test_none_provider")
+    mod.create_sandbox_config = lambda cfg: None  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "_test_none_provider", mod)
+    monkeypatch.setenv("OMNIGENT_SANDBOX_PROVIDER_MODULE", "_test_none_provider")
+
+    assert load_sandbox_config({}) is None
+
+
+def test_load_sandbox_config_malformed_provider_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider module returning the wrong type fails startup loud."""
+    import sys
+    import types
+
+    mod = types.ModuleType("_test_bad_return")
+    mod.create_sandbox_config = lambda cfg: "not a config"  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "_test_bad_return", mod)
+    monkeypatch.setenv("OMNIGENT_SANDBOX_PROVIDER_MODULE", "_test_bad_return")
+
+    with pytest.raises(RuntimeError, match="expected ManagedSandboxConfig or None"):
+        load_sandbox_config({})
+
+
+def test_load_sandbox_config_provider_import_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A module that cannot be imported raises a clear RuntimeError."""
+    monkeypatch.setenv("OMNIGENT_SANDBOX_PROVIDER_MODULE", "nonexistent_pkg.xyz")
+    with pytest.raises(RuntimeError, match="Could not import sandbox provider module"):
+        load_sandbox_config({})
+
+
+def test_load_sandbox_config_provider_missing_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A module without create_sandbox_config raises a clear RuntimeError."""
+    import sys
+    import types
+
+    mod = types.ModuleType("_test_no_factory")
+    # No create_sandbox_config attribute.
+    monkeypatch.setitem(sys.modules, "_test_no_factory", mod)
+    monkeypatch.setenv("OMNIGENT_SANDBOX_PROVIDER_MODULE", "_test_no_factory")
+
+    with pytest.raises(RuntimeError, match="does not expose a callable 'create_sandbox_config'"):
+        load_sandbox_config({})
+
+
+def test_load_sandbox_config_provider_raises_during_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception from the provider's factory surfaces as a RuntimeError."""
+    import sys
+    import types
+
+    def _boom(cfg: object) -> ManagedSandboxConfig:
+        raise ValueError("habitat endpoint unreachable")
+
+    mod = types.ModuleType("_test_boom_provider")
+    mod.create_sandbox_config = _boom  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "_test_boom_provider", mod)
+    monkeypatch.setenv("OMNIGENT_SANDBOX_PROVIDER_MODULE", "_test_boom_provider")
+
+    with pytest.raises(RuntimeError, match="habitat endpoint unreachable"):
+        load_sandbox_config({})
+
+
+def test_load_sandbox_config_env_overrides_yaml(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the env var is set, the YAML sandbox section is ignored."""
+    from tests.server.helpers import FakeSandboxLauncher
+
+    fake = FakeSandboxLauncher()
+    expected = ManagedSandboxConfig(
+        server_url="https://hab.example.com",
+        launcher_factory=lambda: fake,
+        token_ttl_s=7200,
+        provider="habitat",
+    )
+
+    import sys
+    import types
+
+    mod = types.ModuleType("_test_override_provider")
+    mod.create_sandbox_config = lambda cfg: expected  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "_test_override_provider", mod)
+    monkeypatch.setenv("OMNIGENT_SANDBOX_PROVIDER_MODULE", "_test_override_provider")
+
+    # YAML has a different provider — the external module wins.
+    cfg = {"sandbox": {"provider": "modal", "server_url": "https://s.example.com"}}
+    result = load_sandbox_config(cfg)
+    assert result is expected
+    assert result.provider == "habitat"

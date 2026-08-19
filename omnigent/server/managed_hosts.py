@@ -119,6 +119,19 @@ stores into ``create_app``):
    A managed-only launcher implements ``prepare`` / ``provision`` /
    ``run`` / ``terminate``; the CLI-bootstrap primitives default to
    capability errors and need no overrides.
+
+3. **External provider module** (installed-wheel deployments): set
+   the ``OMNIGENT_SANDBOX_PROVIDER_MODULE`` environment variable to a
+   dotted module path (e.g. ``omnigent_hab_launcher``).  At startup
+   :func:`load_sandbox_config` imports the module and calls its
+   ``create_sandbox_config(cfg)`` callable, which must return a
+   :class:`ManagedSandboxConfig` or ``None``.  This is the production
+   seam for deployments that ship their launcher as a standalone
+   wheel (e.g. Habitat) and must not monkeypatch Omnigent internals.
+   Both the ``omnigent server`` CLI and the Docker ``entrypoint.py``
+   use this same loading path, so the behaviour is identical across
+   startup modes.  When the env var is absent the YAML path (1) is
+   used unchanged.
 """
 
 from __future__ import annotations
@@ -799,6 +812,99 @@ def _parse_host_config(raw: dict[str, object]) -> dict[str, object] | None:
             "(mapping keys must be strings and values must preserve their JSON types)"
         )
     return host_config
+
+
+# ── External provider seam ──────────────────────────────────────
+
+#: Environment variable naming a Python module that supplies the
+#: :class:`ManagedSandboxConfig` at startup.  When set, the module is
+#: imported and its ``create_sandbox_config(cfg)`` callable is invoked
+#: *instead of* :func:`parse_sandbox_config`.  This is the production seam
+#: for embedding deployments (e.g. Habitat) that ship their launcher
+#: as an installed wheel and must not monkeypatch Omnigent internals.
+#:
+#: The module must expose a top-level ``create_sandbox_config`` callable
+#: accepting the full server-config dict and returning a
+#: :class:`ManagedSandboxConfig` or ``None``.  Habitat implementation
+#: details stay in the wheel; Omnigent only learns about the
+#: :class:`ManagedSandboxConfig` contract.
+SANDBOX_PROVIDER_MODULE_ENV = "OMNIGENT_SANDBOX_PROVIDER_MODULE"
+
+
+def load_sandbox_config(
+    cfg: dict[str, object],
+) -> ManagedSandboxConfig | None:
+    """Resolve the managed-sandbox config from the server config.
+
+    This is the unified entry point for **both** startup paths (the
+    ``omnigent server`` CLI and the Docker ``entrypoint.py``).  It
+    checks :data:`SANDBOX_PROVIDER_MODULE_ENV` first:
+
+    * **Set** — import the named module and call its
+      ``create_sandbox_config(cfg)``.  The return must be a
+      :class:`ManagedSandboxConfig` or ``None``.  Import errors,
+      missing callables, and type mismatches raise as startup
+      failures (clear error, not a deferred 502).
+    * **Unset** — fall through to :func:`parse_sandbox_config` with
+      the ``sandbox:`` section from the YAML, preserving the existing
+      upstream behaviour unchanged.
+
+    The external module owns all provider-specific configuration
+    (endpoints, credentials, image references, etc.).  Omnigent only
+    consumes the returned :class:`ManagedSandboxConfig` — Habitat
+    implementation details never enter this repository.
+
+    :param cfg: The full server-config dict (as loaded by
+        :func:`~omnigent.server.server_config.load_server_config` or
+        :func:`~omnigent.cli._load_config`).
+    :returns: The resolved config, or ``None`` when managed hosts are
+        not configured.
+    :raises ValueError: When the YAML ``sandbox:`` section is malformed
+        (only on the fall-through path).
+    :raises RuntimeError: When the external provider module cannot be
+        imported, does not expose ``create_sandbox_config``, returns a
+        non-:class:`ManagedSandboxConfig` value, or raises during
+        invocation.
+    """
+    import os
+
+    module_name = os.environ.get(SANDBOX_PROVIDER_MODULE_ENV, "").strip()
+    if not module_name:
+        return parse_sandbox_config(cfg.get("sandbox"))
+
+    import importlib
+
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Could not import sandbox provider module {module_name!r} "
+            f"(set via {SANDBOX_PROVIDER_MODULE_ENV}): {exc}"
+        ) from exc
+
+    factory = getattr(module, "create_sandbox_config", None)
+    if factory is None or not callable(factory):
+        raise RuntimeError(
+            f"Sandbox provider module {module_name!r} does not expose a "
+            f"callable 'create_sandbox_config' — expected a function accepting "
+            f"the server config dict and returning ManagedSandboxConfig or None"
+        )
+
+    try:
+        result = factory(cfg)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Sandbox provider module {module_name!r} raised while building "
+            f"the sandbox config: {exc}"
+        ) from exc
+
+    if result is not None and not isinstance(result, ManagedSandboxConfig):
+        raise RuntimeError(
+            f"Sandbox provider module {module_name!r} returned "
+            f"{type(result).__name__}, expected ManagedSandboxConfig or None"
+        )
+
+    return result
 
 
 def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
