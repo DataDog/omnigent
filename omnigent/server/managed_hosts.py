@@ -122,7 +122,7 @@ stores into ``create_app``):
 
 3. **External provider module** (installed-wheel deployments): set
    the ``OMNIGENT_SANDBOX_PROVIDER_MODULE`` environment variable to a
-   dotted module path (e.g. ``hab_launcher.provider``).  At startup
+   dotted module path (e.g. ``omnigent_hab_launcher``).  At startup
    :func:`load_sandbox_config` imports the module and calls its
    ``create_sandbox_config(cfg)`` callable, which must return a
    :class:`ManagedSandboxConfig` or ``None``.  This is the production

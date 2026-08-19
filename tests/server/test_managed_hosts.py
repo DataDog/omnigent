@@ -3151,17 +3151,19 @@ def test_load_sandbox_config_external_provider_loaded(
         server_url="https://hab.example.com",
         launcher_factory=lambda: fake,
         token_ttl_s=3600,
-        provider="habitat",
+        provider="hab",
     )
 
-    # Build a throwaway module that exposes create_sandbox_config.
+    # Match the public import path and factory exposed by the installed
+    # omnigent_hab_launcher wheel without making that internal wheel a test
+    # dependency of the public Omnigent repository.
     import sys
     import types
 
-    mod = types.ModuleType("_test_hab_provider")
+    mod = types.ModuleType("omnigent_hab_launcher")
     mod.create_sandbox_config = lambda cfg: expected  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "_test_hab_provider", mod)
-    monkeypatch.setenv("OMNIGENT_SANDBOX_PROVIDER_MODULE", "_test_hab_provider")
+    monkeypatch.setitem(sys.modules, "omnigent_hab_launcher", mod)
+    monkeypatch.setenv("OMNIGENT_SANDBOX_PROVIDER_MODULE", "omnigent_hab_launcher")
 
     result = load_sandbox_config({})
     assert result is expected
