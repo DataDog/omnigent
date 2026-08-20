@@ -1947,6 +1947,42 @@ async def test_launch_provision_failure_maps_to_502(
     assert fake.terminated == []
 
 
+async def test_launch_provision_session_error_maps_to_502(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The external hab provider raises ``SessionError(RuntimeError)`` for
+    per-session Habitat failures (unconfigured endpoint, missing token,
+    unreachable API, quota). Such a failure must surface as a clear 502
+    with the provider's message — not fall through to the broad
+    "internal error" handler in routes/_sessions/helpers.py. Mirrors
+    ``test_launch_provision_failure_maps_to_502`` but for the
+    non-``ClickException`` error contract.
+    """
+    fake = FakeSandboxLauncher()
+
+    class _SessionError(RuntimeError):
+        """Mirrors omnigent_hab_launcher.lifecycle.SessionError."""
+
+    def _fail_provision(_host_name: str) -> None:
+        raise _SessionError(
+            "Habitat API server is not configured (HAB_APISERVER); "
+            "cannot create a Habitat-backed session"
+        )
+
+    monkeypatch.setattr(fake, "provision", _fail_provision)
+    host_store = HostStore(db_uri)
+
+    with pytest.raises(HTTPException) as exc:
+        await launch_managed_host(
+            config=_injected_config(fake), owner=_OWNER, host_store=host_store
+        )
+    assert exc.value.status_code == 502
+    assert "Habitat API server is not configured" in exc.value.detail
+    assert host_store.list_hosts(_OWNER) == []
+    assert fake.terminated == []
+
+
 async def test_launch_host_start_failure_terminates_and_deletes_host(db_uri: str) -> None:
     """
     A failure AFTER provisioning must clean up: terminate the sandbox
