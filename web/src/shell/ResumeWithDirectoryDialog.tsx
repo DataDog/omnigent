@@ -390,10 +390,11 @@ export function ResumeWithDirectoryDialog({
             <DialogFooter>
               <Button
                 data-testid="resume-dir-bind-button"
-                disabled={!selectedHostId || !workspaceValid || submitting}
+                loading={submitting}
+                disabled={!selectedHostId || !workspaceValid}
                 onClick={handleBind}
               >
-                {submitting ? "Starting…" : "Start session"}
+                Start session
               </Button>
             </DialogFooter>
           </>
