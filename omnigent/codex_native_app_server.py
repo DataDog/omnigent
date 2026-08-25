@@ -1018,6 +1018,22 @@ async def codex_launch_catalog(*, codex_path: str | None = None) -> list[_JsonOb
     return await model_catalog_store.ensure_catalog("codex-native", fingerprint, _probe)
 
 
+async def codex_launch_catalog_is_stale() -> bool:
+    """
+    Whether the default launch shape's stored catalog is past the TTL.
+
+    :returns: ``True`` when the store holds only a stale entry; ``False``
+        when it is fresh, absent, or the launch shape cannot resolve.
+    """
+    from omnigent import model_catalog_store
+
+    try:
+        launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
+    except Exception:  # noqa: BLE001 — a broken provider config means no catalog
+        return False
+    return model_catalog_store.catalog_is_stale("codex-native", codex_catalog_fingerprint(launch))
+
+
 def _build_native_codex_app_server_argv(
     *,
     tagged_argv0: str,
