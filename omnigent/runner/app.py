@@ -30,8 +30,10 @@ if TYPE_CHECKING:
     from omnigent.claude_native import ClaudeNativeUcodeConfig
     from omnigent.claude_native_bridge import ClaudeNativeToolRelay
     from omnigent.codex_native_bridge import CodexNativeBridgeState
+    from omnigent.llms.client import Client as LLMClient
     from omnigent.runner.mcp_manager import RunnerMcpManager
-    from omnigent.terminals.registry import TerminalListEntry
+    from omnigent.runner.policy import PolicyVerdict
+    from omnigent.terminals.registry import TerminalListEntry, TerminalRegistry
 
 import click
 import httpx
@@ -319,6 +321,24 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
     _logger.warning("%s failed: %s", context, exc, exc_info=exc)
     log_reference = process_log_reference("runner")
     return f"Request failed on the runner; see the runner log for details: {log_reference}"
+
+
+_SpecEntry: TypeAlias = AgentSpec | ResolvedSpec
+SpecResolver: TypeAlias = Callable[[str, str | None], Awaitable[_SpecEntry | None]]
+_ResourceType: TypeAlias = Literal["environment", "terminal", "file"]
+
+
+@overload
+def _unwrap_spec_entry(entry: None) -> None: ...
+
+
+@overload
+def _unwrap_spec_entry(entry: _SpecEntry) -> AgentSpec: ...
+
+
+def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
+    """Return the agent spec from a runner app cache entry."""
+    return entry.spec if isinstance(entry, ResolvedSpec) else entry
 
 
 _SpecEntry: TypeAlias = AgentSpec | ResolvedSpec
@@ -1878,12 +1898,6 @@ def create_runner_app(
     _live_response_id: dict[str, str] = {}
     _session_start_cache: dict[str, float] = {}  # session_id → registered start time
     _session_spec_cache: dict[str, _SpecEntry | None] = {}  # session_id → session AgentSpec
-    # session_id → the harness the session actually runs, when it differs from
-    # the spec's. Smart Routing pins a routed child's harness on the
-    # conversation and forwards it as ``harness_override``; without this record
-    # every spec-derived read (native-vs-SDK checks above all) still answers
-    # with the harness the spec declared, which a routed session is not on.
-    _session_harness_overrides: dict[str, str] = {}
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
@@ -2637,18 +2651,6 @@ def create_runner_app(
                 },
             )
 
-        # Stamp the session's Smart Routing class before anything reads it: the
-        # spawn env is rebuilt on every harness respawn, long after this
-        # envelope is gone, and on the codex family the class decides whether
-        # the session gets the extended model catalog and the spawn-routing
-        # endpoint at all.
-        _routing_class = init_context.routing_class
-        remember_session_routing_class(session_id, _routing_class)
-        if init_context.envelope is not None:
-            _note_session_harness_override(
-                session_id, init_context.envelope.snapshot.harness_override
-            )
-
         spec: AgentSpec | None = None
         spec_entry: _SpecEntry | None = None
         if spec_resolver is not None:
@@ -2662,10 +2664,8 @@ def create_runner_app(
                         "detail": _client_safe_error_detail(exc, context="spec resolve"),
                     },
                 )
-        if spec is not None:
-            spec_entry = spec
-            if isinstance(spec_entry, ResolvedSpec):
-                spec = _unwrap_resolved_spec(spec_entry)
+        if spec_entry is not None:
+            spec = _unwrap_spec_entry(spec_entry)
             raw_sub_agent_name = body.get("sub_agent_name")
             _sa_name_assign = cast(str | None, raw_sub_agent_name)
             if _sa_name_assign:
@@ -8897,51 +8897,6 @@ class _SpawnEnvBuilder(Protocol):
 
 class _ModelCopyValue(Protocol):
     def model_copy(self, *, update: Mapping[str, object]) -> object: ...
-
-
-async def _ensure_session_subagent_router(
-    session_id: str,
-    harness: str | None,
-    *,
-    server_client: httpx.AsyncClient | None,
-    routing_class: SessionRoutingClass | None = None,
-) -> None:
-    """Start this session's subagent-routing endpoint.
-
-    Only for the SDK harness families: the native terminals know their own
-    bridge directory and start the router from their launch paths, where
-    the harness's hooks are also pointed at it.
-
-    Started for Smart Routing sessions only: a plain session must not carry
-    the loopback server, its on-disk bearer token, or an in-process hook on
-    every ``Task`` for a verdict the server never routes. On the codex SDK
-    arm the advertisement also turns generated hooks and the routed-spawn
-    tool pre-approvals on, and those spawns already route through
-    session-create, so there it takes auto-harness.
-
-    Never raises: ``ensure_session_router_quietly`` owns the bridge-dir
-    resolution too, so a hostile or pre-existing ``$TMPDIR`` root cannot
-    fail session creation for harnesses that do not even use routing.
-
-    :param session_id: Session/conversation identifier.
-    :param harness: Canonical harness name, e.g. ``"claude-sdk"``.
-    :param server_client: Runner→server client the relay forwards on.
-        ``None`` (in-process tests) skips the start.
-    :param routing_class: The session's Smart Routing class. ``None``
-        reads whatever was stamped at session init, which for an unknown
-        session is the plain class.
-    """
-    from omnigent.runner.subagent_routing import ensure_session_router_quietly
-
-    if is_native_harness(harness):
-        return
-    resolved = routing_class if routing_class is not None else session_routing_class(session_id)
-    ensure_session_router_quietly(
-        session_id,
-        server_client=server_client,
-        harness=harness,
-        routing_class=resolved,
-    )
 
 
 def _build_spawn_env_from_spec(
