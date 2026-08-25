@@ -171,12 +171,6 @@ import {
   moveConversationToProject,
   PROJECT_LABEL_KEY,
 } from "@/hooks/useConversations";
-import {
-  collectConversationIds,
-  type ConversationsInfiniteData,
-  type SessionListWireItem,
-} from "@/lib/sessionListCache";
-import { nextPushedSession } from "@/lib/sessionUpdatesSocket";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
@@ -3404,6 +3398,28 @@ export function NewChatLandingScreen() {
         ? { ...(baseLabels ?? {}), [PROJECT_LABEL_KEY]: selectedProject }
         : baseLabels;
 
+      // Native terminal agents open terminal-first: `omnigent.ui: terminal`
+      // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
+      // selects which CLI bridge the runner launches — the values are the
+      // registered wrapper ids the runner keys off, not the display name. The
+      // DANGEROUS codex full-bypass opt-in rides along as an extra label (only
+      // when the toggle is armed for a codex-native agent) so the runner
+      // launches with --dangerously-bypass-approvals-and-sandbox and the choice
+      // survives reload.
+      const baseLabels =
+        agentSupportsApprovalMode && bypassSandbox
+          ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
+          : nativeLabels;
+      // When filing into a project, stamp its legacy `omni_project` label at
+      // create so the session is BORN FILED. The sidebar dual-reads project
+      // membership from this label OR the first-class `project_id` the follow-up
+      // move sets, so the row groups under its project from its very first
+      // sidebar appearance instead of flashing through the ungrouped "Sessions"
+      // section while the search-indexed session list catches up to the move.
+      const createLabels = selectedProject
+        ? { ...(baseLabels ?? {}), [PROJECT_LABEL_KEY]: selectedProject }
+        : baseLabels;
+
       let data: { id: string };
 
       if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
@@ -3490,11 +3506,7 @@ export function NewChatLandingScreen() {
                 }),
             // Native-wrapper labels + codex bypass + the born-filed project
             // label (see `createLabels` above).
-            // Smart Routing sends none of these: the bound agent is only a
-            // placeholder, so the placeholder's wrapper labels, launch args and
-            // model would all describe a CLI the router may not pick. The
-            // server stamps the routed wrapper's labels once it has rebound.
-            labels: smartRoutingHarnessSelected ? undefined : createLabels,
+            labels: createLabels,
             // Permission / approval / cursor mode → CLI flag pair, persisted as
             // terminal_launch_args. Omitted for the default and non-native agents.
             terminal_launch_args: smartRoutingHarnessSelected
