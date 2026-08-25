@@ -171,6 +171,12 @@ import {
   moveConversationToProject,
   PROJECT_LABEL_KEY,
 } from "@/hooks/useConversations";
+import {
+  collectConversationIds,
+  type ConversationsInfiniteData,
+  type SessionListWireItem,
+} from "@/lib/sessionListCache";
+import { nextPushedSession } from "@/lib/sessionUpdatesSocket";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import {
