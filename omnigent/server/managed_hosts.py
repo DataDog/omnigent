@@ -1240,6 +1240,7 @@ def _boxlite_launcher_factory(
     env: list[str] | None,
     home_dir: str | None,
     registry: dict[str, object] | None,
+    disk_size_gb: int | None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: boxlite`` path.
