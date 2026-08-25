@@ -209,7 +209,6 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
 // is the path. Global so all markers in a message are found / stripped.
 const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
-
 /** Server-info as consumers see it: the probe's result, or "loading". */
 type ServerInfoValue = ServerInfo | "loading";
 
