@@ -12,9 +12,9 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import NotRequired, TypeAlias, TypedDict, cast
 
-from omnigent.json_types import JsonObject as _JsonObject
+_JsonObject: TypeAlias = dict[str, object]
 
 SCHEMA_VERSION = 1
 LEDGER_NAME = "install_ledger.json"
@@ -198,13 +198,7 @@ class InstallLedger:
 
     @classmethod
     def from_dict(cls, data: _JsonObject) -> InstallLedger:
-        entries_value = data.get("entries")
-        if entries_value is None:
-            entries_data: _JsonObject = {}
-        elif isinstance(entries_value, dict):
-            entries_data = entries_value
-        else:
-            raise ValueError("install ledger entries must be an object")
+        entries_data = cast(_JsonObject, data.get("entries") or {})
         entries = LedgerEntries(
             profiles=[
                 ProfileEntry(**item)
@@ -247,10 +241,8 @@ class InstallLedger:
             ),
         )
         schema_version = data.get("schema_version", SCHEMA_VERSION)
-        if isinstance(schema_version, bool) or not isinstance(
-            schema_version, int | str | bytes | bytearray
-        ):
-            raise ValueError("install ledger schema_version must be an integer")
+        if not isinstance(schema_version, int | str | bytes | bytearray):
+            schema_version = SCHEMA_VERSION
         return cls(
             schema_version=int(schema_version),
             ledger_source=str(data.get("ledger_source", "backfill")),
@@ -288,14 +280,7 @@ def load_ledger(path: Path) -> InstallLedger | None:
         return None
     except json.JSONDecodeError:
         return None
-    if not isinstance(data, dict):
-        return None
-    schema_version = data.get("schema_version")
-    if isinstance(schema_version, bool) or schema_version != SCHEMA_VERSION:
-        return None
-    try:
-        return InstallLedger.from_dict(data)
-    except (AttributeError, TypeError, ValueError):
+    if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
         return None
 
 
