@@ -649,6 +649,17 @@ function SubagentRow({
             )}
             <Icon className="size-3.5 shrink-0 text-muted-foreground" />
             <span className="shrink-0 truncate text-sm font-medium">{primary}</span>
+            {child.routed_model ? (
+              // Model the intelligent router picked for this sub-agent — the
+              // per-subagent half of routing visibility.
+              <span
+                data-testid="subagent-routed-model"
+                title={`Smart routing picked ${child.routed_model}`}
+                className="shrink-0 truncate font-mono text-[10px] text-muted-foreground"
+              >
+                {shortModelName(child.routed_model)}
+              </span>
+            ) : null}
             <span className="flex-1" />
             <StatusIndicator {...status} />
           </div>

@@ -423,7 +423,9 @@ async def _receive_loop(
     :param host_id: Host id for logging.
     :param host_store: Persistent store receiving live readiness updates.
     :param host_registry: Live host registry, so a frame only refreshes
-        liveness while ``conn`` is still the registered generation.
+        liveness while ``conn`` is still the registered generation; it also
+        receives the reported gateway-inference map (held in memory, never
+        persisted).
     :param runner_exit_reports: Store for ``host.runner_exited``
         reports; ``None`` drops them.
     :param on_runner_exited: Callback fired with ``(runner_id, error)``

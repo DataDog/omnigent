@@ -59,6 +59,7 @@ from omnigent.server.routes._content_type import (
 from omnigent.server.routes._sessions.common import (
     _EVALUATE_HOOK_ELICITATION_ID_RE,
     _TURN_ACTOR_LABEL,
+    _logger,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -69,7 +70,9 @@ from omnigent.server.routes._sessions.helpers import (
     _build_evaluation_context,
     _claude_native_remember_host,
     _client_supplied_hook_elicitation_id,
+    _emit_server_routing_decision,
     _forward_session_change_to_runner,
+    _get_runner_client,
     _native_ask_gate_lock,
     _publish_policy_denied,
     _structured_ask_user_question,
@@ -77,6 +80,7 @@ from omnigent.server.routes._sessions.helpers import (
 from omnigent.server.routes._sessions.orchestration import (
     _hold_native_ask_gate,
     _publish_and_wait_for_harness_elicitation,
+    _spawn_gateway_backed,
     _spawn_native_blocked_notice_forward,
 )
 from omnigent.server.schemas import (
@@ -1528,12 +1532,10 @@ def register_hooks_routes(
             decision_scope,
             resolve_turn_route,
         )
-        from omnigent.server.routes._sessions.helpers import _resolve_harness
         from omnigent.server.routes._sessions.orchestration import (
             _native_turn_catalog,
             _publish_routed_model,
             _stamp_routing_decision_label,
-            _unavailable_routing_card,
         )
         from omnigent.server.smart_routing import route_turn as _route_turn_seam
 
@@ -1632,54 +1634,14 @@ def register_hooks_routes(
             )
             await _stamp_routing_decision_label(session_id, conversation_store, decision_id)
 
-        async def _record_decline(cause: str) -> None:
-            """Persist the declined chip for a failed routing call.
-
-            The card, not the label: a failure must stay visible without
-            claiming the route-once gate, or one outage would make this the
-            session's routing decision forever.
-            """
-            model, verdict = _unavailable_routing_card(cause)
-            await _emit_server_routing_decision(
-                session_id,
-                conversation_store,
-                model,
-                verdict,
-                scope=decision_scope(),
-                harness=route_request.harness,
-            )
-
-        async def _reuse_create_route() -> bool:
-            """Claim the create-time decision as this session's routing decision.
-
-            No second chip: the create's own row already says what was picked,
-            and the pane launched on it. Claiming the route-once label is what
-            makes this the session's decision, so a later prompt does not ask
-            again.
-
-            :returns: ``True`` when the create's decision was claimed.
-            """
-            decision_id = await asyncio.to_thread(
-                _create_route_decision_id, session_id, conversation_store
-            )
-            if decision_id is None:
-                return False
-            await _stamp_routing_decision_label(session_id, conversation_store, decision_id)
-            return True
-
         decision = await resolve_turn_route(
             session_id,
             route_request,
             conv=conv,
             parent=parent,
-            # A pinned routed parent confines its spawns to its own family, so
-            # the pane's own family is not the only one that matters.
-            parent_harness=_resolve_harness(parent) if parent is not None else None,
             route_turn=_route,
-            reuse_create_route=_reuse_create_route,
             pin=_pin,
             persist=_persist,
-            record_decline=_record_decline,
         )
         _logger.info(
             "route-turn: session=%s harness=%s live_model=%s pinned=%s action=%s model=%s",

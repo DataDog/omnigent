@@ -46,6 +46,7 @@ from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
+from omnigent.inner.hook_scripts import subagent_router
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri

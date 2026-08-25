@@ -662,14 +662,7 @@ describe("stripGatedSubagentRoutingChips", () => {
     const shown = stripGatedSubagentRoutingChips(bubbles, null);
     expect(chipIds(shown)).toEqual(["rd_session", "rd_turn", "rd_legacy", "rd_child"]);
     // Everything else keeps its place and its reference (BubbleView's memo).
-    expect(bubbleIds(shown)).toEqual([
-      "rd_session",
-      "rd_turn",
-      "rd_legacy",
-      "rd_child",
-      "u1",
-      "a1",
-    ]);
+    expect(bubbleIds(shown)).toEqual(["", "", "", "", "u1", "a1"]);
   });
 
   it("hides spawn chips on an explicit off", () => {

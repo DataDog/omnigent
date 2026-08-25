@@ -1233,7 +1233,7 @@ export function AgentHarnessPicker({
                     onSelectAutoHarness?.();
                     setOpen(false);
                   }}
-                  className="items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+                  className="items-center gap-2 rounded-sm px-2 py-1.5 text-13 data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
                 >
                   <span className="flex-1 truncate">{SMART_ROUTING_LABEL}</span>
                 </DropdownMenuItem>
@@ -1563,40 +1563,23 @@ function HarnessConfigModal({
           {!autoRouting && hasPermission && (
             <>
               <ConfigRow label="Model" description="Underlying LLM">
-                <Select value={modelValue} onValueChange={onModelChange}>
-                  <SelectTrigger
-                    className="w-full"
-                    data-testid="new-chat-landing-config-model"
-                    aria-label="Model"
-                  >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent
-                    position="popper"
-                    align="start"
-                    className="[&_[data-slot=select-item]]:pl-2.5"
-                  >
-                    {smartRoutingEligible && (
-                      <SelectItem value={MODEL_SELECT_SMART}>Smart Routing</SelectItem>
-                    )}
-                    <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
-                    {claudeModelOptions.map((m) => (
-                      <SelectItem key={m.id} value={m.id}>
-                        {m.displayName}
-                      </SelectItem>
-                    ))}
-                    {claudeModelsLoading && (
-                      <div className="px-2.5 py-1 text-sm text-muted-foreground">
-                        Loading models…
-                      </div>
-                    )}
-                    {!claudeModelsLoading && claudeModelOptions.length === 0 && (
-                      <div className="px-2.5 py-1 text-sm text-muted-foreground">
-                        Models unavailable
-                      </div>
-                    )}
-                  </SelectContent>
-                </Select>
+                <RoutingModelSelect
+                  value={modelValue}
+                  onValueChange={onModelChange}
+                  offerSmartRouting={smartRoutingEligible}
+                  testId="new-chat-landing-config-model"
+                  models={claudeModelSelectOptions}
+                  contentClassName="[&_[data-slot=select-item]]:pl-2.5"
+                >
+                  {claudeModelsLoading && (
+                    <div className="px-2.5 py-1 text-sm text-muted-foreground">Loading models…</div>
+                  )}
+                  {!claudeModelsLoading && claudeModelOptions.length === 0 && (
+                    <div className="px-2.5 py-1 text-sm text-muted-foreground">
+                      Models unavailable
+                    </div>
+                  )}
+                </RoutingModelSelect>
               </ConfigRow>
 
               <ConfigRow label="Effort" description="Reasoning depth vs. speed">
@@ -1958,7 +1941,7 @@ export function NewChatLandingScreen() {
   // Unfiltered brain-harness labels: safe for membership checks and for
   // labelling an existing pick, but the OPTIONS offered in the gear modal use
   // the gated `brainHarnessLabels` below, which drops the fully-auto row when
-  // neither router can back both arms.
+  // the gateway cannot back both arms.
   const brainHarnessLabelsAll = useBrainHarnessLabels(smartRoutingEnabled);
   // Provider-named label for the sandbox option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" when the server names no
@@ -2738,28 +2721,25 @@ export function NewChatLandingScreen() {
         unreadyHarnesses: SMART_ROUTING_ARMS.filter((harness) =>
           harnessUnconfiguredOnHost(harness, harnessWarningHost),
         ),
-        // Picking the harness is the external router's job alone, so the row
-        // needs it configured AND both families on the gateway its apply layer
-        // rewrites through. The built-in judge routes a model inside one
-        // harness and can't stand in here.
-        externalRoutingAvailable: externalRoutingConfigured,
+        // The five-arm menu the top-level row drives needs BOTH families on the
+        // gateway for the external router, so either one the host doesn't back
+        // takes the row away — unless the built-in judge can route it instead.
         notGatewayBackedHarnesses: SMART_ROUTING_ARMS.filter(
           (harness) => !hostBacksHarnessWithGateway(harnessWarningHost, harness),
         ),
+        ossRoutingAvailable: ossRoutingConfigured,
       }),
-    [smartRoutingEnabled, smartRoutingWrappers, harnessWarningHost, externalRoutingConfigured],
+    [smartRoutingEnabled, smartRoutingWrappers, harnessWarningHost, ossRoutingConfigured],
   );
   const smartRoutingHarnessAvailable = smartRoutingUnavailableCause === null;
   // The fully-auto brain needs SOME router able to answer for both model
   // families — the router may land the session's work on either, and an arm the
   // external router can't reach (off the workspace AI gateway) is only a loss
-  // when the built-in judge can't cover it either. The judge picks the bundle
-  // brain's harness as well as its model, so unlike the native-pane row above
-  // this surface stays on a judge-only deployment. Source availability ONLY:
-  // the bundle brain routes across SDK harnesses, so the native wrappers/CLIs
-  // are deliberately not required here. Gates the OPTIONS map only — membership
-  // checks and the summary label for an existing pick keep reading
-  // `brainHarnessLabelsAll`.
+  // when the built-in judge can't cover it either. Source availability ONLY:
+  // unlike the top-level row, the bundle brain routes across SDK harnesses, so
+  // the native wrappers/CLIs are deliberately not required here. Gates the
+  // OPTIONS map only — membership checks and the summary label for an existing
+  // pick keep reading `brainHarnessLabelsAll`.
   const brainRoutable = SMART_ROUTING_ARMS.every(
     (harness) =>
       smartRoutingSourceFor({
@@ -3372,16 +3352,6 @@ export function NewChatLandingScreen() {
       // sending both would silently disable routing for the whole session. Never
       // pin a model or an effort alongside routing, whatever the UI state says.
       const routingOwnsModel = costControlOverride === "on";
-      // A pinned native pane routes its MODEL at create too: the terminal
-      // launches with the session row and its turns start in the TUI, so
-      // routing after the fact means blocking the first prompt and replaying
-      // it. Sending the prompt here pins `model_override` before the pane
-      // exists. Bundle agents are excluded — they route on the first message
-      // event by design.
-      const pinnedNativeRoutes =
-        routingOwnsModel &&
-        !smartRoutingHarnessSelected &&
-        SMART_ROUTING_ARMS.some((harness) => harness === nativeAgent?.harness);
 
       // Prepend each "@"-tagged path as an attachment marker on its own line —
       // the same wording the native executors emit and that title-seeding
@@ -3392,28 +3362,6 @@ export function NewChatLandingScreen() {
       const initialPrompt =
         buildMentionPreamble(mentionedItems, selectedAgent?.harness ?? null) +
         sanitizeInitialPrompt(message);
-
-      // Native terminal agents open terminal-first: `omnigent.ui: terminal`
-      // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
-      // selects which CLI bridge the runner launches — the values are the
-      // registered wrapper ids the runner keys off, not the display name. The
-      // DANGEROUS codex full-bypass opt-in rides along as an extra label (only
-      // when the toggle is armed for a codex-native agent) so the runner
-      // launches with --dangerously-bypass-approvals-and-sandbox and the choice
-      // survives reload.
-      const baseLabels =
-        agentSupportsApprovalMode && bypassSandbox
-          ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
-          : nativeLabels;
-      // When filing into a project, stamp its legacy `omni_project` label at
-      // create so the session is BORN FILED. The sidebar dual-reads project
-      // membership from this label OR the first-class `project_id` the follow-up
-      // move sets, so the row groups under its project from its very first
-      // sidebar appearance instead of flashing through the ungrouped "Sessions"
-      // section while the search-indexed session list catches up to the move.
-      const createLabels = selectedProject
-        ? { ...(baseLabels ?? {}), [PROJECT_LABEL_KEY]: selectedProject }
-        : baseLabels;
 
       // Native terminal agents open terminal-first: `omnigent.ui: terminal`
       // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
@@ -3523,7 +3471,11 @@ export function NewChatLandingScreen() {
                 }),
             // Native-wrapper labels + codex bypass + the born-filed project
             // label (see `createLabels` above).
-            labels: createLabels,
+            // Smart Routing sends none of these: the bound agent is only a
+            // placeholder, so the placeholder's wrapper labels, launch args and
+            // model would all describe a CLI the router may not pick. The
+            // server stamps the routed wrapper's labels once it has rebound.
+            labels: smartRoutingHarnessSelected ? undefined : createLabels,
             // Permission / approval / cursor mode → CLI flag pair, persisted as
             // terminal_launch_args. Omitted for the default and non-native agents.
             terminal_launch_args: smartRoutingHarnessSelected
@@ -3564,8 +3516,7 @@ export function NewChatLandingScreen() {
             harness_override: smartRoutingHarnessSelected
               ? AUTO_HARNESS_ID
               : (pickedHarness ?? undefined),
-            smart_routing_message:
-              smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
+            smart_routing_message: smartRoutingHarnessSelected ? initialPrompt : undefined,
           }),
         });
         // The create doesn't answer until the host has spawned a runner — a
@@ -4007,6 +3958,12 @@ export function NewChatLandingScreen() {
                     onSelectPending={handleSelectPending}
                     onCreateCustomAgent={() => setCreateAgentOpen(true)}
                     sandboxSelected={sandboxSelected}
+                    triggerTooltip={
+                      smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
+                    }
+                    autoHarnessAvailable={smartRoutingHarnessAvailable}
+                    autoHarnessActive={smartRoutingHarnessSelected}
+                    onSelectAutoHarness={handleSelectSmartRoutingHarness}
                     // Match the gear's touch-target height so both halves fill
                     // the shared pill; pr-2 equals the gear icon's own centering
                     // inset (8px) so the divider sits evenly between them.

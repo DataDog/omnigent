@@ -147,6 +147,13 @@ from omnigent.runner.subagent_routing import (
     session_routing_class,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
+from omnigent.runtime.prompt import (
+    SHARED_SESSION_AUTHORSHIP_INSTRUCTION,
+    input_items_have_multiple_authors,
+    prepare_input_items_for_model,
+    shared_message_attribution_enabled,
+)
+from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
@@ -2632,6 +2639,14 @@ def create_runner_app(
                 },
             )
 
+        # Stamp the session's Smart Routing class before anything reads it: the
+        # spawn env is rebuilt on every harness respawn, long after this
+        # envelope is gone, and on the codex family the class decides whether
+        # the session gets the extended model catalog and the spawn-routing
+        # endpoint at all.
+        _routing_class = init_context.routing_class
+        remember_session_routing_class(session_id, _routing_class)
+
         spec: AgentSpec | None = None
         spec_entry: _SpecEntry | None = None
         if spec_resolver is not None:
@@ -3253,10 +3268,6 @@ def create_runner_app(
 
         await asyncio.to_thread(shutdown_session_router, session_id)
         forget_session_routing_class(session_id)
-
-        from omnigent.runner.tool_dispatch import forget_spawn_family
-
-        forget_spawn_family(session_id)
 
         _session_spec_cache.pop(session_id, None)
         _session_harness_overrides.pop(session_id, None)
@@ -5256,6 +5267,7 @@ def create_runner_app(
                 workdir=cached_spec_workdir,
                 cwd=await _session_runtime_cwd(conv),
                 model_override=cast(str | None, msg_body.get("model_override")),
+                session_id=conv,
             )
             from omnigent.runtime.prompt import build_instructions
 
@@ -8876,6 +8888,51 @@ class _SpawnEnvBuilder(Protocol):
 
 class _ModelCopyValue(Protocol):
     def model_copy(self, *, update: Mapping[str, object]) -> object: ...
+
+
+async def _ensure_session_subagent_router(
+    session_id: str,
+    harness: str | None,
+    *,
+    server_client: httpx.AsyncClient | None,
+    routing_class: SessionRoutingClass | None = None,
+) -> None:
+    """Start this session's subagent-routing endpoint.
+
+    Only for the SDK harness families: the native terminals know their own
+    bridge directory and start the router from their launch paths, where
+    the harness's hooks are also pointed at it.
+
+    Started for Smart Routing sessions only: a plain session must not carry
+    the loopback server, its on-disk bearer token, or an in-process hook on
+    every ``Task`` for a verdict the server never routes. On the codex SDK
+    arm the advertisement also turns generated hooks and the routed-spawn
+    tool pre-approvals on, and those spawns already route through
+    session-create, so there it takes auto-harness.
+
+    Never raises: ``ensure_session_router_quietly`` owns the bridge-dir
+    resolution too, so a hostile or pre-existing ``$TMPDIR`` root cannot
+    fail session creation for harnesses that do not even use routing.
+
+    :param session_id: Session/conversation identifier.
+    :param harness: Canonical harness name, e.g. ``"claude-sdk"``.
+    :param server_client: Runner→server client the relay forwards on.
+        ``None`` (in-process tests) skips the start.
+    :param routing_class: The session's Smart Routing class. ``None``
+        reads whatever was stamped at session init, which for an unknown
+        session is the plain class.
+    """
+    from omnigent.runner.subagent_routing import ensure_session_router_quietly
+
+    if is_native_harness(harness):
+        return
+    resolved = routing_class if routing_class is not None else session_routing_class(session_id)
+    ensure_session_router_quietly(
+        session_id,
+        server_client=server_client,
+        harness=harness,
+        routing_class=resolved,
+    )
 
 
 def _build_spawn_env_from_spec(

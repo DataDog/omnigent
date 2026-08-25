@@ -63,12 +63,6 @@ def static_model_fallback(provider_kind: str, cli: str) -> StaticModelFallback |
     return _STATIC_MODEL_FALLBACKS.get((provider_kind, cli))
 
 
-#: Codex's launch default when nothing else names a model. The bundled OpenAI
-#: catalog's newest row is a bare family alias (``gpt-5.6``) that codex rejects,
-#: so a codex launch defaults to a concrete variant from its own catalog.
-CODEX_DEFAULT_MODEL = _STATIC_MODEL_FALLBACKS[(SUBSCRIPTION_KIND, "codex")].model_ids[0]
-
-
 # ── Smart Routing ───────────────────────────────────────────────────────────
 #
 # The router's static tables. A live per-session catalog wins wherever one is

@@ -2721,6 +2721,10 @@ class HostProcess:
         :returns: None. Runs until cancelled when the connection ends.
         """
         configured = initial
+        # Gateway-backing baseline, recomputed with readiness: a flip alone
+        # (same binaries, new credentials) must reach the server without a
+        # reconnect.
+        gateway = await asyncio.to_thread(gateway_inference_map)
         loop = asyncio.get_running_loop()
         next_quick = loop.time() + HARNESS_READINESS_REFRESH_INTERVAL_S
         next_full = loop.time() + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
@@ -2737,12 +2741,19 @@ class HostProcess:
             if not refresh_full:
                 continue
             latest = await asyncio.to_thread(configured_harness_map)
+            latest_gateway = await asyncio.to_thread(gateway_inference_map)
             next_full = now + HARNESS_READINESS_FULL_REFRESH_INTERVAL_S
-            if latest != configured:
+            if latest != configured or latest_gateway != gateway:
                 await ws.send(
-                    encode_host_frame(HostHarnessReadinessFrame(configured_harnesses=latest))
+                    encode_host_frame(
+                        HostHarnessReadinessFrame(
+                            configured_harnesses=latest,
+                            gateway_inference=latest_gateway,
+                        )
+                    )
                 )
                 configured = latest
+                gateway = latest_gateway
 
     async def _handle_raw_message(
         self, ws: websockets.asyncio.client.ClientConnection, raw: str

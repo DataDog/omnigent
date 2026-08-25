@@ -21,7 +21,15 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, MutableMapping
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+    MutableMapping,
+    Sequence,
+)
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,7 +44,7 @@ from omnigent.codex_model_vocabulary import (
 )
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
-from omnigent.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
+from omnigent.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG
 from omnigent.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 from omnigent.spec.types import RetryPolicy
 
@@ -1523,69 +1531,6 @@ def set_codex_model_catalog_path(config_path: Path, catalog_path: Path) -> bool:
     return True
 
 
-def materialize_codex_provider_config(
-    codex_home: Path,
-    config_overrides: Iterable[str],
-) -> list[str]:
-    """Move generated provider definitions into a private Codex config.
-
-    Codex accepts provider tables through ``-c``/``--config``, but those
-    tables can contain static credentials or credential-bearing auth
-    commands. Persist them in the session-owned ``config.toml`` instead so
-    process arguments contain only non-secret routing and behavior overrides.
-
-    :param codex_home: Private session ``CODEX_HOME`` directory.
-    :param config_overrides: Pending Codex config override strings.
-    :returns: Overrides safe to retain in subprocess arguments.
-    """
-    codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(codex_home, 0o700)
-    config_path = codex_home / "config.toml"
-
-    provider_overrides: list[str] = []
-    argv_overrides: list[str] = []
-    for override in config_overrides:
-        if override.lstrip().startswith(_CODEX_PROVIDER_CONFIG_PREFIX):
-            provider_overrides.append(override)
-        else:
-            argv_overrides.append(override)
-    if not provider_overrides:
-        if config_path.is_file() and not config_path.is_symlink():
-            os.chmod(config_path, 0o600)
-        return argv_overrides
-
-    import tomlkit
-
-    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
-    document = tomlkit.parse(existing) if existing else tomlkit.document()
-    providers = document.get("model_providers")
-    if providers is None:
-        document["model_providers"] = tomlkit.table()
-        providers = document["model_providers"]
-    if not isinstance(providers, MutableMapping):
-        raise ValueError("Codex model_providers config must be a TOML table")
-
-    for override in provider_overrides:
-        fragment = tomlkit.parse(override)
-        generated = fragment.get("model_providers")
-        if not isinstance(generated, MutableMapping) or not generated:
-            raise ValueError("Codex provider override must define model_providers")
-        for provider_name, provider_config in generated.items():
-            providers[provider_name] = provider_config
-
-    fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
-    try:
-        os.chmod(tmp_name, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(tomlkit.dumps(document))
-        os.replace(tmp_name, config_path)
-        os.chmod(config_path, 0o600)
-    finally:
-        with suppress(FileNotFoundError):
-            os.unlink(tmp_name)
-    return argv_overrides
-
-
 # Top-level ``model_reasoning_effort = "<value>"`` assignment, tolerating
 # leading whitespace and a trailing comment. Only applied to lines *before*
 # the first table header so keys inside ``[profiles.*]`` etc. are never
@@ -2173,6 +2118,13 @@ class _CodexAppServerSession:
             self._codex_home_dir,
             self._codex_config_overrides,
         )
+        if router_bridge_dir is not None:
+            write_codex_router_hooks_file(
+                self._codex_home_dir,
+                router_bridge_dir,
+                session_id=codex_router_session_id(self._env),
+                user_hooks_source=config_source / _CODEX_HOOKS_FILENAME,
+            )
         # Override CODEX_HOME so Codex stores its data (including conversation
         # history) in a private temp directory rather than the user's ~/.codex/.
         # This prevents subagent sessions from polluting the user's Codex history.

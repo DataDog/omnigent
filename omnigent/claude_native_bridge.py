@@ -1247,6 +1247,8 @@ def build_hook_settings(
     launch_model: str | None = None,
     launch_permission_mode: str | None = None,
     launch_effort: str | None = None,
+    subagent_router_dir: Path | None = None,
+    turn_routing: bool = False,
 ) -> _JsonObject:
     """
     Build invocation-local Claude Code hook settings.
@@ -1471,6 +1473,36 @@ def build_hook_settings(
         # server-side. Covers both web-UI-injected and direct-terminal
         # prompts, since both fire UserPromptSubmit.
         hooks["UserPromptSubmit"].append({"hooks": [evaluate_policy_hook]})
+    if subagent_router_dir is not None:
+        # Route natively spawned subagents (the Task/Agent tool) through
+        # the runner's route-subagent endpoint. Settings-level hooks also
+        # apply to nested spawns, so a routed subagent's own spawns are
+        # routed too. The script fails open — an unreachable endpoint
+        # emits no output and the spawn proceeds unchanged.
+        router_command_parts = [
+            python,
+            "-I",
+            "-m",
+            "omnigent.inner.hook_scripts.claude_router_hook",
+            "--bridge-dir",
+            str(bridge_dir),
+            "--router-dir",
+            str(subagent_router_dir),
+        ]
+        from omnigent.inner.hook_scripts.subagent_router import HOOK_TIMEOUT_S
+
+        router_hook: _JsonObject = {
+            "type": "command",
+            "command": shlex.join(router_command_parts),
+            # Outermost hop of the routing timeout budget documented in
+            # ``omnigent.runner.subagent_routing``: derived from the hook
+            # script's own request budget so it always exceeds it and the
+            # script's fail-open branch runs before Claude kills it.
+            "timeout": int(HOOK_TIMEOUT_S),
+        }
+        hooks.setdefault("PreToolUse", []).append(
+            {"matcher": CLAUDE_SUBAGENT_TOOL_MATCHER, "hooks": [router_hook]}
+        )
     settings: _JsonObject = {"hooks": hooks}
     if launch_model:
         settings["model"] = launch_model

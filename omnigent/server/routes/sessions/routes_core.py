@@ -115,6 +115,7 @@ from omnigent.server.routes._sessions.common import (
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import (
+    _TUI_INJECT_FORWARD_TIMEOUT_S,
     SessionLiveness,
     _agent_carries_cursor_fork_history,
     _agent_carries_native_fork_history,
@@ -143,9 +144,11 @@ from omnigent.server.routes._sessions.helpers import (
     _same_provider_family,
     _session_status_from_cache,
     _set_read_state,
+    _surface_model_change_forward_failure,
     _title_content_from_item,
     _validate_terminal_launch_args,
     _validated_cost_control_mode_override,
+    _validated_subagent_routing_override,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,

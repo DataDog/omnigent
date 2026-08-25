@@ -9,7 +9,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { SMART_ROUTING_LABEL } from "@/lib/agentLabels";
-import { cn } from "@/lib/utils";
 
 // Sentinel Select values for the Model row. Radix requires a non-empty value,
 // so the two "no explicit model" choices ride on reserved tokens rather than
@@ -79,11 +78,7 @@ export function RoutingModelSelect({
       <SelectTrigger className="w-full" data-testid={testId} aria-label={ariaLabel}>
         <SelectValue />
       </SelectTrigger>
-      <SelectContent
-        position="popper"
-        align="start"
-        className={cn("w-max min-w-(--radix-select-trigger-width) max-w-[300px]", contentClassName)}
-      >
+      <SelectContent position="popper" align="start" className={contentClassName}>
         {offerSmartRouting && (
           <SelectItem value={MODEL_SELECT_SMART}>{SMART_ROUTING_LABEL}</SelectItem>
         )}

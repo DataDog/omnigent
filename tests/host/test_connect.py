@@ -998,6 +998,7 @@ async def test_live_host_refreshes_harness_readiness_without_reconnect(
     receive loop, so a slow probe can never stall the tunnel keepalive.
     """
     readiness = iter(({"pi": True},))
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": True})
     monkeypatch.setattr(
         "omnigent.host.connect.configured_harness_map",
         lambda: next(readiness),
@@ -1031,6 +1032,7 @@ async def test_live_host_full_refresh_detects_auth_completion(
 ) -> None:
     """The full-refresh fallback catches readiness changes beyond binary installs."""
     readiness = iter(({"codex": True},))
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": True})
     monkeypatch.setattr(
         "omnigent.host.connect.configured_harness_map",
         lambda: next(readiness),
@@ -1066,6 +1068,7 @@ async def test_live_host_does_not_repeat_unchanged_readiness(
         return {"codex": "needs-auth"}
 
     monkeypatch.setattr("omnigent.host.connect.configured_harness_map", _unchanged_map)
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", lambda: {"codex": True})
     monkeypatch.setattr(
         "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
         0.01,
@@ -1085,6 +1088,40 @@ async def test_live_host_does_not_repeat_unchanged_readiness(
 
     assert calls["n"] >= 2
     assert ws.sent == []
+    _cleanup_host(host)
+
+
+async def test_live_host_repushes_when_only_gateway_inference_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway-inference flip alone must reach the server, readiness unchanged."""
+    gateway = iter(({"codex": False}, {"codex": True}))
+    monkeypatch.setattr(
+        "omnigent.host.connect.configured_harness_map",
+        lambda: {"codex": True},
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.gateway_inference_map",
+        lambda: next(gateway, {"codex": True}),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S",
+        0.01,
+    )
+    host = _make_host_process()
+    ws = _RecordingWS()
+
+    task = asyncio.create_task(host._harness_readiness_loop(ws, {"codex": True}))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
+
+    assert len(ws.sent) == 1
+    refresh = decode_host_frame(ws.sent[0])
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses == {"codex": True}
+    assert refresh.gateway_inference == {"codex": True}
     _cleanup_host(host)
 
 

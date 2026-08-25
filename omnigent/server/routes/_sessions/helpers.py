@@ -177,6 +177,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _UI_ADDED_AGENT_TITLE_PREFIX,
     _UPLOAD_READ_CHUNK_BYTES,
     COST_CONTROL_OVERRIDE_VALUES,
+    SUBAGENT_ROUTING_OVERRIDE_VALUES,
     _logger,
     _managed_launch_tasks,
     _model_options_cache,

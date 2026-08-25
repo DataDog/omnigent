@@ -21,11 +21,7 @@ import { DatabricksIcon } from "@/components/icons/DatabricksIcon";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { shortModelName } from "@/components/CostRoutingControl";
-import {
-  type RoutingDecisionExtras,
-  harnessDisplayLabel,
-  subagentScopeLabel,
-} from "@/lib/routingDecision";
+import { type RoutingDecisionExtras, subagentScopeLabel } from "@/lib/routingDecision";
 import { cn } from "@/lib/utils";
 import { TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
 
@@ -139,28 +135,13 @@ function rawPickName(model: string, rawModel: string | null | undefined): string
  * different one. `null` when nothing was attempted or both names collapse to
  * the same tier — a struck-through name identical to the pill reads as a bug.
  */
-export function RoutingDecisionChip({ model, applied, rationale }: RoutingDecisionChipProps) {
-  const short = shortModelName(model);
-  const lead = applied ? short : `would have picked ${short}`;
-  const summary = `Intelligent model router · ${lead}`;
-  return (
-    <div
-      className="my-1 flex flex-col items-center gap-0.5 text-muted-foreground text-sm"
-      data-testid="routing-decision-chip"
-      data-applied={applied ? "true" : "false"}
-      title={rationale || summary}
-    >
-      <span className="flex items-center gap-1.5">
-        <BrainCircuitIcon className="size-3 shrink-0" />
-        <span>
-          Intelligent model router{" · "}
-          {!applied && <span>would have picked </span>}
-          <span className="font-medium text-foreground">{short}</span>
-        </span>
-      </span>
-      {rationale ? <span className="text-muted-foreground/70">{rationale}</span> : null}
-    </div>
-  );
+function attemptedPickName(
+  model: string,
+  attemptedOverride: string | null | undefined,
+): string | null {
+  if (!attemptedOverride) return null;
+  const attempted = shortModelName(attemptedOverride);
+  return attempted === shortModelName(model) ? null : attempted;
 }
 
 interface RoutingDecisionCardProps {
@@ -195,7 +176,6 @@ export function RoutingDecisionCard({
   const rawShort = rawPickName(model, rawModel);
   const attemptedShort = attemptedPickName(model, attemptedOverride);
   const scopeLabel = subagentScopeLabel(scope, agent);
-  const harnessLabel = harnessDisplayLabel(harness);
   const rowLabel = agent && agent.length > 0 ? agent : "Session";
   const prettyOutput = useMemo(
     () =>
@@ -253,9 +233,9 @@ export function RoutingDecisionCard({
           </span>
         ) : null}
         <span className="text-muted-foreground">{applied ? "· applied" : "· advisory"}</span>
-        {harnessLabel ? (
+        {harness ? (
           <span className="text-muted-foreground" data-testid="routing-decision-harness">
-            · {harnessLabel}
+            · {harness}
           </span>
         ) : null}
         {scopeLabel ? (

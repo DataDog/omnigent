@@ -159,7 +159,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
-import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
+import { showsRoutingDecisionChip } from "@/lib/routingDecision";
 import {
   Dialog,
   DialogContent,
@@ -5443,6 +5443,7 @@ export function Composer({
                 modelPickerKind={modelPickerKind}
                 codexModelOptions={codexModelOptions}
                 costRoutingEligible={costRoutingEligible}
+                subagentRoutingEligible={subagentRoutingEligible}
                 // Config changes persist server-side and apply on the next
                 // wake/turn (the runner forward is best-effort), so the gear
                 // stays live wherever a message could be sent — including
