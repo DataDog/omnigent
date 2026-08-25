@@ -79,8 +79,7 @@ if TYPE_CHECKING:
 
     from omnigent.install_ledger import InstallLedger
     from omnigent.onboarding.acp_auth import AcpAgentEntry
-    from omnigent.server.smart_routing import LLMRoutingClient
-    from omnigent.smart_routing_cli import ArmedSession
+    from omnigent.server.smart_routing import ExternalRoutingClient, LLMRoutingClient
     from omnigent.spec.types import LLMConfig
     from omnigent.update_check import _InstalledWheelInfo
 
@@ -98,7 +97,7 @@ def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-a
 
 
 def _parse_model_prefixes(
-    raw: Any,  # str | list | None from YAML
+    raw: object,
 ) -> list[str]:
     """Normalize the ``model_prefix`` config into a list of prefixes.
 
@@ -127,128 +126,9 @@ def _routing_config_text(routing_cfg: Mapping[str, object], key: str) -> str:
     raise click.ClickException(f"routing.{key} must be a string")
 
 
-def parse_routing_settings(
-    routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
-) -> Any:  # type: ignore[explicit-any]  # RoutingSettings
-    """Parse the ``routing:`` block into the shared ``RoutingSettings``.
-
-    This is the only place ``routing.*`` config is read; every consumer
-    (the routing clients, the subagent router) reads the dataclass off
-    ``RuntimeCaps`` instead.
-
-    :param routing_cfg: The parsed ``routing:`` mapping, or ``None``.
-    :returns: A :class:`~omnigent.server.smart_routing.RoutingSettings`;
-        all-defaults when the block is absent or malformed.
-    """
-    from omnigent.server.smart_routing import (
-        DEFAULT_ROUTER_NAME,
-        MODEL_ID_PREFIXES,
-        RoutingSettings,
-        parse_routing_tables,
-    )
-
-    if not isinstance(routing_cfg, dict):
-        return RoutingSettings()
-    router_name = (routing_cfg.get("router_name") or "").strip() or DEFAULT_ROUTER_NAME
-    selection_model = (routing_cfg.get("selection_model") or "").strip() or None
-    prefixes = _parse_model_prefixes(routing_cfg.get("model_prefix"))
-    return RoutingSettings(
-        router_name=router_name,
-        selection_model=selection_model,
-        # Only an absent key falls back: ``model_prefix: []`` means bare ids.
-        model_prefixes=MODEL_ID_PREFIXES if prefixes is None else tuple(prefixes),
-        # The arm menu / alias / effort tables a deployment fronting a different
-        # catalog overrides; absent keys keep the built-in defaults.
-        **parse_routing_tables(routing_cfg),
-    )
-
-
-# Databricks workspaces serve the routing API under this path.
-_AIGW_ROUTING_PATH = "/ai-gateway/routing/v1"
-
-
-def _databricks_provider_profile(
-    cfg: Any,  # type: ignore[explicit-any]  # parsed server config
-) -> str | None:
-    """Return the profile of the config's Databricks provider, if any.
-
-    Reads the server ``--config`` first and falls back to the global
-    ``providers:`` block, which is where most deployments declare their
-    workspace. A ``default:``-flagged entry wins so a workspace that also
-    declares a secondary Databricks provider still routes against the primary.
-
-    :param cfg: The parsed server ``--config`` mapping.
-    :returns: The Databricks profile name, or ``None`` when the deployment
-        declares no ``kind: databricks`` provider.
-    """
-    providers = cfg.get("providers") if isinstance(cfg, dict) else None
-    if not isinstance(providers, dict):
-        from omnigent.onboarding.provider_config import load_config as load_provider_config
-
-        providers = load_provider_config().get("providers")
-    if not isinstance(providers, dict):
-        return None
-    matches: list[tuple[bool, str]] = []
-    for entry in providers.values():
-        if not isinstance(entry, dict) or entry.get("kind") != "databricks":
-            continue
-        profile = entry.get("profile")
-        if isinstance(profile, str) and profile.strip():
-            matches.append((bool(entry.get("default")), profile.strip()))
-    if not matches:
-        return None
-    matches.sort(key=lambda m: not m[0])
-    return matches[0][1]
-
-
-def _build_default_databricks_routing_client(
-    cfg: Any,  # type: ignore[explicit-any]  # parsed server config
-    settings: Any,  # type: ignore[explicit-any]  # RoutingSettings
-) -> Any | None:  # type: ignore[explicit-any]  # ExternalRoutingClient | None
-    """Route through the workspace's AI Gateway when no ``routing:`` block exists.
-
-    A Databricks-backed deployment gets smart routing without extra
-    config: the client points at that workspace's routing API and authenticates
-    with the same profile. Returns ``None`` for any other deployment, so the
-    built-in judge stays the fallback.
-
-    :param cfg: The parsed server ``--config`` mapping.
-    :param settings: The parsed routing settings (all defaults here).
-    :returns: A configured client, or ``None`` when there is no Databricks
-        provider or its workspace host can't be resolved.
-    """
-    profile = _databricks_provider_profile(cfg)
-    if profile is None:
-        return None
-    from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
-
-    try:
-        host = resolve_databricks_workspace(profile).host.rstrip("/")
-    except Exception:  # noqa: BLE001 — unresolvable workspace just means no routing
-        logging.getLogger(__name__).info(
-            "routing: could not resolve workspace host for Databricks profile %r; "
-            "leaving smart routing off",
-            profile,
-        )
-        return None
-    if not host:
-        return None
-    from omnigent.server.smart_routing import ExternalRoutingClient
-
-    return ExternalRoutingClient(
-        base_url=host + _AIGW_ROUTING_PATH,
-        router_name=settings.router_name,
-        databricks_profile=profile,
-        model_prefixes=list(settings.model_prefixes),
-        selection_model=settings.selection_model,
-        menus=settings.menus,
-        servable_aliases=settings.servable_aliases,
-    )
-
-
 def _build_external_routing_client(
-    routing_cfg: Any,  # parsed YAML block
-) -> Any | None:  # ExternalRoutingClient | None
+    routing_cfg: Mapping[str, object],
+) -> ExternalRoutingClient | None:
     """Build an :class:`ExternalRoutingClient` from the ``routing:`` config.
 
     Requires ``base_url`` + ``router_name``. Auth mirrors the ``llm:`` block:
@@ -271,12 +151,11 @@ def _build_external_routing_client(
     :returns: A configured client, or ``None`` when required config is
         missing (a warning is logged; routing stays off rather than raising).
     """
-    if settings is None:
-        settings = parse_routing_settings(routing_cfg)
     base_url = _routing_config_text(routing_cfg, "base_url")
     router_name = _routing_config_text(routing_cfg, "router_name")
     api_key = _routing_config_text(routing_cfg, "api_key")
     profile = _routing_config_text(routing_cfg, "profile")
+    model_prefixes = _parse_model_prefixes(routing_cfg.get("model_prefix"))
 
     if not base_url or not router_name:
         click.echo(
@@ -323,8 +202,8 @@ def _build_external_routing_client(
 
 
 def _build_local_llm_routing_client(
-    server_llm: Any,  # LLMConfig | None
-) -> Any | None:  # LLMRoutingClient | None
+    server_llm: LLMConfig | None,
+) -> LLMRoutingClient | None:
     """Build the built-in :class:`LLMRoutingClient` from the ``llm:`` block.
 
     :param server_llm: The parsed server-level ``LLMConfig``.
@@ -391,7 +270,7 @@ def _server_uvicorn_log_config(
     log_path: Path | None = None,
     *,
     log_to_stderr: bool | None = None,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """
     Return Uvicorn logging config with request-duration access logs.
 
@@ -700,6 +579,7 @@ _HostJsonValue: TypeAlias = (
 _HostJsonObject: TypeAlias = dict[str, _HostJsonValue]
 _HostSessionRow: TypeAlias = dict[str, _HostJsonValue]
 _HostPayload: TypeAlias = dict[str, _HostJsonValue]
+_JsonObject: TypeAlias = dict[str, object]
 
 
 def _effective_global_config_path() -> Path:
@@ -1053,7 +933,7 @@ def _resolve_auto_open_conversation_from_config(cfg: dict[str, Any]) -> bool:  #
 
 
 def _normalize_harness_scalar_on_write(
-    cfg: dict[str, Any],
+    cfg: dict[str, object],
     path: Path,
 ) -> bool:
     """Migrate a legacy scalar ``harness:`` to the mapping form in *cfg*.
@@ -1188,7 +1068,7 @@ def _materialize_internal_beta_agents() -> Path:
 
 
 def _save_local_config(
-    settings: dict[str, str | bool | Mapping[str, Any]],
+    settings: Mapping[str, object],
     unset_keys: tuple[str, ...] = (),
     deep_merge_keys: tuple[str, ...] = (),
 ) -> None:
@@ -3752,8 +3632,20 @@ def server(
 
     server_llm = parse_server_llm(cfg.get("llm"))
 
-    routing_settings = parse_routing_settings(cfg.get("routing"))
-    routing_backends = _build_routing_backends(cfg, server_llm, routing_settings)
+    # Build the routing client from configuration alone — no opt-in env needed.
+    # Two mutually-exclusive providers, chosen by ``routing.provider``:
+    #   - ``external``: call an external ``routes:select`` service (built when a
+    #     ``routing:`` block declares ``provider: external``).
+    #   - ``llm`` (default): the built-in judge using the ``llm:`` block (built
+    #     whenever a server ``llm:`` block is configured).
+    # Stays None when neither is configured. Managed deployments override
+    # RuntimeCaps.routing_client with their own implementation.
+    routing_cfg = cfg.get("routing")
+    routing_client: ExternalRoutingClient | LLMRoutingClient | None
+    if isinstance(routing_cfg, dict) and routing_cfg.get("provider") == "external":
+        routing_client = _build_external_routing_client(routing_cfg)
+    else:
+        routing_client = _build_local_llm_routing_client(server_llm)
 
     caps = RuntimeCaps(
         execution_timeout=int(effective_timeout),
@@ -3942,7 +3834,7 @@ def server(
         cleanly within the graceful window.
         """
 
-        async def shutdown(self, sockets=None) -> None:
+        async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
             import asyncio as _asyncio
 
             from omnigent.runtime import session_stream as _session_stream
@@ -4964,6 +4856,7 @@ def upgrade(
             raise SystemExit(0)
 
     current = importlib.metadata.version("omnigent")
+    latest: str | None
     if target_version:
         # A pinned target version means we don't have to ask the index what
         # "latest" is. Treat the target as the desired release. This is
@@ -8788,7 +8681,7 @@ def _parse_config_settings(
 
 
 def _harness_deep_merge_keys(
-    parsed: dict[str, str | bool | Mapping[str, Any]],
+    parsed: dict[str, object],
 ) -> tuple[str, ...]:
     """Rewrite a ``harness=<id>`` setting for deep-merge into the harness mapping.
 
@@ -8854,7 +8747,7 @@ def _format_harness_for_display(
 
 
 def _resolve_harness_startup_args(
-    cfg: dict[str, Any],
+    cfg: Mapping[str, object],
     harness: str,
     cli_args: tuple[str, ...],
 ) -> tuple[str, ...]:
