@@ -248,12 +248,6 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
           </Button>
         </form>
 
-        {canDelegateApprovals && !sharingReadOnly && (
-          <p className="text-sm text-muted-foreground">
-            Approvers can authorize actions that use your session credentials.
-          </p>
-        )}
-
         {error && <p className="text-sm text-destructive">{error}</p>}
 
         <DialogFooter className="flex-row justify-between sm:justify-between">
@@ -600,7 +594,7 @@ function GrantRow({
       </span>
       {fixedLevel ? (
         <span className="flex h-8 w-28 items-center px-3 text-ui text-muted-foreground">
-          {levelLabel}
+          {LEVEL_LABELS[permission.level] ?? "Read"}
         </span>
       ) : (
         <Select

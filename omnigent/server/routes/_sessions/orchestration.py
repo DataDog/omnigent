@@ -196,7 +196,6 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
 from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
     _ancestor_session_ids,
-    _approval_access_from_grants,
     _await_settled_managed_launch,
     _build_new_item,
     _build_policy_engine_from_spec,
@@ -290,7 +289,6 @@ from omnigent.server.routes._sessions.helpers import (
     _signal_terminal_resolved_harness_elicitation,
     _spec_harness,
     _stop_session_via_runner,
-    _strip_pending_author_prefix,
     _usage_by_model_for_display,
     _validate_session_workspace,
     _validate_terminal_launch_args,
@@ -4493,7 +4491,6 @@ async def _forward_event_to_runner(
     artifact_store: ArtifactStore | None = None,
     has_mcp_servers: bool = False,
     created_by: str | None = None,
-    author_attribution_required: bool = False,
     host_store: HostStore | None = None,
 ) -> str:
     """
@@ -4523,8 +4520,6 @@ async def _forward_event_to_runner(
         this turn. ``False`` by default (agents without MCP servers).
     :param created_by: Authenticated identity of the posting actor,
         recorded on the persisted item for attribution.
-    :param author_attribution_required: Whether the posting actor is a
-        shared-session collaborator.
     :param host_store: Host registrations, read only to learn whether this
         session's harness is AI-Gateway-backed (which router may route it).
         ``None`` reads as unknown, which counts as backed.
@@ -5389,8 +5384,6 @@ async def _dispatch_session_event_to_runner_impl(
                 model_override=(
                     _native_routed_model if _native_applied_model is not None else None
                 ),
-                created_by=created_by,
-                author_attribution_required=author_attribution_required,
             )
             forwarded = True
         finally:
@@ -5440,7 +5433,6 @@ async def _dispatch_session_event_to_runner_impl(
         artifact_store=artifact_store,
         has_mcp_servers=has_mcp_servers,
         created_by=created_by,
-        author_attribution_required=author_attribution_required,
         host_store=host_store,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)

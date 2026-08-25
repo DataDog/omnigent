@@ -1916,7 +1916,6 @@ function MainAgentSurface({
                   <BubbleView
                     key={bubbleKey(bubble)}
                     bubble={bubble}
-                    canApprove={canApprove}
                     isLastAssistant={bubbleIndex === lastAssistantIndex}
                     showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
                   />
@@ -3357,12 +3356,10 @@ function CompactionLoadingIndicator() {
 export const BubbleView = memo(
   function BubbleView({
     bubble,
-    canApprove = true,
     isLastAssistant = false,
     showsWorking = false,
   }: {
     bubble: Bubble;
-    canApprove?: boolean;
     isLastAssistant?: boolean;
     showsWorking?: boolean;
   }) {
@@ -3385,14 +3382,12 @@ export const BubbleView = memo(
     return (
       <AssistantBubble
         bubble={bubble}
-        canApprove={canApprove}
         isLastAssistant={isLastAssistant}
         showsWorking={showsWorking}
       />
     );
   },
   (prev, next) =>
-    prev.canApprove === next.canApprove &&
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
     (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
     bubblesEqual(prev.bubble, next.bubble),
@@ -3618,12 +3613,10 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
 
 function AssistantBubble({
   bubble,
-  canApprove,
   isLastAssistant = false,
   showsWorking = false,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
-  canApprove: boolean;
   isLastAssistant?: boolean;
   showsWorking?: boolean;
 }) {
@@ -3684,7 +3677,6 @@ function AssistantBubble({
           <BlockRenderer
             items={bubble.items}
             sessionStatus={sessionStatus}
-            canApprove={canApprove}
             turnLifecycle={bubble.lifecycle}
             workedForS={bubble.workedForS}
             continued={bubble.continued}

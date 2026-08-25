@@ -147,13 +147,6 @@ from omnigent.runner.subagent_routing import (
     session_routing_class,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
-from omnigent.runtime.prompt import (
-    SHARED_SESSION_AUTHORSHIP_INSTRUCTION,
-    input_items_have_multiple_authors,
-    prepare_input_items_for_model,
-    shared_message_attribution_enabled,
-)
-from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
@@ -1961,7 +1954,6 @@ def create_runner_app(
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     _native_pane_status: dict[str, str] = {}
     _session_message_buffers: dict[str, list[_JsonObject]] = {}
-    _author_attribution_sessions: set[str] = set()
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
     _ingest_cond: dict[str, asyncio.Condition] = {}
@@ -4866,50 +4858,6 @@ def create_runner_app(
                 exc_info=True,
             )
         await _cancel_active_turn(conv_id, expected_task=target)
-
-    def _history_message_from_body(body: _JsonObject) -> _JsonObject:
-        message = {
-            "type": "message",
-            "role": body.get("role", "user"),
-            "content": body.get("content", []),
-        }
-        if body.get("created_by") is not None:
-            message["created_by"] = body["created_by"]
-        return message
-
-    def _note_message_author(session_id: str, body: _JsonObject) -> None:
-        if session_id in _author_attribution_sessions:
-            return
-        if body.get("author_attribution_required") is True:
-            _author_attribution_sessions.add(session_id)
-            return
-        authors = {
-            item.get("created_by")
-            for item in _session_histories.get(session_id, [])
-            if isinstance(item.get("created_by"), str) and item.get("created_by")
-        }
-        created_by = body.get("created_by")
-        if isinstance(created_by, str) and created_by:
-            authors.add(created_by)
-        if len(authors) >= 2:
-            _author_attribution_sessions.add(session_id)
-
-    def _message_body_for_harness(
-        body: _JsonObject,
-        *,
-        force_author_attribution: bool,
-    ) -> _JsonObject:
-        event = {
-            key: value
-            for key, value in body.items()
-            if key not in {"created_by", "author_attribution_required"}
-        }
-        prepared = prepare_input_items_for_model(
-            [_history_message_from_body(body)],
-            force_author_attribution=force_author_attribution,
-        )
-        event["content"] = prepared[0]["content"]
-        return event
 
     async def _check_and_start_next_turn(
         session_id: str,
