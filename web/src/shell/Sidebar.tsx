@@ -884,6 +884,38 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             </Button>
           </div>
 
+          {/* Session-scope tabs: split the viewer's own sessions ("My
+          sessions") from ones shared with them ("Shared with me"). Sits above
+          the scrolling list (non-scrolling) so it stays put while the list
+          scrolls. Stays visible during selection mode so the viewer can still
+          switch scopes while bulk-selecting. */}
+          {multiUser && (
+            <div className="px-2 pb-2">
+              <Tabs
+                value={activeTab}
+                onValueChange={(v) => switchTab(v as SidebarTab)}
+                className="w-full"
+              >
+                <TabsList className="w-full">
+                  <TabsTrigger
+                    value="mine"
+                    data-testid="sidebar-tab-mine"
+                    className="sidebar-compact-text min-w-0 font-normal hover:bg-[var(--sidebar-hover)] data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none"
+                  >
+                    <span className="min-w-0 truncate">My sessions</span>
+                  </TabsTrigger>
+                  <TabsTrigger
+                    value="shared"
+                    data-testid="sidebar-tab-shared"
+                    className="sidebar-compact-text min-w-0 font-normal hover:bg-[var(--sidebar-hover)] data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none"
+                  >
+                    <span className="min-w-0 truncate">Shared with me</span>
+                  </TabsTrigger>
+                </TabsList>
+              </Tabs>
+            </div>
+          )}
+
           <nav
             ref={scrollContainerRef}
             // Keep wheel/touch scrolling without letting classic-scrollbar
