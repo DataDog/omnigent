@@ -24,6 +24,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import TypeAlias
 
 import click
 import httpx
@@ -58,6 +59,8 @@ from omnigent.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
 from omnigent.native_terminal import url_component
+
+_JsonObject: TypeAlias = dict[str, object]
 
 _DEFAULT_HERMES_COMMAND = "hermes"
 _HERMES_PATH_ENV = "OMNIGENT_HERMES_PATH"

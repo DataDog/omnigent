@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import TypeAlias
 
 import click
 import httpx
@@ -49,6 +50,7 @@ from omnigent.pi_native_bridge import bridge_dir_for_session_id
 
 _logger = logging.getLogger(__name__)
 
+_JsonObject: TypeAlias = dict[str, object]
 
 _DEFAULT_PI_COMMAND = "pi"
 _PI_PATH_ENV = "OMNIGENT_PI_PATH"
