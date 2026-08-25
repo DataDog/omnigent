@@ -3687,10 +3687,11 @@ export function NewChatLandingScreen() {
             onDragOver={handleDragOver}
             onDragEnter={handleDragEnter}
             onDragLeave={handleDragLeave}
-            // A home-specific focus shadow adds depth without a resting shadow
-            // or focus border.
-            // dark:bg-card-solid stays opaque so dark glass --card doesn't show
-            // through. Drag-over keeps its separate inset ring.
+            // Two visual states only (no hover): resting --border, and
+            // --foreground while the textarea itself has focus (has-[]
+            // scopes it so focusing footer buttons doesn't trigger it).
+            // dark:bg-card-solid: opaque fill so dark glass --card doesn't
+            // show through; mirrors the chat composer. Drag-over inset ring.
             className={cn(
               "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
               isDragActive && "ring-2 ring-ring ring-inset",
@@ -4089,12 +4090,9 @@ export function NewChatLandingScreen() {
               </div>
             </div>
           </form>
-          {/* Footer tray (host / cwd / worktree). Sits below the composer with
-              symmetric vertical padding and no overlap. */}
-          <div
-            className="relative z-0 flex w-full items-center rounded-b-2xl py-1.5 pr-4 pl-2"
-            data-testid="new-chat-landing-footer"
-          >
+          {/* Footer tray (host / cwd / worktree). z-0 under the pill; -mt-9
+              tucks under it. Padding-driven height so chips can wrap. */}
+          <div className="relative z-0 -mt-9 flex w-full items-center rounded-b-2xl pt-8 pr-3 pb-2 pl-2">
             <div className="flex flex-wrap items-center gap-1">
               {/* Host chip */}
               <DropdownMenu
