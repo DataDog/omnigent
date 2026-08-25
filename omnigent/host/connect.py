@@ -1250,25 +1250,33 @@ class HostProcess:
         # unexpected id shapes from older servers.
         import re
 
-        _session_slug = (
-            re.sub(r"[^\w-]", "", frame.session_id)[:32] + "-" if frame.session_id else ""
-        )
-
-        # Spawning blocks (log-file open, plus the zygote's one-time import on
-        # first launch), so run it off the event loop. Shielded so a
-        # cancellation mid-spawn cannot abandon a live runner: the handle is
-        # only registered in ``self._runners`` after this returns, so an
-        # abandoned fork would never be watched, stopped, or reaped, and the
-        # zygote would retain its exit status forever. On cancellation we let
-        # the spawn land and then tear that runner down.
-        spawn = asyncio.ensure_future(
-            asyncio.to_thread(self._spawn_runner_proc, env, _session_slug)
-        )
-        try:
-            proc, log_path = await asyncio.shield(spawn)
-        except asyncio.CancelledError:
-            spawn.add_done_callback(self._discard_abandoned_spawn)
-            raise
+            _session_slug = (
+                re.sub(r"[^\w-]", "", frame.session_id)[:32] + "-" if frame.session_id else ""
+            )
+            log_path, _log_fh = open_process_log_file(
+                "runner",
+                prefix=f"runner-{_session_slug}",
+            )
+            env[PROCESS_LOG_FILE_ENV_VAR] = str(log_path)
+            try:
+                with child_logging_popen_kwargs(env) as logging_kwargs:
+                    proc: subprocess.Popen[bytes] = subprocess.Popen(
+                        [sys.executable, "-m", "omnigent.runner._entry"],
+                        env=env,
+                        # Runners are WS-tunnel clients with no interactive input.
+                        # Give them a clean /dev/null stdin instead of inheriting the
+                        # daemon's: a long-lived daemon (e.g. backgrounded / nohup'd)
+                        # can end up with a closed or recycled stdin fd, and an
+                        # inherited bad fd makes the runner die at interpreter startup
+                        # with "init_sys_streams: Bad file descriptor" — it never
+                        # connects, so the session fails with "runner did not connect".
+                        stdin=subprocess.DEVNULL,
+                        stdout=_log_fh,
+                        stderr=_log_fh,
+                        **logging_kwargs,
+                    )
+            finally:
+                _log_fh.close()
         except OSError as exc:
             return HostLaunchRunnerResultFrame(
                 request_id=frame.request_id,
