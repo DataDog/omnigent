@@ -731,35 +731,6 @@ from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedE
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.tools.client_specified import parse_client_side_tool_specs
 
-if TYPE_CHECKING:
-    __all__ = [
-        "_agent_carries_native_fork_history",
-        "_agent_is_native",
-        "_build_policy_engine_from_spec",
-        "_compact_lock",
-        "_dispatch_session_event_to_runner",
-        "_ensure_runner_relay_ready",
-        "_forward_session_change_to_runner",
-        "_get_runner_client",
-        "_get_runner_client_for_resource_access",
-        "_hold_native_ask_gate",
-        "_kick_managed_wake",
-        "_launch_runner_on_host",
-        "_load_agent_spec_for_session",
-        "_mark_runner_sessions_offline",
-        "_poll_request_disconnect",
-        "_presentation_labels_for_agent",
-        "_publish_runner_recovered_status",
-        "_publish_sandbox_status",
-        "_reset_runner_resources_after_switch",
-        "_resolve_harness",
-        "_same_provider_family",
-        "_signal_terminal_resolved_harness_elicitation",
-        "_stop_session_via_runner",
-        "_wait_for_runner_client",
-    ]
-
-
 get_agent_cache = _runtime_get_agent_cache
 get_caps = _runtime_get_caps
 _get_user_id = _auth_get_user_id
