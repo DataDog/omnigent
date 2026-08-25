@@ -231,12 +231,13 @@ const SIDEBAR_FILTERS: { value: SidebarTab; label: string }[] = [
   { value: "archived", label: "Archived sessions" },
 ];
 
-// Shown in place of the list when a filter matches nothing.
+// Shown in place of the list when a filter matches nothing. Named per filter so
+// the empty state says which slice is empty, not just "No sessions".
 const SIDEBAR_FILTER_EMPTY: Record<SidebarTab, string> = {
-  all: "No sessions",
-  mine: "No sessions",
-  shared: "No sessions",
-  archived: "No sessions",
+  all: "No active sessions",
+  mine: "No sessions of your own",
+  shared: "No sessions shared with you",
+  archived: "No archived sessions",
 };
 
 // Bulk-selection targets either the flat "Sessions" list or the sessions
@@ -887,38 +888,6 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             </Button>
           </div>
 
-          {/* Session-scope tabs: split the viewer's own sessions ("My
-          sessions") from ones shared with them ("Shared with me"). Sits above
-          the scrolling list (non-scrolling) so it stays put while the list
-          scrolls. Stays visible during selection mode so the viewer can still
-          switch scopes while bulk-selecting. */}
-          {multiUser && (
-            <div className="px-2 pb-2">
-              <Tabs
-                value={activeTab}
-                onValueChange={(v) => switchTab(v as SidebarTab)}
-                className="w-full"
-              >
-                <TabsList className="w-full">
-                  <TabsTrigger
-                    value="mine"
-                    data-testid="sidebar-tab-mine"
-                    className="sidebar-compact-text min-w-0 font-normal hover:bg-muted hover:text-foreground data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none dark:hover:bg-muted/50 dark:data-active:hover:bg-[var(--sidebar-active)] dark:data-active:hover:text-[var(--sidebar-active-foreground)]"
-                  >
-                    <span className="min-w-0 truncate">My sessions</span>
-                  </TabsTrigger>
-                  <TabsTrigger
-                    value="shared"
-                    data-testid="sidebar-tab-shared"
-                    className="sidebar-compact-text min-w-0 font-normal hover:bg-muted hover:text-foreground data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)] data-active:shadow-none dark:hover:bg-muted/50 dark:data-active:hover:bg-[var(--sidebar-active)] dark:data-active:hover:text-[var(--sidebar-active-foreground)]"
-                  >
-                    <span className="min-w-0 truncate">Shared with me</span>
-                  </TabsTrigger>
-                </TabsList>
-              </Tabs>
-            </div>
-          )}
-
           <nav
             ref={scrollContainerRef}
             // Keep wheel/touch scrolling without letting classic-scrollbar
@@ -930,7 +899,6 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               scrollContainerRef={scrollContainerRef}
               onRowClick={onNavClick}
               searchQuery=""
-              newSessionProjectName={newSessionProjectName}
               activeTab={activeTab}
               onActiveTabChange={switchTab}
               multiUser={multiUser}
@@ -1376,33 +1344,28 @@ function ConversationList({
     const pinned = orderByPinnedTimestamp(notArchived.filter((c) => pinnedSet.has(c.id)));
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
 
-    // The Projects section renders the same folders on every filter (scope to
-    // notArchived, not tabScoped, so folders don't empty out on Shared or
-    // Archived). Filing is owner-only, though — UNLIKE pins — so membership is
-    // gated on ownership: a folder only ever holds the viewer's OWNED sessions.
-    // Without the guard the legacy label arm would match a shared session by
-    // project name alone, pulling a foreign session into the viewer's folder
-    // (and out of the flat Shared list via filedIds). Each folder holds its
+    // Filing is owner-only, so Shared renders no folders; Archived is flat too
+    // (archived outranks project membership). Elsewhere each folder holds its
     // non-pinned sessions — pinning a project's last one leaves it empty.
     const filedIds = new Set<string>();
     const projectGroups: { id: string | null; name: string; conversations: Conversation[] }[] =
-      projects.map(({ id, name }) => {
-        // Dual-read membership: a session belongs to this folder if it has
-        // the first-class id OR the legacy omni_project label of this name,
-        // and (filing being owner-only) the viewer owns it.
-        const inProject = notArchived.filter(
-          (c) =>
-            isOwnedByViewer(c, viewerId) &&
-            ((id !== null && c.project_id === id) || c.labels?.[PROJECT_LABEL_KEY] === name) &&
-            !pinnedIdSet.has(c.id),
-        );
-        inProject.forEach((c) => filedIds.add(c.id));
-        return {
-          id,
-          name,
-          conversations: sortByUpdatedAtDesc(inProject, activeOverride, frozenKeys),
-        };
-      });
+      activeTab === "shared" || activeTab === "archived"
+        ? []
+        : projects.map(({ id, name }) => {
+            // Dual-read membership: a session belongs to this folder if it has
+            // the first-class id OR the legacy omni_project label of this name.
+            const inProject = tabScoped.filter(
+              (c) =>
+                ((id !== null && c.project_id === id) || c.labels?.[PROJECT_LABEL_KEY] === name) &&
+                !pinnedIdSet.has(c.id),
+            );
+            inProject.forEach((c) => filedIds.add(c.id));
+            return {
+              id,
+              name,
+              conversations: sortByUpdatedAtDesc(inProject, activeOverride, frozenKeys),
+            };
+          });
     // NOTE: empty projects are intentionally NOT filtered out. A project comes
     // from the server project list (useProjects), so it can have zero *loaded*
     // conversations — either genuinely empty or because its chats live on an
@@ -1872,7 +1835,7 @@ function ConversationList({
                             (group) => group.conversations.length > 0,
                           )}
                           onExpandAll={expandAllProjects}
-                          onRevert={revertProjects}
+                          onCollapseAll={collapseAllProjects}
                           onProjectCreated={expandProject}
                           onEnterSelectionMode={() => onEnterSelectionMode("projects")}
                         />
@@ -1902,55 +1865,15 @@ function ConversationList({
                         onDeselectAll={onDeselectAll}
                         onExit={onExitSelectionMode}
                       />
-                    ) : undefined
-                  }
-                  headerAction={
-                    !selectionMode ? (
-                      <ProjectHeaderActions
-                        projectNames={sections.projectGroups.map((group) => group.name)}
-                        collapsed={effectiveCollapsedSections.includes("Projects")}
-                        expandedProjects={expandedProjects}
-                        hasProjectSessions={sections.projectGroups.some(
-                          (group) => group.conversations.length > 0,
-                        )}
-                        onExpandAll={expandAllProjects}
-                        onCollapseAll={collapseAllProjects}
-                        onProjectCreated={expandProject}
-                        onEnterSelectionMode={() => onEnterSelectionMode("projects")}
-                      />
-                    ) : undefined
-                  }
-                >
-                  {sections.projectGroups.map((group) => (
-                    <ProjectFolder
-                      key={group.name}
-                      name={group.name}
-                      projectId={group.id}
-                      windowConversations={group.conversations}
-                      expanded={expandedProjects.includes(group.name)}
-                      active={newSessionProjectName === group.name}
-                      // Best-effort marker from the globally-loaded window: a
-                      // collapsed folder hasn't fetched its own sessions yet.
-                      marker={projectMarkerState(group.conversations)}
-                      onToggleCollapsed={() => toggleProjectExpanded(group.name)}
-                      pinnedConversationIds={pinnedConversationIds}
-                      activeOverride={activeOverride}
-                      frozenSortKeys={frozenKeys}
-                      scrollRoot={scrollContainerRef}
-                      onRowClick={onRowClick}
-                      onTogglePinned={onTogglePinned}
-                      selectionMode={projectsSelecting}
-                      selectedIds={selectedIds}
-                      onToggleSelected={onToggleSelected}
-                      onProjectAssigned={expandProject}
-                      onConversationsLoaded={handleFolderConversationsLoaded}
-                    />
-                  ))}
-                  {sections.projectGroups.length === 0 &&
-                    !effectiveCollapsedSections.includes("Projects") && (
-                      <p className="px-2 py-1 text-ui text-muted-foreground">No projects</p>
-                    )}
-                </SectionGroup>
+                    ))}
+                    {sections.projectGroups.length === 0 &&
+                      !effectiveCollapsedSections.includes("Projects") && (
+                        <p className="px-3 py-1.5 text-xs text-muted-foreground">
+                          No projects yet. Create one to group your sessions.
+                        </p>
+                      )}
+                  </SectionGroup>
+                )}
                 {/* Always rendered, even with no rows: the header carries the
                     filter menu, so hiding it on an empty slice would strand the
                     viewer with no way to pick another filter. */}
@@ -1988,27 +1911,37 @@ function ConversationList({
                         ) : undefined
                       }
                       headerAction={
-                        !selectionMode ? (
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="icon-xs"
-                                aria-label="Select sessions"
-                                data-testid="toggle-selection-mode"
-                                className="text-muted-foreground"
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  onEnterSelectionMode("sessions");
-                                }}
-                              >
-                                <ListChecksIcon className="size-3.5" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent side="bottom">Select sessions</TooltipContent>
-                          </Tooltip>
-                        ) : undefined
+                        // The filter stays reachable while bulk-selecting;
+                        // switching scope just exits selection. Only the
+                        // "select" entry point hides, being already active.
+                        <div className="flex items-center gap-0.5">
+                          {!selectionMode && (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  aria-label="Select sessions"
+                                  data-testid="toggle-selection-mode"
+                                  className="text-muted-foreground"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    onEnterSelectionMode("sessions");
+                                  }}
+                                >
+                                  <ListChecksIcon className="size-3.5" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent side="bottom">Select sessions</TooltipContent>
+                            </Tooltip>
+                          )}
+                          <SessionFilterMenu
+                            value={activeTab}
+                            onChange={onActiveTabChange}
+                            multiUser={multiUser}
+                          />
+                        </div>
                       }
                     />
                   </ChatsDropZone>
@@ -2275,8 +2208,8 @@ function SessionFilterMenu({
         </TooltipTrigger>
         <TooltipContent side="bottom">Filter sessions</TooltipContent>
       </Tooltip>
-      <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-ui">
-        <DropdownMenuLabel className="text-muted-foreground text-sm">Display</DropdownMenuLabel>
+      <DropdownMenuContent align="end" className="min-w-44 [&_[role=menuitemradio]]:text-xs">
+        <DropdownMenuLabel className="text-muted-foreground text-xs">Display</DropdownMenuLabel>
         <DropdownMenuRadioGroup
           value={value}
           onValueChange={(next) => onChange(next as SidebarTab)}
@@ -2320,6 +2253,7 @@ function ProjectHeaderActions({
   const showExpandControls = !collapsed && projectNames.length > 0;
   const allExpanded =
     projectNames.length > 0 && projectNames.every((name) => expandedProjects.includes(name));
+  const anyExpanded = projectNames.some((name) => expandedProjects.includes(name));
   // The kebab only carries the expand/collapse and "Select sessions" items; with
   // neither applicable (e.g. no projects yet) it would open empty, so hide it.
   const showMenu = showExpandControls || hasProjectSessions;
@@ -2343,21 +2277,23 @@ function ProjectHeaderActions({
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="min-w-40">
-            {showExpandControls &&
-              (allExpanded ? (
-                <DropdownMenuItem data-testid="revert-projects" onSelect={() => onRevert()}>
-                  <Minimize2Icon className="size-3.5" />
-                  Collapse to previous
-                </DropdownMenuItem>
-              ) : (
-                <DropdownMenuItem
-                  data-testid="expand-all-projects"
-                  onSelect={() => onExpandAll(projectNames)}
-                >
-                  <Maximize2Icon className="size-3.5" />
-                  Expand all
-                </DropdownMenuItem>
-              ))}
+            {/* Gated independently: each hides only when it would be a no-op, so
+                a mixed set offers both. */}
+            {showExpandControls && !allExpanded && (
+              <DropdownMenuItem
+                data-testid="expand-all-projects"
+                onSelect={() => onExpandAll(projectNames)}
+              >
+                <Maximize2Icon className="size-3.5" />
+                Expand all
+              </DropdownMenuItem>
+            )}
+            {showExpandControls && anyExpanded && (
+              <DropdownMenuItem data-testid="collapse-all-projects" onSelect={onCollapseAll}>
+                <Minimize2Icon className="size-3.5" />
+                Collapse all
+              </DropdownMenuItem>
+            )}
             {hasProjectSessions && (
               <DropdownMenuItem
                 data-testid="projects-select-sessions"
@@ -2508,7 +2444,8 @@ function ConversationSection({
       {!isCollapsed && (
         <>
           {conversations.length === 0 && emptyMessage ? (
-            // Expanded but empty (e.g. a project with no loaded chats).
+            // Expanded but empty — a project with no loaded chats (indented, in a
+            // dashed well) or a top-level list whose filter matched nothing.
             <p
               className={
                 indentRows
@@ -2516,7 +2453,7 @@ function ConversationSection({
                       SIDEBAR_ROW,
                       "mt-1 mr-2 ml-8 flex items-center justify-center border border-dashed border-border text-center text-ui text-muted-foreground",
                     )
-                  : "px-2 py-1 text-xs text-muted-foreground"
+                  : "px-2 py-1 text-ui text-muted-foreground"
               }
             >
               {emptyMessage}

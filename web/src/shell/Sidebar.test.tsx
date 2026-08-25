@@ -402,7 +402,7 @@ describe("Sidebar session list", () => {
 
     selectSessionFilter("archived");
     expect(screen.queryByText("conv_live")).toBeNull();
-    expect(screen.getAllByText("No sessions")[0]).toBeInTheDocument();
+    expect(screen.getByText("No archived sessions")).toBeInTheDocument();
 
     // Still there, and still able to switch back.
     expect(screen.getByTestId("session-filter")).toBeInTheDocument();
@@ -928,11 +928,11 @@ describe("Sidebar tabs", () => {
     expect(screen.queryByText("conv_mine")).toBeNull();
   });
 
-  it("shows every pinned session in Pinned regardless of the My/Shared filter", () => {
-    // Pins are ownership-agnostic, so the Pinned section always includes all
-    // pinned sessions — an owned pin stays visible on the Shared tab and a
-    // shared pin stays visible on My sessions. Only the unpinned rows re-scope
-    // with the filter.
+  it("gives a pinned shared session a Pinned section under Shared, not My sessions", () => {
+    // Pins are ownership-agnostic (localStorage), so every filter reuses the
+    // same Pinned section — scoped to that filter's conversations. A pinned
+    // shared session floats to Pinned under Shared and never leaks onto My
+    // sessions (which shows only owned sessions).
     mockConversations([
       conv("conv_mine", "Claude Code"),
       conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
@@ -940,15 +940,14 @@ describe("Sidebar tabs", () => {
     seedPins(["conv_mine", "conv_shared"]);
     renderSidebar();
 
-    // "My sessions": both pins show under Pinned even though conv_shared is not
-    // owned by the viewer.
+    // "My sessions": owned session is unpinned (no Pinned section), and the
+    // pinned shared row doesn't appear here at all.
     selectSessionFilter("mine");
-    const minePinned = screen.getByText("Pinned").closest("section")!;
-    expect(within(minePinned).getByText("conv_mine")).toBeInTheDocument();
-    expect(within(minePinned).getByText("conv_shared")).toBeInTheDocument();
+    expect(screen.queryByText("Pinned")).toBeNull();
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+    expect(screen.queryByText("conv_shared")).toBeNull();
 
-    // "Shared sessions": both pins still show under Pinned even though
-    // conv_mine is owned by the viewer.
+    // "Shared sessions": the shared session shows under its own Pinned section.
     showSharedTab();
     const sharedPinned = screen.getByText("Pinned").closest("section")!;
     expect(within(sharedPinned).getByText("conv_mine")).toBeInTheDocument();
