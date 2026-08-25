@@ -2337,7 +2337,6 @@ function ProjectHeaderActions({
   const showExpandControls = !collapsed && projectNames.length > 0;
   const allExpanded =
     projectNames.length > 0 && projectNames.every((name) => expandedProjects.includes(name));
-  const anyExpanded = projectNames.some((name) => expandedProjects.includes(name));
   // The kebab only carries the expand/collapse and "Select sessions" items; with
   // neither applicable (e.g. no projects yet) it would open empty, so hide it.
   const showMenu = showExpandControls || hasProjectSessions;
@@ -2354,30 +2353,27 @@ function ProjectHeaderActions({
               size="icon-xs"
               aria-label="Project list actions"
               data-testid="project-list-actions"
-              className="text-muted-foreground"
               onClick={(event) => event.stopPropagation()}
             >
               <MoreHorizontalIcon className="size-3.5" />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="min-w-40">
-            {/* Gated independently: each hides only when it would be a no-op, so
-                a mixed set offers both. */}
-            {showExpandControls && !allExpanded && (
-              <DropdownMenuItem
-                data-testid="expand-all-projects"
-                onSelect={() => onExpandAll(projectNames)}
-              >
-                <Maximize2Icon className="size-3.5" />
-                Expand all
-              </DropdownMenuItem>
-            )}
-            {showExpandControls && anyExpanded && (
-              <DropdownMenuItem data-testid="collapse-all-projects" onSelect={onCollapseAll}>
-                <Minimize2Icon className="size-3.5" />
-                Collapse all
-              </DropdownMenuItem>
-            )}
+          <DropdownMenuContent align="end" className="min-w-40 [&_[role=menuitem]]:text-xs">
+            {showExpandControls &&
+              (allExpanded ? (
+                <DropdownMenuItem data-testid="revert-projects" onSelect={() => onRevert()}>
+                  <Minimize2Icon className="size-3.5" />
+                  Collapse to previous
+                </DropdownMenuItem>
+              ) : (
+                <DropdownMenuItem
+                  data-testid="expand-all-projects"
+                  onSelect={() => onExpandAll(projectNames)}
+                >
+                  <Maximize2Icon className="size-3.5" />
+                  Expand all
+                </DropdownMenuItem>
+              ))}
             {hasProjectSessions && (
               <DropdownMenuItem
                 data-testid="projects-select-sessions"
