@@ -6,7 +6,7 @@ import asyncio
 import secrets
 from collections import OrderedDict
 from collections.abc import Callable
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 import httpx
 from fastapi import (

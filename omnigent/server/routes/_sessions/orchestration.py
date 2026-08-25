@@ -12,8 +12,7 @@ import contextlib
 import json
 import secrets
 import time
-from collections import OrderedDict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from typing import Any, Literal, cast
 
 import httpx

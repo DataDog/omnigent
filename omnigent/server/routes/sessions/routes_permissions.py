@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import functools
-from collections.abc import Callable
-from typing import Any, TypedDict
+from typing import TypedDict
 
 from fastapi import (
     APIRouter,
