@@ -434,6 +434,7 @@ jobs:
           REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           EVENT_ACTION: ${{ github.event.action }}
+          ISSUE_PRIORITIZATION_V2_ENABLED: ${{ vars.ISSUE_PRIORITIZATION_V2_ENABLED }}
         run: |
           set -euo pipefail
 
@@ -466,38 +467,6 @@ jobs:
           v2_owns_scoring = (
               os.environ.get("ISSUE_PRIORITIZATION_V2_ENABLED", "").lower() == "true"
           )
-          candidates = json.loads(pathlib.Path("/tmp/duplicates.json").read_text())
-          duplicate = validate_duplicate_decision(result, issue_data, candidates)
-
-          # The duplicate call is made once, at open time. On the re-triage path
-          # (needs-info removed) the label, comment, and closure decision were
-          # all settled then, so they are left exactly as they are.
-          def flag(name):
-              return os.environ.get(name, "").strip().lower() == "true"
-
-          # A dispatch classifies as though the issue had just opened so the full
-          # duplicate path runs, but every write is opt-in: each dispatch input
-          # decides on its own, never falling back to the repo default.
-          is_dispatch = flag("IS_DISPATCH")
-          is_open_event = is_dispatch or os.environ.get("EVENT_ACTION") == "opened"
-          apply_labels = flag("DISPATCH_APPLY_LABELS") if is_dispatch else True
-          post_comment_enabled = (
-              flag("DISPATCH_POST_COMMENT") if is_dispatch else flag("POST_DUPLICATE_COMMENTS")
-          )
-          # Closure has no dispatch input of its own: a dry run that closed the
-          # issue it was inspecting would be the worst possible surprise, so it
-          # rides on apply_labels as well as the repo flag.
-          is_duplicate = duplicate["duplicate_decision"] == "duplicate" and is_open_event
-          close_duplicate_issue = (
-              is_duplicate and flag("CLOSE_DUPLICATE_ISSUES") and apply_labels
-          )
-          # Nothing is posted for a `none` verdict: most issues are not
-          # duplicates, so the comment would be noise on the majority of them.
-          post_duplicate_comment = (
-              is_open_event
-              and post_comment_enabled
-              and duplicate["duplicate_decision"] != "none"
-          )
 
           labels_add = []
           labels_remove = []
@@ -523,21 +492,14 @@ jobs:
 
               components = result.get("components", [])
               if not v2_owns_scoring and isinstance(components, list):
-                  labels_add.extend(
-                      component
-                      for component in components
-                      if isinstance(component, str)
-                      and component in ALLOWED_COMPONENTS
-                  )
+                  for c in components:
+                      if c in ALLOWED_COMPONENTS:
+                          labels_add.append(c)
 
-              priority = result.get("priority")
-              if (
-                  not v2_owns_scoring
-                  and isinstance(priority, str)
-                  and priority in ALLOWED_PRIORITIES
-              ):
-                  labels_add.append(priority)
-                  valid_priority = priority
+              # Priority
+              p = result.get("priority")
+              if not v2_owns_scoring and p and p in ALLOWED_PRIORITIES:
+                  labels_add.append(p)
 
               if result.get("help_wanted") and not is_duplicate:
                   labels_add.append("help wanted")
@@ -599,7 +561,11 @@ jobs:
               "components": valid_components,
               "ranked_owners": ranked_owners,
               "duplicate_of": dup if isinstance(dup, int) else None,
-              "priority": result.get("priority") if result.get("priority") in ALLOWED_PRIORITIES else None,
+              "priority": (
+                  result.get("priority")
+                  if not v2_owns_scoring and result.get("priority") in ALLOWED_PRIORITIES
+                  else None
+              ),
               "needs_info": bool(result.get("needs_info")),
               "reasoning": result.get("reasoning", ""),
           }
@@ -648,13 +614,9 @@ jobs:
           print(f"Labels to remove: {labels_remove}")
           if v2_owns_scoring:
               print("Databricks v2 owns priority and component labels")
-          print(f"Duplicate decision: {duplicate['duplicate_decision']}")
-          print(f"Duplicate confidence: {duplicate['duplicate_confidence']}")
-          if duplicate["duplicate_of"]:
-              print(f"Duplicate of: #{duplicate['duplicate_of']}")
-          if duplicate["similar_issues"]:
-              print(f"Similar issues: {duplicate['similar_issues']}")
-          print(f"Reasoning: {json.dumps(output['reasoning'], ensure_ascii=True)}")
+          if output["duplicate_of"]:
+              print(f"Duplicate of: #{output['duplicate_of']}")
+          print(f"Reasoning: {output['reasoning']}")
           PYEOF
 
           # Execute the validated label changes.
