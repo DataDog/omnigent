@@ -464,6 +464,7 @@ def generate(
     index_url: str,
     uv: str,
     exclude: set[str],
+    cooldown: int,
     allow_no_sdist: set[str] | None = None,
     api_base: str = PYPI_JSON_API,
     url_rewrites: list[tuple[str, str]] | None = None,
@@ -676,6 +677,14 @@ def main(argv: list[str]) -> int:
         help="Package allowed to have no PyPI sdist (repeatable). Without this, a "
         "wheel-only dependency fails the run instead of vanishing from the formula.",
     )
+    ap.add_argument(
+        "--cooldown-days",
+        type=int,
+        default=None,
+        help="Supply-chain cooldown in days: ignore distributions uploaded more "
+        "recently than this, except the lockstep omnigent packages. Defaults to "
+        "the repo uv.toml `exclude-newer` span. 0 disables it (not recommended).",
+    )
     ap.add_argument("--uv", default="uv", help="uv binary path.")
     args = ap.parse_args(argv)
 
@@ -699,6 +708,7 @@ def main(argv: list[str]) -> int:
         index_url=index_url,
         uv=args.uv,
         exclude={normalize_name(n) for n in (args.exclude or [])},
+        cooldown=args.cooldown_days if args.cooldown_days is not None else cooldown_days(),
         allow_no_sdist={normalize_name(n) for n in (args.allow_no_sdist or [])},
         api_base=api_base,
         url_rewrites=url_rewrites,
