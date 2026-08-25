@@ -49,7 +49,7 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 from urllib import error, request
 
 from omnigent._platform import stable_user_id
@@ -1247,8 +1247,6 @@ def build_hook_settings(
     launch_model: str | None = None,
     launch_permission_mode: str | None = None,
     launch_effort: str | None = None,
-    subagent_router_dir: Path | None = None,
-    turn_routing: bool = False,
 ) -> _JsonObject:
     """
     Build invocation-local Claude Code hook settings.
@@ -1473,36 +1471,6 @@ def build_hook_settings(
         # server-side. Covers both web-UI-injected and direct-terminal
         # prompts, since both fire UserPromptSubmit.
         hooks["UserPromptSubmit"].append({"hooks": [evaluate_policy_hook]})
-    if subagent_router_dir is not None:
-        # Route natively spawned subagents (the Task/Agent tool) through
-        # the runner's route-subagent endpoint. Settings-level hooks also
-        # apply to nested spawns, so a routed subagent's own spawns are
-        # routed too. The script fails open — an unreachable endpoint
-        # emits no output and the spawn proceeds unchanged.
-        router_command_parts = [
-            python,
-            "-I",
-            "-m",
-            "omnigent.inner.hook_scripts.claude_router_hook",
-            "--bridge-dir",
-            str(bridge_dir),
-            "--router-dir",
-            str(subagent_router_dir),
-        ]
-        from omnigent.inner.hook_scripts.subagent_router import HOOK_TIMEOUT_S
-
-        router_hook: _JsonObject = {
-            "type": "command",
-            "command": shlex.join(router_command_parts),
-            # Outermost hop of the routing timeout budget documented in
-            # ``omnigent.runner.subagent_routing``: derived from the hook
-            # script's own request budget so it always exceeds it and the
-            # script's fail-open branch runs before Claude kills it.
-            "timeout": int(HOOK_TIMEOUT_S),
-        }
-        hooks.setdefault("PreToolUse", []).append(
-            {"matcher": CLAUDE_SUBAGENT_TOOL_MATCHER, "hooks": [router_hook]}
-        )
     settings: _JsonObject = {"hooks": hooks}
     if launch_model:
         settings["model"] = launch_model
@@ -3709,7 +3677,7 @@ def start_tool_relay(
     )
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     host, port = _http_server_host_port(httpd)
-    relay_info: dict[str, Any] = {
+    relay_info: _JsonObject = {
         "url": f"http://{host}:{port}",
         "token": token,
         "tools": _normalize_relay_tool_specs(tools),
@@ -3999,37 +3967,6 @@ def _tool_relay_handler_factory(
                 self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
-
-        def _send_policy_proxy_error(self, exc: Exception) -> None:
-            """Return a 502 whose body names why the upstream forward failed.
-
-            The default ``send_error`` writes a generic ``http.server`` HTML
-            page; the policy hook truncates that body into its fail-closed
-            ``Detail:``, so a bare page reads as an opaque gateway blip. Most
-            failures here are a Databricks token-refresh lapse the
-            refresh-capable client surfaces as ``httpx.RequestError`` — lead the
-            body with that cause so the blocked-turn message is actionable.
-
-            :param exc: The exception raised by the upstream policy POST.
-            :returns: None.
-            """
-            reason = str(exc).strip()
-            detail = f"{type(exc).__name__}: {reason}" if reason else type(exc).__name__
-            # Truncate the detail (not the composed message) so the leading
-            # cause always survives intact instead of being cut mid-reason once
-            # the fixed prefix is prepended.
-            if len(detail) > _POLICY_PROXY_ERROR_DETAIL_MAX:
-                detail = detail[: _POLICY_PROXY_ERROR_DETAIL_MAX - 3] + "..."
-            message = f"omnigent policy-eval proxy could not reach the Omnigent server: {detail}"
-            # Keep the full exception (with traceback) in the runner log; the
-            # user-facing body is capped and can drop a diagnostically useful tail.
-            _logger.warning("policy-eval proxy forward failed: %s", detail, exc_info=exc)
-            body = message.encode("utf-8", "replace")
-            self.send_response(HTTPStatus.BAD_GATEWAY)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
 
         def _read_json_body(self) -> _JsonObject | None:
             """
