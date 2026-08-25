@@ -57,7 +57,10 @@ import {
   useWorkspaceEnvironment,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
-import { isNativeWrapper as isNativeWrapperLabel } from "@/lib/nativeCodingAgents";
+import {
+  isNativeWrapper as isNativeWrapperLabel,
+  WRAPPER_LABEL_KEY,
+} from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";

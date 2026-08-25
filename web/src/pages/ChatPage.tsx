@@ -2051,6 +2051,7 @@ function MainAgentSurface({
         costRoutingEligible={costRoutingEligible}
         subagentRoutingEligible={subagentRoutingEligible}
         subAgentLabel={subAgentLabel}
+        wrapperLabel={wrapperLabel}
         onGrowthChange={publishComposerGrowth}
       />
 
@@ -3772,6 +3773,13 @@ interface ComposerProps {
    */
   subAgentLabel?: string | null;
   /**
+   * The session's ``omnigent.wrapper`` label, or ``null`` when it carries
+   * none. Only the identity label reads it — to name the vendor running a
+   * native sub-agent child (see ``composerHarnessLabel``). Behavior gates
+   * keep using ``modelPickerKind`` / ``isNativeWrapper``.
+   */
+  wrapperLabel?: string | null;
+  /**
    * Reports how many pixels taller than its resting height the composer has
    * grown. The composer keeps that growth out of the column's flex layout
    * (see the negative top margin below); the transcript uses the number to
@@ -4183,6 +4191,7 @@ export function Composer({
   costRoutingEligible = false,
   subagentRoutingEligible = false,
   subAgentLabel = null,
+  wrapperLabel = null,
   onGrowthChange,
 }: ComposerProps) {
   const [value, setValue] = useState("");

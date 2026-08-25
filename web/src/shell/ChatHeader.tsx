@@ -266,7 +266,7 @@ export function ChatHeader({
               {subAgentName ? (
                 <div className="flex min-w-0 flex-col leading-tight">
                   <span className="truncate text-ui font-semibold text-foreground">
-                    {boundAgent.name}
+                    {subAgentName}
                   </span>
                   <span className="text-sm text-muted-foreground">Sub-agent</span>
                 </div>

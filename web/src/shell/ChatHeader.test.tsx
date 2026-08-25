@@ -247,6 +247,7 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
                 parentSessionId={undefined}
                 conversationId="sess-1"
                 boundAgent={undefined}
+                wrapperLabel={null}
                 canShare={false}
                 onShare={() => {}}
                 hasAgentInfo={false}
@@ -267,6 +268,7 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
               parentSessionId={undefined}
               conversationId="sess-1"
               boundAgent={undefined}
+              wrapperLabel={null}
               canShare={false}
               onShare={() => {}}
               hasAgentInfo={false}
