@@ -110,7 +110,7 @@ class SqlAlchemyProjectStore(ProjectStore):
 
     def _name_taken(
         self,
-        session: Session,
+        session,
         *,
         user_id: str | None,
         name: str,
