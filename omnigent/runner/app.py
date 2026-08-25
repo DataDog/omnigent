@@ -8800,9 +8800,13 @@ def create_runner_app(
         and _pane_reaper_registry is not None
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
-        from omnigent.native_cost_popup import _list_tmux_clients
+        from omnigent.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
-        from omnigent.terminals.pane_reaper import NativePaneReaper, PaneRef
+        from omnigent.terminals.pane_reaper import (
+            PANE_OUTPUT_BUSY_WINDOW_S,
+            NativePaneReaper,
+            PaneRef,
+        )
 
         def _native_panes_for_reaper() -> list[PaneRef]:
             panes: list[PaneRef] = []
@@ -8823,7 +8827,18 @@ def create_runner_app(
             if _native_pane_status.get(conv_id) == "running":
                 return True
             clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
-            return bool(clients)
+            if clients:
+                return True
+            # Primary evidence: tmux stamps window_activity on every byte the
+            # pane emits, so a producing terminal stays busy even when the
+            # status pipeline above has silently stalled (a stalled forwarder
+            # once froze the busy signal and got a live session reaped).
+            activity_at = await asyncio.to_thread(
+                _tmux_window_activity_at, str(pane.socket_path), "main"
+            )
+            return (
+                activity_at is not None and time.time() - activity_at < PANE_OUTPUT_BUSY_WINDOW_S
+            )
 
         async def _reap_native_pane(pane: PaneRef) -> None:
             try:
