@@ -38,7 +38,12 @@ class BackgroundTitleProcessManager(Protocol):
     ) -> httpx.AsyncClient:
         pass
 
-    async def release(self, conversation_id: str) -> None:
+    async def release(
+        self,
+        conversation_id: str,
+        *,
+        only_if_idle_cutoff: float | None = None,
+    ) -> None:
         pass
 
 

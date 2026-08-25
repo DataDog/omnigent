@@ -50,6 +50,10 @@ _LAUNCHER_PRIVATE_TMPDIR_ENV = "OMNIGENT_LAUNCHER_SPAWN_PRIVATE_TMPDIR"
 _SPAWN_WRAP_BACKENDS = frozenset({"linux_bwrap", "darwin_seatbelt"})
 
 
+def _json_string_list(values: Sequence[object]) -> list[JsonValue]:
+    return cast(list[JsonValue], [str(value) for value in values])
+
+
 @dataclass
 class SandboxPolicy:
     """
