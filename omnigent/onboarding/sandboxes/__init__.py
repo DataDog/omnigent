@@ -85,7 +85,7 @@ __all__ = [
 ]
 
 
-def get_launcher(provider: str, *, workspace_host: str | None = None) -> SandboxHostLauncher:
+def get_launcher(provider: str, *, workspace_host: str | None = None) -> SandboxLauncher:
     """
     Resolve a provider name to a launcher instance.
 
@@ -109,20 +109,7 @@ def get_launcher(provider: str, *, workspace_host: str | None = None) -> Sandbox
         raise click.ClickException(
             f"Unknown or unavailable sandbox provider '{provider}'. Available: {offered}."
         )
-    module_name = target.partition(":")[0]
-    if importlib.util.find_spec(module_name) is None:
-        offered = ", ".join(available_providers()) or "(none in this build)"
-        raise click.ClickException(
-            f"Unknown or unavailable sandbox provider '{provider}'. Available: {offered}."
-        )
-    if provider == "lakebox" and workspace_host is not None:
-        # Imported here (not at module top) because the lakebox module
-        # may be absent from a distribution; the availability check above
-        # guarantees it exists in this one.
-        import omnigent.onboarding.sandboxes.lakebox as lakebox  # type: ignore[import-not-found]
-
-        return lakebox.LakeboxLauncher(workspace_host=workspace_host)
-    module_name, _, class_name = target.partition(":")
-    module = importlib.import_module(module_name)
-    launcher_cls: type[SandboxLauncher] = getattr(module, class_name)
-    return launcher_cls()
+    try:
+        return instantiate(provider, workspace_host=workspace_host)
+    except SandboxRegistryError as exc:
+        raise click.ClickException(str(exc)) from exc
