@@ -2213,9 +2213,7 @@ def register_core_routes(
         # unfiled (a foreign project id would show in no folder view).
         fork_project_id = None
         if source.project_id is not None and project_store is not None:
-            owned = await asyncio.to_thread(
-                project_store.get, source.project_id, owner_user_id=user_id
-            )
+            owned = await asyncio.to_thread(project_store.get, source.project_id, user_id=user_id)
             if owned is not None:
                 fork_project_id = source.project_id
 
