@@ -30,10 +30,8 @@ if TYPE_CHECKING:
     from omnigent.claude_native import ClaudeNativeUcodeConfig
     from omnigent.claude_native_bridge import ClaudeNativeToolRelay
     from omnigent.codex_native_bridge import CodexNativeBridgeState
-    from omnigent.llms.client import Client as LLMClient
     from omnigent.runner.mcp_manager import RunnerMcpManager
-    from omnigent.runner.policy import PolicyVerdict
-    from omnigent.terminals.registry import TerminalListEntry, TerminalRegistry
+    from omnigent.terminals.registry import TerminalListEntry
 
 import click
 import httpx
@@ -1954,6 +1952,7 @@ def create_runner_app(
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     _native_pane_status: dict[str, str] = {}
     _session_message_buffers: dict[str, list[_JsonObject]] = {}
+    _author_attribution_sessions: set[str] = set()
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
     _ingest_cond: dict[str, asyncio.Condition] = {}
@@ -2663,8 +2662,10 @@ def create_runner_app(
                         "detail": _client_safe_error_detail(exc, context="spec resolve"),
                     },
                 )
-        if spec_entry is not None:
-            spec = _unwrap_spec_entry(spec_entry)
+        if spec is not None:
+            spec_entry = spec
+            if isinstance(spec_entry, ResolvedSpec):
+                spec = _unwrap_resolved_spec(spec_entry)
             raw_sub_agent_name = body.get("sub_agent_name")
             _sa_name_assign = cast(str | None, raw_sub_agent_name)
             if _sa_name_assign:
@@ -4859,6 +4860,50 @@ def create_runner_app(
             )
         await _cancel_active_turn(conv_id, expected_task=target)
 
+    def _history_message_from_body(body: _JsonObject) -> _JsonObject:
+        message = {
+            "type": "message",
+            "role": body.get("role", "user"),
+            "content": body.get("content", []),
+        }
+        if body.get("created_by") is not None:
+            message["created_by"] = body["created_by"]
+        return message
+
+    def _note_message_author(session_id: str, body: _JsonObject) -> None:
+        if session_id in _author_attribution_sessions:
+            return
+        if body.get("author_attribution_required") is True:
+            _author_attribution_sessions.add(session_id)
+            return
+        authors = {
+            item.get("created_by")
+            for item in _session_histories.get(session_id, [])
+            if isinstance(item.get("created_by"), str) and item.get("created_by")
+        }
+        created_by = body.get("created_by")
+        if isinstance(created_by, str) and created_by:
+            authors.add(created_by)
+        if len(authors) >= 2:
+            _author_attribution_sessions.add(session_id)
+
+    def _message_body_for_harness(
+        body: _JsonObject,
+        *,
+        force_author_attribution: bool,
+    ) -> _JsonObject:
+        event = {
+            key: value
+            for key, value in body.items()
+            if key not in {"created_by", "author_attribution_required"}
+        }
+        prepared = prepare_input_items_for_model(
+            [_history_message_from_body(body)],
+            force_author_attribution=force_author_attribution,
+        )
+        event["content"] = prepared[0]["content"]
+        return event
+
     async def _check_and_start_next_turn(
         session_id: str,
     ) -> None:
@@ -5230,7 +5275,6 @@ def create_runner_app(
                 workdir=cached_spec_workdir,
                 cwd=await _session_runtime_cwd(conv),
                 model_override=cast(str | None, msg_body.get("model_override")),
-                session_id=conv,
             )
             from omnigent.runtime.prompt import build_instructions
 
@@ -5494,7 +5538,6 @@ def create_runner_app(
         spawn_env = (
             dispatch.spawn_env if dispatch else cast(dict[str, str] | None, body.get("spawn_env"))
         )
-        _note_session_harness_override(conv_id, cast(str | None, body.get("harness_override")))
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
         if not harness_name:
@@ -5747,6 +5790,8 @@ def create_runner_app(
                                         _resp_to_conv[_response_id] = conv_id
                                         _live_response_id[conv_id] = _response_id
                                         manager.mark_in_flight(conv_id, _response_id)
+
+                                _defer_publish = False
 
                                 _overflow = _is_context_overflow_error(event)
                                 if _overflow is not None:
