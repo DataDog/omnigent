@@ -11,12 +11,10 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Callable
 from typing import Protocol
 
 from opentelemetry import metrics as otel_metrics
 from opentelemetry.util.types import Attributes
-from starlette.types import Scope
 
 _OTEL_METER_NAME = "omnigent.server.websocket"
 _WS_DURATION_NAME = "omnigent.server.websocket.connection.duration"
@@ -87,7 +85,7 @@ class _NoopHistogram:
         del amount, attributes
 
 
-def ws_route_template(scope: Scope) -> str:
+def ws_route_template(scope: dict) -> str:
     """
     Resolve an ASGI WebSocket scope to a bounded route template.
 
@@ -131,7 +129,7 @@ class WebSocketMetricsOtelPublisher:
         self,
         meter: _MeterLike | None = None,
         *,
-        clock: Callable[[], float] = time.monotonic,
+        clock: callable = time.monotonic,
     ) -> None:
         """Initialize WebSocket metric instruments."""
         self._clock = clock
