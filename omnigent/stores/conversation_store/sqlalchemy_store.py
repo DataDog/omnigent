@@ -775,7 +775,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         Fetch the metadata row for a conversation from the Omnigent DB.
         """
-        with self._session("select_conversation_metadata_by_id") as meta_sess:
+        with (
+            self._session() as meta_sess,
+            query_name_scope("omnigent.conversation_store.select_conversation_metadata_by_id"),
+        ):
             return meta_sess.get(
                 SqlConversationMetadata, (current_workspace_id(), conversation_id)
             )
@@ -921,11 +924,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Get parent's root from AP, then write AP row and Omnigent meta separately.
             root_id = new_id
             if parent_conversation_id is not None:
-                with self._conv_session("select_parent_conversation") as ap_sess:
-                    parent_row = ap_sess.get(
-                        SqlConversation,
-                        (current_workspace_id(), parent_conversation_id),
-                    )
+                with self._conv_session() as ap_sess:
+                    with query_name_scope(
+                        "omnigent.conversation_store.select_parent_conversation"
+                    ):
+                        parent_row = ap_sess.get(
+                            SqlConversation,
+                            (current_workspace_id(), parent_conversation_id),
+                        )
                     if parent_row is None:
                         raise ConversationNotFoundError(
                             f"parent conversation {parent_conversation_id!r} does not exist"
@@ -971,6 +977,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     agent_id=agent_id,
                 )
                 ap_sess.add(row)
+                with query_name_scope("omnigent.conversation_store.insert_conversation"):
+                    ap_sess.flush()
             meta = SqlConversationMetadata(
                 id=new_id,
                 kind=encode_conversation_kind(kind),
@@ -985,6 +993,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             with self._session("insert_conversation_metadata") as meta_sess:
                 meta_sess.add(meta)
+                with query_name_scope("omnigent.conversation_store.insert_conversation_metadata"):
+                    meta_sess.flush()
             return _to_conversation(row, meta)
         except IntegrityError as exc:
             # Translate a caller-supplied-id PK collision into a clean exception
@@ -1027,8 +1037,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         :returns: The :class:`Conversation` if found, otherwise
             ``None``.
         """
-        with self._conv_session("select_conversation_by_id") as session:
-            row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+        with self._conv_session() as session:
+            with query_name_scope("omnigent.conversation_store.select_conversation_by_id"):
+                row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             if row is None:
                 return None
             meta = self._get_meta(session, conversation_id)
