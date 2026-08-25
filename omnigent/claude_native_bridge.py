@@ -49,7 +49,7 @@ from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib import error, request
 
 from omnigent._platform import stable_user_id
@@ -3709,7 +3709,7 @@ def start_tool_relay(
     )
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     host, port = _http_server_host_port(httpd)
-    relay_info: _JsonObject = {
+    relay_info: dict[str, Any] = {
         "url": f"http://{host}:{port}",
         "token": token,
         "tools": _normalize_relay_tool_specs(tools),
@@ -3814,7 +3814,7 @@ def _start_http_ingress(
     handler_cls = _handler_factory(token, notification_queue)
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
     host, port = _http_server_host_port(httpd)
-    server_info: _JsonObject = {
+    server_info = {
         "url": f"http://{host}:{port}",
         "token": token,
         "pid": os.getpid(),
