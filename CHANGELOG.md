@@ -5,11 +5,6 @@ generated at release time from each PR's `## Changelog` section, tagged by the
 PR's `Type of change` (e.g. `[UI]`); the concise, curated highlights live on the
 website under `/releases`.
 
-## [v0.8.1] — 2026-08-03
-
-- [UI] Reverted the v0.8.0 "Chat/Terminal switcher in the header" change; the
-  switcher returns to its previous location. (#3931)
-
 ## [v0.8.0] — 2026-08-03
 
 - [Bug fix] Cursor YOLO sessions no longer stall piloted parents on mirrored tool-approval cards when Cursor leaves a lingering pending gate. (#2338)
