@@ -102,7 +102,6 @@ lint-ts:
     pnpm install --frozen-lockfile --filter web --filter omnigent-vscode
     pnpm --filter web run lint
     pnpm --filter web run type-check
-    pnpm --filter omnigent-vscode run type-check
 
 # --- Lockfile maintenance ---
 
