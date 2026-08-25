@@ -21,7 +21,6 @@ Usage (from the repo root):
   python dev/repro.py                     # prompts for the bug URL
   python dev/repro.py https://github.com/omnigent-ai/omnigent/issues/1234
   python dev/repro.py OMNI-1234 --server http://localhost:6767
-  python dev/repro.py <bug_url> --public  # share the session public-read at start
 
 Reproducing runs against whatever server ``omnigent run`` uses (the local server
 it spins up by default, or the one you pass with ``--server``).
@@ -31,7 +30,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
@@ -46,39 +44,6 @@ _AGENT_REL = "dev/repro-agent"
 def _die(msg: str) -> NoReturn:
     print(f"error: {msg}", file=sys.stderr)
     raise SystemExit(1)
-
-
-def _launch_env(bug_url: str) -> dict[str, str]:
-    """Build the child env for ``omnigent run``, forwarding the Linear key.
-
-    Reading a Linear ticket needs ``DATABRICKS_LINEAR_API_KEY`` to reach the
-    agent's shell. Under ``--server`` the daemon→runner hop strips everything
-    not in its allowlist, and the ``DATABRICKS_`` prefix survives only the
-    CLI→daemon hop — so we also name the key in ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``
-    (itself allowlisted), which tells the runner env-build to forward it the rest
-    of the way. Maintainers usually export the plain ``LINEAR_API_KEY`` locally,
-    so mirror that into the ``DATABRICKS_`` name when only the plain one is set.
-    Only kicks in for Linear URLs; if neither is set we warn rather than fail (the
-    agent stops with ``needs_more_info`` and names the missing key).
-    """
-    env = os.environ.copy()
-    if "linear.app" not in bug_url:
-        return env
-    if not env.get("DATABRICKS_LINEAR_API_KEY") and env.get("LINEAR_API_KEY"):
-        env["DATABRICKS_LINEAR_API_KEY"] = env["LINEAR_API_KEY"]
-    if not env.get("DATABRICKS_LINEAR_API_KEY"):
-        print(
-            "warning: Linear URL but neither LINEAR_API_KEY nor "
-            "DATABRICKS_LINEAR_API_KEY is set — the agent won't be able to read "
-            "the ticket (it will stop with needs_more_info).",
-            file=sys.stderr,
-        )
-        return env
-    names = [n for n in env.get("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "").split(",") if n.strip()]
-    if "DATABRICKS_LINEAR_API_KEY" not in names:
-        names.append("DATABRICKS_LINEAR_API_KEY")
-    env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] = ",".join(names)
-    return env
 
 
 def _slug_from_bug_url(bug_url: str) -> str:
@@ -144,13 +109,6 @@ def _parse_args() -> argparse.Namespace:
         help="Omnigent server URL to reproduce against. Omit to use the local "
         "server omnigent run spins up.",
     )
-    p.add_argument(
-        "--public",
-        action="store_true",
-        help="Share the reproduction session public-read (anyone who can reach "
-        "the server) right after it starts. Off by default — useful when "
-        "watching a live run or reproducing against a shared --server.",
-    )
     return p.parse_args()
 
 
@@ -169,13 +127,9 @@ def main() -> None:
     if not bug_url:
         _die("no bug URL given")
 
-    # The agent's input contract is the bug URL (it always reproduces against the
-    # running build, so there's no version to pass), plus an optional `public`
-    # flag telling it to share the session public-read right after it starts.
-    payload: dict[str, object] = {"bug_url": bug_url}
-    if args.public:
-        payload["public"] = True
-    prompt = json.dumps(payload)
+    # The agent's input contract is just the bug URL; it always reproduces
+    # against the running build (latest main), so there's no version to pass.
+    prompt = json.dumps({"bug_url": bug_url})
 
     # Create the isolated worktree off the CURRENT checkout's HEAD. We resolve
     # HEAD to a concrete commit and pass it as the base, because create_worktree
@@ -208,12 +162,10 @@ def main() -> None:
     cmd = ["omnigent", "run", _AGENT_REL, "-p", prompt]
     if args.server is not None:
         cmd += ["--server", args.server]
-
-    env = _launch_env(bug_url)
     print(f"→ running: {' '.join(cmd)}")
     print(f"→ cwd:     {worktree}\n")
 
-    result = subprocess.run(cmd, cwd=str(worktree), env=env, check=False)
+    result = subprocess.run(cmd, cwd=str(worktree), check=False)
 
     # Always keep the worktree; the authored test (if any) lives on its branch.
     print(
