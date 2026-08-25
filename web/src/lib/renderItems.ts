@@ -18,19 +18,8 @@
 //
 // Pure function. No React, no DOM. Tested in `renderItems.test.ts`.
 
-import type {
-  AnyBlock,
-  MessageContentBlock,
-  RoutingDecisionBlock,
-  ToolExecution,
-  ToolResultBlock,
-} from "./blocks";
+import type { AnyBlock, MessageContentBlock, ToolExecution, ToolResultBlock } from "./blocks";
 import { LIVE_ITEM_PREFIX } from "./blocks";
-import {
-  type RoutingDecisionExtras,
-  isSessionScopedDecision,
-  routingExtras,
-} from "./routingDecision";
 import { isSystemUserContent } from "./systemMessage";
 import type { RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
@@ -285,8 +274,7 @@ export function buildBubbles(
   const superseded = supersededRoutingChips(blocks);
   if (cache === undefined) {
     return markContinuedTurns(
-      walkBubbles(blocks, activeResponse, interruptedResponses, 0, [], new Map(), superseded)
-        .bubbles,
+      walkBubbles(blocks, activeResponse, interruptedResponses, 0, [], new Map()).bubbles,
       activeResponse,
     );
   }
@@ -324,8 +312,6 @@ export function buildBubbles(
     cache.interruptedResponseIds = interruptedResponseIds;
     cache.bubbles = markContinuedTurns(rest.bubbles, activeResponse);
     cache.lastBubbleStart = rest.lastBubbleStart;
-    cache.lastBubbleCount = rest.lastBubbleCount;
-    cache.supersededChips = superseded;
     return cache.bubbles;
   }
 
@@ -344,8 +330,6 @@ export function buildBubbles(
   cache.interruptedResponseIds = interruptedResponseIds;
   cache.bubbles = markContinuedTurns(full.bubbles, activeResponse);
   cache.lastBubbleStart = full.lastBubbleStart;
-  cache.lastBubbleCount = full.lastBubbleCount;
-  cache.supersededChips = superseded;
   return cache.bubbles;
 }
 
@@ -830,7 +814,6 @@ function walkBubbles(
     const stableId = firstItemId ?? `${groupResponseId}:${subIndex}`;
 
     lastBubbleStart = groupStart;
-    lastBubbleCount = 1;
     const workedForS = turnWorkedForS(groupBlocks);
     const lastActivityAtS = turnLastActivityAtS(groupBlocks);
     bubbles.push({
@@ -1105,6 +1088,47 @@ function adjacent(
     return { type: b.type, index: k };
   }
   return null;
+}
+
+/**
+ * Server epoch seconds of the turn's newest block, when known. Lets the
+ * renderer tell a JUST-active trace (a reload can land in a step-wise
+ * turn's between-step gap, where everything else reads settled) from
+ * genuinely old history.
+ */
+function turnLastActivityAtS(groupBlocks: AnyBlock[]): number | undefined {
+  let latest: number | undefined;
+  for (const b of groupBlocks) {
+    const at = b.ctx.createdAtS;
+    if (at !== undefined && (latest === undefined || at > latest)) latest = at;
+  }
+  return latest;
+}
+
+/**
+ * Wall-clock seconds between a turn's first and last block, when both
+ * ends carry a usable stamp from the SAME clock. Live-streamed blocks
+ * carry page-relative `ctx.timestamp` (sub-second precision); reloaded
+ * history carries server `ctx.createdAtS` (epoch seconds). A bubble
+ * that mixes the two clocks (page loaded mid-turn) yields `undefined`
+ * rather than a cross-clock span — the FIRST block's clock decides
+ * which branch is tried: a live-stamped first block only ever pairs
+ * with a live-stamped last, an epoch-stamped first only with an
+ * epoch-stamped last, and either mixed direction fails both guards.
+ */
+function turnWorkedForS(groupBlocks: AnyBlock[]): number | undefined {
+  const first = groupBlocks[0];
+  const last = groupBlocks[groupBlocks.length - 1];
+  if (first === undefined || last === undefined || first === last) return undefined;
+  if (first.ctx.timestamp > 0 && last.ctx.timestamp >= first.ctx.timestamp) {
+    return last.ctx.timestamp - first.ctx.timestamp;
+  }
+  const firstCreated = first.ctx.createdAtS;
+  const lastCreated = last.ctx.createdAtS;
+  if (firstCreated !== undefined && lastCreated !== undefined && lastCreated >= firstCreated) {
+    return lastCreated - firstCreated;
+  }
+  return undefined;
 }
 
 /**

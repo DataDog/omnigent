@@ -3654,23 +3654,13 @@ async function* tapLiveDeltas(
   for await (const ev of events) {
     if (ev.type === "text_delta" && ev.messageId !== undefined) {
       if (get().conversationId === id && !retired.has(ev.messageId)) {
-        // A scheduled wake streams its first deltas ahead of the batch
-        // that names the new turn. They must not preview into the
-        // PREVIOUS turn's bubble (anonymous blocks glue to the trailing
-        // group — killing its fold and inflating its worked-for span):
-        // retire the message so its text renders only via the
-        // authoritative item, which lands in the new turn's bubble.
-        if (isStaleCompletedResponse(get())) {
-          retired.add(ev.messageId);
-          continue;
-        }
         reviveStrayCompletedResponse(set);
         applyLiveDelta(set, ev.messageId, ev.index ?? 0, ev.delta, lastIndex);
       }
       continue;
     }
     if (ev.type === "tool_output_delta") {
-      if (get().conversationId === id && !isStaleCompletedResponse(get())) {
+      if (get().conversationId === id) {
         reviveStrayCompletedResponse(set);
         applyLiveToolOutputDelta(set, ev.callId, ev.delta);
       }
@@ -3726,30 +3716,9 @@ export function adoptTrailingUnattributedBlocks(
   return next;
 }
 
-// How long after a terminal edge a delta still revives the turn. A
-// STRAY mid-turn idle is contradicted by the still-flowing stream
-// within seconds; a scheduled wake (cron / wakeup fires at 60s
-// minimum) streams its FIRST deltas ahead of the transcript batch that
-// names the new turn — reviving the finished turn then popped its
-// "Worked for" fold open at the start of every /loop iteration.
-const REVIVE_WINDOW_MS = 15_000;
-
-/**
- * Whether the finished turn is too old for a delta to plausibly belong
- * to it — such deltas open the NEXT turn (a scheduled wake).
- */
-export function isStaleCompletedResponse(s: { activeResponse: ActiveResponse | null }): boolean {
-  return (
-    s.activeResponse?.state === "completed" &&
-    s.activeResponse.completedAt !== undefined &&
-    Date.now() - s.activeResponse.completedAt > REVIVE_WINDOW_MS
-  );
-}
-
 export function reviveStrayCompletedResponse(set: Setter): void {
   set((s) => {
     if (s.activeResponse?.state !== "completed") return {};
-    if (isStaleCompletedResponse(s)) return {};
     // The delta also proves the SESSION is mid-turn: restore the busy
     // signal the stray idle edge cleared, so send gating
     // (shouldQueueSend) queues instead of firing into the live turn and
@@ -4619,7 +4588,6 @@ export function handleSessionEvent(event: StreamEvent): void {
                 ...s.activeResponse,
                 state: event.status === "failed" ? "failed" : "completed",
                 error: null,
-                completedAt: Date.now(),
               };
             }
           }
