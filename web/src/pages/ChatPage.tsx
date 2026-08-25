@@ -5461,8 +5461,7 @@ export function Composer({
               // reads as "waiting for input", not "almost active".
               className={cn(
                 "size-9 shrink-0 rounded-lg md:size-8",
-                !showInterruptButton &&
-                  "hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
+                !showInterruptButton && "hover:bg-primary/90 disabled:opacity-30",
               )}
               // Interrupt stays live during a pending elicitation —
               // cancelling the turn is the other legitimate way out.
