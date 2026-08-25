@@ -238,6 +238,7 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
         not judged locally — it surfaces at the first turn via the executor.
     """
     from omnigent.onboarding.harness_install import (
+        READINESS_CLI_PROBE_TIMEOUT_S,
         harness_cli_installed,
     )
     from omnigent.onboarding.provider_config import OPENAI_FAMILY
