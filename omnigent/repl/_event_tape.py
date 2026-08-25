@@ -90,7 +90,7 @@ def _snapshot_event(event: object) -> dict[str, object] | None:
     # Pydantic models (server-side events).
     if isinstance(event, _ModelDumpEvent):
         try:
-            return event.model_dump()
+            return model_dump()
         except Exception:  # noqa: BLE001 — best-effort snapshot
             pass
 

@@ -2508,8 +2508,7 @@ class _SessionsChatReplAdapter:
         if not properties or not isinstance(properties, dict):
             return None
 
-        required_value = schema.get("required", [])
-        required = set(required_value) if isinstance(required_value, list) else set()
+        required = set(schema.get("required", []))
         content: dict[str, str | int | float | bool | list[str] | None] = {}
 
         for key, prop in properties.items():
@@ -3159,11 +3158,18 @@ async def run_repl(
         | None
     ) = None
     if tool_handler is not None:
-        tool_callables = {}
-        for schema in tool_handler.schemas:
-            name = schema.get("name")
-            if isinstance(name, str):
-                tool_callables[name] = tool_handler.execute
+        tool_callables = {
+            schema["name"]: tool_handler.execute
+            for schema in tool_handler.schemas
+            if isinstance(schema, dict) and "name" in schema
+        }
+    # ``Session`` typing here is intentional: the adapter
+    # is duck-compatible with the legacy surface the REPL
+    # uses (send/cancel/current_response_id/model/
+    # is_streaming/reset/resume_from_response/
+    # set_reasoning_effort/reasoning_effort). mypy is
+    # appeased via the runtime cast; the static type
+    # mismatch surfaces in tests, not at runtime.
     session = _SessionsChatReplAdapter(
         client=client,
         agent_name=agent_name,
