@@ -1104,6 +1104,70 @@ describe("chatStore — switchTo", () => {
     expect(elicitation?.message).toBe("Approve stalled stream command?");
   });
 
+  it("replaces an answered question card with the copy hydration rebuilt", async () => {
+    // The user answered a question live; the tool call it gated then
+    // persisted, so a rebind's hydration rebuilds the same card from the
+    // items. Both copies rendering would show the exchange twice — and
+    // they can't pair on ids, since the live elicitation id is never
+    // persisted.
+    const questions = {
+      questions: [
+        { question: "Which library?", options: [{ label: "date-fns" }], multiSelect: false },
+      ],
+    };
+    seedSession("conv_answered", [userMessage("resp_1", "pick one")]);
+    await useChatStore.getState().switchTo("conv_answered");
+    useChatStore.setState((s) => ({
+      blocks: [
+        ...s.blocks,
+        {
+          type: "elicitation",
+          ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "resp_1", itemId: null },
+          elicitationId: "elicit_claude_native_deadbeef",
+          message: "Claude wants to call **AskUserQuestion**",
+          phase: "pre_tool_use",
+          policyName: "claude_native_permission",
+          contentPreview: "",
+          requestedSchema: {},
+          status: "responded",
+          response: { action: "accept", content: { "Which library?": "date-fns" } },
+          askUserQuestion: questions,
+        } satisfies ElicitationBlock,
+      ],
+    }));
+    seedSession("conv_answered", [
+      userMessage("resp_1", "pick one"),
+      {
+        id: "fc_ask",
+        response_id: "resp_1",
+        type: "function_call",
+        status: "completed",
+        name: "AskUserQuestion",
+        arguments: JSON.stringify(questions),
+        call_id: "call_ask",
+      },
+      {
+        id: "fco_ask",
+        response_id: "resp_1",
+        type: "function_call_output",
+        status: "completed",
+        call_id: "call_ask",
+        output: 'Your questions have been answered: "Which library?"="date-fns".',
+      },
+    ]);
+
+    // The stream died (idle disconnect): the send-triggered rebind
+    // re-hydrates the window alongside the live blocks.
+    useChatStore.setState({ abortController: null });
+    await useChatStore.getState().send("thanks", "agent_xyz");
+
+    const cards = useChatStore
+      .getState()
+      .blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.ctx.itemId).toBe("fc_ask:answer");
+  });
+
   it("hydrates only the initial window and flags that older history remains", async () => {
     // Longer than the initial window so the loaded window is a strict subset.
     const total = INITIAL_WINDOW_ITEMS + SESSION_HISTORY_PAGE_SIZE + 5;
