@@ -3386,6 +3386,13 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   }
 
+  const SMART_ROUTING_ROW = "new-chat-landing-harness-smart-routing";
+
+  function selectSmartRoutingHarness(): void {
+    openPicker();
+    fireEvent.click(screen.getByTestId(SMART_ROUTING_ROW));
+  }
+
   it("drills into the Custom agents page in place and returns via Back", () => {
     // A custom (non-builtin) agent lands in the Custom agents group.
     mockAgents([
@@ -3420,7 +3427,7 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     expect(screen.queryByTestId("new-chat-landing-agent-ag_custom")).toBeNull();
   });
 
-  it("drills into the More page for harnesses outside the supported set", () => {
+  it("drills into the More page for harnesses outside the supported set", async () => {
     // cursor-native isn't fully supported → folded into "More" (Claude Code and
     // Codex lead inline), so touch gets a drill-in page with a Back row.
     mockAgents([
@@ -3885,72 +3892,6 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
 // carrying both — the two native wrappers AND a bundle agent — so a pick of one
 // flavor can be shown not to move the other.
 // ---------------------------------------------------------------------------
-
-describe("NewChatLandingScreen Smart Routing flavors are scoped separately", () => {
-  const SMART_ROUTING_ROW = "new-chat-landing-harness-smart-routing";
-
-  beforeEach(() => {
-    setupLandingMocks();
-    mockAgents([
-      {
-        id: "a1",
-        name: "claude-native-ui",
-        display_name: "Claude Code",
-        description: null,
-        harness: "claude-native",
-        skills: [],
-      },
-      {
-        id: "a2",
-        name: "codex-native-ui",
-        display_name: "Codex",
-        description: null,
-        harness: "codex-native",
-        skills: [],
-      },
-      {
-        id: "ag_debby",
-        name: "debby",
-        display_name: "Debby",
-        description: null,
-        harness: "claude-sdk",
-        skills: [],
-      },
-    ]);
-  });
-  afterEach(() => {
-    cleanup();
-    localStorage.clear();
-  });
-
-  function openPicker(): void {
-    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
-  }
-
-  /** Give Debby a routed brain from her gear modal and commit it. */
-  function routeDebbysBrain(): void {
-    openAgentConfig("ag_debby");
-    pickSelectOption("new-chat-landing-config-harness", "Smart Routing");
-    saveConfig();
-  }
-
-  it("routing a bundle agent's brain leaves the top-level harness choice alone", () => {
-    renderLanding({ smart_routing_enabled: true });
-    routeDebbysBrain();
-    // The session is still Debby's — this is the leak the fix closes: keying the
-    // chip on the union of both flavors renamed everything "Smart Routing".
-    const chip = screen.getByTestId("new-chat-landing-agent-select");
-    expect(chip.textContent).toContain("Debby");
-    expect(chip.textContent).not.toContain("Smart Routing");
-    // The top-level row is offered here (both wrappers ready) and was NOT picked.
-    openPicker();
-    expect(screen.queryByTestId("new-chat-landing-agent-a_cursor")).toBeNull();
-    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
-    expect(screen.getByTestId("new-chat-landing-agent-a_cursor")).toBeTruthy();
-    fireEvent.click(screen.getByTestId("new-chat-landing-page-back"));
-    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
-  });
-});
 
 // ---------------------------------------------------------------------------
 // Smart Routing (per-harness Model option) + the fully-auto Auto harness

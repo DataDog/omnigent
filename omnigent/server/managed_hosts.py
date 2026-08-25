@@ -985,7 +985,7 @@ SANDBOX_PROVIDER_MODULE_ENV = "OMNIGENT_SANDBOX_PROVIDER_MODULE"
 
 def load_sandbox_config(
     cfg: dict[str, object],
-) -> ManagedSandboxConfig | None:
+) -> ManagedSandboxDeployment | None:
     """Resolve the managed-sandbox config from the server config.
 
     This is the unified entry point for **both** startup paths (the
@@ -1056,10 +1056,12 @@ def load_sandbox_config(
             f"{type(result).__name__}, expected ManagedSandboxConfig or None"
         )
 
-    return result
+    if result is None:
+        return None
+    return ManagedSandboxDeployment.single(result)
 
 
-def parse_sandbox_config(raw: object) -> ManagedSandboxConfig | None:
+def parse_sandbox_config(raw: object) -> ManagedSandboxDeployment | None:
     """
     Parse and validate the server config's ``sandbox:`` section.
 

@@ -1177,7 +1177,6 @@ def register_events_routes(
                 actor_user_id=metric_actor,
                 session_owner_id=metric_owner,
             )
-            )
             try:
                 await _run_compact_locked(
                     session_id,

@@ -3645,8 +3645,8 @@ def test_load_sandbox_config_no_env_falls_through_to_yaml(
     cfg = {"sandbox": {"provider": "modal", "server_url": "https://s.example.com"}}
     result = load_sandbox_config(cfg)
     assert result is not None
-    assert result.provider == "modal"
-    assert result.server_url == "https://s.example.com"
+    assert result.default.provider == "modal"
+    assert result.default.server_url == "https://s.example.com"
 
 
 def test_load_sandbox_config_no_env_no_section_returns_none(
@@ -3683,7 +3683,7 @@ def test_load_sandbox_config_external_provider_loaded(
     monkeypatch.setenv("OMNIGENT_SANDBOX_PROVIDER_MODULE", "omnigent_hab_launcher")
 
     result = load_sandbox_config({})
-    assert result is expected
+    assert result.default is expected
 
 
 def test_load_sandbox_config_external_provider_returns_none(
@@ -3786,5 +3786,5 @@ def test_load_sandbox_config_env_overrides_yaml(
     # YAML has a different provider — the external module wins.
     cfg = {"sandbox": {"provider": "modal", "server_url": "https://s.example.com"}}
     result = load_sandbox_config(cfg)
-    assert result is expected
-    assert result.provider == "habitat"
+    assert result.default is expected
+    assert result.default.provider == "habitat"
