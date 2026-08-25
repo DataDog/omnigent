@@ -9034,7 +9034,6 @@ __all__ = [
     "_run_managed_wake",
     "_schedule_deferred_elicitation_clear",
     "_spawn_archive_stop",
-    "_spawn_gateway_backed",
     "_spawn_native_approval_popup_forward",
     "_spawn_native_blocked_notice_forward",
     "_wait_for_host_bound_runner_client",
