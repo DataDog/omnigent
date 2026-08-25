@@ -4706,6 +4706,13 @@ def _upgrade_to_nightly(
     "installer's allow-pre-releases flag. Useful for validating a TestPyPI rc.",
 )
 @click.option(
+    "--nightly",
+    is_flag=True,
+    help="Upgrade to the newest nightly build: a vX.Y.Z.devYYYYMMDD git tag "
+    "installed straight from GitHub with your installer (needs git, plus "
+    "Node 22 and pnpm to build the web UI). Skips the package index.",
+)
+@click.option(
     "--extra",
     "extra_overrides",
     multiple=True,
@@ -4726,6 +4733,7 @@ def upgrade(
     check_only: bool,
     force: bool,
     pre: bool,
+    nightly: bool,
     extra_overrides: tuple[str, ...],
     target_version: str | None,
     dry_run: bool,
@@ -4742,6 +4750,11 @@ def upgrade(
     stop them immediately. Pass ``--pre`` to consider pre-releases (rc /
     beta). Pass ``--extra`` to keep or add extras that the installer did not
     record. Use ``--target-version`` when validating a specific release.
+    Pass ``--nightly`` to move onto the newest nightly build instead:
+    nightlies are git tags that never reach the index, so that path
+    reinstalls from GitHub pinned to the newest nightly tag (``--extra``,
+    ``--dry-run``, and ``--check`` compose with it; ``--pre`` and
+    ``--target-version`` do not apply).
 
     Requires the install to have come from a tool that records extras:
     ``uv tool install`` or ``pipx install``. ``pip`` does not record
@@ -4753,6 +4766,8 @@ def upgrade(
         with status 1 when a newer release exists.
     :param force: Stop in-flight sessions immediately rather than draining.
     :param pre: Consider pre-releases and allow the installer to fetch them.
+    :param nightly: Upgrade to the newest nightly git tag instead of the
+        latest index release.
     :param extra_overrides: Extras requested via ``--extra``.
     :param target_version: Pin the upgrade to this version.
     :param dry_run: Print the command and exit without running it.
