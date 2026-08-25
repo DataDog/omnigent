@@ -3693,7 +3693,7 @@ export function NewChatLandingScreen() {
             // dark:bg-card-solid: opaque fill so dark glass --card doesn't
             // show through; mirrors the chat composer. Drag-over inset ring.
             className={cn(
-              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+              "relative z-10 flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-composer transition-[border-color,box-shadow] duration-150 has-[textarea:focus]:border-foreground has-[textarea:focus]:shadow-composer-focus",
               isDragActive && "ring-2 ring-ring ring-inset",
             )}
             data-testid="new-chat-landing-composer"
@@ -4472,7 +4472,7 @@ export function NewChatLandingScreen() {
                             // Floats over the popover as a combobox popup, so it
                             // doesn't stretch the box. Bounded height + internal
                             // scroll keep it from running off the viewport.
-                            className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-[12px] border border-border bg-popover p-2 shadow-menu"
+                            className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-md border border-input bg-popover p-1 shadow-menu"
                             data-testid="new-chat-landing-worktree-dropdown"
                           >
                             <span className="px-2 pt-1 pb-0.5 text-sm font-medium tracking-wide text-muted-foreground uppercase">
