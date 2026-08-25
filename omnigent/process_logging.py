@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import logging
 import os
 import sys
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, TextIO, TypedDict
 
@@ -190,7 +191,7 @@ def display_log_path(path: Path) -> str:
 
 
 def _timestamp() -> str:
-    return datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    return datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S-%f")
 
 
 def create_process_log_path(
@@ -333,6 +334,16 @@ def terminal_log_formatter() -> logging.Formatter:
     return TerminalLogFormatter(use_colors=terminal_supports_color())
 
 
+def _unlink_if_empty(path: Path) -> None:
+    """Remove *path* if it is still an empty file.
+
+    :param path: Log file to sweep, e.g. a self-allocated host log.
+    """
+    with contextlib.suppress(OSError):
+        if path.stat().st_size == 0:
+            path.unlink()
+
+
 def configure_process_logging(
     destination: str,
     *,
@@ -354,6 +365,11 @@ def configure_process_logging(
     path = Path(log_path).expanduser() if log_path is not None else _process_log_file_from_env()
     if path is None:
         path = create_process_log_path(destination)
+        # A process that dies before its first record would leave this
+        # freshly created file empty forever (crash-at-birth hosts littered
+        # dozens a day); sweep it on exit. Self-allocated paths only — a
+        # parent-published or explicit path is the caller's to manage.
+        atexit.register(_unlink_if_empty, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     _current_process_log_path = path
 
@@ -396,6 +412,15 @@ def configure_process_logging(
         if not logger.propagate or not root:
             for handler in handlers:
                 _add_handler_once(logger, handler)
+
+    # Mirror the file handler's reach with the optional debug-log upload sink,
+    # so it captures the same records this process writes to disk.
+    from omnigent.debug_logging import attach_debug_log_sink
+
+    sink_targets = (
+        [logging.getLogger()] if root else [logging.getLogger(name) for name in logger_names]
+    )
+    attach_debug_log_sink(sink_targets, source=destination, level=resolved_level)
 
     logging.captureWarnings(True)
     return path
