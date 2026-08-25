@@ -98,6 +98,7 @@ from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
     configure_process_logging,
+    display_log_path,
     env_truthy,
     open_process_log_file,
     process_log_dir,

@@ -326,7 +326,8 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
         ~/.omnigent/logs/runner/runner-conv_ab12.log"``.
     """
     _logger.warning("%s failed: %s", context, exc, exc_info=exc)
-    return "Request failed on the runner; see runner logs for details."
+    log_reference = process_log_reference("runner")
+    return f"Request failed on the runner; see the runner log for details: {log_reference}"
 
 
 _SpecEntry: TypeAlias = AgentSpec | ResolvedSpec
