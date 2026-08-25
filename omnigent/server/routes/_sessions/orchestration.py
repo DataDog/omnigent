@@ -224,6 +224,7 @@ from omnigent.server.routes._sessions.helpers import (
     _invalidate_runner_backed_snapshot_state,
     _is_codex_native_subagent,
     _is_kiro_native_session,
+    _is_native_interrupt_record,
     _last_task_error_from_labels,
     _latest_assistant_text_from_store,
     _latest_message_preview,
