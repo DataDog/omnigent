@@ -139,13 +139,28 @@ function rawPickName(model: string, rawModel: string | null | undefined): string
  * different one. `null` when nothing was attempted or both names collapse to
  * the same tier — a struck-through name identical to the pill reads as a bug.
  */
-function attemptedPickName(
-  model: string,
-  attemptedOverride: string | null | undefined,
-): string | null {
-  if (!attemptedOverride) return null;
-  const attempted = shortModelName(attemptedOverride);
-  return attempted === shortModelName(model) ? null : attempted;
+export function RoutingDecisionChip({ model, applied, rationale }: RoutingDecisionChipProps) {
+  const short = shortModelName(model);
+  const lead = applied ? short : `would have picked ${short}`;
+  const summary = `Intelligent model router · ${lead}`;
+  return (
+    <div
+      className="my-1 flex flex-col items-center gap-0.5 text-muted-foreground text-sm"
+      data-testid="routing-decision-chip"
+      data-applied={applied ? "true" : "false"}
+      title={rationale || summary}
+    >
+      <span className="flex items-center gap-1.5">
+        <BrainCircuitIcon className="size-3 shrink-0" />
+        <span>
+          Intelligent model router{" · "}
+          {!applied && <span>would have picked </span>}
+          <span className="font-medium text-foreground">{short}</span>
+        </span>
+      </span>
+      {rationale ? <span className="text-muted-foreground/70">{rationale}</span> : null}
+    </div>
+  );
 }
 
 interface RoutingDecisionCardProps {

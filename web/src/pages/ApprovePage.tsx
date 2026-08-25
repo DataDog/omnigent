@@ -112,7 +112,7 @@ export function ApprovePage() {
       {state.kind === "resolved" && (
         <Alert className="flex flex-col gap-2 border-muted py-4 px-5">
           <AlertTitle className="text-ui">Elicitation resolved</AlertTitle>
-          <AlertDescription className="text-xs">
+          <AlertDescription className="text-sm">
             This approval request is no longer pending. It may have been resolved, timed out, or
             cancelled.
           </AlertDescription>
@@ -122,7 +122,7 @@ export function ApprovePage() {
       {state.kind === "error" && (
         <Alert variant="destructive" className="flex flex-col gap-2 py-4 px-5">
           <AlertTitle className="text-ui">Error</AlertTitle>
-          <AlertDescription className="text-xs">{state.message}</AlertDescription>
+          <AlertDescription className="text-sm">{state.message}</AlertDescription>
         </Alert>
       )}
 
@@ -158,6 +158,11 @@ export function ApprovePage() {
             )}
           </AlertTitle>
           <AlertDescription className="flex flex-col gap-2">
+            {state.data.can_approve === false && (
+              <span className="text-sm text-muted-foreground" role="note">
+                Only the session owner or a delegated approver can approve. You can still reject.
+              </span>
+            )}
             <span>{state.data.message}</span>
             {state.data.content_preview && (
               <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">

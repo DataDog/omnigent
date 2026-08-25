@@ -173,7 +173,7 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
           <div className="flex items-center justify-between rounded-lg border px-3 py-2">
             <div>
               <p className="text-ui font-medium">Public access</p>
-              <p className="text-xs text-muted-foreground">Anyone can view this session</p>
+              <p className="text-sm text-muted-foreground">Anyone can view this session</p>
             </div>
             <Switch
               checked={isPublic}
@@ -247,6 +247,12 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
             Grant
           </Button>
         </form>
+
+        {canDelegateApprovals && !sharingReadOnly && (
+          <p className="text-sm text-muted-foreground">
+            Approvers can authorize actions that use your session credentials.
+          </p>
+        )}
 
         {error && <p className="text-sm text-destructive">{error}</p>}
 

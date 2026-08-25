@@ -483,6 +483,11 @@ export function ApprovalCard({
         )}
       </AlertTitle>
       <AlertDescription className="flex flex-col gap-2">
+        {!canApprove && (
+          <span className="text-sm text-muted-foreground" role="note">
+            Only the session owner or a delegated approver can approve. You can still reject.
+          </span>
+        )}
         {isExitPlanMode ? (
           <>
             <span>Claude finished planning and wants to proceed.</span>

@@ -2183,7 +2183,7 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
           >
             <OttoIcon className="otto-working h-4 w-auto shrink-0" />
             <Shimmer className="text-sm font-mono" duration={1.5}>
-              {workingIndicatorLabel(bgCount, tick, blockedOn)}
+              {workingIndicatorLabel(bgCount, tick)}
             </Shimmer>
           </div>
         )}
@@ -4099,12 +4099,21 @@ function ComposerStatusLine({
     <div
       data-testid="composer-status-line"
       className={cn(
-        // -mt-4 tucks under the card; pt-5.5 keeps content below the overlap.
-        "mx-auto -mt-4 flex w-full items-center gap-3 rounded-b-2xl px-4 pb-1.5 pt-5.5",
+        // -mt-4 slides the tray's square top corners up behind the card
+        // (the 16px overlap exceeds the card's ~14px corner radius, so
+        // they hide behind its straight sides); pt-5.5 (= --spacing *
+        // 5.5) re-reserves the hidden region so the content sits below
+        // the card's edge. bg-tray/40 (not bg-card) keeps it out of the
+        // dark-mode glass rule — bg-card here would re-decorate the tray
+        // with its own border/shadow, duplicating the composer's chrome —
+        // and matches the home composer's footer tray surface.
+        "mx-auto -mt-4 flex w-full items-center gap-3 rounded-b-2xl bg-tray/20 px-4 pb-1.5 pt-5.5",
         CHAT_COLUMN_WIDTH,
       )}
     >
-      {/* Left: host + branch. flex-1 keeps the right cluster pinned; truncate, no wrap. */}
+      {/* Left: host badge then worktree branch. Always holds the flex-1 slot
+          so the right cluster stays pinned right even when both are absent;
+          each item truncates to an ellipsis so the tray never wraps. */}
       <div className="flex min-w-0 flex-1 items-center gap-3 text-sm text-muted-foreground">
         {showHost && conversationId && (
           <HostBadge sessionId={conversationId} onReconnect={onHostReconnect} />
@@ -5088,7 +5097,9 @@ export function Composer({
           ring; drag-over still lifts an inset ring. dark:bg-card-solid so
           upper trays (queued / sub-agent) don't ghost through glass --card. */}
       <div
-        // Opaque card edge for transcript clearance; status shelf below is translucent.
+        // Marks the opaque card so the row can measure where it ends: the
+        // translucent status shelf below it is what the transcript shows
+        // through, so clearance stops at this edge, not the row's bottom.
         data-composer-card
         className={cn(
           "relative mx-auto flex w-full flex-col rounded-2xl border border-border bg-card dark:bg-card-solid shadow-composer transition-[border-color,box-shadow] has-[textarea:focus]:shadow-composer-focus",
@@ -6459,7 +6470,7 @@ function ComposerModelEffortLabel({
     return (
       <span
         data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate pl-2.5 pr-2 text-xs tabular-nums text-muted-foreground"
+        className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
       >
         <span className="text-foreground">{SMART_ROUTING_LABEL}</span>
       </span>
@@ -6483,7 +6494,7 @@ function ComposerModelEffortLabel({
     return (
       <span
         data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate pl-2.5 pr-2 text-xs tabular-nums text-muted-foreground"
+        className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
       >
         <span className="text-foreground">{harnessLabel}</span>
       </span>
@@ -6493,7 +6504,7 @@ function ComposerModelEffortLabel({
   return (
     <span
       data-testid="composer-model-effort-label"
-      className="min-w-0 shrink truncate pl-2.5 pr-2 text-xs tabular-nums text-muted-foreground"
+      className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
     >
       {model && <span className="text-foreground">{model}</span>}
       {model && effortLabel && " "}

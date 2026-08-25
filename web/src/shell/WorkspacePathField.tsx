@@ -67,10 +67,8 @@ function PathRow({ path, active, onSelect, testId }: RowProps) {
         e.preventDefault();
         onSelect();
       }}
-      className={`flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-ui transition ${
-        active
-          ? "bg-muted text-foreground dark:bg-muted/50"
-          : "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50"
+      className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition ${
+        active ? "bg-accent text-accent-foreground" : "hover:bg-accent hover:text-accent-foreground"
       }`}
       data-testid={testId}
     >
@@ -325,7 +323,7 @@ export function WorkspacePathField({
               ))}
               {hiddenMatchCount > 0 && (
                 <div
-                  className="px-1.5 py-1 text-sm text-muted-foreground"
+                  className="px-3 py-2 text-sm text-muted-foreground"
                   data-testid="workspace-match-overflow"
                 >
                   +{hiddenMatchCount} more — keep typing to narrow
@@ -333,7 +331,7 @@ export function WorkspacePathField({
               )}
             </>
           )}
-          {showLoading && <div className="px-1.5 py-1 text-sm text-muted-foreground">Loading…</div>}
+          {showLoading && <div className="px-3 py-2 text-sm text-muted-foreground">Loading…</div>}
         </div>
       )}
     </div>

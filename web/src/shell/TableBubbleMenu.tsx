@@ -241,7 +241,7 @@ function HandleMenu({
               onClose();
             }}
             className={cn(
-              "flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-ui transition-colors",
+              "flex w-full items-center gap-2.5 px-3 py-1.5 text-sm transition-colors",
               item.destructive
                 ? "text-destructive hover:bg-destructive/10"
                 : "text-foreground hover:bg-muted",

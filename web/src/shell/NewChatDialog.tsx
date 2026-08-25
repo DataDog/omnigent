@@ -401,7 +401,7 @@ function HostOption({
       )}
       <span className="flex min-w-0 flex-col">
         <span className="flex items-center gap-2">
-          <span className="truncate text-sm">{displayName}</span>
+          <span className="truncate text-sm">{host.name}</span>
           <span
             className={`inline-flex shrink-0 items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${isOnline ? "text-green-600" : "text-muted-foreground"}`}
           >
@@ -1027,7 +1027,7 @@ export function AgentHarnessPicker({
         data-testid={`new-chat-landing-agent-${agent.id}`}
         data-active={active ? "true" : undefined}
         onSelect={() => onSelectAgent(agent)}
-        className="items-start data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+        className="items-start gap-2 rounded-sm px-2 py-1.5 text-ui data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
       >
         {renderRowInner(agent, true)}
         {renderBadge(agent)}
@@ -1084,7 +1084,7 @@ export function AgentHarnessPicker({
     <DropdownMenuItem
       data-testid="new-chat-landing-create-agent"
       onSelect={onCreateCustomAgent}
-      className="text-muted-foreground"
+      className="gap-2 rounded-sm px-2 py-1.5 text-ui text-muted-foreground"
     >
       <PlusIcon className="size-3.5" />
       Create custom agent
@@ -1102,7 +1102,7 @@ export function AgentHarnessPicker({
           data-testid="new-chat-landing-agent-pending"
           data-active={effectiveAgentId === pendingAgentId ? "true" : undefined}
           onSelect={onSelectPending}
-          className="items-start data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
+          className="items-start gap-2 rounded-sm px-2 py-1.5 text-ui data-[active=true]:bg-accent/60 data-[active=true]:text-foreground"
         >
           <div className="flex min-w-0 flex-1 items-baseline gap-2.5">
             <span className="truncate">{pendingAgent.name}</span>
@@ -1195,7 +1195,7 @@ export function AgentHarnessPicker({
                 e.preventDefault();
                 setMobilePage(null);
               }}
-              className="items-center font-medium"
+              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-ui font-medium"
             >
               <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
               <span className="truncate">More</span>
@@ -1212,7 +1212,7 @@ export function AgentHarnessPicker({
                 e.preventDefault();
                 setMobilePage(null);
               }}
-              className="items-center font-medium"
+              className="items-center gap-1.5 rounded-sm px-2 py-1.5 text-ui font-medium"
             >
               <ChevronLeftIcon className="size-4 shrink-0 opacity-70" />
               <span className="truncate">Custom agents</span>
@@ -1256,7 +1256,7 @@ export function AgentHarnessPicker({
                         e.preventDefault();
                         setMobilePage("more");
                       }}
-                      className="items-center"
+                      className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
                     >
                       <span className="flex-1">More</span>
                       <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
@@ -1266,7 +1266,7 @@ export function AgentHarnessPicker({
                     <DropdownMenuSub>
                       <DropdownMenuSubTrigger
                         data-testid="new-chat-landing-harness-more"
-                        className="items-center"
+                        className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
                       >
                         <span className="flex-1">More</span>
                       </DropdownMenuSubTrigger>
@@ -1295,7 +1295,7 @@ export function AgentHarnessPicker({
                     e.preventDefault();
                     setMobilePage("custom");
                   }}
-                  className="items-center"
+                  className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
                 >
                   <span className="flex-1">Custom agents</span>
                   <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
@@ -1305,7 +1305,7 @@ export function AgentHarnessPicker({
                 <DropdownMenuSub>
                   <DropdownMenuSubTrigger
                     data-testid="new-chat-landing-custom-agents"
-                    className="items-center"
+                    className="items-center gap-2 rounded-sm px-2 py-1.5 text-ui"
                   >
                     <span className="flex-1">Custom agents</span>
                   </DropdownMenuSubTrigger>
@@ -1563,23 +1563,40 @@ function HarnessConfigModal({
           {!autoRouting && hasPermission && (
             <>
               <ConfigRow label="Model" description="Underlying LLM">
-                <RoutingModelSelect
-                  value={modelValue}
-                  onValueChange={onModelChange}
-                  offerSmartRouting={smartRoutingEligible}
-                  testId="new-chat-landing-config-model"
-                  models={claudeModelSelectOptions}
-                  contentClassName="[&_[data-slot=select-item]]:pl-2.5"
-                >
-                  {claudeModelsLoading && (
-                    <div className="px-2.5 py-1 text-sm text-muted-foreground">Loading models…</div>
-                  )}
-                  {!claudeModelsLoading && claudeModelOptions.length === 0 && (
-                    <div className="px-2.5 py-1 text-sm text-muted-foreground">
-                      Models unavailable
-                    </div>
-                  )}
-                </RoutingModelSelect>
+                <Select value={modelValue} onValueChange={onModelChange}>
+                  <SelectTrigger
+                    className="w-full"
+                    data-testid="new-chat-landing-config-model"
+                    aria-label="Model"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent
+                    position="popper"
+                    align="start"
+                    className="[&_[data-slot=select-item]]:pl-2.5"
+                  >
+                    {smartRoutingEligible && (
+                      <SelectItem value={MODEL_SELECT_SMART}>Smart Routing</SelectItem>
+                    )}
+                    <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
+                    {claudeModelOptions.map((m) => (
+                      <SelectItem key={m.id} value={m.id}>
+                        {m.displayName}
+                      </SelectItem>
+                    ))}
+                    {claudeModelsLoading && (
+                      <div className="px-2.5 py-1 text-sm text-muted-foreground">
+                        Loading models…
+                      </div>
+                    )}
+                    {!claudeModelsLoading && claudeModelOptions.length === 0 && (
+                      <div className="px-2.5 py-1 text-sm text-muted-foreground">
+                        Models unavailable
+                      </div>
+                    )}
+                  </SelectContent>
+                </Select>
               </ConfigRow>
 
               <ConfigRow label="Effort" description="Reasoning depth vs. speed">
@@ -4133,12 +4150,7 @@ export function NewChatLandingScreen() {
                     className="flex h-6 items-center gap-1 rounded-full px-2.5 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
                     data-testid="new-chat-landing-host-chip"
                   >
-                    {selectedHost?.status === "online" && !sandboxSelected ? (
-                      <>
-                        <span aria-hidden className="size-2 shrink-0 rounded-full bg-success" />
-                        <span className="sr-only">Online</span>
-                      </>
-                    ) : isCloudHost ? (
+                    {isCloudHost ? (
                       <MonitorCloudIcon className="ui-icon" />
                     ) : (
                       <MonitorIcon className="ui-icon" />
@@ -4157,7 +4169,7 @@ export function NewChatLandingScreen() {
                           onSelect={selectSandbox}
                           data-testid="new-chat-landing-sandbox-option"
                           data-active={sandboxSelected ? "true" : undefined}
-                          className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                          className="text-sm data-[active=true]:bg-accent/60"
                         >
                           <span className="flex items-center gap-2">
                             <MonitorCloudIcon className="size-4 text-muted-foreground" />
@@ -4209,7 +4221,7 @@ export function NewChatLandingScreen() {
                       onSelect={() => selectHost(host.host_id)}
                       data-testid={`new-chat-landing-host-${host.host_id}`}
                       data-active={host.host_id === selectedHostId ? "true" : undefined}
-                      className="text-sm data-[active=true]:bg-muted dark:data-[active=true]:bg-muted/50"
+                      className="text-sm data-[active=true]:bg-accent/60"
                     >
                       <HostOption
                         host={host}
@@ -4307,7 +4319,9 @@ export function NewChatLandingScreen() {
                       data-testid="new-chat-landing-repo-chip"
                     >
                       <GitBranchIcon className="ui-icon" />
-                      <span className="hidden max-w-40 truncate text-sm sm:block">
+                      <span
+                        className={`hidden max-w-40 truncate sm:block ${sandboxRepoName ? "text-foreground" : "text-muted-foreground"}`}
+                      >
                         {sandboxRepoLabel}
                       </span>
                     </button>
@@ -4414,7 +4428,9 @@ export function NewChatLandingScreen() {
                       data-testid="new-chat-landing-branch-chip"
                     >
                       <GitBranchIcon className="ui-icon" />
-                      <span className="hidden max-w-32 truncate text-sm sm:block">
+                      <span
+                        className={`hidden max-w-32 truncate sm:block ${branchName.trim() ? "text-foreground" : ""}`}
+                      >
                         {worktreeLabel}
                       </span>
                     </button>
@@ -4498,7 +4514,7 @@ export function NewChatLandingScreen() {
                             className="absolute top-full right-0 left-0 z-20 mt-1 flex max-h-40 flex-col overflow-y-auto rounded-[12px] border border-border bg-popover p-2 shadow-menu"
                             data-testid="new-chat-landing-worktree-dropdown"
                           >
-                            <span className="px-1.5 py-1 text-sm font-medium text-muted-foreground">
+                            <span className="px-2 pt-1 pb-0.5 text-sm font-medium tracking-wide text-muted-foreground uppercase">
                               Existing worktrees
                             </span>
                             <ul className="flex flex-col gap-0.5">
@@ -4519,8 +4535,8 @@ export function NewChatLandingScreen() {
                                         setBranchInputFocused(false);
                                         setWorktreePopoverOpen(false);
                                       }}
-                                      className={`flex w-full flex-col items-start gap-0.5 rounded-md px-1.5 py-1 text-left text-sm transition-colors hover:bg-muted dark:hover:bg-muted/50 ${
-                                        selected ? "bg-muted dark:bg-muted/50" : ""
+                                      className={`flex w-full flex-col items-start gap-0.5 rounded-md px-2 py-1 text-left text-sm transition-colors hover:bg-accent ${
+                                        selected ? "bg-accent" : ""
                                       }`}
                                       data-testid="new-chat-landing-worktree-option"
                                     >
