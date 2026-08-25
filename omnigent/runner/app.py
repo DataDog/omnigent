@@ -319,26 +319,7 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
         ~/.omnigent/logs/runner/runner-conv_ab12.log"``.
     """
     _logger.warning("%s failed: %s", context, exc, exc_info=exc)
-    log_reference = process_log_reference("runner")
-    return f"Request failed on the runner; see the runner log for details: {log_reference}"
-
-
-_SpecEntry: TypeAlias = AgentSpec | ResolvedSpec
-SpecResolver: TypeAlias = Callable[[str, str | None], Awaitable[_SpecEntry | None]]
-_ResourceType: TypeAlias = Literal["environment", "terminal", "file"]
-
-
-@overload
-def _unwrap_spec_entry(entry: None) -> None: ...
-
-
-@overload
-def _unwrap_spec_entry(entry: _SpecEntry) -> AgentSpec: ...
-
-
-def _unwrap_spec_entry(entry: _SpecEntry | None) -> AgentSpec | None:
-    """Return the agent spec from a runner app cache entry."""
-    return entry.spec if isinstance(entry, ResolvedSpec) else entry
+    return "Request failed on the runner; see runner logs for details."
 
 
 _SpecEntry: TypeAlias = AgentSpec | ResolvedSpec
