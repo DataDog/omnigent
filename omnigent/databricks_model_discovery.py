@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import logging
 import re
-import warnings
-from collections.abc import Iterable
-from dataclasses import dataclass
 
 import httpx
 
