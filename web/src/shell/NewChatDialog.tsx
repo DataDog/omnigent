@@ -3642,7 +3642,11 @@ export function NewChatLandingScreen() {
       {/* Label collapses to icon-only on narrow viewports (mobile). Capped
           tight so a long working-directory path truncates instead of pushing
           the chip row onto a second line. */}
-      <span className="hidden max-w-40 truncate text-sm sm:block">{workspaceLabel}</span>
+      <span
+        className={`hidden max-w-40 truncate sm:block ${workspaceTrimmed !== "" ? "text-foreground" : ""}`}
+      >
+        {workspaceLabel}
+      </span>
     </button>
   );
 
@@ -4116,7 +4120,11 @@ export function NewChatLandingScreen() {
                     ) : (
                       <MonitorIcon className="ui-icon" />
                     )}
-                    <span className="hidden max-w-32 truncate text-sm sm:block">{hostLabel}</span>
+                    <span
+                      className={`hidden max-w-32 truncate sm:block ${sandboxSelected || selectedHost != null || connectingThisMachine ? "text-foreground" : ""}`}
+                    >
+                      {hostLabel}
+                    </span>
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" className="min-w-52">
