@@ -113,6 +113,7 @@ function loadMainHarness({
       expandDatabricksWorkspaceUrl: async (url) => url,
     },
     "./workspace-chrome": { registerWorkspaceChromeHide: () => {} },
+    "./workspace-root-bounce": { registerWorkspaceRootBounce: () => {} },
     "./omnigent_cli": {
       isExecutableFile: () => false,
       resolveCliPath: () => null,
