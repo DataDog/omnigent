@@ -436,7 +436,8 @@ class _InitialAuthTokenFactory:
     def declined(self) -> bool:
         """True when the inner fallback factory has definitively declined."""
         with self._lock:
-            return getattr(self._fallback_factory, "declined", False)
+            f = self._fallback_factory
+            return getattr(f, "declined", False) and not getattr(f, "proxy_auth_failed", False)
 
     def invalidate(self) -> bool:
         """Discard the host bearer so the next call resolves local auth."""
@@ -777,6 +778,14 @@ class _ManagedMintTokenFactory:
                     self.declined = True
                     return None
                 return self._still_valid_cached_token(now)
+            if response.status_code in (401, 403):
+                # The proxy bearer is expired or invalid. If we have never
+                # successfully minted, there is no self-sustaining refresh
+                # loop to fall back to — signal proxy_auth_failed so the
+                # caller can try SDK/OIDC instead of looping on a dead bearer.
+                if self._cached_token is None:
+                    self.proxy_auth_failed = True
+                    return None
             return self._still_valid_cached_token(now)
         except (httpx.HTTPError, ValueError, KeyError, OSError):
             # Transient mint failure: keep serving the cached token while
