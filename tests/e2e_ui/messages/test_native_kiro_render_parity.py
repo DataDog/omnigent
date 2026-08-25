@@ -83,10 +83,12 @@ pytestmark = pytest.mark.skipif(
 
 def _open_terminal_view(page: Page) -> None:
     """Switch a terminal-first session to its Terminal (TUI) view."""
-    expect(page.get_by_test_id("view-mode-toggle")).to_be_visible(
-        timeout=_TERMINAL_READY_TIMEOUT_MS
-    )
-    _select_view_mode(page, "Terminal")
+    view_mode = page.get_by_test_id("view-mode-toggle")
+    expect(view_mode).to_be_visible(timeout=_TERMINAL_READY_TIMEOUT_MS)
+    view_mode.click()
+    terminal_item = page.get_by_role("menuitemradio", name="Terminal")
+    expect(terminal_item).to_be_visible(timeout=30_000)
+    terminal_item.click()
 
 
 def _wait_terminal_connected(page: Page) -> None:
