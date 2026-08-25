@@ -5441,7 +5441,6 @@ export function Composer({
                 modelPickerKind={modelPickerKind}
                 codexModelOptions={codexModelOptions}
                 costRoutingEligible={costRoutingEligible}
-                subagentRoutingEligible={subagentRoutingEligible}
                 // Config changes persist server-side and apply on the next
                 // wake/turn (the runner forward is best-effort), so the gear
                 // stays live wherever a message could be sent — including
@@ -5461,7 +5460,8 @@ export function Composer({
               // reads as "waiting for input", not "almost active".
               className={cn(
                 "size-9 shrink-0 rounded-lg md:size-8",
-                !showInterruptButton && "hover:bg-primary/90 disabled:opacity-30",
+                !showInterruptButton &&
+                  "hover:bg-primary/90 disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100",
               )}
               // Interrupt stays live during a pending elicitation —
               // cancelling the turn is the other legitimate way out.
@@ -6459,7 +6459,7 @@ function ComposerModelEffortLabel({
     return (
       <span
         data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
+        className="min-w-0 shrink truncate pl-2.5 pr-2 text-xs tabular-nums text-muted-foreground"
       >
         <span className="text-foreground">{SMART_ROUTING_LABEL}</span>
       </span>
@@ -6483,7 +6483,7 @@ function ComposerModelEffortLabel({
     return (
       <span
         data-testid="composer-model-effort-label"
-        className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
+        className="min-w-0 shrink truncate pl-2.5 pr-2 text-xs tabular-nums text-muted-foreground"
       >
         <span className="text-foreground">{harnessLabel}</span>
       </span>
@@ -6493,7 +6493,7 @@ function ComposerModelEffortLabel({
   return (
     <span
       data-testid="composer-model-effort-label"
-      className="min-w-0 shrink truncate pl-2.5 pr-2 text-sm tabular-nums text-muted-foreground"
+      className="min-w-0 shrink truncate pl-2.5 pr-2 text-xs tabular-nums text-muted-foreground"
     >
       {model && <span className="text-foreground">{model}</span>}
       {model && effortLabel && " "}

@@ -3990,12 +3990,6 @@ export function NewChatLandingScreen() {
                     onSelectPending={handleSelectPending}
                     onCreateCustomAgent={() => setCreateAgentOpen(true)}
                     sandboxSelected={sandboxSelected}
-                    triggerTooltip={
-                      smartRoutingHarnessSelected ? AUTO_HARNESS_DESCRIPTION : undefined
-                    }
-                    autoHarnessAvailable={smartRoutingHarnessAvailable}
-                    autoHarnessActive={smartRoutingHarnessSelected}
-                    onSelectAutoHarness={handleSelectSmartRoutingHarness}
                     // Match the gear's touch-target height so both halves fill
                     // the shared pill; pr-2 equals the gear icon's own centering
                     // inset (8px) so the divider sits evenly between them.
@@ -4097,7 +4091,7 @@ export function NewChatLandingScreen() {
                           aria-label={creating ? "Starting session" : "Start session"}
                           aria-busy={creating}
                           data-testid="new-chat-landing-submit"
-                          className="size-8 rounded-lg bg-foreground text-card transition-opacity hover:opacity-80 disabled:opacity-50"
+                          className="size-8 rounded-lg bg-foreground disabled:bg-muted disabled:text-muted-foreground transition-opacity hover:opacity-80 disabled:opacity-100 "
                         >
                           {creating ? (
                             <Loader2Icon className="size-4 animate-spin" />
