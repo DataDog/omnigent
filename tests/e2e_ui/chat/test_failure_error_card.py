@@ -191,6 +191,42 @@ def test_live_native_failure_status_surfaces_each_turn(
     expect(second_pill.get_by_test_id("error-message-content")).to_contain_text(message)
 
 
+def test_failed_turn_surfaces_error_as_pill_not_raw_text(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A failed turn shows its error through the pill, never a bare red "Error:".
+
+    A native ``failed`` status leaves the assistant bubble at
+    ``lifecycle == "failed"`` with a null free-form ``error`` — the message
+    rides on the error pill. The bubble must not paint a separate raw
+    ``Error:`` line beneath it (the empty-content red text a dropped host
+    connection used to show); the failure reads through the pill alone.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=15_000)
+
+    _publish_native_status(base_url, session_id, "running", response_id="codex_turn_fail")
+    _publish_native_status(
+        base_url,
+        session_id,
+        "failed",
+        response_id="codex_turn_fail",
+        output="You've hit your usage limit.",
+    )
+
+    # The failure surfaces as the standard error pill...
+    expect(page.get_by_test_id("error-pill")).to_have_count(1, timeout=15_000)
+    # ...and never as a bare, raw-red "Error:" line beneath the bubble.
+    expect(page.get_by_text("Error:", exact=True)).to_have_count(0)
+
+
 def test_persisted_failure_expands_retries_and_dismisses_locally(
     page: Page,
     seeded_session: tuple[str, str],
