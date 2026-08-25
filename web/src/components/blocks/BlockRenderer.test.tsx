@@ -1183,6 +1183,152 @@ describe("BlockRenderer dispatch", () => {
     });
   });
 
+  describe("math rendering", () => {
+    it("normalizes explicit TeX delimiters outside code", () => {
+      expect(normalizeExplicitMathDelimiters(String.raw`中文 \(\sqrt{x}\) 文本`)).toBe(
+        String.raw`中文 $\sqrt{x}$ 文本`,
+      );
+      expect(normalizeExplicitMathDelimiters(String.raw`\[\sqrt{x}\]`)).toBe(
+        String.raw`$$\sqrt{x}$$`,
+      );
+      expect(normalizeExplicitMathDelimiters(String.raw`\`\(\sqrt{x}\)\``)).toBe(
+        String.raw`\`\(\sqrt{x}\)\``,
+      );
+      expect(
+        normalizeExplicitMathDelimiters(["```", String.raw`\(\sqrt{x}\)`, "```"].join("\n")),
+      ).toBe(["```", String.raw`\(\sqrt{x}\)`, "```"].join("\n"));
+    });
+
+    it("leaves LaTeX line breaks inside existing display math untouched", () => {
+      // `\\[1em]` is a spaced line break, not an explicit display-math opener;
+      // converting its `\[` to `$$` would corrupt the already-`$$`-delimited block.
+      const aligned = String.raw`$$\begin{aligned} a &= b \\[1em] c &= d \end{aligned}$$`;
+      expect(normalizeExplicitMathDelimiters(aligned)).toBe(aligned);
+    });
+
+    it("does not convert delimiters already inside a dollar-math span", () => {
+      const inline = String.raw`$\[x\]$`;
+      expect(normalizeExplicitMathDelimiters(inline)).toBe(inline);
+    });
+
+    it("skips normalization inside multi-backtick inline code", () => {
+      const doubleTick = "``" + String.raw`\(x\)` + "``";
+      expect(normalizeExplicitMathDelimiters(doubleTick)).toBe(doubleTick);
+    });
+
+    it("escapes currency dollar amounts so prose isn't parsed as inline math", () => {
+      // With single-dollar math enabled, "it costs $5 or $10" would otherwise
+      // parse "5 or " as inline math. Escaping the digit-led `$` renders literal
+      // dollar figures and stops the run from flipping the math toggle.
+      expect(normalizeExplicitMathDelimiters("it costs $5 or $10")).toBe(
+        String.raw`it costs \$5 or \$10`,
+      );
+      // Delimiters after the currency text still normalize — the toggle didn't flip.
+      expect(normalizeExplicitMathDelimiters(String.raw`$5 then \(x\)`)).toBe(
+        String.raw`\$5 then $x$`,
+      );
+    });
+
+    it("does not double-escape an already-escaped dollar", () => {
+      expect(normalizeExplicitMathDelimiters(String.raw`\$5`)).toBe(String.raw`\$5`);
+    });
+
+    it("detects indented code fences per CommonMark", () => {
+      const indentedFence = ["   ```", String.raw`\(\sqrt{x}\)`, "   ```"].join("\n");
+      expect(normalizeExplicitMathDelimiters(indentedFence)).toBe(indentedFence);
+    });
+
+    it("keeps a mismatched fence marker inside a code block as literal text", () => {
+      // A `~~~` line inside a ``` block does not close it (CommonMark requires
+      // the same fence char), so delimiters there must stay verbatim.
+      const block = ["```", "~~~", String.raw`\(\sqrt{x}\)`, "```"].join("\n");
+      expect(normalizeExplicitMathDelimiters(block)).toBe(block);
+    });
+
+    it("loads required Streamdown and KaTeX styles at the app entrypoint", () => {
+      // KaTeX's DOM is mostly positioned spans. Without its stylesheet, radicals
+      // and fractions can leave only the root bar/outer shell visible while the
+      // radicand appears missing. Keep this as a source-level guard because
+      // jsdom cannot catch visual CSS layout failures. Resolve relative to this
+      // file (not process.cwd()) so the test is independent of the runner's dir.
+      const srcDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+      const entrypoints = ["main.tsx", "embed.tsx"].map((file) =>
+        readFileSync(path.join(srcDir, file), "utf8"),
+      );
+      const indexCss = readFileSync(path.join(srcDir, "index.css"), "utf8");
+
+      for (const source of entrypoints) {
+        expect(source).toContain('import "katex/dist/katex.min.css"');
+        expect(source).toContain('import "streamdown/styles.css"');
+      }
+      expect(indexCss).toContain('@source "../node_modules/streamdown/dist/*.js"');
+    });
+
+    it("renders radicals, fractions, and superscripts without dropping the radicand", async () => {
+      const { container } = renderMarkdownText(
+        String.raw`$$x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}$$`,
+      );
+
+      await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+      const katex = container.querySelector(".katex") as HTMLElement;
+
+      expect(katex.querySelector(".mfrac")).not.toBeNull();
+      expect(katex.querySelector(".sqrt")).not.toBeNull();
+      expect(katex.querySelector(".vlist")).not.toBeNull();
+      expect(katex.textContent).toContain("b");
+      expect(katex.textContent).toContain("2");
+      expect(katex.textContent).toContain("4");
+      expect(katex.textContent).toContain("a");
+      expect(katex.textContent).toContain("c");
+    });
+
+    it("renders multi-term square roots used by distance formulas", async () => {
+      const { container } = renderMarkdownText(
+        String.raw`$$d = \sqrt{(x_2 - x_1)^2 + (y_2 - y_1)^2}$$`,
+      );
+
+      await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+      const katex = container.querySelector(".katex") as HTMLElement;
+
+      expect(katex.querySelector(".sqrt")).not.toBeNull();
+      expect(katex.textContent).toContain("x");
+      expect(katex.textContent).toContain("y");
+      expect(katex.textContent).toContain("1");
+      expect(katex.textContent).toContain("2");
+    });
+
+    it("keeps invalid math visible instead of swallowing the message", async () => {
+      const { container } = renderMarkdownText(String.raw`$$\sqrt{$$`);
+
+      await waitFor(() => {
+        expect(container.textContent).toContain("\\sqrt");
+      });
+      expect(container.textContent).not.toBe("");
+    });
+
+    it("recovers from an incomplete streamed radical to the final KaTeX output", async () => {
+      const streamingItem = (text: string): RenderItem[] => [
+        { kind: "text", itemId: null, text, final: false },
+      ];
+      const renderStreamingMath = (text: string) => (
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={streamingItem(text)} sessionStatus="running" />
+        </FileViewerContext.Provider>
+      );
+
+      const { container, rerender } = render(renderStreamingMath(String.raw`$$\sqrt{`));
+      await waitFor(() => expect(container.textContent).toContain("\\sqrt"));
+
+      rerender(renderStreamingMath(String.raw`$$\sqrt{x + 1}$$`));
+
+      await waitFor(() => expect(container.querySelector(".katex")).not.toBeNull());
+      const katex = container.querySelector(".katex") as HTMLElement;
+      expect(katex.querySelector(".sqrt")).not.toBeNull();
+      expect(katex.textContent).toContain("x");
+      expect(katex.textContent).toContain("1");
+    });
+  });
+
   // Proves the markdown throttle is actually wired into the render path (not
   // just unit-tested in isolation): a regression that drops `useThrottledValue`
   // from `FilePathAwareMessageResponse` would let the live bubble re-parse on
