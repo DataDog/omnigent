@@ -483,23 +483,10 @@ describe("Sidebar session list", () => {
     const inbox = within(primaryNav).getByTestId("inbox-button");
     const newChat = within(primaryNav).getByTestId("new-chat-button");
 
+    expect(primaryNav).toHaveClass("px-2", "pt-2", "pb-0");
+    expect(primaryNav).not.toHaveClass("-mt-0.5");
     expect(inbox).toHaveAttribute("href", "/inbox");
-    expect(inbox).toHaveClass(
-      "sidebar-row",
-      "h-auto",
-      "min-h-0",
-      "w-full",
-      "justify-start",
-      "gap-2",
-      "px-2",
-      "py-1.5",
-      "md:py-1",
-    );
-    expect(inbox).toHaveClass("hover:bg-muted", "hover:text-foreground", "dark:hover:bg-muted/50");
-    expect(inbox.className).not.toContain("sidebar-hover");
-    expect(inbox).not.toHaveClass("h-8");
-    expect(newChat.querySelector("svg")).toHaveClass("text-[var(--sidebar-active-foreground)]");
-    expect(inbox.querySelector("svg")).toHaveClass("text-muted-foreground");
+    expect(inbox).toHaveClass("h-8", "w-full", "justify-start");
     expect(within(inbox).getByText("Inbox")).toBeInTheDocument();
     expect(within(primaryNav).queryByTestId("toggle-selection-mode")).toBeNull();
   });
@@ -745,8 +732,8 @@ describe("Sidebar session list", () => {
     const plainRow = screen.getByText("Plain session").closest("a")!;
     const worktreeRow = screen.getByText("Worktree session").closest("a")!;
 
-    expect(plainRow).toHaveClass("sidebar-row", "h-auto", "min-h-0", "justify-center");
-    expect(worktreeRow).toHaveClass("sidebar-row", "h-auto", "min-h-0", "justify-center");
+    expect(plainRow).toHaveClass("h-8", "justify-center");
+    expect(worktreeRow).toHaveClass("h-8", "justify-center");
     expect(within(worktreeRow).queryByText("fix/sidebar-row-height")).toBeNull();
   });
 

@@ -794,8 +794,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 // headers and project folders. border-0 drops the Button base's
                 // transparent 1px border so the icon lands exactly on that
                 // column, flush with the Inbox row and folder rows.
-                SIDEBAR_ROW,
-                "w-full justify-start border-0 font-normal",
+                "sidebar-compact-text h-8 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-1 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
@@ -830,8 +829,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 // Same shared nav-row construct as "New session" / "Inbox" so
                 // the active-pill, hover, insets, icon column, and text weight
                 // all match post-refactor.
-                SIDEBAR_ROW,
-                "w-full justify-start border-0 font-normal",
+                "sidebar-compact-text h-8 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-1 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
@@ -854,8 +852,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               asChild
               variant="ghost"
               className={cn(
-                SIDEBAR_ROW,
-                "w-full justify-start border-0 font-normal",
+                "sidebar-compact-text h-8 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-1 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
@@ -2173,9 +2170,8 @@ function SectionHeader({
                 SIDEBAR_ROW,
                 "group flex w-full items-center border-0 text-left text-foreground transition-colors",
                 SIDEBAR_HOVER_HIGHLIGHT,
-                active && SIDEBAR_ACTIVE_HIGHLIGHT,
-              )
-            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
+              )} sidebar-compact-text text-foreground`
+            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-2 pl-2 text-left text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground"
         }
       >
         {icon ? (
@@ -3337,8 +3333,7 @@ function ConversationRow({
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       componentId="sidebar.conversation_switcher"
       className={cn(
-        SIDEBAR_ROW,
-        "relative flex flex-col justify-center text-left text-foreground transition-colors",
+        "sidebar-compact-text relative flex h-8 flex-col justify-center rounded-[var(--radius-otto-sm)] py-1 pl-2 text-left text-foreground transition-colors",
         SIDEBAR_HOVER_HIGHLIGHT,
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
@@ -4377,7 +4372,7 @@ function BulkActionBar({
   return (
     <>
       <div className="mt-1 mb-1 flex flex-col gap-1.5">
-        <div className="flex items-center gap-2 rounded-lg border border-border bg-transparent p-1.5">
+        <div className="flex items-center gap-2 rounded-lg border border-border bg-background p-1.5">
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
