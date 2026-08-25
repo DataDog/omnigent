@@ -7,7 +7,6 @@ import {
   WRAPPER_LABEL_KEY,
   isFullySupportedNativeCodingAgent,
   isNativeTerminalSession,
-  isNativeWrapper,
   isRecentHarness,
   nativeCodingAgentForHarness,
   nativeCodingAgentForSubagentWrapper,
