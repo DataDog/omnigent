@@ -17,9 +17,6 @@
     "               comp:policies, comp:harnesses, comp:infra) -- gh cannot add a",
     "               label that does not exist, and there is no label-sync. Several",
     "               areas may share a label (all harness areas share comp:harnesses).",
-    "  priority_label - v2 comp:* label proposed by the ranking job. This may use",
-    "               labels from .github/issue-prioritization-labels.json; the legacy",
-    "               issue-triage workflow ignores it until v2 is enabled.",
     "  weight     - importance multiplier for the composite issue-priority score",
     "               (designs/prioritization). Discrete bands 1.4/1.2/1.1/1.0/0.9. Applies",
     "               to EVERY area, harness or not -- it is the unified component-weight",
@@ -49,7 +46,6 @@
     {
       "key": "repo-automation",
       "label": "comp:infra",
-      "priority_label": "comp:infra",
       "weight": 0.9,
       "weight_source": "editorial",
       "definition": "Repo automation and CI: GitHub Actions workflows, scripts, Dependabot, issue/PR templates.",
@@ -65,7 +61,6 @@
     {
       "key": "web",
       "label": "comp:web-ui",
-      "priority_label": "comp:web-ui",
       "weight": 1.0,
       "weight_source": "editorial",
       "definition": "The web frontend (web/) shared by all clients: React UI, components, embed. NOT the desktop or mobile app shells (those are separate areas below).",
@@ -80,7 +75,6 @@
     {
       "key": "desktop-app",
       "label": "comp:web-ui",
-      "priority_label": "comp:web-ui",
       "weight": 1.0,
       "weight_source": "editorial",
       "definition": "The desktop app shell (Electron wrapper around the web UI): main process, packaging, native desktop chrome.",
@@ -96,7 +90,6 @@
     {
       "key": "mobile-app",
       "label": "comp:web-ui",
-      "priority_label": "comp:ios",
       "weight": 1.0,
       "weight_source": "editorial",
       "definition": "The mobile app shell (iOS wrapper around the web UI): native mobile integration and packaging.",
@@ -128,7 +121,6 @@
     {
       "key": "inner",
       "label": "comp:harnesses",
-      "priority_label": "comp:harness-t2",
       "weight": 1.1,
       "weight_source": "editorial",
       "definition": "Core agent runtime and the harness/executor layer shared by all harnesses (loader, executor base, tool bridge, sandboxes). Harness-specific code has its own areas below.",
@@ -149,7 +141,6 @@
     {
       "key": "runner",
       "label": "comp:runner",
-      "priority_label": "comp:runner",
       "weight": 1.2,
       "weight_source": "editorial",
       "definition": "The agent runner: the execution engine that drives a turn.",
@@ -169,7 +160,6 @@
     {
       "key": "runtime",
       "label": "comp:runner",
-      "priority_label": "comp:runner",
       "weight": 1.2,
       "weight_source": "editorial",
       "definition": "The agent runtime and execution scaffolding surrounding the runner.",
@@ -189,7 +179,6 @@
     {
       "key": "server",
       "label": "comp:server",
-      "priority_label": "comp:server",
       "weight": 1.2,
       "weight_source": "editorial",
       "definition": "The Omnigent server: HTTP API, session creation and lifecycle, request routing.",
@@ -210,7 +199,6 @@
     {
       "key": "onboarding",
       "label": "comp:tui",
-      "priority_label": "comp:tui",
       "weight": 1.0,
       "weight_source": "editorial",
       "definition": "The setup / onboarding flow: first-run setup, provider auth, credential onboarding driven through the CLI.",
@@ -225,7 +213,6 @@
     {
       "key": "policies",
       "label": "comp:policies",
-      "priority_label": "comp:policies",
       "weight": 1.0,
       "weight_source": "editorial",
       "definition": "Safety policies, guardrails, and policy evaluation/elicitation.",
@@ -242,7 +229,6 @@
     {
       "key": "spec",
       "label": "comp:repr",
-      "priority_label": "comp:repr",
       "weight": 0.9,
       "weight_source": "editorial",
       "definition": "Spec and schema layer: representation of agents/sessions and their serialized form.",
@@ -258,7 +244,6 @@
     {
       "key": "llms",
       "label": "comp:harnesses",
-      "priority_label": "comp:harness-t2",
       "weight": 1.1,
       "weight_source": "editorial",
       "definition": "LLM provider and model-catalog layer: gateways, provider adapters, model selection.",
@@ -273,7 +258,6 @@
     {
       "key": "host",
       "label": "comp:server",
-      "priority_label": "comp:server",
       "weight": 1.2,
       "weight_source": "editorial",
       "definition": "The host / daemon: the long-running local process that hosts sessions and terminals.",
@@ -290,7 +274,6 @@
     {
       "key": "sandbox",
       "label": "comp:runner",
-      "priority_label": "comp:sandbox",
       "weight": 1.2,
       "weight_source": "editorial",
       "definition": "The OS sandbox (bwrap/seatbelt isolation) and egress controls around agent execution.",
@@ -305,7 +288,6 @@
     {
       "key": "db",
       "label": "comp:server",
-      "priority_label": "comp:db",
       "weight": 1.2,
       "weight_source": "editorial",
       "definition": "Database and persistence layer for the server.",
@@ -325,7 +307,6 @@
     {
       "key": "stores",
       "label": "comp:repr",
-      "priority_label": "comp:repr",
       "weight": 0.9,
       "weight_source": "editorial",
       "definition": "Stores: persistence and serialization of sessions, history, and artifacts.",
@@ -348,7 +329,6 @@
     {
       "key": "terminals",
       "label": "comp:tui",
-      "priority_label": "comp:tui",
       "weight": 1.0,
       "weight_source": "editorial",
       "definition": "Terminal management: PTY/terminal launch, read, and lifecycle.",
@@ -368,7 +348,6 @@
     {
       "key": "tools",
       "label": "comp:harnesses",
-      "priority_label": "comp:harness-t2",
       "weight": 1.1,
       "weight_source": "editorial",
       "definition": "Built-in tools and the tool-bridge exposed to harnesses.",
@@ -389,7 +368,6 @@
     {
       "key": "entities",
       "label": "comp:repr",
-      "priority_label": "comp:repr",
       "weight": 0.9,
       "weight_source": "editorial",
       "definition": "Entity models: the core data model for agents, sessions, and related objects.",
@@ -404,7 +382,6 @@
     {
       "key": "repl",
       "label": "comp:tui",
-      "priority_label": "comp:tui",
       "weight": 0.9,
       "weight_source": "editorial",
       "definition": "The interactive REPL and its terminal UI.",
@@ -422,7 +399,6 @@
     {
       "key": "resources",
       "label": "comp:server",
-      "priority_label": "comp:server",
       "weight": 1.0,
       "weight_source": "editorial",
       "definition": "Bundled resources and static assets used by the runtime.",
@@ -438,7 +414,6 @@
     {
       "key": "deploy",
       "label": "comp:infra",
-      "priority_label": "comp:infra",
       "weight": 0.9,
       "weight_source": "editorial",
       "definition": "Deploy targets and deployment configuration (Docker, Railway, Render, etc.).",
@@ -454,7 +429,6 @@
     {
       "key": "sdks",
       "label": "comp:server",
-      "priority_label": "comp:server",
       "weight": 1.0,
       "weight_source": "editorial",
       "definition": "Python and UI client SDKs.",
@@ -475,7 +449,6 @@
     {
       "key": "harness-claude",
       "label": "comp:harnesses",
-      "priority_label": "comp:harness-t1",
       "weight": 1.4,
       "weight_source": "telemetry",
       "definition": "The Claude harness family: the Claude SDK executor/harness (claude-sdk) and the native Claude Code terminal integration.",
@@ -497,7 +470,6 @@
     {
       "key": "harness-codex",
       "label": "comp:harnesses",
-      "priority_label": "comp:harness-t1",
       "weight": 1.4,
       "weight_source": "telemetry",
       "definition": "The Codex / OpenAI harness family: the OpenAI Agents SDK executor/harness, the open-responses SDK, and the native Codex integration.",
@@ -521,7 +493,6 @@
     {
       "key": "harness-cursor",
       "label": "comp:harnesses",
-      "priority_label": "comp:harness-t2",
       "weight": 1.1,
       "weight_source": "telemetry",
       "definition": "The Cursor harness: SDK executor/harness and the native Cursor integration.",
@@ -537,7 +508,6 @@
     {
       "key": "harness-antigravity",
       "label": "comp:harnesses",
-      "priority_label": "comp:harness-t2",
       "weight": 1.1,
       "weight_source": "telemetry",
       "definition": "The Antigravity (Gemini) harness: SDK executor/harness, native integration, and Gemini/Antigravity auth.",
@@ -555,7 +525,6 @@
     {
       "key": "harness-goose",
       "label": "comp:harnesses",
-      "priority_label": "comp:harness-t3",
       "weight": 0.9,
       "weight_source": "telemetry",
       "definition": "The Goose harness: SDK executor/harness, native TUI/ACP integration, and Goose auth.",
@@ -572,7 +541,6 @@
     {
       "key": "harness-hermes",
       "label": "comp:harnesses",
-      "priority_label": "comp:harness-t2",
       "weight": 1.1,
       "weight_source": "telemetry",
       "definition": "The Hermes harness: SDK executor/harness and the native Hermes integration.",
@@ -588,7 +556,6 @@
     {
       "key": "harness-kimi",
       "label": "comp:harnesses",
-      "priority_label": "comp:harness-t3",
       "weight": 0.9,
       "weight_source": "telemetry",
       "definition": "The Kimi harness: SDK executor/harness and the native Kimi integration.",
@@ -607,7 +574,6 @@
     {
       "key": "harness-kiro",
       "label": "comp:harnesses",
-      "priority_label": "comp:harness-t3",
       "weight": 0.9,
       "weight_source": "telemetry",
       "definition": "The Kiro harness: SDK executor/harness and the native Kiro integration.",
@@ -624,7 +590,6 @@
     {
       "key": "harness-opencode",
       "label": "comp:harnesses",
-      "priority_label": "comp:harness-t2",
       "weight": 1.1,
       "weight_source": "telemetry",
       "definition": "The OpenCode harness: SDK executor/harness, native integration, HTTP transport, and OpenCode auth.",
@@ -643,7 +608,6 @@
     {
       "key": "harness-pi",
       "label": "comp:harnesses",
-      "priority_label": "comp:harness-t2",
       "weight": 1.1,
       "weight_source": "telemetry",
       "definition": "The Pi harness: SDK executor/harness and the native Pi integration.",
@@ -659,7 +623,6 @@
     {
       "key": "harness-qwen",
       "label": "comp:harnesses",
-      "priority_label": "comp:harness-t3",
       "weight": 0.9,
       "weight_source": "telemetry",
       "definition": "The Qwen harness: SDK executor/harness and the native Qwen integration.",
@@ -676,7 +639,6 @@
     {
       "key": "harness-copilot",
       "label": "comp:harnesses",
-      "priority_label": "comp:harness-t2",
       "weight": 1.1,
       "weight_source": "telemetry",
       "definition": "The GitHub Copilot harness: SDK executor/harness and Copilot auth.",
