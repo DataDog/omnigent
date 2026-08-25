@@ -1577,12 +1577,6 @@ _HARNESS_COMMANDS: frozenset[str] = frozenset(
 # module just to draw ``--help``).
 _ACCENT_RGB = (244, 59, 166)
 
-# Command names that are pure aliases of another command (the same Click
-# object registered under a second name, e.g. ``update`` -> ``upgrade``).
-# Kept runnable/registered but omitted from the ``--help`` listing so the
-# alias isn't shown as a duplicate line.
-_ALIAS_COMMANDS: frozenset[str] = frozenset({"update"})
-
 
 def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
     """Map extras-gated harness commands to their SDK-installed predicate.
@@ -1658,10 +1652,6 @@ class _OmnigentCLI(click.Group):
         for subcommand in self.list_commands(ctx):
             cmd = self.get_command(ctx, subcommand)
             if cmd is None or cmd.hidden:
-                continue
-            # Skip pure aliases (e.g. ``update`` -> ``upgrade``) so the
-            # listing doesn't show a duplicate line; still runnable.
-            if subcommand in _ALIAS_COMMANDS:
                 continue
             if subcommand in _HARNESS_COMMANDS:
                 # Hide extras-gated harnesses whose SDK isn't installed;
