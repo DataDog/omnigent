@@ -979,11 +979,10 @@ def register_events_routes(
             blocked_on = (
                 raw_blocked_on if isinstance(raw_blocked_on, str) and raw_blocked_on else None
             )
-            # A background-task ``waiting`` marks an ended turn, so deliver it
-            # as ``idle``: the session takes a new message now, and for a
-            # sub-agent the terminal-delivery branch below must fire (otherwise
-            # the orchestrator hangs). The tally still drives the spinner.
-            effective_status = _background_task_delivery_status(status, bg_count, conv)
+            # A sub-agent's background-task ``waiting`` must deliver as ``idle``
+            # so the parent's terminal-delivery branch below fires (otherwise
+            # the orchestrator hangs); the tally still drives the child spinner.
+            effective_status = _subagent_delivery_status(status, bg_count, conv)
             if effective_status != status:
                 status = effective_status
                 body.data["status"] = status

@@ -2182,7 +2182,7 @@ function WorkingStatusPin({ show, suppress = false }: { show: boolean; suppress?
           >
             <OttoIcon className="otto-working h-4 w-auto shrink-0" />
             <Shimmer className="text-sm font-mono" duration={1.5}>
-              {workingIndicatorLabel(bgCount, tick)}
+              {workingIndicatorLabel(bgCount, tick, blockedOn)}
             </Shimmer>
           </div>
         )}

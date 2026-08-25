@@ -402,34 +402,42 @@ async def _observe_native_agent_terminal_and_capture(
 class _FakeStatusPoller:
     """Controllable stand-in for the claude-native status-file poller.
 
-    Lets a test flip :attr:`active` (file resolved vs. falling back) and
-    fire status edges through the registry's callback, without touching a
-    real ``sessions/<pid>.json``.
+    Lets a test flip :attr:`active` (file resolved vs. falling back), flip
+    :attr:`running_level` (the file freshly reports running vs. its value
+    having gone stale), and fire status edges through the registry's
+    callback, without touching a real ``sessions/<pid>.json``.
     """
 
     def __init__(self, on_status: object) -> None:
         self._on_status = on_status
         self.active = False
+        self.running_level = False
+        self.blocked_on: str | None = None
         self.ticks = 0
 
     def tick(self) -> None:
         self.ticks += 1
 
-    def emit(self, status: str) -> None:
+    def asserts_running(self, *, ttl_s: float, now: float | None = None) -> bool:
+        del ttl_s, now
+        return self.running_level
+
+    def emit(self, status: str, blocked_on: str | None = None) -> None:
         """Simulate the file reporting a new status."""
-        self._on_status(status)
+        self._on_status(status, blocked_on)
 
 
 async def _observe_native_with_fake_poller(
     tmp_path: Path,
     session_id: str,
-) -> tuple[dict[str, object], list[str], list[_FakeStatusPoller]]:
+) -> tuple[dict[str, object], list[str], list[_FakeStatusPoller], SessionResourceRegistry]:
     """Observe a claude-native terminal with an injected fake poller.
 
-    :returns: ``(callbacks, statuses, pollers)`` — the wired watcher
-        callbacks, the list the status publisher appends to, and the
+    :returns: ``(callbacks, statuses, pollers, registry)`` — the wired watcher
+        callbacks, the list the status publisher appends to, the
         single-element list holding the injected poller (so the test can
-        drive ``active`` / ``emit``).
+        drive ``active`` / ``running_level`` / ``emit``), and the registry
+        itself (so the test can post external status edges).
     """
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
@@ -437,7 +445,9 @@ async def _observe_native_with_fake_poller(
     terminal_registry._by_conversation.setdefault(session_id, {})[("claude", "main")] = instance
     statuses: list[str] = []
     pollers: list[_FakeStatusPoller] = []
-    registry.set_session_status_publisher(lambda _sid, status: statuses.append(status))
+    registry.set_session_status_publisher(
+        lambda _sid, status, _reason=None: statuses.append(status)
+    )
 
     def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:
         del session_id, instance
@@ -469,14 +479,16 @@ async def _observe_native_with_fake_poller(
     await registry.observe_required_terminal(
         session_id, "claude", "main", instance, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
     )
-    return callbacks, statuses, pollers
+    return callbacks, statuses, pollers, registry
 
 
 @pytest.mark.asyncio
 async def test_claude_native_wires_status_poller_tick(tmp_path: Path) -> None:
     """The claude-native watcher is wired with an ``on_tick`` that drives
     the status-file poller."""
-    callbacks, _statuses, pollers = await _observe_native_with_fake_poller(tmp_path, "conv_tick")
+    callbacks, _statuses, pollers, _registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_tick"
+    )
     assert len(pollers) == 1
     on_tick = callbacks["on_tick"]
     assert callable(on_tick)
@@ -486,30 +498,90 @@ async def test_claude_native_wires_status_poller_tick(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_status_file_preempts_pty_edges_when_active(tmp_path: Path) -> None:
-    """While the poller is active, the file's status wins and PTY pane
-    edges do not publish status."""
-    callbacks, statuses, pollers = await _observe_native_with_fake_poller(tmp_path, "conv_pre")
+async def test_pty_activity_publishes_running_even_with_active_status_file(
+    tmp_path: Path,
+) -> None:
+    """Pane activity publishes ``running`` even while the file poller is active.
+
+    Claude rewrites ``sessions/<pid>.json`` only when its value *changes*, so a
+    turn that starts while the file already reads ``busy`` produces no write at
+    all. If the file were allowed to mute the pane watcher, nothing could
+    publish ``running`` and the session would sit on a stale ``idle`` — no
+    working indicator, no stop button — for the whole turn.
+    """
+    callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_pre"
+    )
     poller = pollers[0]
     poller.active = True
 
-    # File says running; PTY activity must NOT double-publish.
-    poller.emit("running")
+    # The file already holds ``busy`` from an earlier turn, so it emits nothing.
     callbacks["on_activity"]()
-    # File says idle; PTY idle heuristic must NOT override it.
-    poller.emit("idle")
-    callbacks["on_idle"]()
 
     # Status edges publish via loop.call_soon_threadsafe; let them drain.
     await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+
+@pytest.mark.asyncio
+async def test_pty_idle_deferred_only_while_file_freshly_running(tmp_path: Path) -> None:
+    """A quiet pane goes idle unless the file *freshly* reports running.
+
+    A dialog owning Claude's input quiets the pane without ending the turn, so
+    a fresh ``running`` level holds the idle edge back. Once that level goes
+    stale — a ``busy`` left standing by a background task outlives its turn —
+    the pane decides again, so the session can never be pinned to ``running``.
+    """
+    callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_idle_gate"
+    )
+    poller = pollers[0]
+    poller.active = True
+    poller.running_level = True
+
+    callbacks["on_activity"]()  # → running
+    callbacks["on_idle"]()  # suppressed: file freshly says running
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    poller.running_level = False  # the file's level went stale
+    callbacks["on_idle"]()
+    await asyncio.sleep(0)
     assert statuses == ["running", "idle"]
+
+
+@pytest.mark.asyncio
+async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
+    """A forwarder's hook-derived edge rebases the watcher's dedup.
+
+    ``Stop`` → ``idle`` is posted to the server by the claude-native forwarder,
+    bypassing this watcher. Without adopting it as the baseline the watcher
+    still believes ``running`` is live and swallows the next turn's genuine
+    ``running`` as a duplicate, leaving the session stuck on the hook's idle.
+    """
+    callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_resync"
+    )
+    pollers[0].active = True
+
+    callbacks["on_activity"]()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    # The forwarder posts Stop → idle straight to the server.
+    registry.note_external_session_status("conv_resync", "idle")
+
+    # Next turn: the pane moves again and must re-publish ``running``.
+    callbacks["on_activity"]()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "running"]
 
 
 @pytest.mark.asyncio
 async def test_pty_edges_drive_status_when_poller_inactive(tmp_path: Path) -> None:
     """With no file (poller inactive), the PTY pane edges remain the status
     source — the fallback path for old Claude versions."""
-    callbacks, statuses, pollers = await _observe_native_with_fake_poller(
+    callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_fallback"
     )
     # Poller stays inactive (file never resolved).
