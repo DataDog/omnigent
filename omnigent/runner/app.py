@@ -5791,8 +5791,6 @@ def create_runner_app(
                                         _live_response_id[conv_id] = _response_id
                                         manager.mark_in_flight(conv_id, _response_id)
 
-                                _defer_publish = False
-
                                 _overflow = _is_context_overflow_error(event)
                                 if _overflow is not None:
                                     raise _ContextWindowOverflow(*_overflow)
