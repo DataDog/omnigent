@@ -110,6 +110,26 @@ Open another view with **Server → New Window** (`Cmd/Ctrl+N`). It clones the
 focused window's current URL onto a new window against the same server, so two
 conversations can be watched at once.
 
+## Debugging a packaged macOS build
+
+Developer Tools are disabled by default in the production app. To opt in, quit
+Omnigent, set its macOS user default, and reopen it:
+
+```bash
+defaults write ai.omnigent.desktop DeveloperMode -bool true
+```
+
+The **Debug → Developer Tools** menu is then available in the packaged app. To
+turn production debugging off again, quit Omnigent and remove the override:
+
+```bash
+defaults delete ai.omnigent.desktop DeveloperMode
+```
+
+Development (`pnpm --dir web/electron dev`) builds keep Developer Tools enabled
+without this preference. The override is intentionally macOS-only and does not
+relax production update security checks.
+
 The native enhancements live on the web side in
 [`../src/lib/nativeBridge.ts`](../src/lib/nativeBridge.ts). It detects the
 Electron shell at runtime (the preload exposes `window.omnigentDesktop`
