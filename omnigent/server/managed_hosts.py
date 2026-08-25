@@ -156,6 +156,7 @@ from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxHostLauncher
+    from omnigent.stores.agent_store import AgentStore
 
 _logger = logging.getLogger(__name__)
 
@@ -2473,9 +2474,34 @@ async def _start_sandbox_host(
     repo_branch: str | None,
     repo_name: str | None,
     host_config: dict[str, object] | None,
+    agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> str:
     """Start a host without sending absent optional arguments to legacy launchers."""
+    # Gated on the capability, not on the value: start_host is side-effecting and
+    # non-idempotent, so we never probe the signature by passing then retrying.
+    # `agent_name` is declared on the classifying launcher's `start_host` alone,
+    # so the abstract signature does not carry it and the call is cast: the
+    # capability is the runtime guarantee the static type cannot express. A
+    # launcher declaring it is in-tree and current, so it also takes
+    # `host_config`/`on_stage`, keeping the legacy-omission fan-out below
+    # one-dimensional.
+    if agent_name is not None and launcher.capabilities.classifies_runner_by_agent:
+        start_classified = cast(Callable[..., str], launcher.start_host)
+        return await asyncio.to_thread(
+            start_classified,
+            sandbox_id,
+            token=token,
+            host_id=host_id,
+            host_name=host_name,
+            server_url=server_url,
+            repo_url=repo_url,
+            repo_branch=repo_branch,
+            repo_name=repo_name,
+            host_config=host_config,
+            on_stage=on_stage,
+            agent_name=agent_name,
+        )
     if host_config is None and on_stage is None:
         return await asyncio.to_thread(
             launcher.start_host,
@@ -2609,6 +2635,7 @@ async def _arm_and_start_host(
             repo_branch=repo.branch if repo is not None else None,
             repo_name=repo.repo_name if repo is not None else None,
             host_config=config.host_config,
+            agent_name=agent_name,
             on_stage=on_stage,
         )
         await _wait_for_host_online(host_store, host_id)
