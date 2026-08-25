@@ -11,17 +11,10 @@ function pr({
   draft = false,
   labels = [],
   unlabeled = [],
-  state = "OPEN",
-  author = "ext",
-  assoc = "CONTRIBUTOR",
-  bot = false,
 }) {
   return {
     number,
-    state,
     isDraft: draft,
-    authorAssociation: assoc,
-    author: { login: author, __typename: bot ? "Bot" : "User" },
     labels: { nodes: labels.map((name) => ({ name })) },
     body,
     // Each entry is a label name (removed by a human) or [name, actor].
@@ -39,14 +32,7 @@ function pr({
 // "issue" | "pr" | undefined (404).
 async function run(
   nodes,
-  {
-    linked = {},
-    issues = {},
-    env = {},
-    linkError = false,
-    failLabelOn = null,
-    maintainers = [],
-  } = {}
+  { linked = {}, issues = {}, env = {}, linkError = false, failLabelOn = null } = {}
 ) {
   const labeled = [];
   const rows = [];
@@ -62,20 +48,11 @@ async function run(
   };
   const github = {
     graphql: async (query, vars) => {
-      if (query.includes("closingIssuesReferences")) {
+      if (query.includes("pullRequest(number:")) {
         if (linkError) throw new Error("boom");
         return {
           repository: {
             pullRequest: { closingIssuesReferences: { totalCount: linked[vars.number] ?? 0 } },
-          },
-        };
-      }
-      // Single-PR fetch (the instant path).
-      if (query.includes("createdAt")) {
-        const found = nodes.find((n) => n.number === vars.number) ?? null;
-        return {
-          repository: {
-            pullRequest: found ? { createdAt: "2026-08-06T00:00:00Z", ...found } : null,
           },
         };
       }
@@ -86,11 +63,6 @@ async function run(
       };
     },
     rest: {
-      repos: {
-        getContent: async () => ({
-          data: { content: Buffer.from(maintainers.join("\n"), "utf8").toString("base64") },
-        }),
-      },
       issues: {
         addLabels: async ({ issue_number, labels: ls }) => {
           if (issue_number === failLabelOn) {
@@ -107,11 +79,7 @@ async function run(
             err.status = 404;
             throw err;
           }
-          // "issue" (open), "closed", "draft", or "pr".
-          if (kind === "pr") return { data: { pull_request: {}, state: "open" } };
-          if (kind === "closed") return { data: { state: "closed" } };
-          if (kind === "draft") return { data: { state: "open", draft: true } };
-          return { data: { state: "open" } };
+          return { data: kind === "pr" ? { pull_request: {} } : {} };
         },
       },
     },
@@ -121,10 +89,7 @@ async function run(
   Object.assign(process.env, env);
   try {
     await script({
-      context: {
-        repo: { owner: "o", repo: "r" },
-        payload: { repository: { default_branch: "main" } },
-      },
+      context: { repo: { owner: "o", repo: "r" } },
       github,
       core: { warning: (m) => warnings.push(m), summary },
     });
@@ -154,28 +119,14 @@ const verdictOf = (rows, n) => (rows.find((r) => r[0] === `#${n}`) || [])[1];
     assert.strictEqual(labeled.length, 1, "Part of #N clears the bar");
   }
 
-  // A reference must resolve to an OPEN, non-draft issue. Shares the resolver
-  // with the nudge, so the two cannot disagree about what counts.
-  for (const [kind, why] of [
-    ["pr", "a PR is not a tracking record"],
-    ["closed", "a closed issue is not tracked work"],
-    ["draft", "a draft issue is not agreed work yet"],
-  ]) {
+  // A reference to another PR is not a tracking record.
+  {
     const { labeled, rows } = await run([pr({ number: 12, body: "Refs #88" })], {
-      issues: { 88: kind },
+      issues: { 88: "pr" },
       env: ENFORCE,
     });
-    assert.strictEqual(labeled.length, 0, why);
+    assert.strictEqual(labeled.length, 0);
     assert.strictEqual(verdictOf(rows, 12), "below bar");
-  }
-
-  // A quoted example must not clear the bar either.
-  {
-    const { labeled } = await run(
-      [pr({ number: 121, body: "> - `Part of #77` if this is one step towards it." })],
-      { issues: { 77: "issue" }, env: ENFORCE }
-    );
-    assert.strictEqual(labeled.length, 0, "a blockquoted example does not clear the bar");
   }
 
   // No reference at all: below the bar.
@@ -183,50 +134,6 @@ const verdictOf = (rows, n) => (rows.find((r) => r[0] === `#${n}`) || [])[1];
     const { labeled, rows } = await run([pr({ number: 13 })], { env: ENFORCE });
     assert.strictEqual(labeled.length, 0);
     assert.strictEqual(verdictOf(rows, 13), "below bar");
-  }
-
-  // The label routes incoming contributions, so the project's own work is skipped.
-  for (const [who, opts] of [
-    ["MEMBER", { assoc: "MEMBER" }],
-    ["OWNER", { assoc: "OWNER" }],
-    ["COLLABORATOR", { assoc: "COLLABORATOR" }],
-    ["a bot", { bot: true, author: "omnigent-ci[bot]" }],
-  ]) {
-    const { labeled, rows } = await run([pr({ number: 30, ...opts })], {
-      linked: { 30: 1 },
-      env: ENFORCE,
-    });
-    assert.strictEqual(labeled.length, 0, `${who} PRs are not labelled`);
-    assert.strictEqual(verdictOf(rows, 30), "skip");
-  }
-  // A maintainer with private org membership reads as CONTRIBUTOR, so the
-  // MAINTAINER file is the second signal (same as the nudge).
-  {
-    const { labeled } = await run([pr({ number: 31, author: "listed-maintainer" })], {
-      linked: { 31: 1 },
-      env: ENFORCE,
-      maintainers: ["listed-maintainer", "# a comment"],
-    });
-    assert.strictEqual(labeled.length, 0, "the MAINTAINER file also exempts");
-  }
-  // ...but a genuine outside contributor still gets the label.
-  {
-    const { labeled } = await run([pr({ number: 32, author: "outsider" })], {
-      linked: { 32: 1 },
-      env: ENFORCE,
-      maintainers: ["listed-maintainer"],
-    });
-    assert.strictEqual(labeled.length, 1, "contributors are still labelled");
-  }
-
-  // `is:open` in the search lags, so a just-closed or merged PR still comes back.
-  for (const state of ["CLOSED", "MERGED"]) {
-    const { labeled, rows } = await run([pr({ number: 33, state })], {
-      linked: { 33: 1 },
-      env: ENFORCE,
-    });
-    assert.strictEqual(labeled.length, 0, `${state} PRs are not labelled`);
-    assert.strictEqual(verdictOf(rows, 33), "skip");
   }
 
   // Draft: the author is saying it is not ready.
@@ -311,38 +218,6 @@ const verdictOf = (rows, n) => (rows.find((r) => r[0] === `#${n}`) || [])[1];
       "the sweep continues past a write failure"
     );
     assert.ok(warnings.some((w) => /Could not label #191/.test(w)));
-  }
-
-  // ---- the instant path: PR_NUMBER names one PR ----
-  {
-    const nodes = [pr({ number: 70 }), pr({ number: 71 })];
-    const { labeled } = await run(nodes, {
-      linked: { 70: 1, 71: 1 },
-      env: { ...ENFORCE, PR_NUMBER: "70" },
-    });
-    assert.deepStrictEqual(
-      labeled.map((l) => l.issue_number),
-      [70],
-      "only the named PR is labelled"
-    );
-  }
-  // Exclusions still hold on the instant path.
-  {
-    const { labeled } = await run([pr({ number: 72, assoc: "MEMBER" })], {
-      linked: { 72: 1 },
-      env: { ...ENFORCE, PR_NUMBER: "72" },
-    });
-    assert.strictEqual(labeled.length, 0, "maintainer PRs stay skipped");
-  }
-  // The effective-date floor applies to events too.
-  {
-    const old = pr({ number: 73 });
-    old.createdAt = "2026-07-01T00:00:00Z";
-    const { labeled } = await run([old], {
-      linked: { 73: 1 },
-      env: { ...ENFORCE, PR_NUMBER: "73" },
-    });
-    assert.strictEqual(labeled.length, 0, "a pre-cutoff PR is skipped");
   }
 
   // Dry run touches nothing but still reports.

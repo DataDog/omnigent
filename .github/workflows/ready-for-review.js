@@ -11,16 +11,11 @@
 // and the rest of this file stays the same.
 //
 // Never applied when:
-//   - the author is a maintainer or a bot. The label exists to route incoming
-//     contributions; maintainers land their own work and half the in-window PRs
-//     are theirs, so labelling them halves the signal. It matches the nudge, which
-//     exempts maintainers for the same reason.
-//   - the PR is closed or merged. `is:open` in the search lags, so one that closed
-//     in the last few minutes still comes back and must not be labelled.
 //   - the PR is a draft (the author is telling us it is not ready)
 //   - `waiting-on-author` is set (the ball is in the author's court; applying
 //     both would break the mutual exclusion the two labels rely on)
-//   - the label is already there (idempotent), or a human removed it before
+//   - the label is already there (idempotent, and it must not fight a maintainer
+//     who removed it on purpose -- see REMOVED_BY_HUMAN below)
 //
 // Forward-only, sharing pr-issue-link.js's effective date: labelling 478 backlog
 // PRs in one sweep would bury the signal it exists to create.
@@ -31,7 +26,6 @@ const MS_PER_HOUR = 60 * 60 * 1000;
 const HOURS_TO_SCAN = 24;
 const REVIEW_LABEL = "waiting-for-review";
 const WAITING_LABEL = "waiting-on-author";
-const MAINTAINER_ASSOCIATIONS = ["MEMBER", "OWNER", "COLLABORATOR"];
 
 const QUERY = `
   query($cursor: String, $searchQuery: String!) {
@@ -41,10 +35,7 @@ const QUERY = `
       nodes {
         ... on PullRequest {
           number
-          state
           isDraft
-          authorAssociation
-          author { login __typename }
           labels(first: 30) { nodes { name } }
           body
           timelineItems(last: 50, itemTypes: [UNLABELED_EVENT]) {
@@ -53,33 +44,6 @@ const QUERY = `
                 label { name }
                 actor { login }
               }
-            }
-          }
-        }
-      }
-    }
-  }
-`;
-
-// The same node shape as QUERY, for one named PR, plus createdAt for the
-// effective-date floor.
-const ONE_PR_QUERY = `
-  query($owner: String!, $repo: String!, $number: Int!) {
-    repository(owner: $owner, name: $repo) {
-      pullRequest(number: $number) {
-        number
-        state
-        createdAt
-        isDraft
-        authorAssociation
-        author { login __typename }
-        labels(first: 30) { nodes { name } }
-        body
-        timelineItems(last: 50, itemTypes: [UNLABELED_EVENT]) {
-          nodes {
-            ... on UnlabeledEvent {
-              label { name }
-              actor { login }
             }
           }
         }
@@ -128,8 +92,11 @@ async function referencesIssue({ github, core, owner, repo, pr }) {
     return false;
   }
   for (const candidate of issueLink.trackingReferences(pr.body)) {
-    if (await issueLink.resolvesToOpenIssue({ github, core, owner, repo, number: candidate })) {
-      return true;
+    try {
+      const { data } = await github.rest.issues.get({ owner, repo, issue_number: candidate });
+      if (!data.pull_request) return true;
+    } catch {
+      // A number that does not resolve proves nothing; try the next.
     }
   }
   return false;
@@ -141,91 +108,38 @@ async function belowBar(ctx) {
   return null;
 }
 
-// True when the PR is the project's own work rather than an incoming contribution.
-// Checked on both signals, like the nudge: a maintainer whose org membership is
-// private reads as CONTRIBUTOR, and one with write access may be unlisted.
-function isOwnWork(pr, maintainers) {
-  const login = pr.author?.login ?? "";
-  if (pr.author?.__typename === "Bot" || login.endsWith("[bot]")) return "bot";
-  if (MAINTAINER_ASSOCIATIONS.includes(pr.authorAssociation)) return "maintainer";
-  if (maintainers.has(login.toLowerCase())) return "maintainer";
-  return null;
-}
-
 module.exports = async ({ context, github, core }) => {
   const { owner, repo } = context.repo;
   const enforce = process.env.ENFORCE === "true";
 
   try {
-    // One PR when an event names it, the whole window on the cron sweep. Only the
-    // fetch differs, so both routes reach identical verdicts.
+    const windowStart = new Date(Date.now() - HOURS_TO_SCAN * MS_PER_HOUR);
+    const cutoff = new Date(
+      Math.max(windowStart.getTime(), new Date(issueLink.EFFECTIVE_FROM).getTime())
+    );
+    const cutoffString = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
+    const searchQuery = `repo:${owner}/${repo} is:pr is:open created:>${cutoffString}`;
+    console.log(`Scanning PRs: ${searchQuery} (enforce=${enforce})`);
+
+    let cursor = null;
+    let hasNextPage = true;
     const allPRs = [];
-    const single = Number(process.env.PR_NUMBER) || null;
-    if (single) {
-      const resp = await github.graphql(ONE_PR_QUERY, { owner, repo, number: single });
-      const pr = resp.repository.pullRequest;
-      if (!pr) {
-        console.log(`#${single} not found; nothing to do.`);
-      } else if (new Date(pr.createdAt) < new Date(issueLink.EFFECTIVE_FROM)) {
-        console.log(`#${single} predates ${issueLink.EFFECTIVE_FROM}; skipping.`);
-      } else {
-        allPRs.push(pr);
-      }
-      console.log(`Checking #${single} (enforce=${enforce})`);
-    } else {
-      const windowStart = new Date(Date.now() - HOURS_TO_SCAN * MS_PER_HOUR);
-      const cutoff = new Date(
-        Math.max(windowStart.getTime(), new Date(issueLink.EFFECTIVE_FROM).getTime())
-      );
-      const cutoffString = cutoff.toISOString().replace(/\.\d{3}Z$/, "Z");
-      const searchQuery = `repo:${owner}/${repo} is:pr is:open created:>${cutoffString}`;
-      console.log(`Scanning PRs: ${searchQuery} (enforce=${enforce})`);
-
-      let cursor = null;
-      let hasNextPage = true;
-      while (hasNextPage) {
-        const response = await github.graphql(QUERY, { cursor, searchQuery });
-        const { remaining, resetAt } = response.rateLimit;
-        console.log(`Rate limit: ${remaining} remaining, resets at ${resetAt}`);
-        const { nodes, pageInfo } = response.search;
-        hasNextPage = pageInfo.hasNextPage;
-        cursor = pageInfo.endCursor;
-        allPRs.push(...nodes);
-      }
-      console.log(`Found ${allPRs.length} open PRs in the window`);
+    while (hasNextPage) {
+      const response = await github.graphql(QUERY, { cursor, searchQuery });
+      const { remaining, resetAt } = response.rateLimit;
+      console.log(`Rate limit: ${remaining} remaining, resets at ${resetAt}`);
+      const { nodes, pageInfo } = response.search;
+      hasNextPage = pageInfo.hasNextPage;
+      cursor = pageInfo.endCursor;
+      allPRs.push(...nodes);
     }
-
-    // Read from the API, not the checked-out tree, so a PR cannot self-grant by
-    // editing the file (same approach as the nudge).
-    const maintainers = new Set();
-    try {
-      const resp = await github.rest.repos.getContent({
-        owner,
-        repo,
-        path: ".github/MAINTAINER",
-        ref: context.payload.repository?.default_branch ?? "main",
-      });
-      Buffer.from(resp.data.content, "base64")
-        .toString("utf8")
-        .split("\n")
-        .map((l) => l.replace(/#.*$/, "").trim().toLowerCase())
-        .filter(Boolean)
-        .forEach((m) => maintainers.add(m));
-    } catch (err) {
-      core.warning(`Could not load .github/MAINTAINER: ${err.message}`);
-    }
+    console.log(`Found ${allPRs.length} open PRs in the window`);
 
     const verdicts = [];
     for (const pr of allPRs) {
       const labels = pr.labels?.nodes?.map((l) => l.name) ?? [];
-      let skip = isOwnWork(pr, maintainers);
-      if (skip) {
-        // own work: reported as-is
-      }
-      // `is:open` in the search is index-backed and lags, so a PR closed or merged
-      // in the last few minutes still comes back. Check the state we were handed.
-      else if (pr.state !== "OPEN") skip = pr.state.toLowerCase();
-      else if (pr.isDraft) skip = "draft";
+      let skip = null;
+      if (pr.isDraft) skip = "draft";
       else if (labels.includes(REVIEW_LABEL)) skip = "already labelled";
       else if (labels.includes(WAITING_LABEL)) skip = "waiting on author";
       else if (removedByHuman(pr)) skip = "label was removed by hand";
