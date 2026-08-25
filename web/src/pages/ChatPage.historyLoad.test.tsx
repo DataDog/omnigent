@@ -306,8 +306,8 @@ describe("HistoryAutoLoader", () => {
       loadMoreHistory,
     });
     const scrollRoot = document.createElement("div");
-    // Parked well clear of the top threshold: nothing the reader did asks
-    // for older history.
+    // Parked well clear of the fetch threshold (2.5 viewports), so only the
+    // initial-window build may page — not the scroll-driven path.
     setScrollMetrics(scrollRoot, { scrollTop: 2000, scrollHeight: 4000, clientHeight: 500 });
     stickContext.scrollRef.current = scrollRoot;
 
@@ -327,11 +327,8 @@ describe("HistoryAutoLoader", () => {
       loadMoreHistory,
     });
     const scrollRoot = document.createElement("div");
-    // A transcript barely taller than the pane: wherever it settles is inside
-    // the fetch threshold, so "near the top" is trivially true. Opening still
-    // must not fetch — the scroll below is the open's own scroll-to-bottom.
-    const metrics = { scrollTop: 0, scrollHeight: 900, clientHeight: 800 };
-    setScrollMetrics(scrollRoot, metrics);
+    // Clear of the fetch threshold, so the page count below is the cap alone.
+    setScrollMetrics(scrollRoot, { scrollTop: 2000, scrollHeight: 4000, clientHeight: 500 });
     stickContext.scrollRef.current = scrollRoot;
 
     render(<HistoryAutoLoader />);

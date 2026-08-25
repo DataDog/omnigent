@@ -1863,7 +1863,9 @@ function MainAgentSurface({
               ramp (1rem→1.5rem as the area crosses ~54rem) matches where the
               48rem column's auto-margins shrink past the clearance. md+ only:
               the rail is hidden on mobile, which keeps the plain 1rem gutter. */}
-          {/* HistoryAutoLoader owns prepend anchoring across every browser. */}
+          {/* Native scroll anchoring holds position across a history prepend —
+              the browser does it off the main thread, so it can't interrupt an
+              in-flight scroll the way an imperative scrollTop write does. */}
           <ConversationContent
             scrollClassName="transcript-hide-native-scrollbar"
             className={cn(
@@ -2308,9 +2310,6 @@ function historyLoadThreshold(el: HTMLElement): number {
   return Math.max(HISTORY_LOAD_TOP_MIN_PX, el.clientHeight * HISTORY_LOAD_TOP_VIEWPORTS);
 }
 
-/** Finger travel before a touch drag counts as "show me what's above". */
-const TOUCH_DRAG_SLOP_PX = 8;
-
 export function HistoryAutoLoader({
   scrollElement,
 }: {
@@ -2332,21 +2331,6 @@ export function HistoryAutoLoader({
   const [scrollRevision, setScrollRevision] = useState(0);
   const handledScrollRevisionRef = useRef(scrollRevision);
   const oldestItemIdRef = useRef(oldestItemId);
-  // Whether the reader has asked to move the transcript upward yet.
-  //
-  // "Near the top" alone is not a request for older history: opening a session
-  // scrolls the pane to the bottom, and on a transcript shorter than the fetch
-  // threshold that lands trivially near the top — so the open fetched a page,
-  // the prepend moved the cursor, and that fed the next fetch. Fifteen
-  // requests and a "Loading earlier messages…" row, for someone who never
-  // touched the scrollbar.
-  //
-  // Intent, not movement: a window taller than the transcript has no scroll
-  // range at all, so waiting for scrollTop to fall would strand older history
-  // behind a gesture the pane can never report.
-  const scrolledUpRef = useRef(false);
-  const lastScrollTopRef = useRef<number | null>(null);
-  const touchStartYRef = useRef<number | null>(null);
 
   // Position across a prepend is held by native scroll anchoring, not by this
   // component. Writing scrollTop here instead used to interrupt the reader's
@@ -2357,42 +2341,7 @@ export function HistoryAutoLoader({
   useLayoutEffect(() => {
     const el = scrollElement ?? ctx.scrollRef?.current;
     if (!el) return;
-    // Baseline from where the pane currently sits, so the reader's very first
-    // upward scroll already has something to compare against.
-    lastScrollTopRef.current = el.scrollTop;
-    // Arming has to re-run the paging effect itself: a pane with no scroll
-    // range fires no scroll event, so nothing else would notice the gesture.
-    const armScrollUp = () => {
-      if (scrolledUpRef.current) return;
-      scrolledUpRef.current = true;
-      setScrollRevision((revision) => revision + 1);
-    };
-    const handleScroll = () => {
-      const previous = lastScrollTopRef.current;
-      lastScrollTopRef.current = el.scrollTop;
-      // Only an upward move counts. The open's scroll-to-bottom and a
-      // prepend's native anchor correction both move scrollTop DOWN the
-      // document (larger), so neither can arm paging on its own.
-      if (previous !== null && el.scrollTop < previous - 0.5) scrolledUpRef.current = true;
-      // Every scroll re-runs the paging effect, armed or not: staying near the
-      // top has to keep paging, not just the moment the reader arrives there.
-      setScrollRevision((revision) => revision + 1);
-    };
-    // Wheel/trackpad up, and a touch drag downward (which reveals what is
-    // above). These fire whether or not the pane has anywhere to scroll.
-    const handleWheel = (event: WheelEvent) => {
-      if (event.deltaY < 0) armScrollUp();
-    };
-    const handleTouchStart = (event: TouchEvent) => {
-      touchStartYRef.current = event.touches[0]?.clientY ?? null;
-    };
-    const handleTouchMove = (event: TouchEvent) => {
-      const start = touchStartYRef.current;
-      const current = event.touches[0]?.clientY;
-      if (start !== null && current !== undefined && current > start + TOUCH_DRAG_SLOP_PX) {
-        armScrollUp();
-      }
-    };
+    const handleScroll = () => setScrollRevision((revision) => revision + 1);
     el.addEventListener("scroll", handleScroll, { passive: true });
     el.addEventListener("wheel", handleWheel, { passive: true });
     el.addEventListener("touchstart", handleTouchStart, { passive: true });
@@ -2420,25 +2369,24 @@ export function HistoryAutoLoader({
 
     if (generationChanged) {
       generationRef.current = historyGeneration;
-      // A new window is a new open: require a fresh upward scroll.
-      scrolledUpRef.current = false;
-      lastScrollTopRef.current = el.scrollTop;
+      pagesFetchedRef.current = 1;
     }
 
     const state = useChatStore.getState();
+    const userPromptCount = state.blocks.reduce(
+      (count, block) =>
+        count + (block.type === "user_message" && !isSystemUserContent(block.content) ? 1 : 0),
+      0,
+    );
+    const buildingInitialWindow = !initialWindowComplete(userPromptCount, pagesFetchedRef.current);
 
-    // Reader-driven only. Opening a session used to keep paging from here
-    // until it found the previous prompt, so history kept landing for seconds
-    // after the page had settled and the transcript shifted under someone who
-    // had not scrolled at all. The bind now fetches its whole window in one
-    // request, and this waits for the reader to actually scroll up.
     if (
       !scrolledUpRef.current ||
       !state.oldestItemId ||
       !state.hasMoreHistory ||
       state.loadingMoreHistory ||
-      !(itemsChanged || scrollPositionChanged) ||
-      el.scrollTop >= historyLoadThreshold(el)
+      (!buildingInitialWindow &&
+        (!(itemsChanged || scrollPositionChanged) || el.scrollTop >= historyLoadThreshold(el)))
     ) {
       return;
     }
