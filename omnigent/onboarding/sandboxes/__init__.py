@@ -85,7 +85,7 @@ __all__ = [
 ]
 
 
-def get_launcher(provider: str, *, workspace_host: str | None = None) -> SandboxLauncher:
+def get_launcher(provider: str, *, workspace_host: str | None = None) -> SandboxHostLauncher:
     """
     Resolve a provider name to a launcher instance.
 
