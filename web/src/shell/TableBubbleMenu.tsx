@@ -223,7 +223,7 @@ function HandleMenu({
   return createPortal(
     <div
       data-table-handle-menu
-      className="fixed z-[9999] min-w-[180px] overflow-hidden rounded-md border border-border bg-popover py-1 shadow-menu"
+      className="fixed z-[9999] min-w-[180px] overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu"
       style={{ top: anchorTop, left: anchorLeft }}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
@@ -241,7 +241,7 @@ function HandleMenu({
               onClose();
             }}
             className={cn(
-              "flex w-full items-center gap-2.5 px-3 py-1.5 text-sm transition-colors",
+              "flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-ui transition-colors",
               item.destructive
                 ? "text-destructive hover:bg-destructive/10"
                 : "text-foreground hover:bg-muted",

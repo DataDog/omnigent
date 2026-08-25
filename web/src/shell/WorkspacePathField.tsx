@@ -67,8 +67,10 @@ function PathRow({ path, active, onSelect, testId }: RowProps) {
         e.preventDefault();
         onSelect();
       }}
-      className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition ${
-        active ? "bg-accent text-accent-foreground" : "hover:bg-accent hover:text-accent-foreground"
+      className={`flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-ui transition ${
+        active
+          ? "bg-muted text-foreground dark:bg-muted/50"
+          : "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50"
       }`}
       data-testid={testId}
     >
@@ -292,7 +294,7 @@ export function WorkspacePathField({
           // clipped by the dialog's scrollable body, and a body
           // portal can't be clicked through Radix's modal layer.
           // Inline content just scrolls with the form instead.
-          className="mt-1 max-h-72 overflow-y-auto rounded-md border border-border bg-popover shadow-menu"
+          className="mt-1 max-h-72 overflow-y-auto rounded-[12px] border border-border bg-popover p-2 shadow-menu"
           data-testid="workspace-path-dropdown"
         >
           {filteredRecent.length > 0 && (
@@ -323,7 +325,7 @@ export function WorkspacePathField({
               ))}
               {hiddenMatchCount > 0 && (
                 <div
-                  className="px-3 py-2 text-sm text-muted-foreground"
+                  className="px-1.5 py-1 text-sm text-muted-foreground"
                   data-testid="workspace-match-overflow"
                 >
                   +{hiddenMatchCount} more — keep typing to narrow
@@ -331,7 +333,7 @@ export function WorkspacePathField({
               )}
             </>
           )}
-          {showLoading && <div className="px-3 py-2 text-sm text-muted-foreground">Loading…</div>}
+          {showLoading && <div className="px-1.5 py-1 text-sm text-muted-foreground">Loading…</div>}
         </div>
       )}
     </div>
