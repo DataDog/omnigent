@@ -186,7 +186,7 @@ function NewTabMenu({
       )}
       <span className="whitespace-nowrap">{isReconnecting ? "Reconnecting…" : "Shell"}</span>
       {connectState === "offline" && (
-        <span className="ml-auto pl-4 text-sm text-muted-foreground">Offline</span>
+        <span className="ml-auto pl-4 text-xs text-muted-foreground">Offline</span>
       )}
     </>
   );
