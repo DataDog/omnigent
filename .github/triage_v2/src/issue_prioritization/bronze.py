@@ -56,7 +56,6 @@ class BronzeIssue:
             severity=classification.severity,
             area_keys=classification.area_keys,
             component_labels=classification.component_labels,
-            classification_reasoning=classification.reasoning,
             duplicate_count=self.duplicate_count,
             upvote_count=self.upvote_count,
             current_priority=_current_priority(self.labels),

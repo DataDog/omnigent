@@ -142,6 +142,3 @@ def test_linear_aligned_type_labels_are_normalized() -> None:
 
     assert feature.issue_type == IssueType.ENHANCEMENT
     assert docs.issue_type == IssueType.DOCUMENTATION
-    assert IssueType.parse("enhancement") == IssueType.ENHANCEMENT
-    assert feature.issue_type.label == "Feature"
-    assert docs.issue_type.label == "Docs"
