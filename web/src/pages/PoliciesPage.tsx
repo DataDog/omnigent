@@ -171,7 +171,7 @@ function AddDefaultPolicyDialog({
                     value={filter}
                     onChange={(e) => setFilter(e.target.value)}
                     placeholder="Filter policies..."
-                    className="w-full rounded border border-border bg-background px-2 py-1.5 text-ui placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
+                    className="w-full rounded border border-border bg-background px-2 py-1.5 text-sm placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
                     autoFocus
                   />
                   <div className="flex max-h-52 flex-col divide-y divide-border overflow-y-auto rounded border border-border">
