@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -822,3 +823,76 @@ def test_host_background_signs_in_before_spawning(
     # configured target instead.
     assert "server: https://example.databricksapps.com" in result.output
     assert "omnigent host stop --server https://example.databricksapps.com" in result.output
+
+
+# ── omnigent start ────────────────────────────────────────────────
+
+
+def test_start_spawns_background_host_and_suggests_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``start`` is the friendly spelling of ``host --background``.
+
+    It must spawn the same detached daemon (local mode here, so the daemon
+    brings up the local server too) and suggest the matching off switch —
+    ``omnigent stop``, not the host-specific teardown.
+    """
+    spawned_args, _ = _patch_background_host_spawn(monkeypatch, tmp_path)
+    foreground_runs: list[str] = []
+
+    with patch(
+        "omnigent.host.connect.run_host_process",
+        lambda server_url, **kwargs: foreground_runs.append(server_url),
+    ):
+        result = CliRunner().invoke(cli, ["start"])
+
+    assert result.exit_code == 0, result.output
+    assert foreground_runs == []
+    assert "pid 4242" in result.output
+    assert "server: http://127.0.0.1:6767" in result.output
+    assert "omnigent stop" in result.output
+    assert "host stop" not in result.output
+    assert spawned_args and "--local" in spawned_args[0]
+
+
+def test_start_hosts_on_explicit_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``start --server <url>`` hosts on that server, signing in first.
+
+    The alias must not quietly drop the target or the foreground sign-in
+    pre-flight that a detached daemon cannot perform itself.
+    """
+    spawned_args, _ = _patch_background_host_spawn(monkeypatch, tmp_path)
+    auth_calls: list[tuple[str, bool]] = []
+
+    def _fake_auth(server: str, *, non_interactive: bool = False) -> None:
+        """Record the sign-in pre-flight.
+
+        :param server: Server URL being authenticated.
+        :param non_interactive: Whether prompting is suppressed.
+        """
+        auth_calls.append((server, non_interactive))
+
+    monkeypatch.setattr("omnigent.cli._ensure_databricks_server_auth", _fake_auth)
+
+    result = CliRunner().invoke(
+        cli, ["start", "--server", "https://example.databricksapps.com", "--non-interactive"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert auth_calls == [("https://example.databricksapps.com", True)]
+    assert "server: https://example.databricksapps.com" in result.output
+    assert spawned_args == [
+        [
+            sys.executable,
+            "-m",
+            "omnigent.host._daemon_entry",
+            "--server",
+            "https://example.databricksapps.com",
+        ]
+    ]
