@@ -48,8 +48,10 @@
   /**
    * Normalize a user-entered server URL to its origin. Accepts a bare
    * `host[:port][/path]`, defaults the scheme (https://, or http:// for loopback
-   * hosts), trims whitespace, and discards paths, queries, and fragments. A
-   * server connection always starts at the canonical root; workspace mounts
+   * hosts), trims whitespace, and discards paths, fragments, and query
+   * parameters. For Databricks workspace hosts only, it preserves `o` (the
+   * workspace organization selector). A server connection always starts at the
+   * canonical root; workspace mounts
    * are discovered separately by expandDatabricksWorkspaceUrl.
    *
    * @param {string} raw
@@ -70,7 +72,65 @@
     if (url.protocol !== "http:" && url.protocol !== "https:") {
       throw new Error(`unsupported scheme '${url.protocol}' (use http/https)`);
     }
-    return `${url.origin}/`;
+    const normalized = new URL(`${url.origin}/`);
+    if (isDatabricksWorkspaceHost(url.hostname)) {
+      for (const organization of url.searchParams.getAll("o")) {
+        normalized.searchParams.append("o", organization);
+      }
+    }
+    return normalized.toString();
+  }
+
+  /**
+   * Normalize persisted recent-server targets for the setup-page picker. The
+   * stored target may include an internal mount such as `/omnigent`; the picker
+   * shows and reconnects through the user-facing root URL instead. Invalid and
+   * duplicate entries are omitted.
+   *
+   * @param {unknown} rawRecents
+   * @returns {string[]}
+   */
+  function normalizeRecentServers(rawRecents) {
+    if (!Array.isArray(rawRecents)) return [];
+    const normalized = [];
+    const seen = new Set();
+    for (const candidate of rawRecents) {
+      if (typeof candidate !== "string") continue;
+      let url;
+      try {
+        url = normalizeUrl(candidate);
+      } catch {
+        continue;
+      }
+      if (seen.has(url)) continue;
+      seen.add(url);
+      normalized.push(url);
+    }
+    return normalized;
+  }
+
+  /**
+   * Compact label for a server in the setup-page recent list: host (including
+   * a non-default port), plus `/?o=…` for a Databricks organization selector.
+   *
+   * @param {string} rawUrl
+   * @returns {string}
+   */
+  function serverDisplayLabel(rawUrl) {
+    let url;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return String(rawUrl ?? "");
+    }
+    const query = new URLSearchParams();
+    if (isDatabricksWorkspaceHost(url.hostname)) {
+      for (const organization of url.searchParams.getAll("o")) {
+        query.append("o", organization);
+      }
+    }
+    const serialized = query.toString();
+    return `${url.host}${serialized ? `/?${serialized}` : ""}`;
   }
 
   /**
@@ -199,7 +259,8 @@
     if ((probe.headers.get("server") ?? "").toLowerCase() !== "databricks") {
       return normalized;
     }
-    return `${url.origin}${WORKSPACE_UI_PATH}`;
+    url.pathname = WORKSPACE_UI_PATH;
+    return url.toString();
   }
 
   /**
@@ -299,6 +360,8 @@
     LOCAL_HOSTS,
     defaultSchemeFor,
     normalizeUrl,
+    normalizeRecentServers,
+    serverDisplayLabel,
     isPlainHttpRemote,
     WORKSPACE_UI_PATH,
     WORKSPACE_PROBE_TIMEOUT_MS,

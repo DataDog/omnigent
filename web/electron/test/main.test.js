@@ -197,6 +197,13 @@ describe("recent-server startup wiring (src/main.js)", () => {
       ].join(" "),
     );
   });
+
+  it("normalizes persisted targets before returning setup-page recents", () => {
+    assert.match(
+      liveCode,
+      /ipcMain\.handle\("omnigent:get-recent-servers"[\s\S]{0,300}return normalizeRecentServers\(loadSettings\(\)\.recent_servers\)/,
+    );
+  });
 });
 
 // Guard for the deep-link path join in createWindow. A basename-less SPA path

@@ -39,6 +39,7 @@ const { execFile } = require("node:child_process");
 const { registerLocalhostCors } = require("./localhost_cors");
 const {
   normalizeUrl,
+  normalizeRecentServers,
   expandDatabricksWorkspaceUrl,
   fetchServerManifest,
   PRE_MANIFEST_BASELINE,
@@ -2188,9 +2189,7 @@ function registerIpc() {
     if (!isSetupPageSender(event)) {
       throw new Error("get-recent-servers is only available to the setup page");
     }
-    const recents = loadSettings().recent_servers;
-    // Same hand-edited-settings tolerance as rememberRecentServer.
-    return Array.isArray(recents) ? recents.filter((u) => typeof u === "string") : [];
+    return normalizeRecentServers(loadSettings().recent_servers);
   });
 
   ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
