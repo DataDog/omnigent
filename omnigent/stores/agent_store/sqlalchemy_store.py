@@ -69,23 +69,12 @@ class SqlAlchemyAgentStore(AgentStore):
 
     def _session_id_for_agent(self, agent_id: str) -> str | None:
         """
-        Reverse-lookup the owning conversation of a session-scoped agent.
+        Reverse-lookup the conversation bound to a session-scoped agent.
 
         ``conversations.agent_id`` is the sole link (the agent row carries no
         back-pointer), and the ``conversations`` table lives in the AP DB — so
         this must run on the conversation engine, not the Omnigent engine that
         owns the ``agents`` table.
-
-        A session-scoped agent is 1:1 with the top-level conversation it was
-        minted for (forks always clone a fresh agent). But named
-        ``sys_session_send`` children are created bound to the *same*
-        ``agent_id`` as their parent, so several conversation rows can share
-        it — the owning session plus one row per named child. The owner is the
-        only one with no parent, so filter on ``parent_conversation_id IS
-        NULL`` to return it deterministically. Without that filter an unordered
-        ``LIMIT 1`` could return a child's id; the caller's owning-session auth
-        check would then run against a row that may not yet be visible on a
-        read replica and surface as a spurious 404 (OMNI-1611).
 
         :param agent_id: Agent identifier, e.g. ``"ag_abc123"``.
         :returns: Owning conversation id, or ``None`` when no
@@ -97,7 +86,6 @@ class SqlAlchemyAgentStore(AgentStore):
                 .where(
                     SqlConversation.workspace_id == current_workspace_id(),
                     SqlConversation.agent_id == agent_id,
-                    SqlConversation.parent_conversation_id.is_(None),
                 )
                 .limit(1)
             ).scalar_one_or_none()
