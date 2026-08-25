@@ -746,6 +746,24 @@ def _router_error_detail(body: str) -> str:
     return text[:300]
 
 
+def router_permanently_disabled(status_code: int, body: str) -> bool:
+    """Whether the router's answer reports a condition no retry can clear.
+
+    A workspace without the routing API answers ``routes:select`` with a 404
+    saying it is not enabled for the account. That is configuration, not an
+    outage: every later call would 404 identically, so the client latches it
+    and the deployment's other backend answers instead.
+
+    :param status_code: The response status.
+    :param body: The raw response text.
+    :returns: ``True`` when the service is disabled for this account.
+    """
+    if status_code != 404:
+        return False
+    text = (body or "").lower()
+    return "routes:select" in text and "not enabled" in text
+
+
 # ── Route-options seam ──────────────────────────────────────────────────────
 #
 # Every assumption about the router's wire contract lives here: the arms it
@@ -1785,6 +1803,11 @@ class ExternalRoutingClient:
 
         from omnigent.api.routing.v1 import routing_pb2 as pb
 
+        if self.permanently_unavailable:
+            # The account has no routing API; skip the call rather than spend a
+            # round trip per turn to be told so again.
+            self.last_error = self._permanent_error
+            return None
         # The seam turns the catalog into router vocabulary and injects
         # whatever arms the router's scenario menu demands.
         harnesses = list(available_models)
@@ -2031,10 +2054,14 @@ async def route_session_harness(
     except ImportError:
         return None, None, None, "Smart routing is not available."
 
-    from omnigent.server.routing_backend import backends_from_caps, select_router
+    from omnigent.server.routing_backend import (
+        backends_from_caps,
+        route_with_fallback,
+        select_router,
+    )
 
-    router = select_router(backends_from_caps(_caps), gateway_backed=gateway_backed)
-    if router is None:
+    backends = backends_from_caps(_caps)
+    if select_router(backends, gateway_backed=gateway_backed) is None:
         return None, None, None, "Smart routing is not configured on this server."
 
     # Fetch the live catalog. Its rows are keyed by worker name (sub-agent
@@ -2102,15 +2129,20 @@ async def route_session_harness(
         return None, None, None, "No routable harnesses are available on this runner."
 
     try:
-        result = await router.client.route(user_message, harness_models)
+        call = await route_with_fallback(
+            backends, user_message, harness_models, gateway_backed=gateway_backed
+        )
     except Exception as exc:  # routing failures must not block session creation
         _logger.exception("smart_routing: route_session_harness failed")
         return None, None, None, f"Routing call failed: {failure_detail(exc)}"
+    if call is None:
+        return None, None, None, "Smart routing is not configured on this server."
+    result = call.result
 
     if result is None:
         # Surface the client's specific failure reason (e.g. HTTP 401 with the
         # gateway's message) when it exposes one; otherwise a generic note.
-        detail = routing_last_error(router.client)
+        detail = routing_last_error(call.client)
         reason = (
             f"Routing unavailable: {detail}"
             if detail
@@ -2133,6 +2165,27 @@ async def route_session_harness(
         if result.harness
         else harness_for_model(chosen_model, harness_models, prefixes=prefixes)
     )
+    if chosen_harness is not None and chosen_harness not in harness_models:
+        # A harness this call never offered is not a verdict — it is a pick the
+        # caller cannot honor. A child confined to one harness would otherwise
+        # have another family's harness written to its row and stamped
+        # "applied" while its pane keeps running the harness it booted on.
+        # A verdict may still spell an offered harness as its WORKER name
+        # (``claude_code``), which is the same harness, not an escape.
+        from omnigent.harness_aliases import canonicalize_harness
+
+        _spelled = _WORKER_NAME_TO_HARNESS.get(chosen_harness) or canonicalize_harness(
+            chosen_harness
+        )
+        if _spelled in harness_models:
+            chosen_harness = _spelled
+        else:
+            _logger.info(
+                "smart_routing: dropping verdict harness=%s; offered=%s",
+                chosen_harness,
+                offered,
+            )
+            chosen_harness = None
     if chosen_harness is None and result.harness in harness_models:
         # Every offered harness bars the pick, and the family the caller allowed
         # is not negotiable — swap the model instead of the harness.
@@ -2168,7 +2221,7 @@ async def route_session_harness(
     verdict: dict[str, Any] = {
         "model": chosen_model,
         "rationale": result.rationale,
-        "router_source": router.source,
+        "router_source": call.source,
     }
     if raw_model and _bare_id(raw_model, prefixes) != _bare_id(chosen_model, prefixes):
         verdict["raw_model"] = raw_model
@@ -2218,10 +2271,14 @@ async def route_turn(
     except ImportError:
         return None, None
 
-    from omnigent.server.routing_backend import backends_from_caps, select_router
+    from omnigent.server.routing_backend import (
+        backends_from_caps,
+        route_with_fallback,
+        select_router,
+    )
 
-    router = select_router(backends_from_caps(_caps), gateway_backed=gateway_backed)
-    if router is None:
+    backends = backends_from_caps(_caps)
+    if select_router(backends, gateway_backed=gateway_backed) is None:
         _logger.info(
             "smart_routing: route_turn skipped for session=%s: no routing client configured",
             session_id,
@@ -2284,9 +2341,12 @@ async def route_turn(
             )
             return None, None
 
-    result = await router.client.route(user_message, available)
-    if result is None:
+    call = await route_with_fallback(
+        backends, user_message, available, gateway_backed=gateway_backed
+    )
+    if call is None or call.result is None:
         return None, None
+    result = call.result
 
     # An injected arm can still come back barred (the menu is offered whole), and
     # a turn cannot change harness — so swap the model for one this gateway
@@ -2318,7 +2378,7 @@ async def route_turn(
     verdict: dict[str, Any] = {
         "model": model,
         "rationale": result.rationale,
-        "router_source": router.source,
+        "router_source": call.source,
     }
     if raw_model and _bare_id(raw_model, prefixes) != _bare_id(model, prefixes):
         verdict["raw_model"] = raw_model

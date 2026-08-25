@@ -1886,6 +1886,12 @@ def create_runner_app(
     _live_response_id: dict[str, str] = {}
     _session_start_cache: dict[str, float] = {}  # session_id → registered start time
     _session_spec_cache: dict[str, _SpecEntry | None] = {}  # session_id → session AgentSpec
+    # session_id → the harness the session actually runs, when it differs from
+    # the spec's. Smart Routing pins a routed child's harness on the
+    # conversation and forwards it as ``harness_override``; without this record
+    # every spec-derived read (native-vs-SDK checks above all) still answers
+    # with the harness the spec declared, which a routed session is not on.
+    _session_harness_overrides: dict[str, str] = {}
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
@@ -2646,6 +2652,10 @@ def create_runner_app(
         # endpoint at all.
         _routing_class = init_context.routing_class
         remember_session_routing_class(session_id, _routing_class)
+        if init_context.envelope is not None:
+            _note_session_harness_override(
+                session_id, init_context.envelope.snapshot.harness_override
+            )
 
         spec: AgentSpec | None = None
         spec_entry: _SpecEntry | None = None
@@ -5531,6 +5541,7 @@ def create_runner_app(
         spawn_env = (
             dispatch.spawn_env if dispatch else cast(dict[str, str] | None, body.get("spawn_env"))
         )
+        _note_session_harness_override(conv_id, cast(str | None, body.get("harness_override")))
         startup_envelope = _fresh_session_init_envelope(conv_id)
         startup_labels = startup_envelope.snapshot.labels if startup_envelope is not None else None
         if not harness_name:
