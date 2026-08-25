@@ -4000,6 +4000,37 @@ def _tool_relay_handler_factory(
             self.end_headers()
             self.wfile.write(raw)
 
+        def _send_policy_proxy_error(self, exc: Exception) -> None:
+            """Return a 502 whose body names why the upstream forward failed.
+
+            The default ``send_error`` writes a generic ``http.server`` HTML
+            page; the policy hook truncates that body into its fail-closed
+            ``Detail:``, so a bare page reads as an opaque gateway blip. Most
+            failures here are a Databricks token-refresh lapse the
+            refresh-capable client surfaces as ``httpx.RequestError`` — lead the
+            body with that cause so the blocked-turn message is actionable.
+
+            :param exc: The exception raised by the upstream policy POST.
+            :returns: None.
+            """
+            reason = str(exc).strip()
+            detail = f"{type(exc).__name__}: {reason}" if reason else type(exc).__name__
+            # Truncate the detail (not the composed message) so the leading
+            # cause always survives intact instead of being cut mid-reason once
+            # the fixed prefix is prepended.
+            if len(detail) > _POLICY_PROXY_ERROR_DETAIL_MAX:
+                detail = detail[: _POLICY_PROXY_ERROR_DETAIL_MAX - 3] + "..."
+            message = f"omnigent policy-eval proxy could not reach the Omnigent server: {detail}"
+            # Keep the full exception (with traceback) in the runner log; the
+            # user-facing body is capped and can drop a diagnostically useful tail.
+            _logger.warning("policy-eval proxy forward failed: %s", detail, exc_info=exc)
+            body = message.encode("utf-8", "replace")
+            self.send_response(HTTPStatus.BAD_GATEWAY)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def _read_json_body(self) -> _JsonObject | None:
             """
             Read and decode a JSON request body.
