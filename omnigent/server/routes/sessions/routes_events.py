@@ -127,7 +127,6 @@ from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
     _apply_pending_policy_ask_writes,
     _await_settled_managed_launch,
-    _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
     _dispatch_skill_slash_command_to_runner,
@@ -168,6 +167,7 @@ from omnigent.server.routes._sessions.helpers import (
     _stop_session_host_runner,
     _stop_session_via_runner,
     _stream_live_events,
+    _subagent_delivery_status,
     _wait_for_runner_client,
 )
 from omnigent.server.routes._sessions.orchestration import (

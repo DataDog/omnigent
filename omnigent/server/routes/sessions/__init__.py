@@ -334,7 +334,6 @@ from omnigent.server.routes._sessions.common import (
 # Lower-layer helpers (SSE builders, publishers, persistence, runner-forward
 # primitives) live in _sessions.helpers.
 from omnigent.server.routes._sessions.helpers import (
-    FILE_CONTENT_CACHE_CONTROL as FILE_CONTENT_CACHE_CONTROL,
     SessionLiveness as SessionLiveness,
     _HostLaunchAttempt as _HostLaunchAttempt,
     _NativeTerminalEnsureOutcome as _NativeTerminalEnsureOutcome,
@@ -351,10 +350,10 @@ from omnigent.server.routes._sessions.helpers import (
     _announce_session_added as _announce_session_added,
     _apply_liveness_to_items as _apply_liveness_to_items,
     _apply_pending_policy_ask_writes as _apply_pending_policy_ask_writes,
+    _approval_access_from_grants as _approval_access_from_grants,
     _attachment_disposition as _attachment_disposition,
     _authorize_bundled_parent_and_inherit_runner as _authorize_bundled_parent_and_inherit_runner,
     _await_settled_managed_launch as _await_settled_managed_launch,
-    _background_task_delivery_status as _background_task_delivery_status,
     _build_actor as _build_actor,
     _build_evaluation_context as _build_evaluation_context,
     _build_new_item as _build_new_item,
@@ -385,7 +384,6 @@ from omnigent.server.routes._sessions.helpers import (
     _extract_persistent_item_from_sse as _extract_persistent_item_from_sse,
     _extract_user_text_for_routing as _extract_user_text_for_routing,
     _extract_user_text_from_event as _extract_user_text_from_event,
-    _file_content_etag as _file_content_etag,
     _find_claude_native_subagent_child as _find_claude_native_subagent_child,
     _find_codex_native_subagent_child as _find_codex_native_subagent_child,
     _find_subagent_child_by_title as _find_subagent_child_by_title,
@@ -396,7 +394,6 @@ from omnigent.server.routes._sessions.helpers import (
     _handle_external_session_todos as _handle_external_session_todos,
     _handle_mcp_tools_list as _handle_mcp_tools_list,
     _host_model_options_via_registry as _host_model_options_via_registry,
-    _if_none_match_matches as _if_none_match_matches,
     _invalidate_runner_backed_snapshot_state as _invalidate_runner_backed_snapshot_state,
     _is_codex_native_subagent as _is_codex_native_subagent,
     _is_kiro_native_session as _is_kiro_native_session,
@@ -510,7 +507,9 @@ from omnigent.server.routes._sessions.helpers import (
     _stop_session_host_runner as _stop_session_host_runner,
     _stored_file_to_resource as _stored_file_to_resource,
     _stream_live_events as _stream_live_events,
+    _strip_pending_author_prefix as _strip_pending_author_prefix,
     _structured_ask_user_question as _structured_ask_user_question,
+    _subagent_delivery_status as _subagent_delivery_status,
     _targeted_elicitation_event as _targeted_elicitation_event,
     _title_content_from_item as _title_content_from_item,
     _truncate_label as _truncate_label,
@@ -525,7 +524,6 @@ from omnigent.server.routes._sessions.helpers import (
     _wait_for_managed_runner_tunnel as _wait_for_managed_runner_tunnel,
     announce_hosts_changed as announce_hosts_changed,
     cancel_managed_launch_tasks as cancel_managed_launch_tasks,
-    prefetch_session_routing_catalogs as prefetch_session_routing_catalogs,
 )
 
 # Runner-forward / ASK-gate helpers are patched by tests on this facade module
@@ -730,6 +728,34 @@ from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedE
 from omnigent.telemetry.events import SessionStoppedEvent as _TelSessionStoppedEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
 from omnigent.tools.client_specified import parse_client_side_tool_specs
+
+if TYPE_CHECKING:
+    __all__ = [
+        "_agent_carries_native_fork_history",
+        "_agent_is_native",
+        "_build_policy_engine_from_spec",
+        "_compact_lock",
+        "_dispatch_session_event_to_runner",
+        "_ensure_runner_relay_ready",
+        "_forward_session_change_to_runner",
+        "_get_runner_client",
+        "_get_runner_client_for_resource_access",
+        "_hold_native_ask_gate",
+        "_kick_managed_wake",
+        "_launch_runner_on_host",
+        "_load_agent_spec_for_session",
+        "_poll_request_disconnect",
+        "_presentation_labels_for_agent",
+        "_publish_runner_recovered_status",
+        "_publish_sandbox_status",
+        "_reset_runner_resources_after_switch",
+        "_resolve_harness",
+        "_same_provider_family",
+        "_signal_terminal_resolved_harness_elicitation",
+        "_stop_session_via_runner",
+        "_wait_for_runner_client",
+    ]
+
 
 get_agent_cache = _runtime_get_agent_cache
 get_caps = _runtime_get_caps

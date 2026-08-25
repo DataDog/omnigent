@@ -70,12 +70,9 @@ from omnigent.server.routes._sessions.common import (
     set_server_runner_router,
 )
 from omnigent.server.routes._sessions.helpers import (
-    FILE_CONTENT_CACHE_CONTROL,
     _ancestor_session_ids,
     _attachment_disposition,
-    _file_content_etag,
     _get_runner_client_for_resource_access,
-    _if_none_match_matches,
     _load_agent_spec_for_session,
     _proxy_get_session_resources_to_runner,
     _publish_and_persist_resource_event,
