@@ -228,8 +228,8 @@ export function SettingsSidebarBody({
           closing onto the content behind it. On desktop onNavClick is a no-op
           (persistent card), so dropping it changes nothing there. */}
           <Link to={settingsReturnPath} componentId="settings.back_to_omnigent">
-            <ArrowLeftIcon className="ui-icon" />
-            Back
+            <ArrowLeftIcon className="size-4" />
+            Back to Omnigent
           </Link>
         </Button>
       </div>
