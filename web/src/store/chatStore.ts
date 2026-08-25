@@ -531,6 +531,17 @@ export interface ChatState {
    */
   terminalPending: boolean;
   /**
+   * Epoch ms when this client last asked a host to launch a runner for the
+   * open session outside the send path — today, a host switch. The runner
+   * is coming up but nothing on the wire says so yet: the session is not
+   * newly created, so the liveness startup grace doesn't apply, and no turn
+   * is in flight, so it would otherwise read as idle `runner_asleep` and
+   * show nothing at all. Feeds `useSessionLiveness` as a `starting` nudge
+   * and self-expires after `STARTING_GRACE_S`. `null` when no such launch
+   * is outstanding.
+   */
+  runnerLaunchedAt: number | null;
+  /**
    * Users currently viewing this session (presence circles in the
    * chat header). Replaced wholesale by every `session.presence` SSE
    * event — the wire protocol is full-state, never deltas — and
@@ -701,6 +712,9 @@ export interface ChatState {
   addComposerAttachment: (attachment: ComposerAttachment) => void;
   /** Drain the queued composer attachments (called by the composer). */
   clearPendingComposerAttachments: () => void;
+  /** Stamp {@link ChatState.runnerLaunchedAt} now — call right after a
+   *  successful `launchRunner` for the open session. */
+  markRunnerLaunched: () => void;
   /**
    * Compact the active session's context. Posts a ``compact`` event to the
    * server, which summarises the conversation history in-place. No-ops when
@@ -1094,6 +1108,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   skills: [],
   codexModelOptions: [],
   terminalPending: false,
+  runnerLaunchedAt: null,
   viewers: [],
   sandboxStatus: null,
   mcpStartup: null,
@@ -1820,6 +1835,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // session's composer (which drains the store on mount). Same reset
         // discipline as ``viewers`` above.
         pendingComposerAttachments: [],
+        runnerLaunchedAt: null,
         sandboxStatus: null,
         mcpStartup: null,
         abortController: null,
@@ -1899,6 +1915,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   clearPendingComposerAttachments: () => set({ pendingComposerAttachments: [] }),
+
+  markRunnerLaunched: () => set({ runnerLaunchedAt: Date.now() }),
 
   compact: async () => {
     const { conversationId } = get();
