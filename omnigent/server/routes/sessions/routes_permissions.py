@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 from typing import TypedDict
 
 from fastapi import (
@@ -103,7 +104,7 @@ def register_permissions_routes(
         except Exception:
             return None
 
-    def _instrument_grant(handler: Callable[..., Any]) -> Callable[..., Any]:
+    def _instrument_grant(handler: object) -> object:
         @functools.wraps(handler)
         async def wrapped(
             request: Request,
@@ -141,7 +142,7 @@ def register_permissions_routes(
 
         return wrapped
 
-    def _instrument_revoke(handler: Callable[..., Any]) -> Callable[..., Any]:
+    def _instrument_revoke(handler: object) -> object:
         @functools.wraps(handler)
         async def wrapped(request: Request, session_id: str, target_user_id: str) -> Response:
             actor = _require_user(request, auth_provider) or RESERVED_USER_LOCAL

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 import weakref
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any, Literal, cast
 
@@ -1169,11 +1170,13 @@ def register_events_routes(
                     "run /compact again.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
-            await _run_compact_locked(
-                session_id,
-                conv,
-                agent_store,
-                agent_cache,
+            metric_actor, metric_owner = await _usage_identity(session_id, user_id)
+            usage = get_feature_usage_recorder().operation(
+                feature_name="context",
+                operation="compact",
+                actor_user_id=metric_actor,
+                session_owner_id=metric_owner,
+            )
             )
             try:
                 await _run_compact_locked(
