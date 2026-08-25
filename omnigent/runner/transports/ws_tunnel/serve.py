@@ -419,23 +419,6 @@ async def serve_tunnel(
             else:
                 http_status = _websocket_http_status(exc)
                 if http_status is not None and http_status in _REFRESHABLE_HTTP_STATUSES:
-                    http_auth_rejection_streak += 1
-                    if http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS:
-                        login_hint = (
-                            f"run `databricks auth login --host {server_url}` to re-authenticate"
-                            if server_url
-                            else "check remote server authentication"
-                        )
-                        raise RuntimeError(
-                            f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
-                            f"(HTTP {http_status} persisted across "
-                            f"{http_auth_rejection_streak} attempts); "
-                            f"{login_hint}"
-                        ) from exc
-                    # Invalidate the cached token so the loop-top _refresh_auth_token
-                    # fetches a fresh one on the next attempt. The loop-top call is
-                    # already guarded against transient factory errors (OSError etc.),
-                    # so we don't call the factory directly here.
                     _invalidate_auth_token_factory(auth_token_factory)
                     _logger.info("HTTP %d; invalidated auth token, retrying", http_status)
                     retry_reason = f"HTTP {http_status}; retrying with refreshed token"
