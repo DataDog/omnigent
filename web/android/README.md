@@ -55,6 +55,41 @@ when the bridge methods are absent, so the Android shell omits them for now:
 - **Native floating server switcher** and **Chat/Terminal bar.** Rendered
   in-page by the SPA.
 
+## Databricks workspaces
+
+A Databricks workspace serves its own landing page at the root and mounts the
+Omnigent SPA at `/omnigent`, so the shell rewrites a **bare** workspace root to
+that mount (`Origins.databricksWorkspaceUiUrl`):
+
+- `https://dbc-a5d4177a-49dc.cloud.databricks.com` →
+  `https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent`
+- `?o=<org>` and any fragment are preserved; a URL that already carries a path
+  (a deep link, or `/omnigent` itself) is left alone.
+
+The rewrite happens when the pinned server URL is read
+(`ServerStore.currentServerUrl`), and in all three `OmnigentWebViewClient`
+callbacks that can observe the WebView reaching the root, because no single one
+sees every case:
+
+- `shouldOverrideUrlLoading` — link/redirect navigations. Not called for loads
+  the shell starts itself, nor for POST-driven ones.
+- `onPageStarted` — every committed main-frame load, including the login chain's
+  POST hand-back.
+- `doUpdateVisitedHistory` — in-page routing (`pushState`/`replaceState`,
+  back/forward), which loads nothing and so fires neither of the above.
+
+Bounces are budgeted at one per app-page load (`MAX_ROOT_BOUNCES`): if a
+workspace answers `/omnigent` with a redirect back to the root, the user stays
+on the root instead of looping, and a successful app page load re-arms the
+budget. They're also posted to the main looper — a `loadUrl` issued while
+WebView is committing a navigation can be dropped.
+
+Host matching is by domain (`*.databricks.com`, `*.azuredatabricks.net`) — no
+probe request. `*.databricksapps.com` is excluded: Apps serve their own app at
+the root and have no workspace mount. Note the desktop and iOS shells still
+expand to `/ml/omnigents` after a `server: databricks` probe; that divergence is
+intentional for now (see the comment in `web/electron/src/url.js`).
+
 ## Managed configuration (org-preset servers)
 
 Organizations can preconfigure server URLs so users don't type one. The app
