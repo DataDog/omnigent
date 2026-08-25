@@ -81,7 +81,13 @@ import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
-import { parseEvent, parseSseStream, type SseStreamResult } from "@/lib/sse";
+import {
+  SSE_STALL_TIMEOUT_MS,
+  parseEvent,
+  parseSseStream,
+  withStallGuard,
+  type SseStreamResult,
+} from "@/lib/sse";
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
@@ -3805,10 +3811,48 @@ const presenceIdle = createPresenceIdleTracker({
     for (const controller of [...presenceAttemptControllers]) controller.abort();
   },
 });
+
+// ── Stream liveness ─────────────────────────────────────────────────
+// When bytes last arrived on each live stream attempt (heartbeats
+// included), stamped from the moment the attempt starts. Lets the fast
+// paths below tell a stream that is merely quiet from one that is
+// probably dead — tracked per attempt, since background conversations
+// hold streams of their own.
+const streamAttemptActivity = new Map<AbortController, number>();
+
+// Two missed 15 s server heartbeats plus slack. Deliberately shorter than
+// the stall guard's own window (`SSE_STALL_TIMEOUT_MS`): the guard is the
+// ceiling; these event-driven checks make the common cases immediate.
+export const SSE_STALE_RECYCLE_MS = 35_000;
+
+/**
+ * Recycle every live stream attempt that looks dead — no bytes for
+ * `SSE_STALE_RECYCLE_MS` while its connection is supposedly up.
+ *
+ * Fired on the two moments a half-open socket is most likely to be
+ * discovered: the tab becoming visible again (wake from sleep) and the
+ * browser regaining network. Aborting only the per-attempt controller
+ * funnels each pump into its normal reconnect + snapshot reconcile
+ * (background pumps add their own jitter); a healthy stream (fresh
+ * bytes) is left untouched, so alt-tabbing never churns connections.
+ */
+function recycleStreamIfStale(): void {
+  const now = Date.now();
+  // Copy first: aborting settles each attempt's `finally`, which deletes
+  // from this map while we iterate it.
+  for (const [attempt, lastActivityAt] of [...streamAttemptActivity]) {
+    if (now - lastActivityAt > SSE_STALE_RECYCLE_MS) attempt.abort();
+  }
+}
+
 if (typeof document !== "undefined") {
-  document.addEventListener("visibilitychange", () =>
-    presenceIdle.handleVisibilityChange(document.hidden),
-  );
+  document.addEventListener("visibilitychange", () => {
+    presenceIdle.handleVisibilityChange(document.hidden);
+    if (!document.hidden) recycleStreamIfStale();
+  });
+}
+if (typeof window !== "undefined") {
+  window.addEventListener("online", () => recycleStreamIfStale());
 }
 
 /**
@@ -3878,6 +3922,9 @@ export async function startStreamPump(
       const onOuterAbort = () => attempt.abort();
       controller.signal.addEventListener("abort", onOuterAbort);
       presenceAttemptControllers.add(attempt);
+      // Stamped from attempt start so the wake fast-path can also recycle
+      // an open that has hung past the stale window, not just a dead body.
+      streamAttemptActivity.set(attempt, Date.now());
       try {
         const idle = presenceIdle.idleNow();
         let streamRes: Response;
@@ -3939,12 +3986,26 @@ export async function startStreamPump(
           failedOpens += 1;
           continue;
         }
+        // An auth layer in front of the server (e.g. an expired app-ingress
+        // session) can answer with a redirect the fetch follows to a 200
+        // text/html login page. Pumping that body would end instantly
+        // without `[DONE]` and reconnect with no backoff — a hot loop that
+        // leaves the transcript silently frozen. Treat a non-SSE content
+        // type as a failed open so it backs off like any other bad answer.
+        const contentType = streamRes.headers.get("content-type") ?? "";
+        if (!contentType.toLowerCase().includes("text/event-stream")) {
+          void streamRes.body.cancel().catch(() => {});
+          console.warn(`Session ${id}: stream open returned '${contentType}', will retry`);
+          failedOpens += 1;
+          continue;
+        }
 
         const reconnecting = hasConnected;
         hasConnected = true;
         failedOpens = 0;
         consecutive404s = 0;
         presenceIdle.noteReported(idle);
+        streamAttemptActivity.set(attempt, Date.now());
         if (reconnecting) {
           dropEphemeralInFlightBlocks(id, set);
         } else {
@@ -3952,9 +4013,25 @@ export async function startStreamPump(
           // a previous stream bind so the debug panel starts clean.
           clearSseLog(id);
         }
+        // Guard the byte stream with a silence watchdog: the server
+        // heartbeats every 15 s, so a longer gap means a half-open socket
+        // (laptop sleep, network path change, proxy reap). The guard ends
+        // the stream like a transport drop, and this loop's reconnect +
+        // reconcile resupplies whatever committed during the dead window —
+        // without it the pump blocks in read() forever and the transcript
+        // silently freezes until a page reload.
+        const guardedBody = withStallGuard(streamRes.body, {
+          onActivity: () => {
+            streamAttemptActivity.set(attempt, Date.now());
+          },
+          onStall: () =>
+            console.warn(
+              `Session ${id}: no stream bytes in ${SSE_STALL_TIMEOUT_MS} ms; reconnecting`,
+            ),
+        });
         // Start the pump, then reconcile the snapshot concurrently (race-safe
         // via itemId dedup) — mirrors bindStream's stream-then-snapshot order.
-        const pumpPromise = pumpStreamEvents(id, streamRes.body, controller, set, get);
+        const pumpPromise = pumpStreamEvents(id, guardedBody, controller, set, get);
         if (reconnecting) {
           await reconcileOnReconnect(id, set, get);
         }
@@ -3971,6 +4048,7 @@ export async function startStreamPump(
       } finally {
         controller.signal.removeEventListener("abort", onOuterAbort);
         presenceAttemptControllers.delete(attempt);
+        streamAttemptActivity.delete(attempt);
       }
     }
   } finally {
