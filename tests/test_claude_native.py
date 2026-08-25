@@ -318,10 +318,6 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
             "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "123456",
             "CLAUDE_CODE_USE_GATEWAY": "1",
             "ANTHROPIC_CUSTOM_HEADERS": "x-databricks-use-coding-agent-mode: true",
-            # No CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: this path launches in
-            # gateway mode (CLAUDE_CODE_USE_GATEWAY=1), where Claude Code
-            # negotiates the anthropic-beta set with the gateway and keeps MCP
-            # tool search on (it rides on the advanced-tool-use beta).
         },
         api_key_helper="printf token",
         model="databricks-claude-opus-test",
