@@ -41,11 +41,11 @@ def _goal_response(session_id: str, method: str, suffix: str = ""):
 # multi-minute cargo build runs here). timeout(300) matches the sibling
 # native-Codex render-parity tests now that the sidecar build is out of band.
 @pytest.mark.timeout(300)
-def test_codex_goal_mode_with_mocked_responses(
+def test_codex_goal_mode_processes_first_message_with_untrusted_hooks(
     page: Page,
     mocked_native_codex_goal_session: MockedCodexNativeSession,
 ) -> None:
-    """Set, pause/resume, and clear a Codex goal through the real UI/API path."""
+    """Bypass hook review, then exercise goal controls through the real UI path."""
     session = mocked_native_codex_goal_session
     page.goto(f"{session.base_url}/c/{session.session_id}")
 

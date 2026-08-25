@@ -710,6 +710,23 @@ def _codex_cli_supports_goal_mode(codex_path: str) -> bool:
     return tuple(int(part) for part in match.groups()) >= _CODEX_GOAL_MIN_VERSION
 
 
+def _write_codex_unknown_version_shim(directory: Path, codex_path: str) -> Path:
+    """Write a Codex shim whose version probe fails without blocking launches."""
+    shim = directory / "codex-unknown-version"
+    shim.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import sys\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('codex-cli version unavailable')\n"
+        "    raise SystemExit(0)\n"
+        f"os.execv({codex_path!r}, [{codex_path!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim
+
+
 def _assert_service_worker_tombstone(build_output: Path) -> None:
     """Fail if the built SPA ships anything but the tombstone service worker.
 
@@ -2829,6 +2846,22 @@ def mocked_native_codex_goal_session(
     artifact_dir = server_tmp / "artifacts"
     for path in (source_codex_home, home_dir, state_dir, artifact_dir):
         path.mkdir(parents=True, exist_ok=True)
+    # Reproduce the intermittent production path deterministically: a user
+    # hook needs review while the runner's version probe is unparseable. The
+    # real Codex binary still handles every non-version invocation.
+    (source_codex_home / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {"hooks": [{"type": "command", "command": "/usr/bin/true"}]}
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    codex_shim = _write_codex_unknown_version_shim(server_tmp, codex_path)
     _write_mock_codex_provider_config(config_home, sidecar.base_url)
 
     port = _find_free_port()
@@ -2852,6 +2885,7 @@ def mocked_native_codex_goal_session(
         "OMNIGENT_CODEX_NATIVE_STATE_DIR": str(state_dir),
         "CODEX_HOME": str(source_codex_home),
         "HOME": str(home_dir),
+        "OMNIGENT_CODEX_PATH": str(codex_shim),
     }
     server_env = {
         **shared_env,
