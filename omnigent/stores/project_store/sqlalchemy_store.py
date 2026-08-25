@@ -154,7 +154,7 @@ class SqlAlchemyProjectStore(ProjectStore):
         ``SqlProject.__table_args__`` for why that is acceptable.
         """
         with self._session("insert_project") as session:
-            if self._name_taken(session, user_id=user_id, name=name, exclude_id=None):
+            if self._name_taken(session, owner_user_id=owner_user_id, name=name, exclude_id=None):
                 raise OmnigentError(
                     f"A project named {name!r} already exists",
                     code=ErrorCode.ALREADY_EXISTS,
