@@ -3424,24 +3424,10 @@ async def _run_managed_wake(
         tracker.fail(session_id, reason)
         _publish_sandbox_status(session_id, "failed", reason)
         return
-
-    def _on_stage(stage: str) -> None:
-        """Relay the wake's launch-pipeline stage to the session's progress surface.
-
-        Without it the wake shows the single ``"provisioning"`` band that
-        ``_kick_managed_wake`` seeded for its whole duration, even while the host
-        is already re-execing. resume_managed_host may invoke this from the
-        worker thread its ``start_host`` runs on; ``_publish_sandbox_status`` is
-        thread-safe.
-        """
-        _publish_sandbox_status(session_id, stage)
-
     try:
         # Wake the same sandbox in place; resume_managed_host is single-flight
         # per host and a no-op if it's already online.
-        await resume_managed_host(
-            host_id, host_store, sandbox_config, force=True, on_stage=_on_stage
-        )
+        await resume_managed_host(host_id, host_store, sandbox_config, force=True)
         _publish_sandbox_status(session_id, "connecting")
         refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if refreshed is None:
@@ -7586,13 +7572,7 @@ async def _create_session_from_existing_agent(
     # "auto" defers harness + model selection to the first-message routing
     # path; validate executor type now but store the sentinel unchanged.
     harness_override: str | None
-    if _native_smart_routing:
-        # The harness is already decided and the agent rebound, so the row keeps
-        # no sentinel: a native wrapper rejects harness_override, and leaving
-        # "auto" behind would make the first message re-route an already-running
-        # terminal. The auto marker is stamped as a label below instead.
-        harness_override = None
-    elif _force_auto_for_child or _spec_auto_brain or body.harness_override == "auto":
+    if _force_auto_for_child or body.harness_override == "auto":
         await asyncio.to_thread(_validated_harness_override_executor_type, agent)
         harness_override = "auto"
         # Ignore any orchestrator-supplied model; routing picks it. (The spec
