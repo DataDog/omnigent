@@ -82,6 +82,47 @@ describe("buttonVariants icon geometry", () => {
     // opt an exceptional icon out with data-icon-size.
     expect(classes).toContain("button-standard-icons");
   });
+
+  it("makes icon-xxs a transparent 14px container with a 14px glyph", () => {
+    render(
+      <Button variant="ghost" size="icon-xxs" aria-label="Tiny icon">
+        <svg aria-hidden />
+      </Button>,
+    );
+
+    expect(screen.getByRole("button", { name: "Tiny icon" })).toHaveClass(
+      "size-3.5",
+      "bg-transparent",
+      "hover:bg-transparent",
+      "dark:hover:bg-transparent",
+      "[&_svg]:size-3.5!",
+      "[&_svg]:p-0!",
+    );
+  });
+
+  it("mutes ghost icon buttons by default without changing primary icon contrast", () => {
+    render(
+      <>
+        <Button variant="ghost" size="icon" aria-label="Ghost icon">
+          <svg aria-hidden />
+        </Button>
+        <Button size="icon" aria-label="Primary icon">
+          <svg aria-hidden />
+        </Button>
+      </>,
+    );
+
+    expect(screen.getByRole("button", { name: "Ghost icon" })).toHaveClass(
+      "text-muted-foreground",
+      "hover:text-foreground",
+    );
+    expect(screen.getByRole("button", { name: "Primary icon" })).toHaveClass(
+      "text-primary-foreground",
+    );
+    expect(screen.getByRole("button", { name: "Primary icon" })).not.toHaveClass(
+      "text-muted-foreground",
+    );
+  });
 });
 
 describe("Button radius scale", () => {

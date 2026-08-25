@@ -898,6 +898,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               scrollContainerRef={scrollContainerRef}
               onRowClick={onNavClick}
               searchQuery=""
+              newSessionProjectName={newSessionProjectName}
               activeTab={activeTab}
               onActiveTabChange={switchTab}
               multiUser={multiUser}
@@ -1090,9 +1091,19 @@ function ProjectFolder({
         title={name}
         icon={
           expanded ? (
-            <FolderOpenIcon className="ui-icon text-muted-foreground" />
+            <FolderOpenIcon
+              className={cn(
+                "ui-icon",
+                active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
+              )}
+            />
           ) : (
-            <FolderIcon className="ui-icon text-muted-foreground" />
+            <FolderIcon
+              className={cn(
+                "ui-icon",
+                active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
+              )}
+            />
           )
         }
         active={active}
@@ -1853,6 +1864,7 @@ function ConversationList({
                       projectId={group.id}
                       windowConversations={group.conversations}
                       expanded={expandedProjects.includes(group.name)}
+                      active={newSessionProjectName === group.name}
                       // Best-effort marker from the globally-loaded window: a
                       // collapsed folder hasn't fetched its own sessions yet.
                       marker={projectMarkerState(group.conversations)}
@@ -2119,6 +2131,7 @@ function SectionHeader({
                 SIDEBAR_ROW,
                 "group flex w-full items-center border-0 text-left text-foreground transition-colors",
                 SIDEBAR_HOVER_HIGHLIGHT,
+                active && SIDEBAR_ACTIVE_HIGHLIGHT,
               )
             : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
         }
@@ -2447,18 +2460,18 @@ function ConversationSection({
           {conversations.length === 0 && emptyMessage ? (
             // Expanded but empty — a project with no loaded chats (indented, in a
             // dashed well) or a top-level list whose filter matched nothing.
-            <p
-              className={
-                indentRows
-                  ? cn(
-                      SIDEBAR_ROW,
-                      "mt-1 mr-2 ml-8 flex items-center justify-center border border-dashed border-border text-center text-ui text-muted-foreground",
-                    )
-                  : "px-2 py-1 text-ui text-muted-foreground"
-              }
-            >
-              {emptyMessage}
-            </p>
+            indentRows ? (
+              <div
+                className={cn(
+                  SIDEBAR_ROW,
+                  "mt-1 mr-2 ml-8 flex flex-col items-start justify-center gap-1.5 px-0 py-1 pb-2 text-left md:py-1 md:pb-2",
+                )}
+              >
+                <p className="text-ui text-muted-foreground">{emptyMessage}</p>
+              </div>
+            ) : (
+              <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
+            )
           ) : (
             // Indent project chats a step under the project-folder name above.
             <ul className={cn("flex flex-col", indentRows ? "gap-0 pl-6" : "gap-0")}>
