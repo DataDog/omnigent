@@ -612,24 +612,10 @@ jobs:
               "labels_remove": labels_remove,
               "components": valid_components,
               "ranked_owners": ranked_owners,
-              **duplicate,
-              # Re-triage runs neither re-label, re-comment, nor close: the
-              # duplicate call was already made and acted on at open time.
-              "duplicate_decision": (
-                  duplicate["duplicate_decision"] if is_open_event else "none"
-              ),
-              "close_duplicate_issue": close_duplicate_issue,
-              "post_duplicate_comment": post_duplicate_comment,
-              # Read by the assignment steps below, which mutate the issue too.
-              "apply_labels": apply_labels,
-              # Left as None while Databricks owns scoring.
-              "priority": valid_priority,
+              "duplicate_of": dup if isinstance(dup, int) else None,
+              "priority": result.get("priority") if result.get("priority") in ALLOWED_PRIORITIES else None,
               "needs_info": bool(result.get("needs_info")),
-              "reasoning": (
-                  result.get("reasoning", "")
-                  if isinstance(result.get("reasoning", ""), str)
-                  else ""
-              ),
+              "reasoning": result.get("reasoning", ""),
           }
           pathlib.Path("/tmp/triage_result.json").write_text(json.dumps(output))
           pathlib.Path("/tmp/duplicate_comment.md").write_text(

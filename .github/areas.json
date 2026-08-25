@@ -140,10 +140,8 @@
         "TomeHirata",
         "bbqiu",
         "fanzeyi",
+        "aravind-segu",
         "dbczumar"
-      ],
-      "owners_paused": [
-        "aravind-segu"
       ]
     },
     {
@@ -160,10 +158,8 @@
         "dhruv0811",
         "bbqiu",
         "fanzeyi",
+        "aravind-segu",
         "dbczumar"
-      ],
-      "owners_paused": [
-        "aravind-segu"
       ]
     },
     {
@@ -180,10 +176,8 @@
         "dhruv0811",
         "bbqiu",
         "fanzeyi",
+        "aravind-segu",
         "dbczumar"
-      ],
-      "owners_paused": [
-        "aravind-segu"
       ]
     },
     {
@@ -201,34 +195,8 @@
         "TomeHirata",
         "bbqiu",
         "fanzeyi",
+        "aravind-segu",
         "dbczumar"
-      ],
-      "owners_paused": [
-        "aravind-segu"
-      ]
-    },
-    {
-      "key": "auth",
-      "label": "comp:server",
-      "priority_label": "comp:auth",
-      "weight": 1.2,
-      "weight_source": "editorial",
-      "definition": "Authentication, OIDC/OAuth, account login, and runtime credentials.",
-      "paths": [
-        "omnigent/cli_auth.py",
-        "omnigent/runtime/credentials/",
-        "omnigent/server/auth.py",
-        "omnigent/server/oidc.py",
-        "omnigent/server/oidc_access.py",
-        "omnigent/server/routes/_auth_helpers.py",
-        "omnigent/server/routes/accounts_auth.py",
-        "omnigent/server/routes/auth.py",
-        "omnigent/server/routes/device_auth.py"
-      ],
-      "owners": [
-        "dhruv0811",
-        "TomeHirata",
-        "fanzeyi"
       ]
     },
     {
@@ -341,9 +309,6 @@
         "fanzeyi",
         "dhruv0811",
         "dbczumar"
-      ],
-      "owners_paused": [
-        "aravind-segu"
       ]
     },
     {
@@ -364,9 +329,6 @@
         "daniellok-db",
         "TomeHirata",
         "dbczumar"
-      ],
-      "owners_paused": [
-        "aravind-segu"
       ]
     },
     {
@@ -384,9 +346,6 @@
         "dhruv0811",
         "bbqiu",
         "dbczumar"
-      ],
-      "owners_paused": [
-        "aravind-segu"
       ]
     },
     {
@@ -404,10 +363,8 @@
         "TomeHirata",
         "bbqiu",
         "fanzeyi",
+        "aravind-segu",
         "dbczumar"
-      ],
-      "owners_paused": [
-        "aravind-segu"
       ]
     },
     {
@@ -490,10 +447,8 @@
         "fanzeyi",
         "TomeHirata",
         "bbqiu",
+        "aravind-segu",
         "dbczumar"
-      ],
-      "owners_paused": [
-        "aravind-segu"
       ]
     },
     {
@@ -512,10 +467,8 @@
         "TomeHirata",
         "bbqiu",
         "fanzeyi",
+        "aravind-segu",
         "dbczumar"
-      ],
-      "owners_paused": [
-        "aravind-segu"
       ]
     },
     {
@@ -536,10 +489,8 @@
         "TomeHirata",
         "bbqiu",
         "fanzeyi",
+        "aravind-segu",
         "dbczumar"
-      ],
-      "owners_paused": [
-        "aravind-segu"
       ]
     },
     {
