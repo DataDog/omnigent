@@ -50,13 +50,7 @@ from omnigent.inner.codex_executor import (
     _find_codex_cli,
     _populate_codex_home_config,
     _provider_codex_config_overrides,
-    codex_extended_catalog_requested,
-    codex_router_bridge_dir,
-    codex_router_hooks_settings,
-    codex_router_session_id,
-    codex_routing_hook_skip_reason,
     materialize_codex_provider_config,
-    write_codex_hooks_file,
 )
 from omnigent.inner.databricks_executor import _databricks_gateway_host
 
@@ -951,7 +945,18 @@ class CodexNativeAppServer:
             self.codex_home,
             self.config_overrides,
         )
-        if codex_version is not None and not policy_hooks_supported:
+        # Native policy enforcement needs codex's hook-trust protocol
+        # (``currentHash`` / ``trustStatus`` in ``hooks/list``), added in
+        # codex 0.129. Below that the hook can never be trusted, so
+        # registering it would only fail at the trust gate. Detect the
+        # version up front; below the minimum we skip registration and
+        # degrade to "no enforcement" with a surfaced reason. A version we
+        # cannot parse (``None``) is treated as supported so a flaky probe
+        # never silently disables enforcement — a genuine trust failure is
+        # then caught below.
+        codex_version = await _codex_cli_version(self.codex_path)
+        self.codex_cli_version = codex_version
+        if codex_version is not None and codex_version < _MIN_POLICY_HOOK_CODEX_VERSION:
             self._disable_policy_hook(
                 f"Codex CLI {_format_codex_version(codex_version)} is older than "
                 f"{_format_codex_version(_MIN_POLICY_HOOK_CODEX_VERSION)}; upgrade "
