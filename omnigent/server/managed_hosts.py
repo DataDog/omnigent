@@ -2846,6 +2846,7 @@ async def resume_managed_host(
                 repo_branch=None,
                 repo_name=None,
                 host_config=config.host_config,
+                on_stage=on_stage,
             )
             await _wait_for_host_online(host_store, host.host_id)
         except Exception as exc:
