@@ -159,7 +159,7 @@ import {
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
-import { showsRoutingDecisionChip } from "@/lib/routingDecision";
+import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import {
   Dialog,
   DialogContent,

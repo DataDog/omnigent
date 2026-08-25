@@ -4175,17 +4175,27 @@ async def _refresh_stale_native_model_options(
     """
     if runner_client is None or session_id not in _model_options_stale:
         return
+    # This wait was the biggest single term in routing's pre-router latency on
+    # a first message, and nothing named it in the logs. Time it, so the ladder
+    # above can be sized against a measurement rather than a guess.
+    started = time.monotonic()
     inflight = _model_options_inflight.get(session_id)
-    if inflight is not None:
-        await _await_briefly(inflight)
-        return
-    endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER[_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE]
-    task = asyncio.create_task(
-        _load_model_options(runner_client, session_id, f"/v1/sessions/{session_id}/{endpoint}")
+    if inflight is None:
+        endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER[_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE]
+        inflight = asyncio.create_task(
+            _load_model_options(runner_client, session_id, f"/v1/sessions/{session_id}/{endpoint}")
+        )
+        _model_options_inflight[session_id] = inflight
+        inflight.add_done_callback(
+            lambda _t, sid=session_id: _model_options_inflight.pop(sid, None)
+        )
+    await _await_briefly(inflight)
+    _logger.info(
+        "smart_routing: session=%s stale catalog refresh waited %.3fs (still_stale=%s)",
+        session_id,
+        time.monotonic() - started,
+        session_id in _model_options_stale,
     )
-    _model_options_inflight[session_id] = task
-    task.add_done_callback(lambda _t, sid=session_id: _model_options_inflight.pop(sid, None))
-    await _await_briefly(task)
 
 
 async def _await_briefly(task: asyncio.Task[None]) -> None:
@@ -4353,6 +4363,59 @@ def _native_pane_harness(conv: Conversation) -> str | None:
     return native.harness if native is not None else harness
 
 
+def _pinned_spawn_family(parent: Conversation | None) -> str | None:
+    """Return the family a parent's spawns are confined to, if any.
+
+    Only a Smart Routing parent on a PINNED harness confines them — its
+    spawns are routed inside its own family. An auto-harness parent hands
+    the family choice to the router, and a parent that routes no spawns at
+    all confines nothing.
+
+    :param parent: The parent session's row, or ``None`` for a top-level
+        create (nothing to stay in family with).
+    :returns: ``"claude"`` / ``"gpt"`` / ``"pi"``, or ``None`` when the
+        parent's spawns may land in any family.
+    """
+    if parent is None or not subagent_routing_enabled(parent.subagent_routing_override):
+        return None
+    if auto_harness_session(parent):
+        return None
+    return harness_family(_resolve_harness(parent))
+
+
+def _reject_out_of_family_child(
+    parent: Conversation | None,
+    child_harness: str | None,
+) -> None:
+    """Refuse a pinned parent's create of a child in another family.
+
+    The primary defense for the family rule: a pinned codex Smart Routing
+    session must not be able to stand up a claude child at all, rather than
+    standing one up and having routing decline it afterwards. The child is
+    refused here, at the create, where the caller still sees the reason.
+
+    :param parent: The parent session's row, or ``None`` for a top-level
+        create.
+    :param child_harness: The harness the child would run, e.g.
+        ``"claude-native"``. ``None`` (unresolvable) is allowed through —
+        nothing proves it is out of family.
+    :raises OmnigentError: 400 ``INVALID_INPUT`` when the child's family
+        differs from the family the parent's spawns are confined to.
+    """
+    family = _pinned_spawn_family(parent)
+    child_family = harness_family(child_harness)
+    if family is None or child_family is None or family == child_family:
+        return
+    parent_harness = _resolve_harness(parent)
+    raise OmnigentError(
+        f"A {parent_harness} session with Smart Routing spawns only agents in its own "
+        f"model family; {child_harness} is not one. Pick an agent that runs on "
+        f"{parent_harness}, or start the session in Smart Routing (auto) harness mode "
+        "to let the router choose the family.",
+        code=ErrorCode.INVALID_INPUT,
+    )
+
+
 def _out_of_family_spawn_notice(
     conv: Conversation,
     parent: Conversation | None,
@@ -4360,11 +4423,14 @@ def _out_of_family_spawn_notice(
 ) -> str | None:
     """Why a pinned parent's cross-family spawn is not routed, if it is not.
 
-    Cross-family picks belong to sessions whose harness the router owns (Smart
-    Routing / auto): a pinned codex session's spawns stay on codex, so a child
-    pane running another family's CLI has no candidate the parent's family can
-    serve. Same predicate the in-harness spawn gate uses, so "auto" means one
-    thing on both spawn paths.
+    The fail-safe behind :func:`_reject_out_of_family_child`, which refuses
+    the out-of-family child at its create: a pane that exists anyway (a
+    legacy row, an unresolvable harness at create time) still must not be
+    routed. Cross-family picks belong to sessions whose harness the router
+    owns (Smart Routing / auto): a pinned codex session's spawns stay on
+    codex, so a child pane running another family's CLI has no candidate the
+    parent's family can serve. Same predicate the in-harness spawn gate uses,
+    so "auto" means one thing on both spawn paths.
 
     :param conv: The child session's row.
     :param parent: The parent session's row, or ``None`` for a top-level
@@ -4592,6 +4658,11 @@ async def _forward_event_to_runner(
     # before the routing card, matching the message routing path).
     _auto_card_model: str | None = None
     _auto_card_verdict: dict[str, Any] | None = None
+    # Set when the auto-harness routing call itself failed. The card still
+    # says so, but the route-once label is left unclaimed — the same rule the
+    # turn, native-pane and child-spawn paths follow, so one outage at create
+    # cannot be the reason this session never routes again.
+    _auto_route_failed = False
     # The resolved harness, read back at card-emission time below.
     _auto_harness: str | None = None
     if conv.harness_override == "auto" and body.type == "message":
@@ -4892,7 +4963,14 @@ async def _forward_event_to_runner(
                 scope="session",
                 harness=_auto_harness,
             )
-            await _stamp_routing_decision_label(session_id, conversation_store, _auto_decision_id)
+            if not _auto_route_failed:
+                # A failed call is NOT this session's routing decision: the
+                # label is the route-once gate, so claiming it would make one
+                # create-time outage the reason nothing routes this session
+                # again. The card still shows what happened.
+                await _stamp_routing_decision_label(
+                    session_id, conversation_store, _auto_decision_id
+                )
             if conv.parent_conversation_id is not None:
                 await _emit_server_routing_decision(
                     conv.parent_conversation_id,
@@ -4996,6 +5074,48 @@ async def _stamp_routing_decision_label(
             session_id,
             exc_info=True,
         )
+
+
+async def _record_create_route_prompt(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    prompt: str | None,
+) -> Conversation:
+    """Record which prompt a create-time route scored, as a fingerprint.
+
+    Read by the in-harness first-prompt hook: the same prompt submitted again
+    reuses the create's decision instead of paying a second router call for it
+    (:func:`omnigent.runner.turn_routing.create_route_covers_prompt`).
+
+    Best-effort — a label that cannot be written costs the session one extra
+    routing call, not its turn.
+
+    :param conv: The created conversation row.
+    :param conversation_store: Store exposing ``set_labels``.
+    :param prompt: The routed prompt, e.g. the create's
+        ``smart_routing_message``. Blank records nothing.
+    :returns: The refreshed row, or *conv* when nothing was recorded.
+    """
+    from omnigent.runner.subagent_routing import CREATE_ROUTE_PROMPT_LABEL_KEY
+    from omnigent.runner.turn_routing import create_route_prompt_fingerprint
+
+    fingerprint = create_route_prompt_fingerprint(prompt or "")
+    if not fingerprint:
+        return conv
+    try:
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            conv.id,
+            {CREATE_ROUTE_PROMPT_LABEL_KEY: fingerprint},
+        )
+    except (OSError, ValueError):
+        _logger.warning(
+            "smart_routing: failed to record the create-time prompt for session=%s",
+            conv.id,
+            exc_info=True,
+        )
+        return conv
+    return await asyncio.to_thread(conversation_store.get_conversation, conv.id) or conv
 
 
 async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> Any:
@@ -7468,30 +7588,6 @@ async def _create_session_from_existing_agent(
     ):
         subagent_routing_override = "on"
 
-    # A session that starts on Smart Routing routes the subagents it spawns.
-    # Stamped here, once, so the spawn gate reads one explicit switch instead
-    # of re-deriving it from this session's (or its parent's) routing state.
-    # Only "on" is written: unset already means Default, so stamping "off" on
-    # every ordinary create would grow the overrides blob and cost a write for
-    # no change in behavior. An explicit caller value always wins.
-    #
-    # Stamped for every routed create, pinned harness included: a pinned codex
-    # session's launch installs the same generated ``hooks.json`` spawn gate and
-    # routed-spawn tool pre-approvals a routed claude one does (see
-    # ``ensure_session_router_quietly``), so the switch has a consumer on every
-    # family. What a pinned session does *not* get is cross-family picks — the
-    # router is offered its own family only. A plain create is still left unset:
-    # nothing routes there, so nothing reads the switch.
-    if subagent_routing_override is None and (
-        cost_control_mode_override == "on"
-        or _native_smart_routing
-        or (
-            _parent_for_routing is not None
-            and subagent_routing_enabled(_parent_for_routing.subagent_routing_override)
-        )
-    ):
-        subagent_routing_override = "on"
-
     # Validated against the loaded spec (known harness + omnigent
     # executor type) before any row exists, mirroring the CLI's
     # --harness fail-loud rules.
@@ -7792,6 +7888,14 @@ async def _create_session_from_existing_agent(
                 _native_routing_verdict,
                 scope="session",
                 harness=_routed_native.harness if _routed_native is not None else None,
+            )
+            # The same prompt is submitted again inside the harness, where the
+            # first-prompt hook would score it a second time for the verdict
+            # this session is already pinned to. Fingerprint what was routed so
+            # that hook reuses this decision — and an edited prompt still
+            # routes on its own.
+            conv = await _record_create_route_prompt(
+                conv, conversation_store, body.smart_routing_message
             )
         elif _native_routing_error is not None:
             await _emit_server_routing_decision(

@@ -54,13 +54,18 @@ ROUTES_SELECT_PATH = "routes:select"
 #:
 #: Sized from the observed round trip: healthy ``routes:select`` answers land
 #: in ~1.4–3s, and the slowest sample on record (~6.7s) was a gateway 500, not
-#: a verdict. Five seconds therefore covers the healthy case with headroom
-#: while capping the hazard paths — a first-message hook and a subagent spawn
-#: gate — at a blink instead of the 30–45s a wedged server used to cost.
+#: a verdict. Nine seconds covers the healthy case with wide headroom while
+#: still capping the hazard paths — a first-message hook and a subagent spawn
+#: gate — well under the 30–45s a wedged server used to cost.
+#:
+#: This budget covers the CALL only. The hops above it must also absorb the
+#: candidate/catalog preparation that runs before it (~3s measured on a first
+#: message), which is why each of them sits several seconds higher rather than
+#: one second above this value.
 #:
 #: One attempt, no retry: on an interactive path a second try only doubles the
 #: stall, and falling open onto the harness's own model is the better answer.
-ROUTING_REQUEST_TIMEOUT_S = 5.0
+ROUTING_REQUEST_TIMEOUT_S = 9.0
 
 # ── Model lists per harness family ──────────────────────────────────────────
 #
@@ -2286,6 +2291,11 @@ async def route_turn(
         return None, None
 
     _logger.info("smart_routing: routing turn session=%s harness=%s", session_id, harness)
+    # Candidate preparation used to be invisible in the logs, so a slow first
+    # message read as a slow router. Time the two phases separately: this is
+    # the number the timeout ladder above the hook has to cover.
+    _prep_started = time.monotonic()
+    _catalog_fetched = False
     # Prefer the live runner catalog, but only its "self" row — the sub-agent
     # workers' models are not this session's. Key the map by harness id, not the
     # "self" label, so the seam infers the right single-harness scenario.
@@ -2295,6 +2305,7 @@ async def route_turn(
         if in_vocabulary:
             available = {harness or "self": in_vocabulary}
     if available is None and session_id and runner_client is not None:
+        _catalog_fetched = True
         runner_catalog = await fetch_runner_models(session_id, runner_client)
         if runner_catalog and "self" in runner_catalog:
             # A native terminal's own catalog can list models from other
@@ -2341,8 +2352,18 @@ async def route_turn(
             )
             return None, None
 
+    _prep_s = time.monotonic() - _prep_started
+    _route_started = time.monotonic()
     call = await route_with_fallback(
         backends, user_message, available, gateway_backed=gateway_backed
+    )
+    _logger.info(
+        "smart_routing: session=%s prep=%.3fs router=%.3fs catalog_fetch=%s candidates=%d",
+        session_id,
+        _prep_s,
+        time.monotonic() - _route_started,
+        _catalog_fetched,
+        sum(len(models) for models in available.values()),
     )
     if call is None or call.result is None:
         return None, None
