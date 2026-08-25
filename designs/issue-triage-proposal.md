@@ -74,7 +74,7 @@ A maintainer only sees issues that the bot could not fully resolve. The escalati
 
 - **`P0-critical` / `P1-high`** - always escalated; exempt from stale bot
 - **`needs-triage` still present** - bot wasn't confident enough to classify
-- **Duplicate contested** - reporter comments that the reports are materially different
+- **Duplicate contested** - reporter reacted 👎 on the duplicate comment
 - **Complex feature requests** - labeled `Feature` + `P2-medium` or higher
 
 Maintainers work from a filtered view: `is:issue is:open label:P0-critical,P1-high,needs-triage -label:stale`. Everything else is either being handled by the bot/lifecycle or picked up by contributors.
