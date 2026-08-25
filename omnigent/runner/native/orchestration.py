@@ -3972,41 +3972,6 @@ async def _auto_create_codex_terminal(
         # This TUI runs detached for the web UI, so trust the runner-selected
         # workspace in the session-private config instead of blocking forever.
         trust_project=True,
-        **routed_spawn_extras,
-    )
-    # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
-    # app-server reads the endpoint out of its own process env at start, and
-    # the server decides per spawn whether to route. Any Smart Routing session,
-    # pinned or auto — the advertisement is also what makes this session's
-    # codex-home diverge from a plain one (generated hooks.json, routed-spawn
-    # tool pre-approvals), and a pinned session cannot spawn without them.
-    _codex_router_dir, _codex_router = _start_subagent_router_for_native_session(
-        session_id,
-        bridge_dir=bridge_dir,
-        harness="codex-native",
-        server_client=server_client,
-        routing_enabled=launch_config.routing_enabled,
-        auto_harness=launch_config.auto_harness,
-    )
-    if _codex_router_dir is not None:
-        from omnigent.runner.subagent_routing import router_env
-
-        app_server.env.update(router_env(session_id, _codex_router_dir, harness="codex-native"))
-    # A routed turn can land on an arm codex's bundled catalog has no entry for
-    # (GLM), which its own client-side validation then refuses — so a Smart
-    # Routing session (pinned or auto) gets the extended catalog. A plain
-    # session keeps codex's bundled catalog and never pays the probe.
-    app_server.env.update(codex_extended_catalog_env(launch_config.routing_enabled))
-    # First-message model routing. Advertised in the same bridge dir the
-    # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of
-    # its own), and live before the app-server starts because the hook can
-    # fire on the very first prompt.
-    _codex_turn_router = _start_turn_router_for_native_session(
-        session_id,
-        bridge_dir=bridge_dir,
-        harness="codex-native",
-        server_client=server_client,
-        turn_routing=launch_config.turn_routing,
     )
     app_server.listen_url = codex_ws_url
     await app_server.start()
