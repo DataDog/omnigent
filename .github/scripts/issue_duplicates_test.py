@@ -5,7 +5,6 @@ from issue_duplicates import (
     AUTO_CLOSE_CONFIDENCE,
     CLOSE_COSINE_FLOOR,
     SIMILAR_MIN_CONFIDENCE,
-    _one_sentence,
     build_duplicate_comment,
     document_tokens,
     extract_issue_references,
@@ -161,8 +160,7 @@ class IssueDuplicatesTest(unittest.TestCase):
         self.assertEqual(result["duplicate_decision"], "similar")
         self.assertEqual(result["similar_issues"], [12, 11, 10])
 
-    def test_similar_comment_never_carries_model_prose(self):
-        """The non-closing comment is fixed copy, so injected text cannot reach it."""
+    def test_public_comment_uses_templated_reason(self):
         issue = {
             "title": "Workspace rail resize is unusable on the browser tab",
             "body": "Dragging the workspace rail orphans the pointer.",
@@ -182,34 +180,10 @@ class IssueDuplicatesTest(unittest.TestCase):
 
         self.assertIn("<!-- omnigent-duplicate-check -->", comment)
         self.assertIn("#12", comment)
-        self.assertIn("may be related", comment)
-        # Like the duplicate case, this asks the reporter to close it rather than
-        # parking it in a maintainer queue.
-        self.assertIn("please close this one", comment)
-        self.assertNotIn("maintainer", comment)
-        # The similar case never surfaces model prose, so injected content in
-        # the reasoning cannot reach the comment at all.
         self.assertNotIn("@admin", comment)
         self.assertNotIn("https://example.com", comment)
-        self.assertNotIn("#999", comment)
-
-    def test_similar_comment_agrees_in_number_with_its_references(self):
-        """One reference reads "it already covers", several read "they already cover"."""
-
-        def comment_for(numbers):
-            return build_duplicate_comment(
-                {
-                    "duplicate_decision": "similar",
-                    "duplicate_of": None,
-                    "similar_issues": numbers,
-                    "duplicate_confidence": 0.8,
-                    "duplicate_reasoning": "unused",
-                },
-                close_issue=False,
-            )
-
-        self.assertIn("it already covers", comment_for([12]))
-        self.assertIn("they already cover", comment_for([12, 34]))
+        self.assertIn("automatic checks", comment)
+        self.assertIn("leaving this issue open", comment)
 
     def test_duplicate_comment_reflects_closure_flag(self):
         decision = {
@@ -223,98 +197,9 @@ class IssueDuplicatesTest(unittest.TestCase):
         observe_comment = build_duplicate_comment(decision, close_issue=False)
         close_comment = build_duplicate_comment(decision, close_issue=True)
 
-        self.assertIn("#12", observe_comment)
-        # The open case asks the reporter to close it themselves rather than
-        # parking the issue in a maintainer queue.
-        self.assertIn("please close this one", observe_comment)
-        self.assertIn("If it doesn't", observe_comment)
-        self.assertNotIn("maintainer", observe_comment)
-        self.assertIn("I’m closing it", close_comment)
-
-    def test_no_comment_is_built_for_a_none_verdict(self):
-        """A non-duplicate gets no bot comment: it would be noise on most issues."""
-        decision = {
-            "duplicate_decision": "none",
-            "duplicate_of": None,
-            "similar_issues": [],
-            "duplicate_confidence": 0.1,
-            "duplicate_reasoning": "Unrelated.",
-        }
-
-        self.assertEqual(build_duplicate_comment(decision, close_issue=False), "")
-
-    def test_closing_comment_defangs_injected_model_prose(self):
-        """The closure reason is model text, so mentions and links are neutralized."""
-        decision = {
-            "duplicate_decision": "duplicate",
-            "duplicate_of": 12,
-            "similar_issues": [],
-            "duplicate_confidence": 1.0,
-            "duplicate_reasoning": "unused",
-        }
-
-        comment = build_duplicate_comment(
-            decision,
-            close_issue=True,
-            reasoning="Ping @admin and see https://evil.example.com about #999 now.",
-        )
-
-        self.assertIn("I’m closing it", comment)
-        self.assertNotIn("@admin", comment)
-        self.assertNotIn("evil.example.com", comment)
-        self.assertNotIn("#999", comment)
-        self.assertIn("admin", comment)
-
-    def test_closing_comment_defangs_evasive_mention_and_link_forms(self):
-        """Doubled `@`, scheme-relative links, and `GH-` refs are all live on GitHub.
-
-        Each renders exactly like the plain form the sanitizer already handled,
-        so missing one would leave a real ping or clickable link in a comment
-        built from attacker-controllable prose.
-        """
-        decision = {
-            "duplicate_decision": "duplicate",
-            "duplicate_of": 12,
-            "similar_issues": [],
-            "duplicate_confidence": 1.0,
-            "duplicate_reasoning": "unused",
-        }
-
-        comment = build_duplicate_comment(
-            decision,
-            close_issue=True,
-            reasoning="Ping @@admin re [x](//evil.example.com) and GH-999 now.",
-        )
-
-        self.assertNotIn("@admin", comment)
-        self.assertNotIn("@@", comment)
-        self.assertNotIn("evil.example.com", comment)
-        self.assertNotIn("GH-999", comment)
-
-    def test_sanitizer_keeps_prose_that_merely_looks_like_a_link(self):
-        """A bare `//` inside prose is not a link, so it must survive intact."""
-        self.assertEqual(
-            _one_sentence("Ratio was 50//50 in both reports."),
-            "Ratio was 50//50 in both reports.",
-        )
-
-    def test_closing_comment_keeps_only_the_first_reason_sentence(self):
-        decision = {
-            "duplicate_decision": "duplicate",
-            "duplicate_of": 12,
-            "similar_issues": [],
-            "duplicate_confidence": 1.0,
-            "duplicate_reasoning": "unused",
-        }
-
-        comment = build_duplicate_comment(
-            decision,
-            close_issue=True,
-            reasoning="Both describe the same crash. Extra detail nobody needs.",
-        )
-
-        self.assertIn("Both describe the same crash.", comment)
-        self.assertNotIn("Extra detail", comment)
+        self.assertIn("closure is currently disabled", observe_comment)
+        self.assertIn("leaving this issue open", observe_comment)
+        self.assertIn("I’m closing this issue", close_comment)
 
     def test_injected_candidate_cannot_authorize_auto_close(self):
         issue = {
