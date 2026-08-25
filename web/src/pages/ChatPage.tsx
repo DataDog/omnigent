@@ -1852,25 +1852,13 @@ function MainAgentSurface({
             ChatHeader overlay's controls (geometry in index.css). */}
         <Conversation className="chat-scroll-fade flex-1">
           {/* Override ConversationContent's default spacing so the thread keeps
-              16px side gutters and consecutive agent turns read as one thread.
-              The left inset grows *continuously* as the conversation area
-              narrows: the centered column slides left with the area until its
-              edge nears the left-edge TurnRail, then the inset ramps up to hold
-              a minimum gap from the ticks — capped at 1.5rem so it stops moving
-              rather than stepping. Keyed on the area's width via cqi (the
-              @container/chat context on the wrapper), not the viewport, so
-              opening the sidebar — which narrows the area — feeds it too. The
-              ramp (1rem→1.5rem as the area crosses ~54rem) matches where the
-              48rem column's auto-margins shrink past the clearance. md+ only:
-              the rail is hidden on mobile, which keeps the plain 1rem gutter. */}
-          {/* Native scroll anchoring holds position across a history prepend —
-              the browser does it off the main thread, so it can't interrupt an
-              in-flight scroll the way an imperative scrollTop write does. */}
+              16px side gutters at every viewport and consecutive agent turns
+              read as one thread. */}
+          {/* HistoryAutoLoader owns prepend anchoring across every browser. */}
           <ConversationContent
             scrollClassName="transcript-hide-native-scrollbar"
             className={cn(
               "chat-conversation-content mx-auto w-full gap-4 px-4 pt-20 pb-6",
-              "md:pl-[clamp(1rem,(54rem-100cqi)*0.5+1rem,1.5rem)]",
               CHAT_COLUMN_WIDTH,
             )}
           >
