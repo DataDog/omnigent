@@ -330,6 +330,13 @@ _RECONNECT_JITTER = 0.5
 # process listens on the port — the local server is gone, not unreachable.
 _LOOPBACK_REFUSED_FATAL_ATTEMPTS = 30
 
+# Consecutive accepted-then-silent connections (upgrade completed, then the
+# socket died without one inbound frame) before the reconnect loop treats the
+# endpoint as unhealthy: it stops using the prompt "recycle" cadence and
+# escalates once, loudly. A healthy tunnel sends a frame within seconds; an
+# endpoint that accepts and never speaks is functionally down.
+_SILENT_CONNECT_ESCALATE_ATTEMPTS = 10
+
 # Host-environment variables a spawned runner is allowed to inherit.
 # Deliberately an allowlist (not ``{**os.environ}``): the host runs as the
 # user, so its environment holds the user's personal secrets (API keys,
@@ -799,6 +806,13 @@ class HostProcess:
         # upgrade or any non-refused error. Fatal past a bounded streak only
         # when the server URL is loopback (the local server is gone).
         self._refused_streak = 0
+        # Consecutive connections that were accepted but died without a single
+        # inbound frame; reset by any received frame or a rejected upgrade.
+        # Past a bound the reconnect loop escalates instead of fast-recycling.
+        self._silent_connect_streak = 0
+        # Per-connection markers feeding the silent-connect streak.
+        self._conn_upgrade_accepted = False
+        self._conn_frame_received = False
         # Live tunnel connection, set by _serve_frames for the watcher
         # tasks (which outlive any single connection) to report on.
         self._ws: websockets.asyncio.client.ClientConnection | None = None
@@ -1368,8 +1382,10 @@ class HostProcess:
         When the zygote is enabled it forks the runner there — sharing the import
         graph copy-on-write — and rewrites ``RUNNER_PARENT_PID`` to the zygote's
         pid so the runner's orphan watchdog (which compares ``os.getppid()``)
-        stays correct across the extra process hop. Any zygote failure disables
-        it for the rest of the daemon's life and falls back to a direct Popen.
+        stays correct across the extra process hop. A zygote start failure, or a
+        channel failure while the zygote is still alive, disables it for the
+        daemon's life; a zygote that died is reaped so the next launch respawns
+        a fresh one. Either way this launch falls back to a direct Popen.
 
         :param env: Runner environment from :func:`_build_runner_env` (its
             ``RUNNER_PARENT_PID`` is the daemon pid; overridden on the zygote path).
@@ -1386,29 +1402,58 @@ class HostProcess:
             if zygote is not None and not self._zygote_disabled:
                 try:
                     zygote.start()
-                    # The runner's OS parent will be the zygote, so its
-                    # getppid()-based orphan check must watch the zygote pid.
-                    zygote_env = dict(env)
-                    zygote_env[RUNNER_PARENT_PID_ENV_VAR] = str(zygote.pid)
-                    proc = zygote.fork_runner(zygote_env, str(log_path), str(workspace))
-                    _logger.info(
-                        "Forked runner via zygote (zygote pid=%s, runner pid=%s)",
-                        zygote.pid,
-                        proc.pid,
-                    )
-                    return proc, log_path
                 except ZygoteUnavailable as exc:
-                    # Disable the zygote for FUTURE launches, but do NOT stop it
-                    # here: healthy runners already forked from it would see
-                    # their parent die and self-terminate via the orphan
-                    # watchdog, so one failed fork must not tear down unrelated
-                    # live sessions. The still-running zygote is retained and
-                    # reaped on daemon shutdown (see run()'s finally); this
-                    # launch falls back to a direct Popen below.
+                    # Spawning the zygote itself is broken; retrying on every
+                    # launch would only add a doomed spawn to each, so disable
+                    # it for the daemon's life and fall back.
                     _logger.warning(
-                        "Runner zygote unavailable (%s); falling back to direct spawn", exc
+                        "Runner zygote failed to start (%s); disabling it and "
+                        "falling back to direct spawn",
+                        exc,
                     )
                     self._zygote_disabled = True
+                else:
+                    try:
+                        # The runner's OS parent will be the zygote, so its
+                        # getppid()-based orphan check must watch the zygote pid.
+                        zygote_env = dict(env)
+                        zygote_env[RUNNER_PARENT_PID_ENV_VAR] = str(zygote.pid)
+                        proc = zygote.fork_runner(zygote_env, str(log_path), str(workspace))
+                        _logger.info(
+                            "Forked runner via zygote (zygote pid=%s, runner pid=%s)",
+                            zygote.pid,
+                            proc.pid,
+                        )
+                        return proc, log_path
+                    except ZygoteUnavailable as exc:
+                        if zygote.is_running():
+                            # Alive but its control channel failed. Do NOT stop
+                            # it: healthy runners already forked from it would
+                            # see their parent die and self-terminate via the
+                            # orphan watchdog. Disable for future launches; the
+                            # still-running zygote is reaped on daemon shutdown
+                            # (see run()'s finally).
+                            _logger.warning(
+                                "Runner zygote unavailable (%s); disabling it "
+                                "and falling back to direct spawn",
+                                exc,
+                            )
+                            self._zygote_disabled = True
+                        else:
+                            # The zygote process died — its forked runners are
+                            # already self-terminating via their own orphan
+                            # watchdogs, so nothing depends on this instance.
+                            # Reap it and let the next launch's start() respawn
+                            # a fresh one instead of losing copy-on-write
+                            # forking for the rest of the daemon's life.
+                            _logger.warning(
+                                "Runner zygote died (%s); falling back to "
+                                "direct spawn and respawning the zygote on "
+                                "the next launch",
+                                exc,
+                            )
+                            with contextlib.suppress(Exception):
+                                zygote.stop()
 
             with child_logging_popen_kwargs(env) as logging_kwargs:
                 proc = subprocess.Popen(
@@ -2481,6 +2526,34 @@ class HostProcess:
                             ) from exc
                     else:
                         self._refused_streak = 0
+                    # An accepted upgrade that died without one inbound frame
+                    # is an endpoint that answers the door but never speaks —
+                    # functionally down even though every connect "succeeds",
+                    # so the recycle classification below would spin at the
+                    # prompt cadence forever, silently. Escalate once past a
+                    # streak; any received frame resets it.
+                    if self._conn_upgrade_accepted and not self._conn_frame_received:
+                        self._silent_connect_streak += 1
+                        if self._silent_connect_streak == _SILENT_CONNECT_ESCALATE_ATTEMPTS:
+                            cause = (
+                                f"The server at {self._server_url} accepted "
+                                f"{self._silent_connect_streak} consecutive "
+                                "connections but never responded on any of them."
+                            )
+                            _logger.error(
+                                "%s Treating the endpoint as unhealthy; "
+                                "reconnecting on slow backoff until it responds.",
+                                cause,
+                            )
+                            print(
+                                f"⚠ {cause} The server may be unhealthy. "
+                                "Retrying on a slower cadence — this recovers "
+                                "automatically once the server responds.",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                    else:
+                        self._silent_connect_streak = 0
                     # Classify the disconnect to choose a reconnect cadence.
                     #
                     # 1012 "service restart" / 1001 "going away" are explicit
@@ -2507,9 +2580,13 @@ class HostProcess:
                         t in reason for t in ("1012", "service restart", "1001", "going away")
                     )
                     ingress_recycle = any(t in reason for t in ("no close frame", "502"))
-                    recycle = explicit_recycle or (
-                        ingress_recycle and not _url_is_loopback(self._server_url)
-                    )
+                    # A silent-connect streak overrides the recycle fast path:
+                    # prompt reconnects are for endpoints that answer.
+                    silent_churn = self._silent_connect_streak >= _SILENT_CONNECT_ESCALATE_ATTEMPTS
+                    recycle = (
+                        explicit_recycle
+                        or (ingress_recycle and not _url_is_loopback(self._server_url))
+                    ) and not silent_churn
                     wait_s = _RECONNECT_BASE_S if recycle else backoff
                     _logger.warning(
                         "Host tunnel disconnected: %s. Reconnecting in %.1fs%s",
@@ -2530,9 +2607,18 @@ class HostProcess:
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
+            # Await the cancellations: a bare cancel() leaves the tasks
+            # pending at loop close ("Task was destroyed but it is pending!").
             if self._reaper_task is not None:
                 self._reaper_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._reaper_task
                 self._reaper_task = None
+            for watcher in list(self._watcher_tasks):
+                watcher.cancel()
+            for watcher in list(self._watcher_tasks):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await watcher
             self._cleanup_runners()
             # Final drain: _cleanup_runners has just reaped the tracked
             # runners via Popen, so any of their still-orphaned tool
@@ -2567,6 +2653,9 @@ class HostProcess:
         :returns: None.
         :raises Exception: On WebSocket disconnect or error.
         """
+        # Fresh per-connection markers for the silent-connect streak.
+        self._conn_upgrade_accepted = False
+        self._conn_frame_received = False
         url = self._tunnel_url()
         headers = self._build_connect_headers()
 
@@ -2604,6 +2693,7 @@ class HostProcess:
         self._login_redirect_streak = 0
         self._auth_retry_streak = 0
         self._refused_streak = 0
+        self._conn_upgrade_accepted = True
         try:
             await self._serve_frames(ws)
         finally:
@@ -2766,6 +2856,9 @@ class HostProcess:
         try:
             while True:
                 raw = await ws.recv()
+                # Any inbound frame proves the server end is alive — the
+                # reconnect loop's silent-connect streak keys off this.
+                self._conn_frame_received = True
                 if isinstance(raw, str):
                     await self._handle_raw_message(ws, raw)
         finally:
