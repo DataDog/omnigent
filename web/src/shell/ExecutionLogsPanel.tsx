@@ -193,7 +193,7 @@ export function ExecutionLogsPanel({
                 </SelectContent>
               </Select>
               {/* View toggle: conv items vs raw SSE events */}
-              <div className="ml-auto flex rounded-md border border-border text-sm">
+              <div className="ml-auto flex rounded-md border border-border text-xs">
                 <button
                   type="button"
                   className={cn(
@@ -366,7 +366,7 @@ function SseEventsList({ sessionId }: { sessionId: string }) {
 
   if (entries.length === 0) {
     return (
-      <div className="text-muted-foreground text-sm">
+      <div className="text-muted-foreground text-xs">
         No SSE events yet — events are captured while the agent runs.
       </div>
     );
@@ -374,7 +374,7 @@ function SseEventsList({ sessionId }: { sessionId: string }) {
   return (
     <div
       ref={scrollRootRef}
-      className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto pr-1 font-mono text-sm"
+      className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto pr-1 font-mono text-xs"
     >
       {entries.map((entry) => (
         <SseEventEntry key={entry.index} entry={entry} />
