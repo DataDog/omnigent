@@ -748,6 +748,7 @@ if TYPE_CHECKING:
         "_kick_managed_wake",
         "_launch_runner_on_host",
         "_load_agent_spec_for_session",
+        "_mark_runner_sessions_offline",
         "_poll_request_disconnect",
         "_presentation_labels_for_agent",
         "_publish_runner_recovered_status",
