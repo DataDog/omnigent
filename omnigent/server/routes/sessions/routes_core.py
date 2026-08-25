@@ -2028,7 +2028,15 @@ def register_core_routes(
                 )
                 if not filed:
                     raise _session_not_found()
-        level = await _get_permission_level(user_id, session_id, permission_store)
+        level, can_approve = await asyncio.gather(
+            _get_permission_level(user_id, session_id, permission_store),
+            _get_approval_access(
+                user_id,
+                session_id,
+                permission_store,
+                conversation_store,
+            ),
+        )
         # PATCH callers consume only the snapshot's scalar fields (clients
         # hydrate transcripts via GET /sessions/{id}/items), so skip the
         # items read — it dominated this response's size and build time.
