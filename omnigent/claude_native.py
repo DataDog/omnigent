@@ -30,8 +30,8 @@ from omnigent.json_types import JsonObject as _JsonObject
 if sys.platform != "win32":
     import termios
     import tty
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -131,6 +131,7 @@ from omnigent.terminals.ws_bridge import (
 
 _logger = logging.getLogger(__name__)
 
+_JsonObject: TypeAlias = dict[str, object]
 _TermiosAttrs: TypeAlias = list[int | list[bytes | int]]
 _SignalHandler: TypeAlias = (
     Callable[[int, FrameType | None], object] | int | signal.Handlers | None
@@ -139,12 +140,6 @@ _SignalHandler: TypeAlias = (
 
 class _WebSocketClient(Protocol):
     """WebSocket operations used by the native terminal bridge."""
-
-    @property
-    def close_code(self) -> int | None: ...
-
-    @property
-    def close_reason(self) -> str | None: ...
 
     def __aiter__(self) -> AsyncIterator[str | bytes]: ...
 
