@@ -42,7 +42,7 @@ export function SkillPills({
           </TooltipTrigger>
           <TooltipContent side="top" align="start" className="block max-w-80 p-3">
             <p className="text-ui font-semibold text-foreground">/{skill.name}</p>
-            <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
               {skill.description}
             </p>
           </TooltipContent>

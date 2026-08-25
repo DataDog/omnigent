@@ -64,7 +64,7 @@ function Field({
     <div className="flex flex-col gap-1.5 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
       <label htmlFor={htmlFor} className="flex flex-col pt-1.5">
         <span className="font-medium text-ui">{label}</span>
-        {hint && <span className="text-muted-foreground text-sm">{hint}</span>}
+        {hint && <span className="text-muted-foreground text-xs">{hint}</span>}
       </label>
       <div className="sm:w-64">{children}</div>
     </div>

@@ -218,7 +218,7 @@ export function MembersPage() {
       {users !== null && users.length > 0 && (
         <div className="overflow-hidden rounded-md border border-border">
           <table className="w-full text-ui">
-            <thead className="bg-muted/40 text-left text-sm uppercase text-muted-foreground">
+            <thead className="bg-muted/40 text-left text-xs uppercase text-muted-foreground">
               <tr>
                 <th className="px-3 py-2 font-medium">Username</th>
                 <th className="px-3 py-2 font-medium">Role</th>

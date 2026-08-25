@@ -39,7 +39,76 @@ export function SessionRail({
 }: SessionRailProps) {
   const { children } = useChildSessions(conversationId);
   if (suppressed) return null;
-  return <ExecutionLogsCard childSessions={children} onExpand={onExpandExecutionLogs} />;
+  return (
+    <>
+      {terminals.length > 0 && <TerminalsCard terminals={terminals} onExpand={onExpandTerminals} />}
+      {debugMode && <ExecutionLogsCard childSessions={children} onExpand={onExpandExecutionLogs} />}
+    </>
+  );
+}
+
+interface TerminalsCardProps {
+  terminals: TerminalInfo[];
+  onExpand: (initialKey: string) => void;
+}
+
+function TerminalsCard({ terminals, onExpand }: TerminalsCardProps) {
+  const [collapsed, setCollapsed] = useState(false);
+  return (
+    <Card size="sm" data-testid="terminals-card">
+      <CardHeader>
+        <CardTitle className="text-ui">Terminals</CardTitle>
+        <CardAction>
+          <button
+            type="button"
+            aria-label={collapsed ? "Expand terminals" : "Collapse terminals"}
+            aria-expanded={!collapsed}
+            className="cursor-pointer rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+            onClick={() => setCollapsed((v) => !v)}
+          >
+            <ChevronDownIcon
+              className={cn(
+                "size-3.5 transition-transform duration-150",
+                collapsed && "-rotate-90",
+              )}
+            />
+          </button>
+        </CardAction>
+      </CardHeader>
+      {!collapsed && (
+        <CardContent>
+          {terminals.length === 0 ? (
+            <p className="text-muted-foreground text-xs">No open terminals</p>
+          ) : (
+            <ul className="flex flex-col gap-0.5">
+              {terminals.map((t) => (
+                <TerminalRow key={t.id} terminal={t} onOpen={() => onExpand(terminalTabKey(t))} />
+              ))}
+            </ul>
+          )}
+        </CardContent>
+      )}
+    </Card>
+  );
+}
+
+function TerminalRow({ terminal, onOpen }: { terminal: TerminalInfo; onOpen: () => void }) {
+  return (
+    <li>
+      <button
+        type="button"
+        data-testid="terminal-row"
+        data-terminal-name={terminal.name}
+        data-terminal-session={terminal.session}
+        className="flex w-full cursor-pointer items-center gap-2 truncate rounded-md px-2 py-1 text-left text-xs hover:bg-muted"
+        onClick={onOpen}
+      >
+        <TerminalIcon className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="truncate">{terminal.name}</span>
+        <span className="shrink-0 text-muted-foreground">· {terminal.session}</span>
+      </button>
+    </li>
+  );
 }
 
 interface ExecutionLogsCardProps {
@@ -52,7 +121,7 @@ function ExecutionLogsCard({ childSessions, onExpand }: ExecutionLogsCardProps) 
   return (
     <Card size="sm" data-testid="execution-logs-card">
       <CardHeader>
-        <CardTitle className="text-ui truncate min-w-0">Execution logs</CardTitle>
+        <CardTitle className="text-ui">Execution logs</CardTitle>
         <CardAction>
           <button
             type="button"

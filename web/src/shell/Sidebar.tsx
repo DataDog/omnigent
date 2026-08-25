@@ -811,14 +811,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                   onNavClick(e);
                 }}
               >
-                <SquarePenIcon
-                  className={cn(
-                    "ui-icon",
-                    isNewChatPage
-                      ? "text-[var(--sidebar-active-foreground)]"
-                      : "text-muted-foreground",
-                  )}
-                />
+                <SquarePenIcon className="ui-icon text-muted-foreground" />
                 New session
               </Link>
             </Button>
@@ -837,14 +830,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               data-testid="scheduled-tasks-nav"
             >
               <Link to="/tasks" onClick={onNavClick}>
-                <ClockIcon
-                  className={cn(
-                    "ui-icon",
-                    isTasksPage
-                      ? "text-[var(--sidebar-active-foreground)]"
-                      : "text-muted-foreground",
-                  )}
-                />
+                <ClockIcon className="ui-icon text-muted-foreground" />
                 Automations
               </Link>
             </Button>
@@ -859,14 +845,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               data-testid="inbox-button"
             >
               <Link to="/inbox" onClick={onNavClick}>
-                <InboxIcon
-                  className={cn(
-                    "ui-icon",
-                    isInboxPage
-                      ? "text-[var(--sidebar-active-foreground)]"
-                      : "text-muted-foreground",
-                  )}
-                />
+                <InboxIcon className="ui-icon text-muted-foreground" />
                 Inbox
                 {inboxCount > 0 && (
                   <span
@@ -1120,19 +1099,9 @@ function ProjectFolder({
         title={name}
         icon={
           expanded ? (
-            <FolderOpenIcon
-              className={cn(
-                "ui-icon",
-                active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
-              )}
-            />
+            <FolderOpenIcon className="ui-icon text-muted-foreground" />
           ) : (
-            <FolderIcon
-              className={cn(
-                "ui-icon",
-                active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
-              )}
-            />
+            <FolderIcon className="ui-icon text-muted-foreground" />
           )
         }
         active={active}
@@ -2054,7 +2023,7 @@ function ConversationList({
           a compact card showing the session's title. */}
         <DragOverlay dropAnimation={null}>
           {activeDrag ? (
-            <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-tooltip">
+            <div className="pointer-events-none max-w-[16rem] truncate rounded-md border bg-card-solid px-3 py-2 text-ui shadow-lg">
               {activeDrag.label}
             </div>
           ) : null}
@@ -2203,7 +2172,7 @@ function SectionHeader({
                 "group flex w-full items-center border-0 text-left text-foreground transition-colors",
                 SIDEBAR_HOVER_HIGHLIGHT,
               )} sidebar-compact-text text-foreground`
-            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-2 pl-2 text-left text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground"
+            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-2 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground"
         }
       >
         {icon ? (
@@ -2524,20 +2493,16 @@ function ConversationSection({
       {!isCollapsed && (
         <>
           {conversations.length === 0 && emptyMessage ? (
-            // Expanded but empty — a project with no loaded chats (indented, in a
-            // dashed well) or a top-level list whose filter matched nothing.
-            indentRows ? (
-              <div
-                className={cn(
-                  SIDEBAR_ROW,
-                  "mt-1 mr-2 ml-8 flex flex-col items-start justify-center gap-1.5 px-0 py-1 pb-2 text-left md:py-1 md:pb-2",
-                )}
-              >
-                <p className="text-ui text-muted-foreground">{emptyMessage}</p>
-              </div>
-            ) : (
-              <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
-            )
+            // Expanded but empty (e.g. a project with no loaded chats).
+            <p
+              className={cn(
+                indentRows
+                  ? "mt-1 mr-2 ml-8 flex min-h-9 items-center justify-center rounded-xl border border-dashed border-border px-3 py-2 text-center text-ui text-muted-foreground"
+                  : "px-2 py-1 text-xs text-muted-foreground",
+              )}
+            >
+              {emptyMessage}
+            </p>
           ) : (
             // Indent project chats a step under the project-folder name above.
             <ul className={cn("flex flex-col", indentRows ? "gap-0 pl-6" : "gap-0")}>
@@ -3848,7 +3813,7 @@ function DeletingRow({
 function ArchivingRow({ label }: { label: string }) {
   return (
     <div
-      className={cn(SIDEBAR_ROW, "flex w-full items-center text-muted-foreground opacity-70")}
+      className="flex w-full items-center gap-1.5 rounded-md px-2 py-2 text-ui text-muted-foreground opacity-70"
       data-testid="conversation-archiving"
       aria-live="polite"
     >

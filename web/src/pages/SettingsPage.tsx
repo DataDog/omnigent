@@ -1588,7 +1588,7 @@ function UpdatesSection() {
           <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-4 py-3">
             <div className="flex flex-col gap-1">
               <span className="text-ui font-medium">Install downloaded updates on next quit</span>
-              <span className="text-sm text-muted-foreground">
+              <span className="text-xs text-muted-foreground">
                 Applies only after you choose to download an update.
               </span>
             </div>

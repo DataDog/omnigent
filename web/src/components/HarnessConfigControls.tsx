@@ -139,7 +139,7 @@ export function ConfigRow({
     <div className="flex flex-col gap-1.5 sm:flex-row sm:items-start sm:justify-between sm:gap-6">
       <div className="min-w-0 sm:pt-1">
         <div className="text-ui font-medium">{label}</div>
-        {description && <div className="text-sm text-muted-foreground">{description}</div>}
+        {description && <div className="text-xs text-muted-foreground">{description}</div>}
       </div>
       <div className="w-full sm:w-52 sm:shrink-0">{children}</div>
     </div>

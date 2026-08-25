@@ -112,7 +112,7 @@ export function ApprovePage() {
       {state.kind === "resolved" && (
         <Alert className="flex flex-col gap-2 border-muted py-4 px-5">
           <AlertTitle className="text-ui">Elicitation resolved</AlertTitle>
-          <AlertDescription className="text-sm">
+          <AlertDescription className="text-xs">
             This approval request is no longer pending. It may have been resolved, timed out, or
             cancelled.
           </AlertDescription>
@@ -122,7 +122,7 @@ export function ApprovePage() {
       {state.kind === "error" && (
         <Alert variant="destructive" className="flex flex-col gap-2 py-4 px-5">
           <AlertTitle className="text-ui">Error</AlertTitle>
-          <AlertDescription className="text-sm">{state.message}</AlertDescription>
+          <AlertDescription className="text-xs">{state.message}</AlertDescription>
         </Alert>
       )}
 

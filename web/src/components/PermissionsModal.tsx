@@ -173,7 +173,7 @@ export function PermissionsModal({ sessionId, open, onOpenChange }: PermissionsM
           <div className="flex items-center justify-between rounded-lg border px-3 py-2">
             <div>
               <p className="text-ui font-medium">Public access</p>
-              <p className="text-sm text-muted-foreground">Anyone can view this session</p>
+              <p className="text-xs text-muted-foreground">Anyone can view this session</p>
             </div>
             <Switch
               checked={isPublic}
@@ -424,8 +424,8 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
                     commit(index);
                   }}
                   className={cn(
-                    "flex cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-ui",
-                    index === activeIndex && "bg-muted dark:bg-muted/50",
+                    "flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-ui",
+                    index === activeIndex && "bg-muted",
                   )}
                 >
                   {/* Primary label fills the row and truncates. When the host
@@ -594,7 +594,7 @@ function GrantRow({
       </span>
       {fixedLevel ? (
         <span className="flex h-8 w-28 items-center px-3 text-ui text-muted-foreground">
-          {LEVEL_LABELS[permission.level] ?? "Read"}
+          {levelLabel}
         </span>
       ) : (
         <Select

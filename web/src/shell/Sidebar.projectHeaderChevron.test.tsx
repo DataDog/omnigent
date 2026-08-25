@@ -13,7 +13,7 @@
 //      hover-revealed trailing chevron and does NOT swap an icon.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -179,63 +179,23 @@ describe("project folder header icon/chevron", () => {
     expect(classOf(trailing)).not.toMatch(/md:group-hover:opacity-100/);
   });
 
-  it("highlights the project row instead of global New session for a project-scoped composer", () => {
-    renderSidebar("/?project=My%20Project");
-
-    const header = headerButton("My Project");
-    expect(header).toHaveAttribute("aria-current", "page");
-    expect(header).toHaveClass(
-      "bg-[var(--sidebar-active)]",
-      "text-[var(--sidebar-active-foreground)]",
-    );
-    expect(header.querySelector(".lucide-folder")).toHaveClass(
-      "text-[var(--sidebar-active-foreground)]",
-    );
-
-    const newSession = screen.getByTestId("new-chat-button");
-    expect(newSession).not.toHaveClass("bg-[var(--sidebar-active)]");
-    expect(newSession.querySelector("svg")).toHaveClass("text-muted-foreground");
-  });
-
-  it("shows a left-aligned empty-project message and new-session action", () => {
+  it("centers an empty-project message in an outlined container aligned to the title", () => {
     renderSidebar();
     fireEvent.click(headerButton("My Project"));
 
-    const action = screen
-      .getAllByRole("link", { name: "new session" })
-      .find((link) => link.getAttribute("href") === "/?project=My%20Project")!;
-    const empty = action.closest(".sidebar-row")!;
+    const empty = screen.getByText("No sessions");
     expect(empty).toHaveClass(
       "ml-8",
       "mr-2",
-      "sidebar-row",
-      "h-auto",
-      "min-h-0",
-      "px-0",
-      "py-1",
-      "pb-2",
-      "md:py-1",
-      "md:pb-2",
+      "min-h-9",
       "justify-center",
-      "rounded-[var(--radius-otto-button)]",
-      "items-start",
-      "text-left",
+      "rounded-xl",
+      "border",
+      "border-dashed",
+      "text-center",
+      "text-ui",
     );
-    expect(empty).not.toHaveClass("border", "border-dashed", "items-center", "text-center");
-    // Both sentences share one body-tier text block.
-    expect(empty).not.toHaveClass("min-h-9", "text-sm");
-    const message = empty.querySelector("p")!;
-    expect(message).toHaveClass("text-ui", "text-muted-foreground");
-    const body = message.querySelector("span")!;
-    expect(body).toHaveClass("text-ui");
-    expect(body).toHaveTextContent("No sessions. Start a new session.");
-    expect(body).toContainElement(action);
-    expect(message).toContainElement(action);
-    expect(within(empty as HTMLElement).getByRole("link", { name: "new session" })).toBe(action);
-    expect(action).toHaveAttribute("href", "/?project=My%20Project");
-    expect(action).toHaveClass("text-primary", "hover:underline");
-    expect(action).not.toHaveAttribute("data-slot", "button");
-    expect(action.querySelector("svg")).toBeNull();
+    expect(empty).not.toHaveClass("text-xs");
   });
 
   it("leaves iconless section headers with a hover-revealed trailing chevron and no swap", () => {
@@ -243,8 +203,9 @@ describe("project folder header icon/chevron", () => {
     // The "Projects" group header carries no leading icon.
     const header = headerButton("Projects");
 
-    // The parent section label remains the compact muted caption tier.
-    expect(header).toHaveClass("gap-1", "pb-2", "pl-2", "text-xs", "leading-4");
+    // The parent section label uses the settings-scaled subtitle tier.
+    expect(header).toHaveClass("gap-1", "pb-2", "pl-2", "text-sm", "font-normal");
+    expect(header).not.toHaveClass("font-medium", "text-caption", "uppercase");
 
     expect(header.querySelector(".lucide-folder")).toBeNull();
 
