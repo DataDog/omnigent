@@ -3346,18 +3346,13 @@ class CodexExecutor(Executor):
         if self._model_provider_override is not None:
             model = None
         elif model is None:
-            if self._gateway_uses_databricks_profile:
-                resolution = await run_sync_on_thread(
-                    model_catalog.resolve_catalog_model,
-                    "databricks",
-                    family="openai",
-                )
-                model = resolution.model_id
-            else:
-                # Codex's own login (ChatGPT account / API key), where codex is
-                # the vocabulary authority: the bundled OpenAI catalog's newest
-                # row is a bare family alias its backend rejects.
-                model = CODEX_DEFAULT_MODEL
+            provider_name = "databricks" if self._gateway_uses_databricks_profile else "openai"
+            resolution = await run_sync_on_thread(
+                model_catalog.resolve_catalog_model,
+                provider_name,
+                family="openai",
+            )
+            model = resolution.model_id
         effective_cwd = (
             self._cwd or (self._os_env_spec.cwd if self._os_env_spec else None) or os.getcwd()
         )
