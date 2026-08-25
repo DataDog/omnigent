@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TypeAlias
 
 import click
 import httpx
@@ -98,7 +97,6 @@ from omnigent.native_terminal import (
 
 _logger = logging.getLogger(__name__)
 
-_JsonObject: TypeAlias = dict[str, object]
 
 _AGENT_NAME = "codex-native-ui"
 _DEFAULT_CODEX_COMMAND = "codex"

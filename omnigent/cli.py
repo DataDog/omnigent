@@ -579,7 +579,6 @@ _HostJsonValue: TypeAlias = (
 _HostJsonObject: TypeAlias = dict[str, _HostJsonValue]
 _HostSessionRow: TypeAlias = dict[str, _HostJsonValue]
 _HostPayload: TypeAlias = dict[str, _HostJsonValue]
-_JsonObject: TypeAlias = dict[str, object]
 
 
 def _effective_global_config_path() -> Path:

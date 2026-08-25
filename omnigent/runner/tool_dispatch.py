@@ -35,6 +35,8 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 from omnigent.json_types import JsonObject as _JsonObject
 
+from omnigent.json_types import JsonObject as _JsonObject
+
 if TYPE_CHECKING:
     from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.inner.os_env import OSEnvironment
