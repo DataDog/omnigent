@@ -7295,10 +7295,6 @@ def run(
     # ambient DATABRICKS_CONFIG_PROFILE.
     if databricks_profile:
         os.environ["DATABRICKS_CONFIG_PROFILE"] = databricks_profile
-    # Rejected before anything is resolved: `run` never routed in-harness, and
-    # its create-time route is gone.
-    if smart_routing:
-        raise click.ClickException(_RUN_SMART_ROUTING_REMOVED)
     # Apply config defaults for any value the user did not pass explicitly.
     # Explicit CLI args always take precedence; project-local config overrides
     # global config, which provides user-level defaults.
