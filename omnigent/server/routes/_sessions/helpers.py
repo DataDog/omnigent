@@ -4281,6 +4281,7 @@ async def _provision_managed_sandbox(
     tracker: ManagedLaunchTracker,
     host_store: HostStore,
     relaunch_host: Host | None,
+    auth_context: object | None = None,
 ) -> ManagedHostLaunch | None:
     """
     Run the provision phase of a background managed launch.
@@ -4323,6 +4324,7 @@ async def _provision_managed_sandbox(
                 host_store=host_store,
                 repo=repo,
                 on_stage=_on_stage,
+                auth_context=auth_context,
             )
         return await launch_managed_host(
             config=sandbox_config,
@@ -4330,6 +4332,7 @@ async def _provision_managed_sandbox(
             host_store=host_store,
             repo=repo,
             on_stage=_on_stage,
+            auth_context=auth_context,
         )
     except HTTPException as exc:
         _logger.warning(

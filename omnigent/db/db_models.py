@@ -1585,3 +1585,55 @@ class SqlScheduledTaskRun(OmnigentBase):
             "conversation_id",
         ),
     )
+
+
+class SqlOidcSession(OmnigentBase):
+    """Encrypted OIDC provider session backing an opaque browser handle.
+
+    Stores the IdP-issued ID token and refresh token as AES-GCM
+    ciphertext, keyed by a separate credential-encryption key. The
+    browser/CLI receives only an opaque ``sess_…`` handle; its
+    HMAC-SHA256 digest is stored here for lookup, never the handle
+    itself.
+
+    :param id: Internal session ID (UUID, 16 raw bytes).
+    :param handle_digest: HMAC-SHA256 hex digest of the external
+        ``sess_…`` handle.
+    :param user_id: Verified user email (lowercased).
+    :param provider_subject: IdP subject claim from the ID token.
+    :param credential_ciphertext: AES-GCM encrypted blob containing
+        the ID token and refresh token.
+    :param id_token_expiry: Unix timestamp when the current ID token
+        expires.
+    :param absolute_expiry: Unix timestamp when the provider session
+        expires absolutely (roughly 24 hours in staging).
+    :param created_at: Row creation timestamp.
+    :param updated_at: Row last-update timestamp.
+    :param revoked_at: Timestamp when the session was revoked, or
+        ``None`` while active.
+    """
+
+    __tablename__ = "oidc_sessions"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    handle_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    provider_subject: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    credential_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    id_token_expiry: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    absolute_expiry: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    revoked_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        Index("ix_oidc_sessions_handle_digest", "workspace_id", "handle_digest"),
+        Index("ix_oidc_sessions_user_id", "workspace_id", "user_id"),
+    )

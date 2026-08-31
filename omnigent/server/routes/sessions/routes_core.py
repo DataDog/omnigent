@@ -405,12 +405,21 @@ def register_core_routes(
             # navigates to the session page immediately after this
             # 201) already carries the "provisioning" stage.
             _publish_sandbox_status(resp.id, "provisioning")
+            # Obtain the authenticated provisioning context for OBO
+            # identity propagation. When a session store is configured,
+            # this carries the verified user_id and a callable for the
+            # current ID token; otherwise None (header/local mode).
+            auth_context = None
+            if auth_provider is not None and user_id is not None:
+                auth_context = auth_provider.get_auth_context(request)
+                if auth_context is not None and auth_context.user_id != user_id:
+                    raise OmnigentError(
+                        "Authenticated user does not match session owner",
+                        code=ErrorCode.UNAUTHORIZED,
+                    )
             launch_task = asyncio.create_task(
                 _run_managed_launch(
                     session_id=resp.id,
-                    # On auth-disabled servers user_id is None; the
-                    # sandbox host registers under the reserved local
-                    # owner, same as a directly-connected host would.
                     owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
                     sandbox_config=sandbox_config,
                     repo=repo,
@@ -419,6 +428,7 @@ def register_core_routes(
                     host_store=host_store_for_managed,
                     host_registry=getattr(request.app.state, "host_registry", None),
                     tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                    auth_context=auth_context,
                 )
             )
             _managed_launch_tasks.add(launch_task)

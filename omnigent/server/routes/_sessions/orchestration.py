@@ -2375,6 +2375,7 @@ async def _run_managed_launch(
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
     relaunch_host: Host | None = None,
+    auth_context: object | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -2432,6 +2433,7 @@ async def _run_managed_launch(
         tracker=tracker,
         host_store=host_store,
         relaunch_host=relaunch_host,
+        auth_context=auth_context,
     )
     if managed is None:
         return
@@ -2549,6 +2551,7 @@ async def _maybe_relaunch_managed_sandbox(
     conv: Conversation,
     app_state: Any,
     conversation_store: ConversationStore,
+    auth_context: object | None = None,
 ) -> bool:
     """
     Relaunch a dead managed sandbox for a session, if it has one.
@@ -2630,6 +2633,7 @@ async def _maybe_relaunch_managed_sandbox(
                 conversation_store=conversation_store,
                 host_store=host_store,
                 app_state=app_state,
+                auth_context=auth_context,
             )
         launch = tracker.get(session_id)
     if launch is not None:
@@ -2643,6 +2647,7 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     conv: Conversation,
     app_state: Any,
     conversation_store: ConversationStore,
+    auth_context: object | None = None,
 ) -> bool:
     """
     Wake a resumable managed host whose persisted liveness has gone stale.
@@ -2718,6 +2723,7 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
         conv=conv,
         app_state=app_state,
         conversation_store=conversation_store,
+        auth_context=auth_context,
     )
 
 
@@ -2728,6 +2734,7 @@ async def ensure_runner_connected(
     app_state: Any,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    auth_context: object | None = None,
 ) -> tuple[httpx.AsyncClient | None, Conversation]:
     """
     Bring a wakeable session's runner online for out-of-band resource access.
@@ -2791,6 +2798,7 @@ async def ensure_runner_connected(
         conv=conv,
         app_state=app_state,
         conversation_store=conversation_store,
+        auth_context=auth_context,
     ):
         conv = await _reread()
         runner_client = await _get_runner_client(session_id, runner_router)
@@ -2843,6 +2851,7 @@ async def ensure_runner_connected(
             conv=conv,
             app_state=app_state,
             conversation_store=conversation_store,
+            auth_context=auth_context,
         ):
             conv = await _reread()
             runner_client = await _get_runner_client(session_id, runner_router)
@@ -2871,6 +2880,7 @@ def _kick_managed_relaunch(
     conversation_store: ConversationStore,
     host_store: HostStore,
     app_state: Any,
+    auth_context: object | None = None,
 ) -> None:
     """
     Register and spawn the background relaunch for a dead sandbox.
@@ -2930,6 +2940,7 @@ def _kick_managed_relaunch(
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
             relaunch_host=host,
+            auth_context=auth_context,
         )
     )
     _managed_launch_tasks.add(relaunch_task)

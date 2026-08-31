@@ -2390,6 +2390,7 @@ def create_app(
                     admin_list,
                     oidc_account_store,
                     allowed_domains=frozenset(allowed_domains or ()) or None,
+                    oidc_session_store=getattr(auth_provider, "_oidc_session_store", None),
                 ),
                 prefix="/auth",
                 tags=["auth"],

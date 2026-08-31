@@ -32,6 +32,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -46,6 +47,23 @@ RESERVED_USER_LOCAL = "local"
 RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
+
+
+@dataclass(frozen=True)
+class AuthenticatedSession:
+    """Server-side resolved authentication context for provisioning.
+
+    Returned by :meth:`UnifiedAuthProvider.get_auth_context` when the
+    request carries a ``sess_…`` opaque handle backed by an encrypted
+    OIDC provider session.
+
+    :param user_id: Verified user email.
+    :param oidc_session_id: Internal session ID for credential lookup.
+    """
+
+    user_id: str
+    oidc_session_id: str
+
 
 # Path prefixes a delegated (device-grant) access token may reach.
 # Fail-closed allowlist: a token carrying a ``scope`` claim is rejected on
@@ -394,6 +412,7 @@ class UnifiedAuthProvider(AuthProvider):
         local_single_user: bool | None = None,
         header_name: str | None = None,
         header_strip_prefix: str | None = None,
+        oidc_session_store: object | None = None,
     ) -> None:
         self._source = source
         self._oidc_config = oidc_config
@@ -408,11 +427,22 @@ class UnifiedAuthProvider(AuthProvider):
             else resolve_auth_header_strip_prefix()
         )
         self._cookie_cache: dict[str, tuple[str, float]] = {}
+        # Encrypted OIDC session store for sess_ handle resolution.
+        # When set, the callback issues sess_ handles instead of
+        # self-contained JWTs, and _check_cookie resolves them here.
+        self._oidc_session_store = oidc_session_store
         # Set by create_app when a device-grant store is wired. Returns
         # True if a grant_id has been revoked (or is unknown → fail
         # closed). Consulted only for delegated tokens (those carrying a
         # ``grant_id`` claim); left None disables the check.
         self._grant_revoked: Callable[[str], bool] | None = None
+
+    def set_oidc_session_store(self, store: object) -> None:
+        """Wire the encrypted OIDC session store after construction.
+
+        :param store: An :class:`OidcSessionStore` instance.
+        """
+        self._oidc_session_store = store
 
     def set_grant_revocation_check(self, check: Callable[[str], bool]) -> None:
         """Wire the device-grant revocation lookup.
@@ -451,7 +481,8 @@ class UnifiedAuthProvider(AuthProvider):
           :func:`resolve_auth_header`).
         - ``"oidc"`` / ``"accounts"``: Read ``__Host-ap_session``
           cookie, validate HS256 signature and expiry, return
-          ``sub`` claim.
+          ``sub`` claim. When an OIDC session store is wired,
+          resolve ``sess_…`` opaque handles instead.
 
         :param request: The incoming HTTP request or WebSocket
             handshake (both are ``HTTPConnection``).
@@ -460,6 +491,37 @@ class UnifiedAuthProvider(AuthProvider):
         if self._source in ("oidc", "accounts"):
             return self._check_cookie(request)
         return self._check_header(request)
+
+    def get_auth_context(self, request: HTTPConnection) -> AuthenticatedSession | None:
+        """Return the authenticated session context for provisioning.
+
+        Resolves a ``sess_…`` opaque handle to its server-side
+        ``{user_id, oidc_session_id}`` via the encrypted session store.
+        Returns ``None`` for JWT-based sessions (managed-runner tokens),
+        header-auth requests, or unauthenticated requests.
+
+        :param request: The incoming HTTP request.
+        :returns: An :class:`AuthenticatedSession` with ``user_id`` and
+            ``oidc_session_id``, or ``None``.
+        """
+        if self._oidc_session_store is None:
+            return None
+        cookie_config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        if cookie_config is None:
+            return None
+        cookie_name = cookie_config.session_cookie_name
+        token = request.cookies.get(cookie_name)
+        if not token:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:]
+        if not token or not token.startswith("sess_"):
+            return None
+        result = self._oidc_session_store.resolve(token)
+        if result is None:
+            return None
+        user_id, session_id, _ = result
+        return AuthenticatedSession(user_id=user_id, oidc_session_id=session_id)
 
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:
         """
@@ -530,6 +592,15 @@ class UnifiedAuthProvider(AuthProvider):
                 token = auth_header[7:]
         if not token:
             return None
+
+        # sess_ opaque handles are resolved via the encrypted session
+        # store when one is configured. Managed-runner JWTs and legacy
+        # self-contained cookies fall through to JWT decode below.
+        if token.startswith("sess_") and self._oidc_session_store is not None:
+            result = self._oidc_session_store.resolve(token)
+            if result is None:
+                return None
+            return result[0]  # user_id
 
         cache_key = hmac_digest(token, cookie_config.cookie_secret)
         cached = self._cookie_cache.get(cache_key)
@@ -619,7 +690,9 @@ class UnifiedAuthProvider(AuthProvider):
         return None
 
 
-def create_auth_provider() -> AuthProvider:
+def create_auth_provider(
+    oidc_session_store: object | None = None,
+) -> AuthProvider:
     """Factory: read ``OMNIGENT_AUTH_PROVIDER`` and return a
     :class:`UnifiedAuthProvider` configured for the selected source.
 
@@ -693,6 +766,7 @@ def create_auth_provider() -> AuthProvider:
         source=source,
         oidc_config=oidc_config,
         accounts_config=accounts_config,
+        oidc_session_store=oidc_session_store,
     )
 
 

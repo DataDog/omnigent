@@ -80,6 +80,7 @@ def _mint_state_cookie(
     code_verifier: str = "test-verifier",
     return_to: str = "/",
     ticket: str | None = None,
+    nonce: str | None = None,
 ) -> str:
     """Mint a signed auth-state cookie matching what /auth/login produces."""
     config = _make_oidc_config()
@@ -91,6 +92,8 @@ def _mint_state_cookie(
     }
     if ticket:
         payload["ticket"] = ticket
+    if nonce:
+        payload["nonce"] = nonce
     return jwt.encode(payload, config.cookie_secret, algorithm="HS256")
 
 
@@ -356,3 +359,237 @@ async def test_evict_expired_tickets_noop_when_all_fresh() -> None:
     _evict_expired_tickets(tickets)
 
     assert len(tickets) == 2
+
+
+# ── 7. Public PKCE client (no client_secret) ─────────────────────
+
+
+def _make_public_oidc_config() -> OIDCConfig:
+    """Build a standard-OIDC config with no client_secret (public client)."""
+    return OIDCConfig(
+        issuer="https://idp.example.com",
+        client_id="public-client-id",
+        client_secret=None,
+        redirect_uri="http://localhost:8000/auth/callback",
+        cookie_secret=_TEST_SECRET,
+        scopes="openid email profile",
+        session_ttl_hours=8,
+        logout_redirect_uri=None,
+        allowed_domains=None,
+        provider_type="oidc",
+        authorization_endpoint="https://idp.example.com/authorize",
+        token_endpoint="https://idp.example.com/token",
+        jwks_uri="https://idp.example.com/jwks",
+        userinfo_endpoint=None,
+        allow_invites=False,
+    )
+
+
+def _build_public_oidc_app() -> httpx.ASGITransport:
+    """Build a FastAPI app with the public-OIDC auth router."""
+    from fastapi import FastAPI
+
+    config = _make_public_oidc_config()
+    auth_provider = UnifiedAuthProvider(source="oidc", oidc_config=config)
+    admin_list = AdminList(Path("/tmp/nonexistent-admin-list.txt"))
+
+    router = create_auth_router(
+        auth_provider=auth_provider,
+        permission_store=None,
+        admin_list=admin_list,
+    )
+
+    app = FastAPI()
+    app.include_router(router, prefix="/auth")
+    return httpx.ASGITransport(app=app)
+
+
+async def test_callback_omits_client_secret_for_public_client() -> None:
+    """Token request omits client_secret when the config has none.
+
+    A public OAuth client uses PKCE instead of a client secret; the token
+    endpoint must not receive an empty or None client_secret value.
+    """
+    captured_data: dict[str, str] = {}
+
+    token_resp = MagicMock()
+    token_resp.status_code = 200
+    token_resp.json.return_value = {"access_token": "test", "id_token": ""}
+    token_resp.text = "{}"
+
+    mock_client = AsyncMock()
+    mock_client.post = AsyncMock(return_value=token_resp)
+    mock_client.get = AsyncMock(return_value=MagicMock(status_code=200))
+
+    mock_cm = AsyncMock()
+    mock_cm.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+    # Capture the data sent to the token endpoint.
+    async def _capture_post(url: str, *, data=None, headers=None, timeout=None):
+        if data is not None:
+            captured_data.update(data)
+        return token_resp
+
+    mock_client.post = _capture_post
+
+    transport = _build_public_oidc_app()
+    state = "test-state-value"
+    state_cookie = _mint_state_cookie(state)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", follow_redirects=False
+    ) as client:
+        with patch("omnigent.server.routes.auth.httpx.AsyncClient", return_value=mock_cm):
+            await client.get(
+                "/auth/callback",
+                params={"code": "auth-code-123", "state": state},
+                cookies={"ap_auth_state": state_cookie},
+            )
+
+    assert "client_secret" not in captured_data, (
+        f"client_secret must not be sent for a public client; got {captured_data}"
+    )
+    assert captured_data.get("client_id") == "public-client-id"
+    assert captured_data.get("code_verifier") == "test-verifier"
+
+
+async def test_callback_sends_client_secret_for_github() -> None:
+    """GitHub's confidential-client path still sends its client_secret.
+
+    The public-client relaxation must not affect the GitHub path, which
+    remains a confidential client.
+    """
+    captured_data: dict[str, str] = {}
+
+    token_resp = MagicMock()
+    token_resp.status_code = 200
+    token_resp.json.return_value = {"access_token": "gho_test", "token_type": "bearer"}
+    token_resp.text = "{}"
+
+    emails_resp = MagicMock()
+    emails_resp.status_code = 200
+    emails_resp.json.return_value = [
+        {"email": "alice@example.com", "primary": True, "verified": True}
+    ]
+
+    mock_client = AsyncMock()
+
+    async def _capture_post(url: str, *, data=None, headers=None, timeout=None):
+        if data is not None:
+            captured_data.update(data)
+        return token_resp
+
+    mock_client.post = _capture_post
+    mock_client.get = AsyncMock(return_value=emails_resp)
+
+    mock_cm = AsyncMock()
+    mock_cm.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+    transport = _build_oidc_app()
+    state = "test-state-value"
+    state_cookie = _mint_state_cookie(state)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", follow_redirects=False
+    ) as client:
+        with patch("omnigent.server.routes.auth.httpx.AsyncClient", return_value=mock_cm):
+            await client.get(
+                "/auth/callback",
+                params={"code": "auth-code-123", "state": state},
+                cookies={"ap_auth_state": state_cookie},
+            )
+
+    assert captured_data.get("client_secret") == "test-client-secret"
+    assert captured_data.get("client_id") == "test-client-id"
+
+
+# ── 9. Logout with session store ────────────────────────────────
+
+
+async def test_logout_revokes_session_when_store_configured() -> None:
+    """GET /auth/logout revokes the exact session when a store is wired."""
+    from unittest.mock import MagicMock
+
+    from fastapi import FastAPI
+
+    mock_store = MagicMock()
+    mock_store.resolve.return_value = ("alice@example.com", "session-123", "sub-1")
+
+    config = _make_oidc_config()
+    auth_provider = UnifiedAuthProvider(
+        source="oidc", oidc_config=config, oidc_session_store=mock_store
+    )
+    admin_list = AdminList(Path("/tmp/nonexistent-admin-list.txt"))
+    router = create_auth_router(
+        auth_provider=auth_provider,
+        permission_store=None,
+        admin_list=admin_list,
+        oidc_session_store=mock_store,
+    )
+    app = FastAPI()
+    app.include_router(router, prefix="/auth")
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", follow_redirects=False
+    ) as client:
+        resp = await client.get(
+            "/auth/logout",
+            cookies={"ap_session": "sess_test-handle-123"},
+        )
+
+    assert resp.status_code == 302
+    mock_store.resolve.assert_called_once_with("sess_test-handle-123")
+    mock_store.revoke.assert_called_once_with("session-123")
+    # Cookie is cleared.
+    set_cookie_headers = resp.headers.get_list("set-cookie")
+    session_cookies = [h for h in set_cookie_headers if "ap_session" in h]
+    assert any("Max-Age=0" in h for h in session_cookies)
+
+
+async def test_logout_without_session_store_just_clears_cookie() -> None:
+    """GET /auth/logout without a store just clears the cookie."""
+    transport = _build_oidc_app()
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", follow_redirects=False
+    ) as client:
+        resp = await client.get("/auth/logout")
+
+    assert resp.status_code == 302
+    set_cookie_headers = resp.headers.get_list("set-cookie")
+    session_cookies = [h for h in set_cookie_headers if "ap_session" in h]
+    assert any("Max-Age=0" in h for h in session_cookies)
+
+
+# ── 8. Nonce binding ─────────────────────────────────────────────
+
+
+async def test_login_includes_nonce_in_auth_url_and_state_cookie() -> None:
+    """GET /auth/login includes a nonce in both the auth URL and state cookie.
+
+    The nonce binds the ID token returned by the IdP to this specific
+    login attempt, preventing token injection/replay.
+    """
+    transport = _build_oidc_app()
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", follow_redirects=False
+    ) as client:
+        resp = await client.get("/auth/login")
+
+    assert resp.status_code == 302
+    location = resp.headers["location"]
+    parsed = urlparse(location)
+    params = parse_qs(parsed.query)
+
+    assert "nonce" in params, "Authorization URL must include a nonce parameter"
+    url_nonce = params["nonce"][0]
+
+    # The state cookie must carry the same nonce.
+    state_cookie = resp.cookies.get("ap_auth_state")
+    assert state_cookie is not None
+    state_payload = jwt.decode(state_cookie, _TEST_SECRET, algorithms=["HS256"])
+    assert state_payload.get("nonce") == url_nonce, (
+        "State cookie nonce must match the authorization URL nonce"
+    )

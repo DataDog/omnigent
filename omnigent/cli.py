@@ -3675,7 +3675,19 @@ def server(
         )
         os.environ.setdefault("OMNIGENT_ACCOUNTS_BASE_URL", f"http://{host}:{port}")
 
-    auth_provider = create_auth_provider()
+    from omnigent.server.auth import resolve_auth_source
+
+    oidc_session_store = None
+    if resolve_auth_source() == "oidc":
+        from sqlalchemy.orm import sessionmaker
+
+        from omnigent.db.utils import get_or_create_engine
+        from omnigent.server.oidc_session_store import OidcSessionStore
+
+        _engine = get_or_create_engine(db_uri)
+        oidc_session_store = OidcSessionStore(sessionmaker(bind=_engine))
+
+    auth_provider = create_auth_provider(oidc_session_store=oidc_session_store)
 
     # Accounts mode: construct the AccountStore (sibling to PermissionStore)
     # here and pass it to create_app explicitly. Any deploy that doesn't run
