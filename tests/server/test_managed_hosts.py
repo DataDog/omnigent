@@ -1983,6 +1983,41 @@ async def test_launch_provision_session_error_maps_to_502(
     assert fake.terminated == []
 
 
+async def test_relaunch_provision_session_error_maps_to_502(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Habitat relaunch failures preserve the host and surface as a 502."""
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
+    host = host_store.get_host(first.host_id)
+    assert host is not None
+
+    class _SessionError(RuntimeError):
+        """Mirrors omnigent_hab_launcher.lifecycle.SessionError."""
+
+    def _fail_provision(_host_name: str) -> None:
+        raise _SessionError("Habitat quota exhausted")
+
+    monkeypatch.setattr(fake, "provision", _fail_provision)
+    with pytest.raises(HTTPException) as exc:
+        await relaunch_managed_host(config=config, host=host, host_store=host_store)
+
+    assert exc.value.status_code == 502
+    assert "Habitat quota exhausted" in exc.value.detail
+    assert host_store.get_host(first.host_id) is not None
+    assert fake.terminated == ["sb-fake-1"]
+
+
 async def test_launch_host_start_failure_terminates_and_deletes_host(db_uri: str) -> None:
     """
     A failure AFTER provisioning must clean up: terminate the sandbox

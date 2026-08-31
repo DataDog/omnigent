@@ -2366,16 +2366,7 @@ async def launch_managed_host(
             detail=f"managed sandbox launch failed: {exc.message}",
         ) from exc
     except RuntimeError as exc:
-        # The external hab provider raises ``SessionError(RuntimeError)``
-        # (and its ``QuotaExceeded`` / ``ProvisioningShutdown`` subclasses)
-        # for per-session Habitat failures — an unconfigured endpoint,
-        # missing token, unreachable API, or exhausted quota. Surface
-        # those as a clear 502 so the UI reports the real cause instead
-        # of the broad "internal error" handler in routes/_sessions/helpers.py
-        # masking it. Duck-typed on ``RuntimeError`` so the public Omnigent
-        # repo does not hard-depend on the internal ``omnigent_hab_launcher``
-        # wheel; ``click.ClickException`` is not a ``RuntimeError`` so the
-        # branch above still handles click errors with their ``.message``.
+        # External providers use RuntimeError for per-session failures.
         raise HTTPException(
             status_code=502,
             detail=f"managed sandbox launch failed: {exc}",
@@ -2460,6 +2451,11 @@ async def relaunch_managed_host(
         raise HTTPException(
             status_code=502,
             detail=f"managed sandbox relaunch failed: {exc.message}",
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"managed sandbox relaunch failed: {exc}",
         ) from exc
     workspace = await _arm_and_start_host(
         launcher=launcher,
