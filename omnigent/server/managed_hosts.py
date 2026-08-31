@@ -2114,6 +2114,7 @@ async def launch_managed_host(
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
     on_stage: Callable[[str], None] | None = None,
+    auth_context: object | None = None,
 ) -> ManagedHostLaunch:
     """
     Provision a sandbox, start a host in it, and wait until it registers.
@@ -2154,6 +2155,10 @@ async def launch_managed_host(
         startup, or registration fails.
     """
     launcher = config.launcher_factory()
+    if auth_context is not None and getattr(
+        launcher.capabilities, "authenticated_provisioning", False
+    ):
+        launcher._provisioning_context = auth_context  # type: ignore[attr-defined]
     host_id = uuid.uuid4().hex
     # Visible label in the host picker; (owner, name) is the hosts
     # table PK, so embed the host_id's leading hex for uniqueness
@@ -2188,6 +2193,7 @@ async def relaunch_managed_host(
     host_store: HostStore,
     repo: RepoWorkspace | None = None,
     on_stage: Callable[[str], None] | None = None,
+    auth_context: object | None = None,
 ) -> ManagedHostLaunch:
     """
     Provision a NEW sandbox generation for an existing managed host.
@@ -2231,6 +2237,10 @@ async def relaunch_managed_host(
                 "was launched with is no longer configured on this server"
             ),
         )
+    if auth_context is not None and getattr(
+        launcher.capabilities, "authenticated_provisioning", False
+    ):
+        launcher._provisioning_context = auth_context  # type: ignore[attr-defined]
     # The old generation is normally already dead (that is why we are
     # here), but terminate defensively so a transient tunnel outage
     # can never leave two live sandboxes claiming one host identity.
@@ -2694,7 +2704,7 @@ async def _terminate_sandbox_best_effort(
     if launcher is not None and host.sandbox_id is not None:
         try:
             await asyncio.to_thread(launcher.terminate, host.sandbox_id)
-        except Exception:  # noqa: BLE001 — deliberate broad catch: this is a
+        except Exception:
             # provider-API boundary on a cleanup path. The provider SDK can
             # fail here in many shapes (auth/config ClickException, network
             # errors, SDK-internal exceptions), the sandbox may already be

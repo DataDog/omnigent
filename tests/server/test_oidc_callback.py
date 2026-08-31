@@ -182,7 +182,12 @@ def callback_client(
         yield client, keys
 
 
-def _do_callback(client: TestClient, id_token: str) -> httpx.Response:
+def _do_callback(
+    client: TestClient,
+    id_token: str,
+    *,
+    nonce: str | None = None,
+) -> httpx.Response:
     """Drive a full ``/auth/callback`` with a valid state cookie.
 
     Crafts the signed state cookie the way ``/auth/login`` would, sets
@@ -192,20 +197,21 @@ def _do_callback(client: TestClient, id_token: str) -> httpx.Response:
 
     :param client: The TestClient mounting the OIDC router.
     :param id_token: The signed ``id_token`` the IdP should return.
+    :param nonce: The nonce to embed in the state cookie. ``None`` omits
+        it (models a state cookie minted before nonce support).
     :returns: The raw callback response.
     """
     client.app.state.pending_id_token[0] = id_token
     state = "state-token-xyz"
-    state_jwt = jwt.encode(
-        {
-            "state": state,
-            "code_verifier": "verifier",
-            "return_to": "/",
-            "exp": int(time.time()) + 300,
-        },
-        _TEST_SECRET,
-        algorithm="HS256",
-    )
+    payload: dict[str, object] = {
+        "state": state,
+        "code_verifier": "verifier",
+        "return_to": "/",
+        "exp": int(time.time()) + 300,
+    }
+    if nonce is not None:
+        payload["nonce"] = nonce
+    state_jwt = jwt.encode(payload, _TEST_SECRET, algorithm="HS256")
     client.cookies.set(_AUTH_STATE_COOKIE_PLAIN, state_jwt)
     return client.get(
         f"/auth/callback?code=auth-code&state={state}",
@@ -445,3 +451,56 @@ def test_callback_accepts_boolean_and_string_true(
     # Accepted as a verified identity → redirect + session.
     assert resp.status_code == 302, resp.text
     assert resp.cookies.get("ap_session") is not None
+
+
+# ── Nonce binding ─────────────────────────────────────────────────
+
+
+def test_callback_accepts_matching_nonce(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """An ID token whose nonce matches the state cookie is accepted.
+
+    /auth/login generates a nonce and stores it in both the auth URL
+    and the signed state cookie. The callback must verify the ID
+    token's nonce matches.
+    """
+    client, keys = callback_client
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "nonce": "test-nonce-123"}
+    )
+
+    resp = _do_callback(client, token, nonce="test-nonce-123")
+
+    assert resp.status_code == 302, resp.text
+    assert resp.cookies.get("ap_session") is not None
+
+
+def test_callback_rejects_missing_nonce(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """An ID token without a nonce is rejected when the state cookie has one."""
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    resp = _do_callback(client, token, nonce="expected-nonce")
+
+    assert resp.status_code == 400, resp.text
+    assert "nonce" in resp.json()["error"].lower()
+    assert resp.cookies.get("ap_session") is None
+
+
+def test_callback_rejects_wrong_nonce(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """An ID token with a different nonce is rejected."""
+    client, keys = callback_client
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "nonce": "wrong-nonce"}
+    )
+
+    resp = _do_callback(client, token, nonce="expected-nonce")
+
+    assert resp.status_code == 400, resp.text
+    assert "nonce" in resp.json()["error"].lower()
+    assert resp.cookies.get("ap_session") is None

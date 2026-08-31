@@ -77,6 +77,9 @@ class SandboxCapabilities:
         inside the sandbox.
     :param foreground_exec: Provider supports a foreground exec that
         inherits local stdio.
+    :param authenticated_provisioning: Provider accepts an
+        :class:`AuthenticatedProvisioningContext` for on-behalf-of
+        identity propagation (e.g. Habitat via Ticino OBO).
     """
 
     cli_bootstrap: bool = False
@@ -87,6 +90,7 @@ class SandboxCapabilities:
     file_copy: bool = False
     streaming_exec: bool = False
     foreground_exec: bool = False
+    authenticated_provisioning: bool = False
 
 
 @dataclass(frozen=True)
@@ -124,3 +128,25 @@ class HostContext:
     repo_name: str | None = None
     host_config: dict[str, object] = field(default_factory=dict)
     on_stage: Callable[[str], None] | None = None
+
+
+@dataclass(frozen=True)
+class AuthenticatedProvisioningContext:
+    """Server-side verified identity for on-behalf-of sandbox provisioning.
+
+    Carries the authenticated user's verified identity and a server-side
+    callable that returns the current signed ID token. The callable may
+    refresh the token from the IdP but never exposes the refresh token.
+    Intentionally not JSON-serializable — it lives only in the server
+    process and is never sent to the browser, sandbox, or API response.
+
+    :param user_id: Verified user email (lowercased).
+    :param oidc_session_id: Internal OIDC session ID for credential lookup.
+    :param get_id_token: Callable returning the current signed ID token
+        string. May raise ``ReauthenticationError`` when the user must
+        sign in again.
+    """
+
+    user_id: str
+    oidc_session_id: str
+    get_id_token: Callable[[], str]
