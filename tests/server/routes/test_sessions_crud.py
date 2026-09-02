@@ -498,6 +498,35 @@ async def test_patch_rejects_client_supplied_per_user_pin_key(
     assert "omnigent.pinned.bob@example.com" not in conv.labels
 
 
+async def test_patch_rejects_client_supplied_sandbox_labels(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """The ``omnigent.sandbox.*`` namespace is server-internal — the server
+    writes these labels (e.g. the repository a relaunch re-clones) and re-reads
+    them to rebuild the runner's workspace. A client seed would forge that
+    reconstruction state (e.g. redirect the relaunch clone), so every key under
+    the prefix — the known ones and an unenumerated future key — must be rejected
+    and nothing persisted."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+
+    for key in (
+        "omnigent.sandbox.agent",
+        "omnigent.sandbox.repo",
+        "omnigent.sandbox.future",
+    ):
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"labels": {key: "code-reviewer"}},
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 400
+        conv = conv_store.get_conversation(session_id)
+        assert conv is not None
+        assert key not in conv.labels
+
+
 async def test_list_sessions_pinned_filter(
     client: httpx.AsyncClient,
     db_uri: str,
