@@ -112,7 +112,7 @@ from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerEx
 from omnigent.server.managed_hosts import (
     ManagedHostLaunch,
     ManagedLaunchTracker,
-    ManagedSandboxConfig,
+    ManagedSandboxDeployment,
     RepoWorkspace,
     host_resume_supported,
     host_sandbox_is_running,
@@ -2635,7 +2635,7 @@ async def _run_managed_launch(
     *,
     session_id: str,
     owner: str,
-    sandbox_config: ManagedSandboxConfig,
+    sandbox_config: ManagedSandboxDeployment,
     repo: RepoWorkspace | None,
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
@@ -2643,6 +2643,7 @@ async def _run_managed_launch(
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
     relaunch_host: Host | None = None,
+    provider: str | None = None,
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
 ) -> None:
@@ -2701,6 +2702,8 @@ async def _run_managed_launch(
     re-derived on every launch through the built-in gate, so there is no
     stored classifier to keep in sync — or to forge.
 
+    :param provider: Sandbox provider the create chose, or ``None`` for
+        the default. Ignored on a relaunch.
     :param agent_store: Store the classifier is resolved from, or
         ``None`` (a stripped test wiring) to leave the runner
         unclassified.
@@ -2726,6 +2729,7 @@ async def _run_managed_launch(
         tracker=tracker,
         host_store=host_store,
         relaunch_host=relaunch_host,
+        provider=provider,
         agent_name=agent_name,
     )
     if managed is None:
@@ -2746,7 +2750,7 @@ async def _bind_and_launch_managed_runner(
     *,
     session_id: str,
     managed: ManagedHostLaunch,
-    sandbox_config: ManagedSandboxConfig,
+    sandbox_config: ManagedSandboxDeployment,
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
     host_store: HostStore,
@@ -3176,7 +3180,7 @@ def _kick_managed_relaunch(
     session_id: str,
     conv: Conversation,
     host: Host,
-    sandbox_config: ManagedSandboxConfig,
+    sandbox_config: ManagedSandboxDeployment,
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
     host_store: HostStore,
@@ -3268,7 +3272,7 @@ def _kick_managed_wake(
     *,
     session_id: str,
     conv: Conversation,
-    sandbox_config: ManagedSandboxConfig,
+    sandbox_config: ManagedSandboxDeployment,
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
     host_store: HostStore,
@@ -3297,7 +3301,7 @@ def _kick_managed_wake_impl(
     *,
     session_id: str,
     conv: Conversation,
-    sandbox_config: ManagedSandboxConfig,
+    sandbox_config: ManagedSandboxDeployment,
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
     host_store: HostStore,
@@ -3351,7 +3355,7 @@ async def _run_managed_wake(
     *,
     session_id: str,
     conv: Conversation,
-    sandbox_config: ManagedSandboxConfig,
+    sandbox_config: ManagedSandboxDeployment,
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
     host_store: HostStore,
@@ -8853,7 +8857,7 @@ async def _get_session_snapshot(
     runner_exit_reports: RunnerExitReports | None = None,
     refresh_state: bool = False,
     host_store: HostStore | None = None,
-    sandbox_config: ManagedSandboxConfig | None = None,
+    sandbox_config: ManagedSandboxDeployment | None = None,
     viewer_id: str | None = None,
 ) -> SessionResponse:
     """

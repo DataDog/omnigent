@@ -1329,6 +1329,119 @@ async def _drive_managed_remembers_host(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def _multi_provider_info_body() -> str:
+    """``GET /v1/info`` for a server offering SEVERAL sandbox providers.
+
+    ``sandbox_providers: ["modal", "e2b"]`` makes the picker render one row per
+    provider; ``sandbox_provider: "modal"`` names the default (first
+    launch-capable) so an older SPA still shows a single labeled option.
+    """
+    return json.dumps(
+        {
+            "accounts_enabled": False,
+            "login_url": None,
+            "needs_setup": False,
+            "databricks_features": True,
+            "managed_sandboxes_enabled": True,
+            "sandbox_provider": "modal",
+            "sandbox_providers": ["modal", "e2b"],
+            "server_version": "0.0.0-e2e",
+            "smart_routing_enabled": False,
+        }
+    )
+
+
+def test_start_session_managed_multi_provider_picks_and_persists(
+    seeded_session: tuple[str, str],
+) -> None:
+    """A multi-provider server offers one row per provider, and the pick is sticky.
+
+    Covers the user-facing behavior added for multiple sandbox providers: the
+    picker shows a row per provider, choosing a non-default one (E2B) rides into
+    the create ``POST`` as ``sandbox_provider`` and labels the chip, and the
+    choice survives a reload (the composer reopens on the last provider used).
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_managed_multi_provider(base_url, session_id))
+
+
+async def _drive_managed_multi_provider(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            async def handle_info(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=_multi_provider_info_body(),
+                )
+
+            await page.route("**/v1/info", handle_info)
+
+            # No connected hosts, so the sandbox is unambiguously the default.
+            async def handle_no_hosts(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps({"hosts": []})
+                )
+
+            await page.route("**/v1/hosts", handle_no_hosts)
+
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps({"data": []})
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            # Default is the first launch-capable provider: "Modal Sandbox".
+            await expect(chip).to_contain_text("Modal Sandbox")
+
+            # Open the picker: one row per provider, the first keeping the
+            # original testid and later rows a provider-scoped one.
+            await chip.click()
+            await expect(page.get_by_test_id("new-chat-landing-sandbox-option")).to_contain_text(
+                "Modal Sandbox"
+            )
+            e2b_row = page.get_by_test_id("new-chat-landing-sandbox-option-e2b")
+            await expect(e2b_row).to_contain_text("E2B Sandbox")
+
+            # Pick the non-default provider; the chip reflects it.
+            await e2b_row.click()
+            await expect(chip).to_contain_text("E2B Sandbox")
+
+            # A managed create carries the chosen provider in its body.
+            await page.get_by_test_id("new-chat-landing-input").fill("audit the repo")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+            await _wait_until(lambda: len(create_bodies) == 1)
+            body = create_bodies[0]
+            assert body["host_type"] == "managed", body
+            assert body["sandbox_provider"] == "e2b", body
+            assert "host_id" not in body, body
+
+            # Reload: the pick is sticky — the composer reopens on E2B, not the
+            # default Modal.
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+            chip = page.get_by_test_id("new-chat-landing-host-chip")
+            await expect(chip).to_contain_text("E2B Sandbox")
+        finally:
+            await browser.close()
+
+
 def test_start_session_select_model_and_effort(seeded_session: tuple[str, str]) -> None:
     """Picking a model + reasoning effort rides along to the create call.
 
