@@ -187,11 +187,20 @@ import {
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { SIDEBAR_ROW } from "./sidebarStyles";
 
-// Positioning for a row's trailing session-state badge. On desktop it shares
-// the controls' right-1 edge and fades on hover so the pin + kebab take its
-// place; on mobile it sits left of the always-visible controls.
+// Positioning for a row's trailing session-state badge. Anchored at the
+// controls' right-1 edge and fades on hover so the pin + kebab take its place;
+// on mobile it sits left of the always-visible controls.
 const SESSION_STATE_SLOT_CLASS =
   "-translate-y-1/2 pointer-events-none absolute top-1/2 right-[4.5rem] flex h-5 items-center transition-opacity md:right-1 md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+
+// Small markers (running/starting/unseen dot, or the draft pencil when there's
+// no session state) get a fixed size-6 centered box so they line up vertically
+// under the kebab. The "awaiting" pill keeps its natural width — a fixed box
+// would clip its "Needs response" label.
+function isDotMarker(state: SessionState | null): boolean {
+  return state === null || state.kind !== "awaiting";
+}
+const SESSION_STATE_DOT_SLOT_CLASS = "md:w-6 md:justify-center";
 
 // Match the Settings sidebar's ghost-button hover treatment across every home
 // sidebar row.
@@ -2279,13 +2288,28 @@ function SectionHeader({
         {collapsed && marker && (
           <span
             className={cn(
-              "ml-auto flex shrink-0 items-center transition-opacity",
+              // Match the session rows' badge slot so the marker lines up
+              // vertically with the dots on the rows above. The header button's
+              // right padding differs by kind (icon folders use px-2, plain
+              // headers use pr-0), so offset each to the same right-1 edge:
+              // -mr-1 trims the folder's 8px padding to 4px; mr-1 pushes the
+              // padless header out to 4px.
+              "ml-auto flex shrink-0 items-center justify-center transition-opacity",
+              icon ? "-mr-1" : "mr-1",
+              // Dot/spinner markers get the fixed size-6 centered box (center
+              // lands 16px from the edge, matching the rows). The "awaiting"
+              // pill keeps its natural width so its label isn't clipped.
+              isDotMarker(marker) && "w-6",
               // When the header also carries a hover-revealed kebab, keep the
               // marker clear of it the same way a row's time/marker slot does:
               // reserve space on mobile (kebab always shown) and fade out on
               // desktop hover so the kebab takes its place.
               hasAction &&
-                "mr-14 md:mr-0 md:group-hover/section:opacity-0 md:group-focus-within/section:opacity-0",
+                cn(
+                  "mr-14",
+                  icon ? "md:-mr-1" : "md:mr-1",
+                  "md:group-hover/section:opacity-0 md:group-focus-within/section:opacity-0",
+                ),
             )}
           >
             <SessionStateBadge state={marker} />
@@ -3597,7 +3621,15 @@ function ConversationRow({
           )}
         </span>
       ) : hasTrailingIndicator ? (
-        <span className={SESSION_STATE_SLOT_CLASS}>
+        <span
+          className={cn(
+            SESSION_STATE_SLOT_CLASS,
+            // The wide "awaiting" pill keeps its natural width; every other
+            // marker (running/starting/unseen dot, or the draft pencil) sits in
+            // the fixed centered box so it lines up under the kebab.
+            isDotMarker(sessionState) && SESSION_STATE_DOT_SLOT_CLASS,
+          )}
+        >
           {sessionState !== null ? (
             <SessionStateBadge state={sessionState} />
           ) : (
