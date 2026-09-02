@@ -10,6 +10,7 @@ const {
   defaultSchemeFor,
   normalizeUrl,
   isPlainHttpRemote,
+  databricksWorkspaceUiUrl,
   expandDatabricksWorkspaceUrl,
   WORKSPACE_UI_PATH,
   fetchServerManifest,
@@ -129,6 +130,42 @@ async function withFetch(stub, fn) {
 function fakeResponse(serverHeader) {
   return { headers: { get: (name) => (name === "server" ? serverHeader : null) } };
 }
+
+describe("databricksWorkspaceUiUrl", () => {
+  it("maps AWS and Azure workspace roots to /omnigent", () => {
+    assert.equal(
+      databricksWorkspaceUiUrl("https://ws.cloud.databricks.com/"),
+      "https://ws.cloud.databricks.com/omnigent",
+    );
+    assert.equal(
+      databricksWorkspaceUiUrl("http://ws.azuredatabricks.net"),
+      "http://ws.azuredatabricks.net/omnigent",
+    );
+  });
+
+  it("preserves port, query, and fragment", () => {
+    assert.equal(
+      databricksWorkspaceUiUrl("https://ws.cloud.databricks.com:8443/?o=123#page"),
+      "https://ws.cloud.databricks.com:8443/omnigent?o=123#page",
+    );
+  });
+
+  it("matches domains only on a dot boundary", () => {
+    assert.equal(databricksWorkspaceUiUrl("https://databricks.com.example.org/"), null);
+    assert.equal(databricksWorkspaceUiUrl("https://notdatabricks.com/"), null);
+  });
+
+  it("does not map Databricks Apps or deliberate deep links", () => {
+    assert.equal(databricksWorkspaceUiUrl("https://my-app.aws.databricksapps.com/"), null);
+    assert.equal(databricksWorkspaceUiUrl("https://ws.cloud.databricks.com/somewhere"), null);
+  });
+
+  it("returns null for unsupported or invalid URLs", () => {
+    assert.equal(databricksWorkspaceUiUrl("ftp://ws.cloud.databricks.com/"), null);
+    assert.equal(databricksWorkspaceUiUrl("not a url"), null);
+    assert.equal(databricksWorkspaceUiUrl(null), null);
+  });
+});
 
 describe("expandDatabricksWorkspaceUrl", () => {
   it("expands a bare https Databricks workspace root to the UI mount", async () => {
@@ -385,7 +422,7 @@ describe("fetchServerManifest", () => {
   });
 
   it("requests the manifest at the origin root, ignoring any path", async () => {
-    // A workspace-mounted server (…/ml/omnigents) still serves the manifest at
+    // A workspace-mounted server (…/omnigent) still serves the manifest at
     // the ORIGIN root — well-known URIs are origin-scoped by RFC 8615.
     await withFetch(
       async (url) => {
@@ -393,7 +430,7 @@ describe("fetchServerManifest", () => {
         return fakeJsonResponse({ manifest_version: 1 });
       },
       async () => {
-        const m = await fetchServerManifest("https://ws.example.com/ml/omnigents");
+        const m = await fetchServerManifest("https://ws.example.com/omnigent");
         assert.equal(m.manifestVersion, 1);
       },
     );
