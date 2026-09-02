@@ -728,6 +728,7 @@ const updater = createDesktopUpdater({
   pinnedOrigin,
   iconPath: ICON_PNG,
   getCurrentVersion: () => currentDesktopVersion,
+  onInstallReadyChange: () => buildMenu(),
   // Dev builds use dev-app-update.yml, which mirrors the production HTTPS
   // endpoint; packaged builds always use their baked app-update.yml. Tying
   // this to !app.isPackaged — not an env var — ensures a packaged app can
@@ -1916,13 +1917,8 @@ function buildMenu() {
     {
       id: "restart_to_update",
       label: "Restart to Update",
+      visible: updater.getStatus().state === "downloaded",
       click: async () => {
-        // Production install path: the UpdateBanner toast is dismissible (and
-        // a user may have closed it), so the menubar must still offer a way to
-        // install a downloaded update. installUpdateNow() quits the app to
-        // hand off to the installer; it returns false when nothing is ready
-        // (e.g. the toast was for an update since skipped or not downloaded),
-        // which we surface with a native dialog instead of silently no-op'ing.
         if (!updater.installUpdateNow()) {
           await dialog.showMessageBox(activeWindow(), {
             type: "info",

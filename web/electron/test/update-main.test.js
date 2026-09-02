@@ -625,6 +625,27 @@ describe("auto-update main-process wiring", () => {
     assert.equal(harness.calls.appQuit, 0); // never re-issued
   });
 
+  it("shows Restart to Update only while an update is ready to install", (t) => {
+    const harness = loadMainHarness({
+      forceDevUpdateConfig: true,
+      settings: { update_mode: "manual" },
+    });
+    t.after(harness.cleanup);
+    harness.api.updater.init();
+
+    harness.api.buildMenu();
+    let restartItem = findMenuItem(harness.calls.setApplicationMenu.at(-1), "restart_to_update");
+    assert.equal(restartItem.visible, false);
+
+    harness.autoUpdater.emit("update-downloaded", { version: "0.4.0" });
+    restartItem = findMenuItem(harness.calls.setApplicationMenu.at(-1), "restart_to_update");
+    assert.equal(restartItem.visible, true);
+
+    harness.autoUpdater.emit("update-not-available");
+    restartItem = findMenuItem(harness.calls.setApplicationMenu.at(-1), "restart_to_update");
+    assert.equal(restartItem.visible, false);
+  });
+
   it("does not start the install path when no update is downloaded", async (t) => {
     const harness = loadMainHarness({
       forceDevUpdateConfig: true,
@@ -645,6 +666,7 @@ describe("auto-update main-process wiring", () => {
     harness.api.buildMenu();
     const restartItem = findMenuItem(harness.calls.setApplicationMenu.at(-1), "restart_to_update");
     assert.ok(restartItem);
+    assert.equal(restartItem.visible, false);
     restartItem.click();
     assert.equal(harness.api.updater.installPending, false);
     assert.equal(harness.calls.appQuit, 0);
