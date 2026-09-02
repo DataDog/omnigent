@@ -5396,7 +5396,7 @@ async def _cmd_switch(
     host: TerminalHost,
     fmt: RichBlockFormatter,
 ) -> None:
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     from rich.table import Table
     from rich.text import Text
@@ -5411,7 +5411,11 @@ async def _cmd_switch(
             table.add_column("Status", style="dim")
             table.add_column("Created", style="dim")
             for i, s in enumerate(sessions_list, 1):
-                when = datetime.fromtimestamp(s.created_at).strftime("%b %d %H:%M")
+                when = (
+                    datetime.fromtimestamp(s.created_at, tz=timezone.utc)
+                    .astimezone()
+                    .strftime("%b %d %H:%M")
+                )
                 table.add_row(str(i), s.id, s.title or "(untitled)", s.status, when)
             host.output(table)
             host.output(
