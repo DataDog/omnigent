@@ -146,6 +146,7 @@ import { sumPendingApprovals } from "@/lib/inbox";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { useHasSessionDraft } from "@/lib/sessionDrafts";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import { useChatStore } from "@/store/chatStore";
 import {
@@ -3196,6 +3197,7 @@ function ConversationRow({
   }, [conversation.title, pendingTitle, rename.isSuccess, rename.isError]);
 
   const label = pendingTitle ?? conversationDisplayLabel(conversation);
+  const hasDraft = useHasSessionDraft(conversation.id);
   // Recompute unseen state the moment the last-seen map changes (e.g. the
   // user picks "Mark as unread" on this row) rather than waiting for the
   // next conversations poll.
@@ -3233,6 +3235,11 @@ function ConversationRow({
       : hasUnseenMessages
         ? { kind: "unseen" as const }
         : (derivedState ?? (isStartingUp ? { kind: "starting" as const } : null));
+  // Drafts share the row's trailing indicator slot, but the active session's
+  // composer already makes its draft visible. Live session state wins while
+  // present; otherwise only an inactive row needs the draft marker.
+  const showDraftIndicator = hasDraft && !isActive;
+  const hasTrailingIndicator = sessionState !== null || showDraftIndicator;
 
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
@@ -3438,7 +3445,7 @@ function ConversationRow({
         !selectionMode &&
           (sessionState?.kind === "awaiting"
             ? "pr-48 md:pr-29"
-            : sessionState !== null
+            : hasTrailingIndicator
               ? "pr-28 md:pr-8"
               : "pr-28 md:pr-2"),
         // The narrowed reserve must track exactly when the trailing controls
@@ -3485,10 +3492,8 @@ function ConversationRow({
       }}
       title={isMobile ? (conversation.title ?? conversation.id) : undefined}
     >
-      {/* Row 1: the session name. Status markers (working, needs-approval,
-          unseen) render in the trailing session-state slot below, not inline
-          here. Leading icons (agent type, pin, shared) were removed to keep
-          rows text-clean; pinned rows still group under "Pinned". */}
+      {/* Row 1: the session name. Working, needs-approval, unseen, and draft
+          markers render in the shared trailing indicator slot below. */}
       <div className="flex w-full items-center gap-1.5">
         <span className="relative min-w-0 truncate">
           {label}
@@ -3591,9 +3596,20 @@ function ConversationRow({
             <SquareIcon className="size-4 text-muted-foreground" />
           )}
         </span>
-      ) : sessionState !== null ? (
+      ) : hasTrailingIndicator ? (
         <span className={SESSION_STATE_SLOT_CLASS}>
-          <SessionStateBadge state={sessionState} />
+          {sessionState !== null ? (
+            <SessionStateBadge state={sessionState} />
+          ) : (
+            <span
+              role="img"
+              aria-label="Draft"
+              data-testid="conversation-draft-indicator"
+              className="inline-flex h-5 shrink-0 items-center justify-center text-muted-foreground"
+            >
+              <PencilIcon aria-hidden className="size-3.5" />
+            </span>
+          )}
         </span>
       ) : null}
       {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
