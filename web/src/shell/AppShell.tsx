@@ -56,7 +56,7 @@ import { useDebugMode } from "@/hooks/useDebugMode";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
 import {
-  AGENT_TERMINAL_IDS,
+  findAgentTerminal,
   inventoryTerminals,
   isAgentTerminalKey,
   PANEL_NO_TERMINAL_KEY,
@@ -352,6 +352,7 @@ export function AppShell() {
   const { terminals } = useTerminals(conversationId ?? null, {
     reconcileWhilePending: terminalPending,
   });
+  const agentTerminal = useMemo(() => findAgentTerminal(terminals), [terminals]);
 
   const debugMode = useDebugMode();
   const { data: conversationsData } = useConversations("", true);
@@ -1471,22 +1472,21 @@ export function AppShell() {
         setPanelInitialKey(null);
         return;
       }
-      if (terminals.length === 0) {
+      if (agentTerminal === null) {
         if (terminalFirst) setPanelInitialKey(PANEL_NO_TERMINAL_KEY);
         return;
       }
-      // The pill's Terminal view is the AGENT's terminal: target it
-      // explicitly (the SDK REPL or the native vendor pane) so the
-      // pill never lands on a user shell.
-      const agentTerminal = terminals.find((t) => AGENT_TERMINAL_IDS.has(t.id));
-      setPanelInitialKey(terminalTabKey(agentTerminal ?? terminals[0]));
+      // The pill targets only the agent's REPL/vendor pane. A user shell may
+      // be the only cached terminal briefly, but it belongs in the workspace
+      // rail and must never become the main Terminal view.
+      setPanelInitialKey(terminalTabKey(agentTerminal));
     },
-    [terminalFirst, terminals, setPanelInitialKey],
+    [terminalFirst, agentTerminal, setPanelInitialKey],
   );
 
-  // `terminals` is already runner-accurate (useTerminals empties it when the
-  // runner is offline), so a non-empty list means an openable PTY.
-  const terminalsAvailable = terminals.length > 0;
+  // Shells do not make the Terminal-view toggle available: that control owns
+  // only the session's agent REPL/vendor pane.
+  const terminalsAvailable = agentTerminal !== null;
   // Single pill-facing "loading" signal: not yet openable, but coming up —
   // either the runner is launching/relaunching (liveness `starting`, known the
   // instant a message is sent) or it's up and auto-creating the PTY
@@ -1520,10 +1520,13 @@ export function AppShell() {
   // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
   // "open with no target" stays a pill view.
   const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
+  const terminalViewTargetAvailable = isShellView
+    ? terminals.some((terminal) => terminalTabKey(terminal) === panelInitialKey)
+    : terminalsAvailable;
 
   // A runner stop/disconnect empties the terminal list; if that lands while the
-  // terminal view is open, flip back to chat rather than stranding the user on
-  // "No terminals available" (and chat is where the composer resumes it).
+  // open agent terminal or explicit mobile shell disappears, flip back to chat
+  // rather than stranding the user on an empty surface.
   // Edge-triggered + startingUp-guarded so a cold boot / relaunch isn't yanked.
   const hadTerminalRef = useRef(false);
   useEffect(() => {
@@ -1531,13 +1534,19 @@ export function AppShell() {
       terminalFirst &&
       panelOpen &&
       hadTerminalRef.current &&
-      !terminalsAvailable &&
+      !terminalViewTargetAvailable &&
       !terminalStartingUp
     ) {
       setPanelInitialKey(null);
     }
-    hadTerminalRef.current = terminalsAvailable;
-  }, [terminalFirst, panelOpen, terminalsAvailable, terminalStartingUp, setPanelInitialKey]);
+    hadTerminalRef.current = terminalViewTargetAvailable;
+  }, [
+    terminalFirst,
+    panelOpen,
+    terminalViewTargetAvailable,
+    terminalStartingUp,
+    setPanelInitialKey,
+  ]);
 
   const terminalFirstContextValue = useMemo<TerminalFirstContextValue>(
     () => ({
