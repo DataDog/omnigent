@@ -1244,9 +1244,19 @@ def _accumulate_session_usage(
             cost_delta = float(provider_cost)
             priced = True
         else:
-            from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
+            from omnigent.llms.context_window import (
+                compute_llm_cost,
+                fetch_model_pricing_with_provider,
+            )
+            from omnigent.onboarding.provider_config import load_config
 
-            pricing = fetch_model_pricing(llm_model)
+            # Load provider config to check for custom pricing
+            provider_config = load_config()
+            # Resolve harness from conversation (agent spec + overrides)
+            harness = _resolve_harness(conv) if conv else None
+            pricing = fetch_model_pricing_with_provider(
+                llm_model, provider_config=provider_config, harness=harness
+            )
             priced = pricing is not None
             if pricing is not None:
                 # Cache-aware: usage_obj carries cache_read/cache_creation
@@ -1430,9 +1440,19 @@ def _persist_native_cumulative_usage(
         current["total_cost_usd"] = max(old_cost, float(cost))
     elif has_tokens:
         if isinstance(model_name, str) and model_name:
-            from omnigent.llms.context_window import compute_llm_cost, fetch_model_pricing
+            from omnigent.llms.context_window import (
+                compute_llm_cost,
+                fetch_model_pricing_with_provider,
+            )
+            from omnigent.onboarding.provider_config import load_config
 
-            pricing = fetch_model_pricing(model_name)
+            # Load provider config to check for custom pricing
+            provider_config = load_config()
+            # Resolve harness from conversation (agent spec + overrides)
+            harness = _resolve_harness(conv) if conv else None
+            pricing = fetch_model_pricing_with_provider(
+                model_name, provider_config=provider_config, harness=harness
+            )
             if pricing is not None:
                 # SET (cumulative) — price the running token totals.
                 # ``current`` carries the cache-read split when the harness
