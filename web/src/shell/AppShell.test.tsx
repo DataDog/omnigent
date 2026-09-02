@@ -760,7 +760,7 @@ describe("TerminalFirstContext", () => {
     expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_bash_s1");
   });
 
-  it("does not enable Terminal view when only a user shell is cached", () => {
+  it("allows Terminal view when only a user shell is cached", () => {
     mockConversations([
       {
         id: "conv_native",
@@ -776,8 +776,13 @@ describe("TerminalFirstContext", () => {
 
     renderShell("/c/conv_native");
 
-    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminals-available", "false");
-    expect(screen.getByTestId("view-mode-terminal")).toBeDisabled();
+    const probe = screen.getByTestId("view-probe");
+    expect(probe).toHaveAttribute("data-terminals-available", "false");
+    const terminalToggle = screen.getByTestId("view-mode-terminal");
+    expect(terminalToggle).toBeEnabled();
+    fireEvent.click(terminalToggle);
+    expect(probe).toHaveAttribute("data-view", "terminal");
+    expect(probe).toHaveAttribute("data-terminal-view-key", "");
   });
 
   it("flags a child (sub-agent) session terminal-first from the snapshot when the sidebar omits it", () => {
@@ -892,17 +897,18 @@ describe("TerminalFirstContext", () => {
     expect(probe).toHaveAttribute("data-terminals-available", "false");
     expect(probe).toHaveAttribute("data-view", "chat");
 
-    fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
+    const terminalToggle = screen.getByTestId("view-mode-terminal");
+    expect(terminalToggle).toBeEnabled();
+    fireEvent.click(terminalToggle);
 
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
     expect(screen.queryByTestId("terminals-panel")).toBeNull();
   });
 
-  it("falls back to chat when an open terminal view loses its terminal", () => {
-    // A runner stop / disconnect empties the terminal list (useTerminals clears
-    // it on the runner-offline edge). Landing while the terminal view is open,
-    // that would strand the user on "No terminals available"; the view must
-    // fall back to chat, where the composer can resume the session.
+  it("stays in Terminal when an open agent terminal loses its runner", () => {
+    // A runner stop / disconnect empties the terminal list. Keep the user's
+    // selected view so its stopped-harness state can explain what happened and
+    // offer the resume action instead of unexpectedly switching back to Chat.
     mockConversations([
       { id: "conv_native", permission_level: null, labels: { "omnigent.ui": "terminal" } },
     ]);
@@ -946,8 +952,7 @@ describe("TerminalFirstContext", () => {
     useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
     rerender(makeTree());
 
-    // Fell back to chat rather than stranding on "No terminals available".
-    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
   });
 
   it("stays in terminal view while the terminal is relaunching", () => {

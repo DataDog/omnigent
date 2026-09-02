@@ -1515,10 +1515,10 @@ export function AppShell() {
   // Shells do not make the Terminal-view toggle available: that control owns
   // only the session's agent REPL/vendor pane.
   const terminalsAvailable = agentTerminal !== null;
-  // Single pill-facing "loading" signal: not yet openable, but coming up —
+  // Single pill-facing "loading" signal: the PTY is not ready, but is coming up —
   // either the runner is launching/relaunching (liveness `starting`, known the
   // instant a message is sent) or it's up and auto-creating the PTY
-  // (`terminalPending`). Idle stopped sessions are neither → greyed, not spinning.
+  // (`terminalPending`). Idle stopped sessions are neither → no spinner.
   // Suppressed once the session has failed AND no send is in flight: a runner
   // that crashed before connecting (`runner_failed_to_start`), or a host that
   // refused the launch (`harness_not_configured`), sits in the `starting` grace
@@ -1548,30 +1548,31 @@ export function AppShell() {
   // affordance. The PANEL_NO_TERMINAL_KEY sentinel ("") is falsy, so
   // "open with no target" stays a pill view.
   const isShellView = terminalFirst && !!panelInitialKey && !isAgentTerminalKey(panelInitialKey);
-  const terminalViewTargetAvailable = isShellView
-    ? terminals.some((terminal) => terminalTabKey(terminal) === panelInitialKey)
-    : terminalsAvailable;
+  const shellViewTargetAvailable =
+    isShellView && terminals.some((terminal) => terminalTabKey(terminal) === panelInitialKey);
 
-  // A runner stop/disconnect empties the terminal list; if that lands while the
-  // open agent terminal or explicit mobile shell disappears, flip back to chat
-  // rather than stranding the user on an empty surface.
-  // Edge-triggered + startingUp-guarded so a cold boot / relaunch isn't yanked.
-  const hadTerminalRef = useRef(false);
+  // An explicit user shell has no useful empty state: if it disappears, return
+  // to chat. The agent-terminal view is different — it remains selectable when
+  // the runner is offline and owns the resume affordance shown in that state.
+  // Edge-triggered + startingUp-guarded so a shell relaunch isn't yanked.
+  const hadShellTerminalRef = useRef(false);
   useEffect(() => {
     if (
       terminalFirst &&
       panelOpen &&
-      hadTerminalRef.current &&
-      !terminalViewTargetAvailable &&
+      isShellView &&
+      hadShellTerminalRef.current &&
+      !shellViewTargetAvailable &&
       !terminalStartingUp
     ) {
       setPanelInitialKey(null);
     }
-    hadTerminalRef.current = terminalViewTargetAvailable;
+    hadShellTerminalRef.current = shellViewTargetAvailable;
   }, [
     terminalFirst,
     panelOpen,
-    terminalViewTargetAvailable,
+    isShellView,
+    shellViewTargetAvailable,
     terminalStartingUp,
     setPanelInitialKey,
   ]);
