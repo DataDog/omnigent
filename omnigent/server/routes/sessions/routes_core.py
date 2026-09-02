@@ -2075,6 +2075,18 @@ def register_core_routes(
             else None
         )
 
+        # Keep the fork filed in the source's first-class project, but only
+        # when the forker owns that project — projects are owner-private, so
+        # a fork of a shared session filed in someone else's project stays
+        # unfiled (a foreign project id would show in no folder view).
+        fork_project_id = None
+        if source.project_id is not None and project_store is not None:
+            owned = await asyncio.to_thread(
+                project_store.get, source.project_id, owner_user_id=user_id
+            )
+            if owned is not None:
+                fork_project_id = source.project_id
+
         try:
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
@@ -2095,6 +2107,7 @@ def register_core_routes(
                 resume_source_native_session=resume_source_native_session,
                 presentation_labels=presentation_labels,
                 up_to_response_id=body.up_to_response_id,
+                project_id=fork_project_id,
             )
         except LookupError as exc:
             raise OmnigentError(
