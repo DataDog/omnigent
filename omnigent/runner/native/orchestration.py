@@ -4129,18 +4129,14 @@ async def _auto_create_codex_terminal(
                     # hook sources itself; skip the interactive trust prompt
                     # that headless sub-agents can never answer.
                     #
-                    # Requires a *positively parsed* version, unlike the
-                    # hooks-file gate in ``codex_native_app_server``, which
-                    # treats an unknown version as supported. The two differ
-                    # because their failure modes do: an unsupported hooks
-                    # file is ignored by codex and caught downstream at the
-                    # trust check, whereas an unknown CLI flag aborts argv
-                    # parsing — so a transient ``codex --version`` hiccup on a
-                    # pre-0.131 codex would turn a recoverable trust prompt
-                    # into a dead terminal.
+                    # A failed version probe must not restore the interactive
+                    # gate: Omnigent's supported Codex floor is newer than the
+                    # release that added this flag. Otherwise a transient
+                    # ``codex --version`` failure strands the queued web
+                    # message behind the terminal-only review screen.
                     bypass_hook_trust=(
-                        app_server.codex_cli_version is not None
-                        and app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
+                        app_server.codex_cli_version is None
+                        or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
                     ),
                 ),
                 env=codex_terminal_env(app_server),
