@@ -23,6 +23,7 @@ from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.spec import AgentSpec
 
 if TYPE_CHECKING:
+    from omnigent.entities import Conversation
     from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
     from omnigent.stores import ConversationStore
 
@@ -115,7 +116,12 @@ class RunnerRouter:
             code=ErrorCode.CONFLICT,
         )
 
-    def client_for_session_resources(self, conversation_id: str) -> RoutedRunner:
+    def client_for_session_resources(
+        self,
+        conversation_id: str,
+        *,
+        conversation: Conversation | None = None,
+    ) -> RoutedRunner:
         """
         Return a runner client for session resource access.
 
@@ -126,11 +132,19 @@ class RunnerRouter:
 
         :param conversation_id: Conversation/session id, e.g.
             ``"conv_0123456789abcdef"``.
+        :param conversation: An already-loaded conversation. Callers that
+            just authorized the session can pass it to avoid another read.
         :returns: Selected runner id and client.
         :raises OmnigentError: If the conversation is missing, the
             pinned runner is offline, or no online runner is available.
         """
-        conv = self._conversation_store.get_conversation(conversation_id)
+        conv = conversation
+        if conv is not None and conv.id != conversation_id:
+            raise ValueError(
+                f"conversation id mismatch: expected {conversation_id!r}, got {conv.id!r}"
+            )
+        if conv is None:
+            conv = self._conversation_store.get_conversation(conversation_id)
         if conv is None:
             raise OmnigentError("conversation not found", code=ErrorCode.NOT_FOUND)
         if conv.runner_id:

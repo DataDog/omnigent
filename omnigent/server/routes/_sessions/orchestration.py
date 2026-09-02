@@ -3075,7 +3075,11 @@ async def ensure_runner_connected(
         return refreshed if refreshed is not None else conv
 
     # Fast path: a live runner tunnel is already reachable.
-    runner_client = await _get_runner_client(session_id, runner_router)
+    runner_client = await _get_runner_client(
+        session_id,
+        runner_router,
+        conversation=conv,
+    )
     if runner_client is not None:
         return runner_client, conv
 
@@ -3092,7 +3096,11 @@ async def ensure_runner_connected(
         conversation_store=conversation_store,
     ):
         conv = await _reread()
-        runner_client = await _get_runner_client(session_id, runner_router)
+        runner_client = await _get_runner_client(
+            session_id,
+            runner_router,
+            conversation=conv,
+        )
         if runner_client is not None:
             return runner_client, conv
 
@@ -3159,7 +3167,11 @@ async def ensure_runner_connected(
             conversation_store=conversation_store,
         ):
             conv = await _reread()
-            runner_client = await _get_runner_client(session_id, runner_router)
+            runner_client = await _get_runner_client(
+                session_id,
+                runner_router,
+                conversation=conv,
+            )
 
         if runner_client is None:
             runner_client = await _wait_for_runner_client(
