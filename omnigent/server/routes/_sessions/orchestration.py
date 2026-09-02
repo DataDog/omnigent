@@ -3165,10 +3165,24 @@ async def _run_managed_wake(
         tracker.fail(session_id, reason)
         _publish_sandbox_status(session_id, "failed", reason)
         return
+
+    def _on_stage(stage: str) -> None:
+        """Relay the wake's launch-pipeline stage to the session's progress surface.
+
+        Without it the wake shows the single ``"provisioning"`` band that
+        ``_kick_managed_wake`` seeded for its whole duration, even while the host
+        is already re-execing. resume_managed_host may invoke this from the
+        worker thread its ``start_host`` runs on; ``_publish_sandbox_status`` is
+        thread-safe.
+        """
+        _publish_sandbox_status(session_id, stage)
+
     try:
         # Wake the same sandbox in place; resume_managed_host is single-flight
         # per host and a no-op if it's already online.
-        await resume_managed_host(host_id, host_store, sandbox_config, force=True)
+        await resume_managed_host(
+            host_id, host_store, sandbox_config, force=True, on_stage=_on_stage
+        )
         _publish_sandbox_status(session_id, "connecting")
         refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if refreshed is None:
