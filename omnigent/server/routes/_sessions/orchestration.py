@@ -50,7 +50,6 @@ from omnigent.native_coding_agents import (
 from omnigent.policies.types import (
     ElicitationRequest,
     EvaluationContext,
-    PolicyAction,
     PolicyResult,
 )
 from omnigent.runner.routing import RunnerRouter
@@ -154,6 +153,7 @@ from omnigent.session_lifecycle import (
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
+    PolicyAction,
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
