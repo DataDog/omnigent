@@ -5667,7 +5667,7 @@ export function Composer({
             (text-transparent, caret kept visible) and render an aligned mirror
             behind it. Same box/typography so wrapping matches the textarea
             exactly. Only mounted while the draft is a command. */}
-        <div className="relative">
+        <div className="relative overflow-hidden">
           {composerIsCommand && (
             <div
               ref={backdropRef}

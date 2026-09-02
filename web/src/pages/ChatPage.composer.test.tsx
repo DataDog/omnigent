@@ -150,11 +150,13 @@ describe("Composer growth layout", () => {
   it("keeps long drafts scrollable without showing a native scrollbar", () => {
     render(<Composer {...composerProps()} />);
 
-    expect(textarea()).toHaveClass(
+    const ta = textarea();
+    expect(ta).toHaveClass(
       "overflow-y-auto",
       "[scrollbar-width:none]",
       "[&::-webkit-scrollbar]:hidden",
     );
+    expect(ta.parentElement).toHaveClass("overflow-hidden");
   });
 });
 
