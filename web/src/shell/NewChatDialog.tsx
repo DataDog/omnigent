@@ -2139,9 +2139,13 @@ export function NewChatLandingScreen() {
 
   // Mirror the current draft fields into a ref every render so the unmount
   // cleanup below can snapshot the latest values without re-subscribing.
-  // `submittedRef` is flipped just before we navigate to a freshly-created
-  // session so the snapshot is dropped instead of resurrected.
+  // `submittedRef` is flipped once the draft is sent to a create, so the
+  // snapshot is dropped instead of resurrected.
   const submittedRef = useRef(false);
+  // Whether this composer is still on screen. The create POST can outlive
+  // it — the user opens another session while the session bootstraps — and
+  // the post-create navigation must not follow them there.
+  const onScreenRef = useRef(true);
   const draftRef = useRef<LandingDraft>(null as unknown as LandingDraft);
   draftRef.current = {
     message,
@@ -2164,7 +2168,11 @@ export function NewChatLandingScreen() {
     costControlMode,
   };
   useEffect(() => {
+    // Re-set on setup so StrictMode's setup→cleanup→setup double-invoke
+    // doesn't leave the screen marked gone.
+    onScreenRef.current = true;
     return () => {
+      onScreenRef.current = false;
       landingDraft = submittedRef.current ? null : draftRef.current;
     };
   }, []);
@@ -3325,6 +3333,14 @@ export function NewChatLandingScreen() {
     }
   }
 
+  // No session was created after all, so the draft is the user's again —
+  // including when they navigated away and the unmount cleanup already
+  // dropped it on the strength of the submit.
+  function returnDraftToUser() {
+    submittedRef.current = false;
+    if (!onScreenRef.current) landingDraft = draftRef.current;
+  }
+
   async function handleCreate() {
     // Mirror the Send button's disabled condition (canSubmit) so the Enter-key
     // and form-submit paths that call this directly can't create a session with
@@ -3332,6 +3348,12 @@ export function NewChatLandingScreen() {
     if (!canSubmit) return;
     setCreating(true);
     setCreateError(null);
+    // The draft is spent from the moment it is submitted: it belongs to the
+    // session now being created, so a detour back to this screen must not
+    // hand it back pre-filled. Flipped here rather than on the response
+    // because the create outlives an unmount; a create that fails hands the
+    // draft back via returnDraftToUser.
+    submittedRef.current = true;
     try {
       const trimmedBranch = branchName.trim();
       // `shouldCreateWorktree` (component scope): true only when a branch is
@@ -3569,6 +3591,7 @@ export function NewChatLandingScreen() {
         // the workspace and agent, so winning on the push can't skip past an
         // error the user needed to see on this screen.
         if ("error" in created) {
+          returnDraftToUser();
           setCreateError(created.error);
           return;
         }
@@ -3626,13 +3649,17 @@ export function NewChatLandingScreen() {
       // the freshly-opened chat (whose composer reads the same per-conversation
       // key). Sanitized text so recall reproduces exactly what was sent.
       appendPromptHistoryEntry(initialPrompt, data.id);
-      // The session was created — drop the preserved draft so the next visit
-      // to the landing screen starts clean (and the unmount cleanup below
-      // doesn't resurrect what we just sent).
-      submittedRef.current = true;
+      // The session was created — drop any draft a detour back to this
+      // screen stashed, so the next visit starts clean.
       landingDraft = null;
-      navigate(`/c/${data.id}`);
+      // Only follow the create while the user is still on the landing
+      // screen. A create that outlived it means they moved on to another
+      // session; jumping them into this one now would hijack that. The
+      // session is created either way and its first message stays held
+      // for whenever they open it.
+      if (onScreenRef.current) navigate(`/c/${data.id}`);
     } catch {
+      returnDraftToUser();
       setCreateError("Couldn't reach the server. Check your connection and try again.");
     } finally {
       setCreating(false);
