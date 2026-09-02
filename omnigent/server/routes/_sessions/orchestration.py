@@ -2405,6 +2405,63 @@ async def _publish_runner_recovered_status_impl(
     await _persist_session_status_error_labels(session_id, None, conversation_store)
 
 
+async def _mark_runner_sessions_offline_impl(
+    convs: list[Conversation],
+    error: ErrorDetail,
+    conversation_store: ConversationStore,
+    *,
+    fail_idle_top_level: bool = False,
+) -> None:
+    """
+    Fail the sessions a departed runner actually interrupted, with the cause.
+
+    A runner going away ends in-flight turns; it does not retroactively
+    fail work that already finished. Sub-agents ride their parent's runner,
+    so the departure reaches every child bound to it — marking the idle
+    ones ``failed`` painted a whole Agents rail red for sub-agents that had
+    completed successfully. The runner's absence is already carried by
+    liveness (``clear_runner_liveness``), which is what drives the
+    reconnect affordances, so a session that was not mid-turn needs no
+    status edge at all.
+
+    The sessions that DO get failed carry the cause, persisted as durable
+    labels. The cause is what lets the client render a benign
+    "Disconnected" instead of a red "Failed", and what lets
+    :func:`_publish_runner_recovered_status` clear the state when the
+    runner comes back — that helper only clears a failure it can identify
+    as a disconnect.
+
+    :param convs: Conversations bound to the departed runner, from
+        :meth:`ConversationStore.list_conversations_by_runner_id`.
+    :param error: The cause to publish and persist, e.g.
+        ``ErrorDetail(code="runner_disconnected", message="...")``.
+    :param conversation_store: Store used to persist the error labels.
+    :param fail_idle_top_level: When ``True``, also fail an idle top-level
+        session. A crash report covers the runner that died *before* it
+        could run anything, so its session never reached ``running`` and
+        would otherwise sit silent; a sub-agent is spawned by an
+        already-live runner and can never be in that state, so idle
+        children are skipped either way.
+    :returns: None.
+    """
+    for conv in convs:
+        # An intentional teardown (Stop / archive) drops the tunnel on
+        # purpose. The relay owns that path — it publishes a quiet idle and
+        # consumes the marker — so peek without discarding here.
+        if conv.id in _intentional_stop_sessions:
+            continue
+        # Cache first (this replica holds the runner's tunnel, so it saw the
+        # turn edges), falling back to the row for a session whose live state
+        # was published before a restart.
+        live = _session_status_cache.get(conv.id, conv.live_status)
+        interrupted = live in ("running", "waiting")
+        dead_on_arrival = fail_idle_top_level and conv.kind != "sub_agent"
+        if not interrupted and not dead_on_arrival:
+            continue
+        _publish_status(conv.id, "failed", error)
+        await _persist_session_status_error_labels(conv.id, error, conversation_store)
+
+
 async def _wait_for_host_bound_runner_client(
     session_id: str,
     runner_router: RunnerRouter | None,
