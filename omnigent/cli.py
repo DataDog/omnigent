@@ -1827,6 +1827,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "sandbox",
         "server",
         "setup",
+        "start",
         "stop",
         "uninstall",
         "update",
@@ -4142,6 +4143,47 @@ def server_status(json_output: bool) -> None:
     click.echo(f"  host daemon attached: {'yes' if daemon_attached else 'no'}")
 
 
+@cli.command("start")
+@click.option("--server", default=None, help="Omnigent server URL to host on.")
+@click.option(
+    "--non-interactive",
+    "non_interactive",
+    is_flag=True,
+    default=False,
+    help=(
+        "Never prompt for sign-in. When the server requires auth and you "
+        "are not logged in, fail with the `omnigent login` hint instead of "
+        "launching the browser login flow. Use this in scripts and CI."
+    ),
+)
+def start(server: str | None, non_interactive: bool) -> None:
+    """Start Omnigent on this machine, in the background.
+
+    The on switch, and the counterpart of ``omnigent stop``: brings up the
+    local server (web UI / history) and registers this machine as a host, then
+    returns. With a configured or explicit ``--server`` it hosts on that server
+    instead, and no local server is started.
+
+    An alias of ``omnigent host --background`` — reach for that spelling when
+    a script wants the host lifecycle by name (``omnigent host status`` /
+    ``omnigent host stop``). Sign-in happens here, in your terminal, before the
+    daemon detaches.
+
+    :param server: Omnigent server URL to host on, e.g.
+        ``"https://example.databricksapps.com"``. ``None`` falls back to
+        config; empty string forces local mode.
+    :param non_interactive: When ``True``, never launch the browser login for
+        an un-authed remote server — fail with the ``omnigent login`` hint
+        instead.
+    :returns: None.
+    """
+    _run_background_host(
+        _resolve_host_server(server),
+        stop_command="omnigent stop",
+        non_interactive=non_interactive,
+    )
+
+
 @cli.command("stop")
 @click.option(
     "--force",
@@ -4151,10 +4193,11 @@ def server_status(json_output: bool) -> None:
 def stop(force: bool) -> None:
     """Stop everything Omnigent is running on this machine.
 
-    The off switch: stops every host daemon (local and remote-targeted)
-    and the detached background server. Runners are reaped when their daemon
-    exits. To stop only hosting while keeping the local server (web UI /
-    history) up, use ``omnigent host stop`` instead.
+    The off switch, and the counterpart of ``omnigent start``: stops every host
+    daemon (local and remote-targeted) and the detached background server.
+    Runners are reaped when their daemon exits. To stop only hosting while
+    keeping the local server (web UI / history) up, use ``omnigent host stop``
+    instead.
 
     :param force: Continue past individual failures and SIGKILL daemons that
         do not exit on SIGTERM.
@@ -7674,14 +7717,15 @@ def _confirm_background_host_alive(record: _HostDaemonRecord) -> None:
 def _run_background_host(
     server: str | None,
     *,
-    explicit_server: str | None,
+    stop_command: str,
     non_interactive: bool,
 ) -> None:
     """Spawn (or reuse) the detached host daemon and report it.
 
     The background counterpart of the foreground ``omnigent host`` body,
-    selected by ``--background``: the same daemon loop runs detached (see
-    :func:`_ensure_host_daemon`) so the command returns instead of blocking.
+    selected by ``--background`` (and the whole of ``omnigent start``): the
+    same daemon loop runs detached (see :func:`_ensure_host_daemon`) so the
+    command returns instead of blocking.
 
     Sign-in stays in the foreground. The detached daemon has no terminal to
     prompt on, so a Databricks-fronted server is authenticated here, before the
@@ -7691,9 +7735,9 @@ def _run_background_host(
     :param server: Resolved Omnigent server URL, e.g.
         ``"https://example.databricksapps.com"``. ``None`` or ``""`` selects
         local mode (the daemon starts or reuses a local Omnigent server).
-    :param explicit_server: The ``--server`` value as the user spelled it
-        (``""`` for local mode), or ``None`` when the option was omitted.
-        Only used to echo a matching ``host stop`` command.
+    :param stop_command: Command to echo for stopping this daemon, e.g.
+        ``"omnigent stop"`` — each entry point suggests the teardown that
+        matches how it was invoked.
     :param non_interactive: When ``True``, never launch the browser login —
         fail with the ``omnigent login`` hint instead.
     :raises click.ClickException: If the daemon cannot be spawned, exits
@@ -7736,7 +7780,7 @@ def _run_background_host(
         _echo_host_field("log", _display_path(Path(record.log_path)))
     click.echo()
     click.echo(_cli_style("Stop it with:", dim=True))
-    click.echo(f"  {_cli_style(_host_stop_command(explicit_server), bold=True)}")
+    click.echo(f"  {_cli_style(stop_command, bold=True)}")
 
 
 def _echo_host_field(label: str, value: str) -> None:
@@ -7852,7 +7896,7 @@ def host(
     if background:
         _run_background_host(
             server,
-            explicit_server=explicit_server,
+            stop_command=_host_stop_command(explicit_server),
             non_interactive=non_interactive,
         )
         return

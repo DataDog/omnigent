@@ -305,7 +305,7 @@ plus one `tools/mcp/*.yaml` server, no sub-agents.
 machine as a host:
 
 ```bash
-omnigent host --background   # starts the local server too, then returns
+omnigent start   # starts the local server and registers this machine as a host
 ```
 
 Open the server URL it prints, hit **New Chat**, pick your machine, and go.
