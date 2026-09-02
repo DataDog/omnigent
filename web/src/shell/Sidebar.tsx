@@ -3759,10 +3759,11 @@ function ConversationRow({
             <Button
               type="button"
               variant="destructive"
+              data-testid="stop-session-confirm"
               onClick={() =>
                 stopSession.mutate(conversation.id, { onSuccess: () => setStopOpen(false) })
               }
-              disabled={stopSession.isPending}
+              loading={stopSession.isPending}
             >
               Stop session
             </Button>
@@ -4099,9 +4100,10 @@ function ProjectFolderMenu({
               <Button
                 type="submit"
                 data-testid="rename-project-confirm"
-                disabled={renameProject.isPending || renameValue.trim() === ""}
+                loading={renameProject.isPending}
+                disabled={renameValue.trim() === ""}
               >
-                {renameProject.isPending ? "Renaming…" : "Rename"}
+                Rename
               </Button>
             </DialogFooter>
           </form>
@@ -4146,7 +4148,7 @@ function ProjectFolderMenu({
             <Button
               type="button"
               variant="destructive"
-              disabled={deleteProject.isPending}
+              loading={deleteProject.isPending}
               onClick={() => {
                 deleteProject.mutate(
                   { id: projectId, name: projectName },
@@ -4159,7 +4161,7 @@ function ProjectFolderMenu({
                 );
               }}
             >
-              {deleteProject.isPending ? "Deleting…" : "Delete project"}
+              Delete project
             </Button>
           </DialogFooter>
         </DialogContent>
