@@ -1442,6 +1442,106 @@ async def _drive_managed_multi_provider(base_url: str, session_id: str) -> None:
             await browser.close()
 
 
+def test_start_session_managed_sandbox_appears_after_slow_info_probe(
+    seeded_session: tuple[str, str],
+) -> None:
+    """A slow ``/v1/info`` still surfaces the managed-sandbox host option.
+
+    The boot probe paints a fail-closed fallback (managed sandboxes OFF) if
+    ``/v1/info`` hasn't answered within 1.5s, so the chat UI never hangs on a
+    slow or proxied probe. The regression this guards: the SPA then *pinned*
+    that fallback for the tab's lifetime, so on a slow-but-successful probe the
+    "Databricks Sandbox" host option never appeared until a full reload — the
+    managed complaint, where a proxied ``/v1/info`` behind a busy server
+    routinely exceeds 1.5s. With the fix the boot code adopts the real
+    ``/v1/info`` value when it finally lands.
+
+    Here ``/v1/info`` is delayed past the 1.5s budget; once it resolves, the
+    sandbox option must appear on its own (no reload). Pre-fix it never does.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_managed_sandbox_after_slow_info(base_url, session_id))
+
+
+async def _drive_managed_sandbox_after_slow_info(base_url: str, session_id: str) -> None:
+    host_id, host_name = _HOST_ALPHA
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_bodies: list[dict[str, Any]] = []
+            await _register_common_routes(
+                page, created_session_id=session_id, create_bodies=create_bodies
+            )
+
+            # Managed capability probe, but SLOW: held past the 1.5s boot budget
+            # so the SPA first paints the fail-closed fallback (sandboxes off),
+            # then must adopt this real value when it finally lands.
+            async def handle_slow_info(route: Route) -> None:
+                await asyncio.sleep(2.5)
+                await route.fulfill(
+                    status=200, content_type="application/json", body=_managed_info_body()
+                )
+
+            await page.route("**/v1/info", handle_slow_info)
+
+            # One connected online host alongside the managed sandbox option.
+            async def handle_one_host(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "hosts": [
+                                {
+                                    "host_id": host_id,
+                                    "name": host_name,
+                                    "owner": "e2e",
+                                    "status": "online",
+                                }
+                            ]
+                        }
+                    ),
+                )
+
+            await page.route("**/v1/hosts", handle_one_host)
+
+            # Neutralize agent discovery so a leaked native agent from another
+            # test can't switch the picker mid-flow (see _drive_permission_mode).
+            async def handle_agent_scan(route: Route) -> None:
+                await route.fulfill(
+                    status=200, content_type="application/json", body=json.dumps({"data": []})
+                )
+
+            await page.route(re.compile(r"/v1/sessions\?.*kind=any"), handle_agent_scan)
+
+            await page.add_init_script(
+                f"""window.localStorage.setItem(
+                    "omnigent:recent-workspaces",
+                    JSON.stringify({{ "{host_id}": ["/work/repo"] }})
+                );"""
+            )
+
+            # Load and wait for the slow probe to actually answer (~2.5s). The
+            # landing composer paints earlier, at the 1.5s fallback; the real
+            # /v1/info lands after, and the fix re-renders with it.
+            async with page.expect_response(lambda r: "/v1/info" in r.url):
+                await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Open the host picker: the "Databricks Sandbox" option must be
+            # present, proving the SPA adopted the late /v1/info rather than
+            # staying pinned to the fail-closed fallback (where it never appears).
+            await page.get_by_test_id("new-chat-landing-host-chip").click()
+            sandbox_option = page.get_by_test_id("new-chat-landing-sandbox-option")
+            await expect(sandbox_option).to_be_visible(timeout=15_000)
+            await expect(sandbox_option).to_contain_text("Databricks Sandbox")
+        finally:
+            await browser.close()
+
+
 def test_start_session_select_model_and_effort(seeded_session: tuple[str, str]) -> None:
     """Picking a model + reasoning effort rides along to the create call.
 
