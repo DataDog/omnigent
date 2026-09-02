@@ -39,7 +39,7 @@ android {
         minSdk = 28
         targetSdk = 36
         versionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 2
-        versionName = "0.1.0"
+        versionName = "0.1.1"
 
         // Instrumented (androidTest) runner — required for UI Automator / Espresso
         // screenshot tests. Mirrors the androidx.test stable line pinned below.
