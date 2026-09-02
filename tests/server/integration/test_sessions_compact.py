@@ -426,6 +426,7 @@ async def test_external_compaction_new_attempt_after_terminal_records_again(
     ("raises", "expected_outcome"),
     [(False, "success"), (True, "failed")],
 )
+@pytest.mark.skip(reason="v0.12.0 removed server-side in-process compaction; compact is runner-owned")
 async def test_server_compaction_records_its_terminal_outcome(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
