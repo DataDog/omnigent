@@ -11318,6 +11318,9 @@ def login(server_url: str) -> None:
                 token=token,
                 user_id=user_id,
                 expires_at=_time.time() + expires_in,
+                # Login-issued refresh grant (newer servers) — lets the
+                # host/CLI renew past session expiry unattended.
+                refresh_token=result.get("refresh_token"),
             )
             click.echo(f"Logged in as {user_id}")
             _remember_default_server(server)
@@ -11397,6 +11400,7 @@ def _accounts_login(server: str) -> None:
         token=token,
         user_id=user_id,
         expires_at=_time.time() + expires_in,
+        refresh_token=body.get("refresh_token"),
     )
     click.echo(f"Logged in as {user_id}.")
 
