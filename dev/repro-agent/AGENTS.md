@@ -165,14 +165,45 @@ the named code path. Whether the cause is exactly the function the report finger
 is something your live reproduction and root-cause work establish — you do not
 take it on faith and you do not let it stand in for driving the real journey.
 
+**Always reproduce as the human interaction — set up the real preconditions,
+don't reach past them.** Drive the same actions a *user* takes and let the system
+do the rest, even when that journey needs infrastructure to be in place first.
+Do **not** substitute a direct call to the internal function the report blames,
+and do **not** hand-fabricate the end-state the bug would produce (e.g. writing a
+session row with the labels you *expect* the buggy path to omit) — both bake your
+own root-cause guess into the reproduction, so if the guess is wrong the test
+guards the wrong thing. If the real journey can't run because a precondition is
+missing in your environment, **establish that precondition and drive the real
+path** rather than shortcutting around it. For example, a scheduled automation
+genuinely cannot fire without an online host, so a faithful repro *makes a host
+online* — e.g. `omnigent host --server <your nested server URL>` registers the
+current environment as a live host — then creates the automation through the UI
+and lets it fire on its own, so the actual create path (labels and all) runs for
+real. Standing up the missing precondition is part of reproducing the user's
+journey, not a workaround for it.
+
 **Stamp each sub-symptom with the user-facing surface it shows on.** Alongside
 the verdict you will give each facet (Step 2), record where a user *sees* the
 failure: `web` (the web SPA), `terminal` (a TUI or shell pane rendered inside
 the app — a native-harness pane, an embedded shell), or `cli` (a command-line
 surface outside the app: the `omnigent` CLI, the REPL, a host daemon's output).
-A facet with no user-visible surface (an internal-only defect) gets `api`. The
-surface picks the kind of test you author (Step 3) and the recorder that
+The surface picks the kind of test you author (Step 3) and the recorder that
 captures it (Step 4).
+
+**Prefer a user-facing surface — reserve `api` for the genuinely invisible.**
+If a user encounters the failure on *any* interactive surface — a screen in the
+web SPA, a terminal/TUI pane, or a CLI command that prints the error — that is
+its surface, and you reproduce it *there* so it can be recorded (a `cli` bug is
+filmed by running the real command in a terminal until it errors, exactly as a
+`web` bug is filmed in the browser). Use `api` **only** when no user ever
+observes the failure on a surface — a purely internal defect (a wrong DB write,
+an internal contract violation) with no visible symptom. Do **not** fall back to
+a server-level or unit-style test *because it is simpler to write* when a
+user-facing reproduction exists: the user-facing path is the reproduction, and
+its recording is required whenever it is obtainable. A server-level test is a
+legitimate reproduction only when the failure truly has no user-facing surface,
+or when the surface exists but the harness genuinely cannot reach the failing
+state (see Step 4) — and then you say which in `evidence`.
 
 **Enumerate every distinct symptom the report claims — do not collapse them.**
 Many reports describe a *compound* bug: a title like "picker is unavailable **and**
@@ -198,6 +229,15 @@ independently, because a compound bug can be partly fixed:
 - **Backend/behavioral bugs** — create a session and drive turns via
   `sys_session_*`, or exercise the server's HTTP API directly, and capture the
   bad response / traceback / exit.
+
+Reach for the real trigger, not the internal function it flows into. If the
+journey depends on a precondition your environment lacks (an online host for a
+scheduled fire, a connected runner, a seeded workspace), set it up — e.g.
+`omnigent host --server <nested server URL>` to bring a host online — and then
+drive the user action so the genuine path executes. Only when a user-facing path
+truly cannot be made to run here do you fall back (naming the specific blocker in
+`evidence`, per Step 4) — never silently swap in a `fire._create_session`-style
+direct call or a hand-written end-state as if it were the reproduction.
 
 Judge **each sub-symptom** honestly and independently:
 
@@ -266,9 +306,29 @@ saved under `recordings/<slug>/` in your workspace:
   behaving correctly on the running build (e.g. `recordings/1234/fixed-picker.webm`).
 
 `not_reproduced` and `needs_more_info` facets have nothing to film — skip them.
+A `web` / `terminal` / `cli` facet is expected to yield a recording: reproduce it
+on that surface and film it. Only an `api` facet (a failure no user observes on
+any surface) legitimately has no recording.
+
+**Record exactly the verdict-appropriate clip per facet — nothing else.** One
+recording per `reproduced` facet (`kind: "before"`) and one per `already_fixed`
+facet (`kind: "fixed"`); the `kind` must match that facet's verdict, and every
+recording must correspond to a facet in `facets`. Do **not** add a "contrast" or
+"control" clip of a *different*, working journey next to a `reproduced` facet
+(e.g. filming an interactive session working beside the automation session that's
+broken) — an unrequested extra video with no facet behind it only confuses the
+reader about what reproduces. The `before` clip of a `reproduced` facet already
+shows the bug; that is the whole recording for that facet.
+
 Recording is best-effort: if the tooling below is missing, skip it, keep
 `recordings: []`, and say what was missing in `evidence` — never let recording
-block or distort the reproduction itself.
+block or distort the reproduction itself. Likewise, if a user-facing facet's
+failing state is genuinely unreachable in this harness (e.g. the journey needs an
+online host the spawned test server doesn't have, so the state is never created),
+keep `recordings: []` for it and **name the specific blocker in `evidence`** — an
+empty recordings list on a `web`/`terminal`/`cli` facet must always come with a
+concrete reason, never a silent skip. Do not fabricate a hollow journey that
+doesn't actually reach the failure just to produce a video.
 
 **The recorder needs its own server — spawn one with a scrubbed env.** A `web`
 recording runs the `tests/e2e_ui/` suite, which drives a live server. Do **not**
