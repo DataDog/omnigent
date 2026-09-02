@@ -25,7 +25,7 @@ class OmnigentWebViewClientTest {
 
         client.onPageStarted(webView, PINNED_URL, null)
 
-        assertNull(webView.evaluatedScript)
+        assertTrue(webView.evaluatedScripts.isEmpty())
     }
 
     @Test
@@ -39,11 +39,53 @@ class OmnigentWebViewClientTest {
 
         client.onPageFinished(webView, PINNED_URL)
 
-        assertEquals(NativeBridgeScript.source, webView.evaluatedScript)
+        // Chrome-hide CSS first, then the facade — the facade's callback is what
+        // declares the page ready, so it has to be the last script evaluated.
+        assertEquals(
+            listOf(WorkspaceChromeScript.source, NativeBridgeScript.source),
+            webView.evaluatedScripts,
+        )
         assertNull(readyUrl)
 
         webView.completeEvaluation()
         assertEquals(PINNED_URL, readyUrl)
+    }
+
+    @Test
+    fun `pinned page finish hides the workspace chrome without the facade fallback`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val client = client(shouldInjectBridgeAtPageReady = false)
+
+        client.onPageFinished(webView, PINNED_URL)
+
+        assertEquals(listOf(WorkspaceChromeScript.source), webView.evaluatedScripts)
+    }
+
+    @Test
+    fun `workspace chrome hide is not gated on the ui mount path`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val client = client(shouldInjectBridgeAtPageReady = false)
+
+        // A post-login landing on the pinned server's root, and the `/omnigent`
+        // mount the CLI records — neither starts with `/ml/omnigents`. Both must
+        // still get the CSS or the workspace switcher stays visible.
+        client.onPageFinished(webView, "$PINNED_ORIGIN/")
+        client.onPageFinished(webView, "$PINNED_ORIGIN/omnigent/c/abc")
+
+        assertEquals(
+            listOf(WorkspaceChromeScript.source, WorkspaceChromeScript.source),
+            webView.evaluatedScripts,
+        )
+    }
+
+    @Test
+    fun `off-origin page finish injects nothing`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val client = client(shouldInjectBridgeAtPageReady = true)
+
+        client.onPageFinished(webView, IDP_URL)
+
+        assertTrue(webView.evaluatedScripts.isEmpty())
     }
 
     @Test
@@ -282,7 +324,7 @@ class OmnigentWebViewClientTest {
     private class RecordingWebView(
         context: Context,
     ) : WebView(context) {
-        var evaluatedScript: String? = null
+        val evaluatedScripts = mutableListOf<String>()
         var stopLoadingCalled = false
         var currentUrl: String? = null
         var loadedUrl: String? = null
@@ -302,7 +344,7 @@ class OmnigentWebViewClientTest {
             script: String,
             resultCallback: ValueCallback<String>?,
         ) {
-            evaluatedScript = script
+            evaluatedScripts += script
             callback = resultCallback
         }
 
