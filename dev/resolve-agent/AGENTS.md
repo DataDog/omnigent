@@ -696,16 +696,45 @@ gh pr edit <pr> --add-label ui-preview
 ```
 
 Do this on **every** PR you're landing — the one you opened *and* an existing PR
-you're reviewing and keeping — right after you start Step 4 (so the deploy builds
-while CI runs), and **not only frontend fixes**. Even a backend-only fix can get a
-deployed app a reviewer connects a runner to and validates directly (see the
-live-validation prompt in 4.4), which is the point of standing the preview up. The
-label is only the request, though: the UI Preview workflow deploys **only for PRs
-authored by an `OWNER`/`MEMBER`/`COLLABORATOR`** (and only when the PR is not a
-draft). If the PR's author is a non-member (common for the community PRs you review
-on the review path), or you're running under a non-member identity, the label
-applies but no preview appears — that is expected; fall back to the "fails / no
-URL" handling below rather than looping.
+you're reviewing and keeping — and **not only frontend fixes**. Even a backend-only
+fix can get a deployed app a reviewer connects a runner to and validates directly
+(see the live-validation prompt in 4.4), which is the point of standing the
+preview up.
+
+**Label only after the code is safe to deploy — never up front.**
+The `ui-preview` label is a trust signal: it triggers a `pull_request_target`
+build+deploy of the PR's code to a Databricks workspace, so applying it vouches
+that *this* code is safe to run there. Do **not** label at the start of Step 4 to
+"let the deploy build while CI runs." Apply the label once, on the current head
+commit, only **after** both gates below are green for that commit:
+  - the reproduction test and full CI pass (4.2), and
+  - the Polly review is clean — no unresolved blocking or security findings (4.3).
+
+How much this matters depends on **whose** PR you're landing:
+  - **A PR you authored** is a branch on `omnigent-ai/omnigent` itself — a
+    same-repo PR no outside contributor can push to, carrying code that already
+    came through your repro→fix→CI→Polly pipeline. Labeling it is low-risk;
+    waiting for green is just good hygiene (don't stand up a preview of a red PR).
+  - **A PR you're reviewing** may be a **fork** PR from an outside contributor.
+    Here the label is the real trust boundary: it green-lights deploying fork
+    code, so never apply it until the current head has passed CI and a clean
+    Polly review. And because an attacker can push a new commit *after* you label,
+    the fork deploy is backstopped by a human-approved Environment that re-gates
+    every commit — but that gate is a safety net, not a licence to label early.
+
+Whichever path, if you push (or the author pushes) a further commit after
+labelling, re-confirm CI + Polly on the new head before you rely on the preview.
+Never label a PR whose approach you're unsure of or whose review is still red.
+
+The workflow deploys for **any labelled PR that isn't a draft — including fork
+PRs**; there is no author-membership gate. The label itself *is* the trust
+boundary: applying it needs Triage+ on the repo, so an outside contributor
+can't self-label their own fork PR — only a maintainer (or a maintainer-
+privileged bot identity) can. So the thing that can stop a preview from
+appearing is not the author but **whether the label actually got applied**: if
+you're running under an identity without label permission, `gh pr edit
+--add-label` fails and no preview appears — that is expected; fall back to the
+"fails / no URL" handling below rather than looping.
 The workflow posts (and updates) a PR comment marked `<!-- ui-preview -->`; it
 starts as "being deployed" and flips to "ready" with the preview **URL** once the
 Databricks App is up (a few minutes). Poll for the ready comment:
@@ -764,8 +793,8 @@ Judge this from `files_changed`, not a guess. When you can't cleanly tell, use
 front of the reviewer in 4.4 and 4.5.
 
 If the preview deploy **fails** or never posts a URL (e.g. workspace secrets not
-configured in this environment, or a non-member author before the labelled-fork
-preview path applies), don't block on it — note it in the handoff (`ui_preview`)
+configured in this environment, or the label couldn't be applied under your
+identity), don't block on it — note it in the handoff (`ui_preview`)
 that no URL was produced, and in 4.4/4.5 fall back to "run against your own app"
 with the same `-p` command minus a preview `--server`. The preview is a
 convenience, not a gate.
@@ -1144,8 +1173,8 @@ Field meanings:
 - `ui_preview` — the result of Step 4.1 (run on every PR, not just frontend fixes):
   the **preview URL** (verbatim, so the ticket write-back can surface it and a
   reviewer can `omnigent claude -p '<prompt>' --server <url>`), or why it failed to
-  deploy (e.g. workspace secrets not configured, non-member author). Empty when no
-  PR was opened.
+  deploy (e.g. workspace secrets not configured, or the label couldn't be
+  applied under your identity). Empty when no PR was opened.
 - `validation_surface` — which side the fix runs on, from Step 4.1: `server` (the
   preview build carries it; `--server <preview>` validates it), `runner` (runs in
   the runner/host process, so only a local `gh pr checkout` + `--server ''` build
