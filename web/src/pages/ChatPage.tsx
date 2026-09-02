@@ -60,6 +60,7 @@ import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/Statu
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
+import { StreamBudgetBanner } from "@/components/StreamBudgetBanner";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
@@ -2142,6 +2143,10 @@ function MainAgentSurface({
               scroller={scroller}
               hasMoreHistory={hasMoreHistory}
             />
+            {/* Too-many-tabs warning: floats as a rounded card just below the
+            header, a sibling of Conversation for the same reason as
+            JumpToTopButton — outside the chat-scroll-fade mask. */}
+            <StreamBudgetBanner />
             {/* Left-edge minimap: one tick per turn, scrolls independently, pages
             in older history on scroll-up. Sibling of Conversation for the same
             reason as JumpToTopButton — it escapes the chat-scroll-fade mask.
@@ -6167,7 +6172,7 @@ function SessionConfigModal({
   costRoutingEligible: boolean;
   subagentRoutingEligible: boolean;
 }) {
-  const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const conversationId = useChatStore((s) => s.conversationId);
@@ -6574,7 +6579,7 @@ function useSessionConfigSummary({
   codexModelOptions: readonly NativeModelOption[];
   costRoutingEligible: boolean;
 }): { label: string; value: string }[] {
-  const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
@@ -6594,6 +6599,21 @@ function useSessionConfigSummary({
     rows.push({ label: "Effort", value: effortValue ?? "Default" });
   }
   return rows;
+}
+
+/**
+ * The effort this conversation is actually at.
+ *
+ * `sessionReasoningEffort` is conversation-scoped, so two live conversations at
+ * different efforts each read their own; `selectedEffort` is the single
+ * app-global sticky pick, used only as the pre-hydration fallback. Reading the
+ * sticky pick alone would show a warm-switched conversation the last effort
+ * picked anywhere.
+ */
+function useSessionEffort(): string | null {
+  const sessionReasoningEffort = useChatStore((s) => s.sessionReasoningEffort);
+  const stickyEffort = useChatStore((s) => s.selectedEffort);
+  return sessionReasoningEffort ?? stickyEffort;
 }
 
 /**
@@ -6734,7 +6754,7 @@ function ComposerModelEffortLabel({
   costRoutingEligible: boolean;
   harnessLabel: string | null;
 }) {
-  const selectedEffort = useChatStore((s) => s.selectedEffort);
+  const selectedEffort = useSessionEffort();
   const costControlModeOverride = useChatStore((s) => s.costControlModeOverride);
   const { modelLabel } = useResolvedComposerModel(modelPickerKind, codexModelOptions);
   const routingOn = costRoutingEligible && costControlModeOverride === "on";
