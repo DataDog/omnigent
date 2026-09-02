@@ -339,7 +339,7 @@ def resolve_managed_agent_label(
         return None
     try:
         agent = agent_store.get(agent_id)
-    except Exception:
+    except Exception:  # noqa: BLE001
         # create precondition. Any store failure degrades to an unlabeled runner
         # (the admission policy skips it) rather than 500-ing a create that has
         # already committed and announced the session.
@@ -3399,7 +3399,7 @@ async def _terminate_sandbox_best_effort(
     if launcher is not None and host.sandbox_id is not None:
         try:
             await asyncio.to_thread(launcher.terminate, host.sandbox_id)
-        except Exception:
+        except Exception:  # noqa: BLE001
             # provider-API boundary on a cleanup path. The provider SDK can
             # fail here in many shapes (auth/config ClickException, network
             # errors, SDK-internal exceptions), the sandbox may already be

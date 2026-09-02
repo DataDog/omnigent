@@ -127,7 +127,7 @@ runs:
         SERVER_VERSION_INPUT: ${{ inputs.server_version }}
       run: |
         tag="$SERVER_VERSION_INPUT"
-        if ! [[ "$tag" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([a-z0-9.]*)?$ ]]; then
+        if ! [[ "$tag" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([a-z0-9.-]*)?$ ]]; then
           echo "Invalid server_version: '$tag'" >&2; exit 1
         fi
         src="$RUNNER_TEMP/ui-server-src"
@@ -150,7 +150,7 @@ runs:
         NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
       run: |
         tag="$UI_VERSION_INPUT"
-        if ! [[ "$tag" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([a-z0-9.]*)?$ ]]; then
+        if ! [[ "$tag" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?([a-z0-9.-]*)?$ ]]; then
           echo "Invalid ui_version: '$tag'" >&2; exit 1
         fi
         src="$RUNNER_TEMP/ui-spa-src"

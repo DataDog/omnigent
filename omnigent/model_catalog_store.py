@@ -246,7 +246,7 @@ def _refresh_in_background(
             if rows:
                 write_catalog(harness, fingerprint, rows)
             return rows
-        except Exception:
+        except Exception:  # noqa: BLE001 — stale rows keep serving
             _logger.warning("background %s catalog refresh failed", harness, exc_info=True)
             return None
         finally:

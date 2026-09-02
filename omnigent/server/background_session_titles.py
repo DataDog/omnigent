@@ -291,7 +291,7 @@ class BackgroundSessionTitleCoordinator:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception:  # noqa: BLE001 - background metadata must never fail the user turn
             _logger.warning(
                 "background session title failed session=%s elapsed_ms=%.1f",
                 request.session_id,
@@ -341,56 +341,7 @@ class BackgroundSessionTitleCoordinator:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            _logger.warning(
-                "background task summary failed session=%s elapsed_ms=%.1f",
-                request.session_id,
-                (time.perf_counter() - started) * 1000,
-                exc_info=True,
-            )
-
-    async def _run_task_summary(
-        self,
-        *,
-        request: BackgroundTitleRequest,
-    ) -> None:
-        """Generate a task summary for a child session and write it to task_summary."""
-        started = time.perf_counter()
-        try:
-            async with self._generation_slots:
-                generated = await asyncio.wait_for(
-                    self._generator(request),
-                    timeout=self._timeout_seconds,
-                )
-            title = normalize_background_title(generated)
-            if title is None:
-                _logger.info(
-                    "background task summary skipped session=%s "
-                    "reason=invalid_title elapsed_ms=%.1f",
-                    request.session_id,
-                    (time.perf_counter() - started) * 1000,
-                )
-                return
-            updated = await asyncio.to_thread(
-                self._conversation_store.set_task_summary,
-                request.session_id,
-                title,
-            )
-            _logger.info(
-                "background task summary completed session=%s set=%s elapsed_ms=%.1f",
-                request.session_id,
-                updated is not None,
-                (time.perf_counter() - started) * 1000,
-            )
-        except TimeoutError:
-            _logger.info(
-                "background task summary timed out session=%s elapsed_ms=%.1f",
-                request.session_id,
-                (time.perf_counter() - started) * 1000,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
+        except Exception:  # noqa: BLE001
             _logger.warning(
                 "background task summary failed session=%s elapsed_ms=%.1f",
                 request.session_id,

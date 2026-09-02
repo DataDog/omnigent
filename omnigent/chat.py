@@ -3827,7 +3827,7 @@ def _spec_used_families(agent_yaml: Path | None) -> list[str]:
         from omnigent.spec import parse
 
         spec = parse(root, expand_env=False)
-    except Exception:
+    except Exception:  # noqa: BLE001 — best-effort startup-header hint: a spec parse must never break `run`
         logger.debug("startup-header family parse failed for %s", agent_yaml, exc_info=True)
         return []
 

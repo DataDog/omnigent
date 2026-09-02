@@ -971,7 +971,7 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
             servable = families.get(tier)
             if servable:
                 return servable
-    except Exception:
+    except Exception:  # noqa: BLE001 — the bundled catalog is the last resort
         logger.warning(
             "claude-sdk: live Databricks model discovery failed for profile %r; "
             "falling back to the bundled catalog",
@@ -3027,7 +3027,7 @@ class ClaudeSDKExecutor(Executor):
                         "summary instead of the harness's real compacted state.",
                         claude_session_id,
                     )
-            except Exception:
+            except Exception:  # noqa: BLE001
                 # WARNING, not DEBUG: a swallowed read here silently degrades
                 # EVERY later resume of this conversation. The runner persists a
                 # compaction item with no ``compacted_messages``, so resume

@@ -1383,7 +1383,7 @@ class _OutputTextDeltaCoalescer:
                     delta,
                     call_id=chunk.tool_call_id,
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - preserve the long-lived forwarder.
                 _logger.warning("Codex forwarder tool-output delta flush failed", exc_info=True)
             return
         index: int | None = None
@@ -1401,7 +1401,7 @@ class _OutputTextDeltaCoalescer:
                 index=index,
                 final=final,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 - preserve the long-lived forwarder.
             _logger.warning("Codex forwarder delta flush failed", exc_info=True)
 
 
@@ -1709,7 +1709,7 @@ class _CodexElicitationTaskTracker:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception:  # noqa: BLE001 - keep the long-lived forwarder alive.
             _logger.warning(
                 "Codex forwarder elicitation hook task failed: method=%s",
                 event.get("method"),
@@ -1963,7 +1963,7 @@ async def supervise_forwarder(
                         codex_client=client,
                         forwarder_state=forwarder_state,
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001 - keep the long-lived mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
         finally:
             if mcp_settle_timer is not None:
@@ -2237,7 +2237,7 @@ async def _subscribe_until_ready(
             response = await client.request("thread/resume", params)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - app-server error envelopes are surfaced as RuntimeError.
             if _is_thread_not_ready_error(exc):
                 if not saw_not_ready:
                     _logger.info(
@@ -3177,7 +3177,7 @@ async def _maybe_handle_turn_event(
                 await _persist_codex_compaction_item(
                     client, session_id=session_id, bridge_dir=bridge_dir
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001
                 _logger.warning(
                     "Failed to persist codex compaction item for %s", session_id, exc_info=True
                 )
@@ -4538,7 +4538,7 @@ async def _handle_completed_item(
                 await _persist_codex_compaction_item(
                     client, session_id=session_id, bridge_dir=bridge_dir
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001
                 _logger.warning(
                     "Failed to persist codex compaction item for %s", session_id, exc_info=True
                 )
@@ -5396,7 +5396,7 @@ async def _ensure_user_message_posted(
         response = await codex_client.request("thread/resume", {"threadId": thread_id})
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception:  # noqa: BLE001 - degrade to current behavior on resume failure.
         _logger.warning(
             "Codex forwarder could not resume to recover user message: thread=%s turn=%s",
             thread_id,
@@ -6238,7 +6238,7 @@ async def _persist_codex_compaction_item(
                 )
                 if rollout_files:
                     compacted = _read_compacted_history(rollout_files[0])
-        except Exception:
+        except Exception:  # noqa: BLE001
             _logger.debug(
                 "Failed to read codex rollout for compaction persist",
                 exc_info=True,
@@ -6608,7 +6608,7 @@ async def _replay_dead_letters_on_startup(
             max_records=_REPLAY_MAX_RECORDS,
             deadline_seconds=_REPLAY_DEADLINE_SECONDS,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 - replay must never block forwarder startup.
         _logger.warning("Codex forwarder dead-letter replay failed", exc_info=True)
 
 

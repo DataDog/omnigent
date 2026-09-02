@@ -82,7 +82,7 @@ jobs:
         run: |
           # Latest final (non-prerelease) tag by version sort.
           tag=$(git tag --sort=-v:refname \
-            | grep -viE '(^|[^a-z])(rc|dev|pre)[0-9]' \
+            | grep -viE '(^|[^a-z])(rc|dev|pre)[0-9]|-dd\.' \
             | head -1)
           if [ -z "$tag" ]; then
             echo "No stable release tag found" >&2; exit 1

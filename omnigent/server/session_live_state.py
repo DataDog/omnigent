@@ -125,7 +125,7 @@ def _submit(description: str, fn, *args, on_failure=None) -> None:  # type: igno
     def _run() -> None:
         try:
             fn(*args)
-        except Exception:
+        except Exception:  # noqa: BLE001 — best-effort display state
             _logger.warning("session live-state write failed (%s)", description, exc_info=True)
             if on_failure is not None:
                 on_failure()

@@ -713,7 +713,7 @@ def attach_debug_log_sink(loggers: list[logging.Logger], *, source: str, level: 
         if _active_sink is None or _active_sink.closed:
             try:
                 _active_sink = ZerobusLogHandler(config, source)
-            except Exception:
+            except Exception:  # noqa: BLE001 — the sink must never break logging setup
                 # Honor the module's best-effort contract: handler construction
                 # (httpx client, uploader thread, probe timer) failing must not
                 # take down configure_process_logging() and thus process startup.

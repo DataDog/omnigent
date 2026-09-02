@@ -851,7 +851,7 @@ async def _persist_native_compaction_item(
                     )
         if msgs:
             compacted_messages = msgs
-    except Exception:
+    except Exception:  # noqa: BLE001
         _logger.debug("Failed to read cursor store for compaction persist", exc_info=True)
 
     compaction_data = {
@@ -1044,7 +1044,7 @@ async def forward_cursor_store_to_session(
                                         session_id=session_id,
                                         store_path=store_path,
                                     )
-                                except Exception:
+                                except Exception:  # noqa: BLE001
                                     _logger.warning(
                                         "cursor forwarder could not persist "
                                         "compaction item; session=%s",
