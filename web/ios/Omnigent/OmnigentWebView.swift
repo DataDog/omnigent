@@ -117,10 +117,38 @@ struct OmnigentWebView: UIViewRepresentable {
           ].join(", ")
         );
       };
-      if (document.head) {
+      // A workspace-hosted page reassigns the whole `content` attribute after it
+      // mounts, dropping `viewport-fit=cover` — and with it every
+      // `env(safe-area-inset-*)` the web layer pads with, so content lands under the
+      // status bar. One-shot injection isn't enough: the host rewrites again on its
+      // own re-renders, so re-assert whenever the token goes missing.
+      const hasViewportFitCover = () => {
+        const meta = document.querySelector('meta[name="viewport"]');
+        if (!meta) return false;
+        const content = (meta.getAttribute("content") || "").toLowerCase();
+        return content.split(" ").join("").includes("viewport-fit=cover");
+      };
+      const watchViewportFit = () => {
+        if (!document.head || typeof MutationObserver === "undefined") return;
+        // `ensureViewportFit` writes the attribute we're observing; the guard turns
+        // that re-entry into a no-op rather than a loop.
+        new MutationObserver(() => {
+          if (!hasViewportFitCover()) ensureViewportFit();
+        }).observe(document.head, {
+          childList: true, // the host may replace the tag instead of editing it
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["content"],
+        });
+      };
+      const applyViewportFit = () => {
         ensureViewportFit();
+        watchViewportFit();
+      };
+      if (document.head) {
+        applyViewportFit();
       } else {
-        document.addEventListener("DOMContentLoaded", ensureViewportFit, { once: true });
+        document.addEventListener("DOMContentLoaded", applyViewportFit, { once: true });
       }
       const callbacks = new Set();
       const openPathCallbacks = new Set();
