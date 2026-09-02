@@ -2390,13 +2390,20 @@ class SqlAlchemyConversationStore(ConversationStore):
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
-                content_match = SqlConversation.id.in_(
+                # Correlated EXISTS rather than ``id IN (SELECT ...)``: the IN
+                # form is uncorrelated, so the match set is built for the WHOLE
+                # workspace before the outer query discards every row the caller
+                # cannot see. Correlating on conversation_id keeps each probe on
+                # the (workspace_id, conversation_id) index and lets it stop at
+                # the first matching item per conversation.
+                content_match = (
                     select(SqlConversationItem.conversation_id)
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == SqlConversation.id,
                         func.lower(SqlConversationItem.search_text).like(pattern),
                     )
-                    .distinct()
+                    .exists()
                 )
                 stmt = stmt.where(or_(title_match, content_match))
             if project is not None:

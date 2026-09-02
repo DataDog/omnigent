@@ -1414,6 +1414,48 @@ def test_list_conversations_no_search_skips_statement_timeout(
     assert not any("statement_timeout" in s.lower() for s in statements), statements
 
 
+def test_list_conversations_search_content_match_is_correlated(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    The content-search predicate is a correlated ``EXISTS``, not an
+    uncorrelated ``id IN (SELECT DISTINCT ...)``.
+
+    The IN form materializes the match set for the entire workspace before the
+    outer query discards the rows the caller cannot see, so on a large
+    ``conversation_items`` table it scans everything regardless of how few
+    conversations the caller can actually access. Correlating on
+    ``conversation_id`` keeps each probe on the
+    ``(workspace_id, conversation_id)`` index. Asserted on the emitted SQL
+    because the difference is a query-plan property, not an observable result
+    difference — the two forms return identical rows.
+    """
+    conv = conversation_store.create_conversation()
+    conversation_store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_corr1",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "fix the deployment pipeline"}],
+                ),
+            ),
+        ],
+    )
+
+    statements = _captured_sql(
+        conversation_store,
+        lambda: conversation_store.list_conversations(search_query="deployment"),
+    )
+    select_sql = " ".join(s for s in statements if "conversation_items" in s).lower()
+    assert "exists" in select_sql, select_sql
+    assert "conversation_items.conversation_id = conversations.id" in select_sql, select_sql
+    # The uncorrelated form is what this guards against.
+    assert "distinct conversation_items.conversation_id" not in select_sql, select_sql
+
+
 def test_list_conversations_search_snippet_uses_earliest_match(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
