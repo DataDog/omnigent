@@ -222,10 +222,12 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     fail-open the ``claude-sdk`` / ``openai-agents`` gateway harnesses already
     rely on: their gateway token is a runtime mint the daemon can't observe.
 
-    The check stays synchronous, side-effect free, and local: it resolves the
-    launch (local config reads) and, only on the defer-to-login path, inspects
-    the local auth source. It never runs ``codex login``, a status command, or a
-    network probe; any resolver failure fails safe onto the ``auth.json`` check.
+    The check stays synchronous and local: it resolves the launch (local config
+    reads) and, only on the defer-to-login path, inspects the local auth source.
+    It never runs ``codex login`` or a status command; the CLI ``--version``
+    probe it does run is bounded by ``READINESS_CLI_PROBE_TIMEOUT_S`` so a hung
+    CLI can't stall the readiness refresh, and any resolver failure fails safe
+    onto the ``auth.json`` check.
 
     :returns: ``"binary-missing"`` when the CLI is absent, ``"needs-auth"``
         when the launch would defer to Codex's own login but ``auth.json`` is
@@ -235,13 +237,14 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
         not judged locally — it surfaces at the first turn via the executor.
     """
     from omnigent.onboarding.harness_install import (
+        READINESS_CLI_PROBE_TIMEOUT_S,
         harness_cli_installed,
     )
     from omnigent.onboarding.provider_config import OPENAI_FAMILY
 
     if _find_codex_cli() is None:
         return HARNESS_BINARY_MISSING
-    if not harness_cli_installed(OPENAI_FAMILY):
+    if not harness_cli_installed(OPENAI_FAMILY, timeout=READINESS_CLI_PROBE_TIMEOUT_S):
         return HARNESS_VERSION_TOO_LOW
     # On a host with no configured provider this may run ambient detection.
     # configured_harness_map shares one probe across all Codex aliases.
