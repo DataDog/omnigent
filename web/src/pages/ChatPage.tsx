@@ -57,7 +57,11 @@ import {
   FilePathAwareMessageResponse,
   rendersOnlyWorkedFold,
 } from "@/components/blocks/BlockRenderer";
-import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
+import {
+  CompactionMarker,
+  ErrorBanner,
+  RoutingDecisionCard,
+} from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
@@ -3171,13 +3175,9 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
     <div
       data-testid="sandbox-failed-indicator"
       role="status"
-      className={cn(
-        "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-destructive text-sm",
-        CHAT_COLUMN_WIDTH,
-      )}
+      className={cn("mx-auto w-full", CHAT_COLUMN_WIDTH)}
     >
-      <AlertTriangleIcon className="size-3.5 shrink-0" aria-hidden />
-      <span>Sandbox launch failed{status.error ? `: ${status.error}` : ""}</span>
+      <ErrorBanner message={status.error ?? ""} source="" code="" title="Sandbox launch failed" />
     </div>
   );
 }
@@ -3244,22 +3244,29 @@ export function ConnectionIndicator({
       return null;
     }
     return (
-      <button
-        type="button"
-        data-testid="disconnected-indicator"
-        onClick={onShowReconnectHelp}
-        className={cn(
-          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-sm text-destructive underline-offset-2 hover:underline",
-          CHAT_COLUMN_WIDTH,
-        )}
-      >
-        <WifiOffIcon className="size-3.5 shrink-0" />
-        <span>
-          {liveness.kind === "host_offline"
-            ? "Host is offline — click to reconnect"
-            : "Agent disconnected — click to reconnect"}
-        </span>
-      </button>
+      <div className={cn("mx-auto mb-4 flex w-full justify-center px-6", CHAT_COLUMN_WIDTH)}>
+        {/* Reconnect affordance styled as the destructive error pill (never
+            raw red text). Keeps its own click → reconnect dialog rather than
+            the ErrorBanner's async Retry, since some states need the picker. */}
+        <button
+          type="button"
+          data-testid="disconnected-indicator"
+          onClick={onShowReconnectHelp}
+          className="flex items-center gap-2 rounded-[12px] px-4 py-2 text-sm text-destructive transition-[filter] hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          style={{
+            background:
+              "color-mix(in srgb, var(--destructive) 4%, var(--app-shell-bg, var(--background)))",
+            border: "1px solid color-mix(in srgb, var(--destructive) 32%, transparent)",
+          }}
+        >
+          <WifiOffIcon className="size-3.5 shrink-0" />
+          <span>
+            {liveness.kind === "host_offline"
+              ? "Host is offline — click to reconnect"
+              : "Agent disconnected — click to reconnect"}
+          </span>
+        </button>
+      </div>
     );
   }
 
@@ -4016,8 +4023,12 @@ function AssistantBubble({
         )}
       </Message>
 
-      {bubble.lifecycle === "failed" && (
-        <p className="text-destructive text-sm">Error: {bubble.error}</p>
+      {/* Surface a turn-level failure (a failed send or stream) as the same
+          destructive pill an error block renders — never raw red text. A
+          dropped host connection already carries its own error pill inside the
+          bubble and leaves `bubble.error` null, so this stays hidden there. */}
+      {bubble.lifecycle === "failed" && bubble.error && (
+        <ErrorBanner message={bubble.error} source="" code="" />
       )}
     </>
   );
