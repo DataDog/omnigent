@@ -135,7 +135,7 @@ def test_python_module_entrypoint_uses_unified_click_cli() -> None:
 
     assert "Usage: python -m omnigent [OPTIONS] COMMAND [ARGS]..." in result.stdout
     assert "Commands:" in result.stdout
-    assert "run" in result.stdout and "Attach the REPL to a LIVE session" in result.stdout
+    assert "run" in result.stdout and "Attach the REPL to a live session" in result.stdout
     assert "Omnigent quick chat" not in result.stdout
 
 
@@ -967,6 +967,18 @@ def test_help_groups_harnesses_and_other_commands() -> None:
     assert commands_at < result.output.index("server")
 
 
+def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
+    """The ``update`` alias is omitted from --help but stays registered."""
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "upgrade" in result.output
+    # The alias line is suppressed so it doesn't duplicate ``upgrade``...
+    assert "\n  update " not in result.output
+    # ...but it's still a real, invokable command.
+    assert cli.commands["update"] is cli.commands["upgrade"]
+
+
 def test_help_hides_extras_gated_harness_when_sdk_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -980,8 +992,8 @@ def test_help_hides_extras_gated_harness_when_sdk_missing(
 
     assert result.exit_code == 0, result.output
     # Not listed as launchable harnesses...
-    assert "Launch the Cursor TUI" not in result.output
-    assert "Launch the Antigravity" not in result.output
+    assert "Launch Cursor with Omnigent" not in result.output
+    assert "Launch Antigravity" not in result.output
     # ...but a generic notice points at setup instead.
     assert "Some harnesses need an optional extra" in result.output
     # Still a real, registered command — only the listing is suppressed.
