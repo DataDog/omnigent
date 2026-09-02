@@ -7,6 +7,7 @@ from sqlalchemy import event, text
 
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
+    CompactionData,
     ErrorData,
     FunctionCallData,
     FunctionCallOutputData,
@@ -3469,6 +3470,54 @@ def test_fork_conversation_copies_items(
         assert fork_item.response_id == src_item.response_id
         # Data content is identical.
         assert fork_item.data == src_item.data
+
+
+def test_fork_remaps_compaction_boundary_to_copied_item(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A fork's compaction cursor must not keep an item ID from its source."""
+    source = conversation_store.create_conversation()
+    [boundary] = conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_001",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "old"}]),
+            )
+        ],
+    )
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="compact_001",
+                data=CompactionData(
+                    summary="The user said old.",
+                    last_item_id=boundary.id,
+                    token_count=6,
+                ),
+            )
+        ],
+    )
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_002",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "recent"}]),
+            )
+        ],
+    )
+
+    fork = conversation_store.fork_conversation(source.id)
+    fork_items = conversation_store.list_items(fork.id).data
+    fork_compaction = next(item for item in fork_items if item.type == "compaction")
+    assert isinstance(fork_compaction.data, CompactionData)
+    assert fork_compaction.data.last_item_id != boundary.id
+    assert fork_compaction.data.last_item_id == fork_items[0].id
 
 
 def test_fork_of_sub_agent_is_top_level(

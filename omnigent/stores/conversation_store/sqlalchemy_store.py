@@ -3659,11 +3659,32 @@ class SqlAlchemyConversationStore(ConversationStore):
                 items_query = items_query.where(SqlConversationItem.position <= cutoff_position)
             source_items = session.execute(items_query).scalars().all()
 
+            # Compaction cursors refer to item IDs. Since every copied item gets
+            # a fresh ID, build the complete mapping before copying any payloads
+            # so compaction records can point at the fork's boundary item.
+            copied_item_ids = {
+                src_item.id: generate_item_id(decode_item_type(src_item.type))
+                for src_item in source_items
+            }
+            decoded_item_data = self._decode_item_data_batch(
+                [src_item.data for src_item in source_items]
+            )
+
             fts_rows: list[tuple[str, str, str]] = []
-            for pos, src_item in enumerate(source_items):
+            for pos, (src_item, decoded_data) in enumerate(
+                zip(source_items, decoded_item_data, strict=True)
+            ):
                 # src_item.type/status are int codes copied verbatim to the new
-                # row; only generate_item_id needs the decoded string type.
-                new_item_id = generate_item_id(decode_item_type(src_item.type))
+                # row. Compaction data is the sole payload containing an item ID.
+                new_item_id = copied_item_ids[src_item.id]
+                copied_data = decoded_data
+                if decode_item_type(src_item.type) == "compaction":
+                    compaction_data = json.loads(decoded_data)
+                    boundary_id = compaction_data.get("last_item_id")
+                    mapped_boundary_id = copied_item_ids.get(boundary_id)
+                    if mapped_boundary_id is not None:
+                        compaction_data["last_item_id"] = mapped_boundary_id
+                        copied_data = json.dumps(compaction_data)
                 new_item = SqlConversationItem(
                     id=new_item_id,
                     conversation_id=new_conv.id,
@@ -3672,7 +3693,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     status=src_item.status,
                     position=pos,
                     type=src_item.type,
-                    data=src_item.data,
+                    data=self._encode_item_data(copied_data),
                     search_text=src_item.search_text,
                     created_by=src_item.created_by,
                 )
