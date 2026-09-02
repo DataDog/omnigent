@@ -751,7 +751,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             </div>
           </div>
 
-          <div className="flex flex-col gap-0 px-2 pt-0 pb-3" data-testid="sidebar-primary-nav">
+          <div className="flex flex-col gap-0 px-2 pt-2 pb-0" data-testid="sidebar-primary-nav">
             {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
@@ -764,7 +764,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 // headers and project folders. border-0 drops the Button base's
                 // transparent 1px border so the icon lands exactly on that
                 // column, flush with the Inbox row and folder rows.
-                "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
+                "sidebar-compact-text h-8 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-1 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isNewChatPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
@@ -792,7 +792,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
                 // Same shared nav-row construct as "New session" / "Inbox" so
                 // the active-pill, hover, insets, icon column, and text weight
                 // all match post-refactor.
-                "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
+                "sidebar-compact-text h-8 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-1 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isTasksPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
@@ -808,7 +808,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
               asChild
               variant="ghost"
               className={cn(
-                "sidebar-compact-text h-7 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 font-normal",
+                "sidebar-compact-text h-8 w-full justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-1 font-normal",
                 SIDEBAR_HOVER_HIGHLIGHT,
                 isInboxPage && SIDEBAR_ACTIVE_HIGHLIGHT,
               )}
@@ -869,7 +869,7 @@ export function Sidebar({ open, onClose, dragProgress = null, onOpenSearch }: Si
             ref={scrollContainerRef}
             // Keep wheel/touch scrolling without letting classic-scrollbar
             // platforms reserve a wide, permanently visible Sidebar gutter.
-            className="relative flex-1 overflow-y-auto px-2 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            className="relative flex-1 overflow-y-auto px-2 pt-4 pb-3 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
           >
             <ConversationList
               conversationsQuery={conversationsQuery}
@@ -2071,7 +2071,7 @@ function SectionHeader({
                 "group flex w-full items-center gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-[3px] text-left transition-colors",
                 SIDEBAR_HOVER_HIGHLIGHT,
               )} sidebar-compact-text text-foreground`
-            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-1 pl-2 text-left text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground"
+            : "group flex w-full items-center gap-1 border-0 pt-0 pr-0 pb-2 pl-2 text-left text-xs leading-4 text-muted-foreground transition-colors hover:text-foreground"
         }
       >
         {icon ? (
@@ -2244,7 +2244,7 @@ function SectionGroup({
         )}
       </div>
       {afterHeader}
-      {!collapsed && <div className="flex flex-col gap-0.5">{children}</div>}
+      {!collapsed && <div className="flex flex-col gap-0">{children}</div>}
     </section>
   );
 }
@@ -2335,7 +2335,7 @@ function ConversationSection({
             </p>
           ) : (
             // Indent project chats a step under the project-folder name above.
-            <ul className={cn("flex flex-col", indentRows ? "gap-0 pl-6" : "gap-0.5")}>
+            <ul className={cn("flex flex-col", indentRows ? "gap-0 pl-6" : "gap-0")}>
               {conversations.map((conv) => (
                 <ConversationRow
                   key={conv.id}
@@ -3145,7 +3145,7 @@ function ConversationRow({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       className={cn(
-        "sidebar-compact-text relative flex h-7 flex-col justify-center rounded-[var(--radius-otto-sm)] py-0.5 pl-2 text-left text-foreground transition-colors",
+        "sidebar-compact-text relative flex h-8 flex-col justify-center rounded-[var(--radius-otto-sm)] py-1 pl-2 text-left text-foreground transition-colors",
         SIDEBAR_HOVER_HIGHLIGHT,
         // Full width (not 100%+1rem) so the highlight stays inset from the
         // right edge, aligning with the project/folder rows above.
@@ -4190,7 +4190,7 @@ function BulkActionBar({
   return (
     <>
       <div className="mt-1 mb-1 flex flex-col gap-1.5">
-        <div className="flex h-7 items-center gap-2 rounded-lg border border-border bg-background px-2">
+        <div className="flex items-center gap-2 rounded-lg border border-border bg-background p-1.5">
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
