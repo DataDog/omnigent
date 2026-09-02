@@ -3,7 +3,7 @@
 # artifact. PyPI publishing lives in the central secure-release repo
 # (databricks/secure-public-registry-releases-eng → `omnigent` workflow), on
 # hardened runners with OIDC Trusted Publishing and a mandatory dependency
-# scan. Keeping those concerns separate is deliberate (see RELEASING.md):
+# scan. Keeping those concerns separate is deliberate (see the maintainer release runbook):
 #
 #   * This job runs NO project or third-party code — no build, no `pip
 #     install`/`npm ci`, no tests. Its only action is SHA-pinned
