@@ -3058,7 +3058,21 @@ function ConversationRow({
   // native `title` tooltip.
   const projectFlyoutName = !isMobile && isPinned ? currentProject : null;
 
-  const label = conversationDisplayLabel(conversation);
+  // The title the user just committed. The rename's cache write reaches this
+  // row as a prop from the list above, which re-renders a tick after the row's
+  // own `setIsEditing(false)` — until then the row would repaint the old name.
+  const [pendingTitle, setPendingTitle] = useState<string | null>(null);
+  useEffect(() => {
+    if (pendingTitle === null) return;
+    // Cleared once the prop carries the committed name, or once the PATCH
+    // settles — the hook overlays the server's title (or rolls back on
+    // failure) before flipping status, so the prop is authoritative by then.
+    if (conversation.title === pendingTitle || rename.isSuccess || rename.isError) {
+      setPendingTitle(null);
+    }
+  }, [conversation.title, pendingTitle, rename.isSuccess, rename.isError]);
+
+  const label = pendingTitle ?? conversationDisplayLabel(conversation);
   // Recompute unseen state the moment the last-seen map changes (e.g. the
   // user picks "Mark as unread" on this row) rather than waiting for the
   // next conversations poll.
@@ -3146,11 +3160,16 @@ function ConversationRow({
     return (
       <li>
         <ConversationEditRow
-          initialTitle={conversation.title ?? ""}
+          // Prefer the just-committed name so a rename reopened before the
+          // prop catches up starts from what the row shows.
+          initialTitle={pendingTitle ?? conversation.title ?? ""}
           onCommit={(title) => {
             // Bail on no-op edits so we don't fire an unnecessary PATCH.
             const trimmed = title.trim();
-            if (trimmed && trimmed !== (conversation.title ?? "")) {
+            if (trimmed && trimmed !== (pendingTitle ?? conversation.title ?? "")) {
+              // Set with the same event as `setIsEditing` so both land in one
+              // render: the row swaps the input for the new name directly.
+              setPendingTitle(trimmed);
               rename.mutate({ id: conversation.id, title: trimmed });
             }
             setIsEditing(false);
