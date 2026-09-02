@@ -30,23 +30,23 @@ on:
   schedule:
     # Every 12 hours (00:00 and 12:00 UTC).
     - cron: "0 */12 * * *"
-  # Fast smoke on PRs that touch the server↔runner contract surface.
-  # Runs both Config 1 (new server, old runner) and Config 2 (new runner,
-  # old server) against the latest stable release so protocol regressions
-  # surface before merge, not in the overnight full matrix.
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - "omnigent/runner/**"
-      - "omnigent/server/**"
-      - "omnigent/host/**"
-      - "web/src/**"
-      - "tests/e2e/**"
-      - "tests/e2e_ui/**"
-      - "tests/_helpers/compat.py"
-      - ".github/actions/compat-smoke-run/**"
-      - ".github/actions/compat-smoke-ui-run/**"
-      - ".github/workflows/server-compat.yml"
+  # Fast smoke on PRs disabled in the Datadog fork: the compat matrix tests
+  # upstream release tags against our -dd suffixed fork, and the version
+  # resolution is not designed for our tag layout. Run manually via
+  # workflow_dispatch if cross-version compat needs checking.
+  # pull_request:
+  #   types: [opened, synchronize, reopened, ready_for_review]
+  #   paths:
+  #     - "omnigent/runner/**"
+  #     - "omnigent/server/**"
+  #     - "omnigent/host/**"
+  #     - "web/src/**"
+  #     - "tests/e2e/**"
+  #     - "tests/e2e_ui/**"
+  #     - "tests/_helpers/compat.py"
+  #     - ".github/actions/compat-smoke-run/**"
+  #     - ".github/actions/compat-smoke-ui-run/**"
+  #     - ".github/workflows/server-compat.yml"
 
 concurrency:
   group: backcompat-${{ github.workflow }}-${{ github.sha }}
