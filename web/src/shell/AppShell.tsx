@@ -80,6 +80,8 @@ import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { isMobileViewport, Sidebar } from "./Sidebar";
+import { SidebarHeaderActions } from "./SidebarHeaderActions";
+import { useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
 import {
@@ -167,6 +169,42 @@ export function AppShell() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
   const [sidebarPeek, setSidebarPeek] = useState(false);
+
+  // The settings nav lives INSIDE the sidebar, and its "Back" row is the only
+  // way off the settings page. A collapsed sidebar therefore strands the user
+  // there — the row is still in the DOM but clipped and inert. So entering
+  // /settings pins the sidebar open (and drops any peek, which is a transient
+  // hover card, not somewhere to read a settings page from), and leaving it
+  // restores whatever the sidebar was before, so a collapsed sidebar stays a
+  // preference rather than being silently undone by a trip to settings.
+  //
+  // The pin is only needed WHILE on the page, so restoring on exit cannot
+  // reintroduce the trap: by then the title-bar toggle is back and the Back row
+  // is no longer the only way out. Mirrors sidebarOpenBeforeMaximizeRef, which
+  // stashes and restores the same state around the maximize flow.
+  const { inSettings } = useSettingsRoute();
+  const sidebarOpenBeforeSettingsRef = useRef<boolean | null>(null);
+  useEffect(() => {
+    if (inSettings) {
+      // Stash inside the updater so it reads the CURRENT value rather than a
+      // closure captured before the pin, and so a re-render while already on
+      // /settings can't overwrite the stash with the pinned-open value.
+      setSidebarOpen((wasOpen) => {
+        if (sidebarOpenBeforeSettingsRef.current === null) {
+          sidebarOpenBeforeSettingsRef.current = wasOpen;
+        }
+        return true;
+      });
+      setSidebarPeek(false);
+      return;
+    }
+    // Leaving /settings: restore, then clear the stash so the next visit
+    // captures fresh state.
+    if (sidebarOpenBeforeSettingsRef.current !== null) {
+      setSidebarOpen(sidebarOpenBeforeSettingsRef.current);
+      sidebarOpenBeforeSettingsRef.current = null;
+    }
+  }, [inSettings]);
 
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
   // tracks the live sidebar width (including a drag) rather than a guess.
@@ -934,9 +972,103 @@ export function AppShell() {
   // cleared so we never leave `sidebarOpen` and `sidebarPeek` both true (a
   // floating-card layout the rest of the shell treats as a pushing panel).
   const toggleLeftSidebar = () => {
+    // On /settings the sidebar holds the only exit (the Back row), so collapsing
+    // it — by hotkey or command palette, the paths that bypass the hidden
+    // title-bar toggle — would strand the user on the page. Opening is still
+    // fine; only the collapse direction is refused. The pre-settings state stays
+    // stashed either way, so what the user had before the visit is still what
+    // gets restored on the way out.
+    if (inSettings) {
+      setSidebarOpen(true);
+      setSidebarPeek(false);
+      return;
+    }
     setSidebarOpen(!(sidebarOpen || sidebarPeek));
     setSidebarPeek(false);
   };
+
+  // Dwell-to-peek for the macOS title-bar toggle. ChatHeader owns this for its
+  // own collapsed-state button, but that button is hidden on the mac shell (the
+  // title-bar cluster replaces it), so the behaviour has to exist here too or
+  // dwell-to-peek would only work on a button the user can no longer see.
+  // Same 400ms as ChatHeader: a quick pass-over must not open the card.
+  const titleBarPeekTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cancelTitleBarPeek = useCallback(() => {
+    if (titleBarPeekTimer.current) {
+      clearTimeout(titleBarPeekTimer.current);
+      titleBarPeekTimer.current = null;
+    }
+  }, []);
+  const armTitleBarPeek = useCallback(() => {
+    cancelTitleBarPeek();
+    titleBarPeekTimer.current = setTimeout(() => {
+      setSidebarPeek(true);
+      setSidebarOpen(false);
+    }, 400);
+  }, [cancelTitleBarPeek]);
+  useEffect(() => cancelTitleBarPeek, [cancelTitleBarPeek]);
+
+  // Dismiss a peeking card when the pointer is clearly elsewhere.
+  //
+  // The card closes itself on its own pointerleave, which is enough when peek is
+  // armed from a button INSIDE it. The title-bar trigger sits outside, so a
+  // pointer that dwells there and then moves away without ever crossing the card
+  // leaves it with no pointerenter — and therefore no pointerleave — so nothing
+  // closes it and the card sits open indefinitely. Watch the document instead:
+  // once the pointer is over neither the card nor the trigger, dismiss on the
+  // same 200ms grace the card uses, so a wobble between the two doesn't.
+  //
+  // A click outside dismisses immediately: at that point the user has committed
+  // their attention elsewhere and waiting out a grace period just feels sticky.
+  const peekDismissTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!sidebarPeek) return;
+    const cancel = () => {
+      if (peekDismissTimer.current) {
+        clearTimeout(peekDismissTimer.current);
+        peekDismissTimer.current = null;
+      }
+    };
+    // Anything the peek card legitimately spawns outside its own subtree (Radix
+    // menus, tooltips, dialogs) must not count as "outside", or opening a row's
+    // context menu would dismiss the card under it.
+    const insidePeekSurface = (target: EventTarget | null) => {
+      if (!(target instanceof Element)) return false;
+      return !!target.closest(
+        [
+          "aside.conversations-sidebar",
+          ".electron-sidebar-header-actions",
+          "[data-radix-popper-content-wrapper]",
+          '[role="menu"]',
+          '[role="dialog"]',
+          '[role="tooltip"]',
+        ].join(","),
+      );
+    };
+    const onPointerMove = (e: PointerEvent) => {
+      if (insidePeekSurface(e.target)) {
+        cancel();
+        return;
+      }
+      if (peekDismissTimer.current) return;
+      peekDismissTimer.current = setTimeout(() => {
+        peekDismissTimer.current = null;
+        setSidebarPeek(false);
+      }, 200);
+    };
+    const onPointerDown = (e: PointerEvent) => {
+      if (insidePeekSurface(e.target)) return;
+      cancel();
+      setSidebarPeek(false);
+    };
+    document.addEventListener("pointermove", onPointerMove);
+    document.addEventListener("pointerdown", onPointerDown, true);
+    return () => {
+      cancel();
+      document.removeEventListener("pointermove", onPointerMove);
+      document.removeEventListener("pointerdown", onPointerDown, true);
+    };
+  }, [sidebarPeek]);
 
   // Toggle the workspace rail's full-screen (maximized) state. Entering
   // collapses the left sidebar (the maximized rail wants the full width) after
@@ -1365,6 +1497,46 @@ export function AppShell() {
           canvas for the traffic lights, and the strip is the window's one
           drag surface — content below and right stays fully clickable. */}
             {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
+            {/* The Search/Settings/toggle cluster lives HERE on the macOS shell,
+          not in the sidebar, so the three icons hold one fixed position beside
+          the traffic lights no matter what the sidebar does. Inside the sidebar
+          they would be clipped and inert once it collapses (md:w-0 +
+          overflow-hidden + inert), and while peeking the floating card's
+          inset-2 would drag them off the lights' centre line. The sidebar's own
+          copy is hidden on mac by CSS; this one is positioned by
+          .electron-sidebar-header-actions in index.css. */}
+            {/* Hidden on /settings: the settings nav replaces the session list
+          INSIDE the sidebar, and its "Back" row is the only way out. Leaving a
+          collapse toggle up here would let the user hide the one exit and strand
+          themselves on the settings page (the row exists but is clipped and
+          inert). So on /settings the sidebar is pinned open — see
+          forceSidebarOpenInSettings — and these controls step aside rather than
+          offer an action that would break the page. */}
+            {isMacElectronShell() && !inSettings && (
+              <div className="electron-sidebar-header-actions">
+                <SidebarHeaderActions
+                  expanded={sidebarOpen || sidebarPeek}
+                  onToggle={() => {
+                    // Mirrors the ⌘⌥[ hotkey: a peeking sidebar counts as open,
+                    // so toggling from peek pins it open rather than collapsing.
+                    if (sidebarOpen) {
+                      setSidebarOpen(false);
+                    } else {
+                      setSidebarOpen(true);
+                    }
+                    setSidebarPeek(false);
+                  }}
+                  onOpenSearch={() => setCommandPaletteOpen(true)}
+                  // Dwell-to-peek moves here with the button: on mac this cluster
+                  // replaces ChatHeader's collapsed-state toggle, which is where
+                  // peek was armed, so without this the affordance would vanish.
+                  // Only meaningful while collapsed — peeking or open, there is
+                  // nothing to peek at.
+                  onTogglePointerEnter={sidebarOpen || sidebarPeek ? undefined : armTitleBarPeek}
+                  onTogglePointerLeave={cancelTitleBarPeek}
+                />
+              </div>
+            )}
             {/* The server picker is NOT here: it lives at the bottom of the
           sidebar (SidebarServerPicker). This strip is shared with the chat
           header — which is taller and also anchored at top-0 — so a centered
