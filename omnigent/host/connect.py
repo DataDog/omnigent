@@ -327,15 +327,19 @@ def _connection_refused(exc: BaseException) -> bool:
 
 
 _RECONNECT_BASE_S = 0.5
-_RECONNECT_CAP_S = 10.0
+_RECONNECT_CAP_S = 3.0
 _RECONNECT_JITTER = 0.5
+# Keep first startup tolerant of a cold server, but do not spend the library's
+# full default timeout on each reconnect after an established tunnel drops.
+_INITIAL_CONNECT_OPEN_TIMEOUT_S = 10.0
+_RECONNECT_OPEN_TIMEOUT_S = 3.0
 # Fresh hosts get a short auth-retry window for Databricks OAuth refreshes.
 # Established hosts retry auth failures indefinitely to preserve sessions.
 _MAX_CONSECUTIVE_AUTH_ERRORS = 3
 # Consecutive connection-refused failures against a loopback server before the
 # host exits (~5 minutes at the backoff cap). Refused on loopback means no
 # process listens on the port — the local server is gone, not unreachable.
-_LOOPBACK_REFUSED_FATAL_ATTEMPTS = 30
+_LOOPBACK_REFUSED_FATAL_ATTEMPTS = 100
 
 # Consecutive accepted-then-silent connections (upgrade completed, then the
 # socket died without one inbound frame) before the reconnect loop treats the
@@ -2939,6 +2943,11 @@ class HostProcess:
                 additional_headers=headers,
                 max_size=100 * 1024 * 1024,
                 ssl=ssl_ctx,
+                open_timeout=(
+                    _RECONNECT_OPEN_TIMEOUT_S
+                    if self._ever_connected
+                    else _INITIAL_CONNECT_OPEN_TIMEOUT_S
+                ),
                 # Align the host->server tunnel's protocol keepalive to the same
                 # 90 s app-level budget as the runner tunnel (not the 20 s library
                 # default that drops a busy-but-healthy tunnel with 1011 — #1116).
