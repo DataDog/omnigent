@@ -645,11 +645,14 @@ jobs:
           {
             echo "## Next steps"
             echo ""
-            echo "1. Dispatch the secure-release repo on this tag:"
+            # Run summaries are world-readable on a public repo, so the
+            # secure-release repo is a placeholder here; the runbook names it.
+            echo "1. Dispatch the secure-release repo on this tag. Substitute the repo"
+            echo "   name from the maintainer release runbook, then run:"
             echo '   ```'
-            echo "   gh workflow run omnigent.yml --repo databricks/secure-public-registry-releases-eng \\"
+            echo "   gh workflow run omnigent.yml --repo <secure-release-repo> \\"
             echo "     -f ref=${TAG} -f destination=pypi -f dry-run=true    # gates rehearsal"
-            echo "   gh workflow run omnigent.yml --repo databricks/secure-public-registry-releases-eng \\"
+            echo "   gh workflow run omnigent.yml --repo <secure-release-repo> \\"
             echo "     -f ref=${TAG} -f destination=pypi -f dry-run=false   # real publish"
             echo '   ```'
             if [ "$PRERELEASE" = "true" ]; then
