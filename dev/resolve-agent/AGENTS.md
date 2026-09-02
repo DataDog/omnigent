@@ -194,6 +194,24 @@ Branch on what you find:
 If there are *multiple* candidate PRs, pick the most recently updated open one to
 review and name the others in your output.
 
+**Find the GitHub issue to close (`closing_issue_number`).** GitHub only
+auto-closes an issue when the PR body carries a closing keyword pointing at a
+GitHub issue *in the same repo* (`Closes #<n>`); a raw Linear URL closes nothing.
+Determine the number now so Step 3 and the maintainer handoff can use it:
+
+- If `bug_url` is a **GitHub issue** in this repo, `closing_issue_number` is its
+  number.
+- If `bug_url` is a **Linear ticket**, look for a mirrored GitHub issue: search
+  `gh issue list --repo <repo> --state open --search "<bug title / OMNI key>"`
+  (Linear bugs are often mirrored to a GitHub issue with the same title). If you
+  find one that is clearly the same bug, that is `closing_issue_number`.
+- If neither yields a GitHub issue, there is **no** `closing_issue_number` — the
+  PR body must **not** use a closing keyword against the Linear URL. Reference the
+  Linear ticket in prose instead (e.g. "Resolves OMNI-1234 (Linear)").
+
+Record the chosen `closing_issue_number` (or its absence) — you reuse it in the
+PR body (Step 3.4) and the maintainer handoff (Step 4.5).
+
 ## Step 2A — Review the existing fix PR
 
 You are reviewing someone else's candidate fix, not writing your own. The
@@ -502,10 +520,17 @@ then goes straight to Step 4 to land it.) Once the set is genuinely green:
 3. Otherwise **push** the branch.
 4. **Open a ready-for-review PR** with `gh pr create` (not a draft — the repo's
    automated review runs on ready PRs). Fill in the PR template at
-   `.github/pull_request_template.md`: link the bug
-   with a closing keyword (`Closes #<n>` when `bug_url` is a GitHub issue),
-   summarize the root cause and the fix, and in the **Test Plan** give the concrete
-   fail→pass proof (test paths, the pre-fix fail reason, the post-fix pass). Check
+   `.github/pull_request_template.md`: link the bug in the **Related issue**
+   section. Use a GitHub closing keyword **only against a GitHub issue number** —
+   `Resolve #<closing_issue_number>` (equivalently `Closes #<n>`), using the
+   `closing_issue_number` you determined in Step 1 (the `bug_url` issue, or the
+   mirrored GitHub issue for a Linear ticket). **Never** point a closing keyword
+   at a raw Linear URL — GitHub can't close it, and it clutters the body. When
+   there is no `closing_issue_number` (Linear-only bug with no mirror), don't use
+   a closing keyword at all: reference the ticket in prose
+   (e.g. "Resolves OMNI-1234 (Linear)"). Then summarize the root cause and the
+   fix, and in the **Test Plan** give the concrete fail→pass proof (test paths,
+   the pre-fix fail reason, the post-fix pass). Check
    "Bug fix" and the test-coverage boxes that apply. Generate the body from the
    actual diff and this reproduction — do not skip template sections. Put the
    before/after recordings in the **Demo** section: upload the files when your
@@ -779,24 +804,24 @@ approval is only an indicator; a human maintainer's approval is always what merg
 
 **Then hand the PR to a human** — the **same maintainer the issue is assigned to**
 — on **both paths** (a PR you authored and an existing PR you reviewed and kept).
-This applies only when `bug_url` is a GitHub issue (Step 1's caveat: it may be some
-other link). Derive `<issue-number>` from `bug_url`, read the issue's assignee, and
-request their review:
+This applies whenever you have a `closing_issue_number` (Step 1) — the `bug_url`
+issue itself, or the mirrored GitHub issue for a Linear ticket. Read that issue's
+assignee and request their review:
 
 ```
-gh issue view <issue-number> --json assignees --jq '.assignees[].login'
+gh issue view <closing_issue_number> --json assignees --jq '.assignees[].login'
 gh pr edit <pr> --add-reviewer <login>
 ```
 
 - If there are **multiple assignees**, request all of them.
-- If `bug_url` is **not a GitHub issue** (so there's no assignee to read), the
+- If there is **no `closing_issue_number`** (so there's no assignee to read), the
   assignee **is the PR author** (you can't request review from the author — common
   on the review path, where the assignee often *is* whoever opened the PR you
   reviewed), or the issue has **no assignee**, don't force a reviewer — instead
   post an `@mention` comment asking them (or, with no assignee/non-issue bug,
   noting the PR is ready for a maintainer):
   ```
-  gh pr comment <pr> --body '@<login> this fixes #<issue-number> — CI is green and the automated review is clean. Ready for your review. Try it live: `omnigent claude -p '\''<validation_prompt>'\'' --server <url>` (the UI preview from the ui-preview comment). See "Validate the fix live" (in the PR body, or the comment above on a reviewed PR).'
+  gh pr comment <pr> --body '@<login> this fixes #<closing_issue_number> — CI is green and the automated review is clean. Ready for your review. Try it live: `omnigent claude -p '\''<validation_prompt>'\'' --server <url>` (the UI preview from the ui-preview comment). See "Validate the fix live" (in the PR body, or the comment above on a reviewed PR).'
   ```
 
 When there is a preview `<url>`, always include the ready-to-run
