@@ -228,28 +228,46 @@ reproduction test is your objective instrument.
    cause** or only mask the symptom? Does it miss facets or obvious adjacent edge
    cases? Does it introduce a regression in the surrounding code (run the touched
    area's tests)?
-5. **Report on the existing PR.** Post your findings as a review comment on that
-   PR (`gh pr comment` / `gh pr review`) with the fail→pass (or fail→still-fails)
-   result and any diff concerns, and record its `pr_url` in your output. The
-   `outcome` reflects what you found (`fixed` when the PR resolves every live facet
-   and the diff is sound; `partially_fixed` / `not_fixed` otherwise, with
-   specifics). **Default to commenting, not competing** — if the PR is close and
-   its approach is sound, review it and let the author iterate; don't open a rival
-   PR over fixable nits.
-6. **Trigger the automated (Polly) review on the PR.** After posting your
-   findings, kick off the repo's Polly AI Review so the PR's author gets a
-   cross-vendor review too. Do **not** use the `/review` *comment* — Polly's
-   handler ignores comments from `[bot]` accounts (you are one), so it would be
-   silently dropped. Use the workflow's `workflow_dispatch` entry point instead,
-   which has no bot/association gate:
-   ```
-   gh workflow run polly-review.yml -R omnigent-ai/omnigent -f pr=<pr>
-   ```
-   Do this whenever you keep the PR as the fix (the sound-PR default). You are
-   reviewing, not owning, so you don't loop on Polly's output here — that
-   push→re-review→re-read loop is the author path's job (Step 4.3). If you instead
-   take the escape hatch below and open your own PR, skip this — Polly runs on
-   *your* PR automatically (Step 4.3).
+5. **Report on the existing PR.** Post your fail→pass (or fail→still-fails) result
+   and any diff concerns now as a `gh pr comment` / `gh pr review --comment`, and
+   record its `pr_url` in your output. The `outcome` reflects what you found
+   (`fixed` when the PR resolves every live facet and the diff is sound;
+   `partially_fixed` / `not_fixed` otherwise, with specifics). **Default to
+   commenting, not competing** — if the PR is close and its approach is sound,
+   review it and let the author iterate; don't open a rival PR over fixable nits.
+
+   The **review verdict (approve / request-changes)** comes at the *end*, after
+   Step 4 settles (4.5) — because whether you end up pushing to the PR is decided
+   there. When you get to it, submit the final review this way:
+
+   **Match the review verdict to what you found — and approve when you're a clean,
+   independent reviewer.** You are a `[bot]`, so your review never satisfies the
+   merge gate (a human maintainer's approval is always required); it's an
+   *indicator* for that maintainer. Choose:
+   - **`fixed` and you never pushed to or authored this code** (pure reviewer: the
+     repro test passes against the PR as-is, CI green, Polly clean, no fix from you
+     was needed) → submit an **approving** review: `gh pr review <pr> --approve
+     --body '…'`. A genuine independent verification — the "someone checked it, take
+     your pass" signal a maintainer wants. Note in the body that it's an automated
+     reviewer's approval and a maintainer's approval is still required to merge.
+   - **`not_fixed` / `partially_fixed`** → `gh pr review <pr> --request-changes
+     --body '…'` naming what still fails.
+   - **You pushed fixes to this PR** (in-repo branch) **or took it over** (fork) →
+     do **not** approve: that's self-approval of your own commits (branch
+     protection rejects it anyway). Leave a `--comment` review and let a human
+     approve.
+6. **Then drive it to landable — go to Step 4.** Once you've kept the PR as the
+   fix (the sound-PR default), it gets the **same landing treatment as a PR you
+   authored**: `ui-preview`, green CI, a clean Polly review, a copy-paste
+   live-validation command, and a maintainer tagged (Step 4, all sub-steps). The
+   one difference is whose branch a fix lands on — Step 4's "push or take over"
+   rule handles it: push fixes directly when the PR branch is in-repo; when it's a
+   **fork PR** you can't push to *and it needs a fix*, take over by opening your
+   own PR that carries their commits + your fix (crediting them). If the fork PR
+   needs no fix, keep it as-is. Either way you **do** iterate CI and Polly, rather
+   than triggering one review and stopping. Record `mode: "reviewed_existing_pr"`
+   and its `pr_url` when you keep it; if a fork takeover made you open your own,
+   record `mode: "authored_fix"` with the fork PR in `reviewed_pr_url`.
 
 **When the existing PR's *approach* is wrong, open your own fix instead.** The
 default above is for a sound PR. But if reviewing shows the PR is not a viable
@@ -265,8 +283,14 @@ the two are linked. Use this escape hatch deliberately, not for style
 preferences — a working, root-cause-sound PR should be reviewed and improved in
 place, not replaced.
 
-You do not modify the existing PR's code in place — either review it (and let its
-author iterate) or open your own per the escape hatch above.
+When you keep the PR, you drive it to landable per Step 4 — pushing fixes directly
+when its branch is in-repo, or (for a fork PR you can't push to that needs a fix)
+taking over into your own PR that carries their commits plus your fix. So there
+are **two** reasons you end up authoring your own PR from the review path: the
+existing approach is *wrong* (this escape hatch), or the approach is *fine* but
+it's an unpushable fork PR that needs changes (Step 4's take-over). Never rewrite a
+sound approach wholesale — a fork takeover replays the contributor's commits and
+adds to them, it doesn't discard their work.
 
 ## Step 2B — Author the fix
 
@@ -461,9 +485,9 @@ Fold the outcome into the PR body (a short "Independent review" note) and the
 
 ## Step 3 — Commit, push, and open the pull request (author path only)
 
-This step applies **only when you authored a fix in Step 2B**. (In the review path
-2A you comment on the existing PR and open nothing.) Once the set is genuinely
-green:
+This step applies **only when you authored a fix in Step 2B** — it's about
+*opening* a PR. (The review path 2A adopts the existing PR instead of opening one,
+then goes straight to Step 4 to land it.) Once the set is genuinely green:
 
 1. **Commit** the fix and the tests on the working branch (the fix builds on the
    repro branch, so the reproduction test and the fix land in one reviewable
@@ -501,18 +525,59 @@ green:
 6. You do **not** merge. Opening the PR is not the finish line — go to Step 4 and
    drive it to a green, reviewed, ready-for-a-human state.
 
-## Step 4 — Land the PR: preview, green CI, clean review, hand it to the maintainer (author path only)
+## Step 4 — Land the PR: preview, green CI, clean review, hand it to the maintainer
 
-This step applies **only when you opened a PR in Step 3** (author path, not
-`skip_push`, not the review path 2A). Once the PR is open you **stay on it** until
-CI is green and the automated review is clean, then hand it to a human. Work the
-sub-steps below; they overlap in time (kick off the preview and the first review,
-then poll), so don't serialize what can run concurrently.
+This step applies to **any PR you are driving toward landable** — the one you
+opened (author path, Step 2B/3) **and** the existing PR you reviewed and kept as
+the fix (review path, Step 2A, when its approach was sound). The goal is identical
+either way: a live preview, green CI, a clean automated review, a copy-paste
+live-validation command, and a maintainer tagged. `skip_push` runs (author path
+that only committed locally) are the sole exception — there is no PR to land, so
+skip Step 4. Once the PR is up you **stay on it** until CI is green and the review
+is clean, then hand it to a human. The sub-steps overlap in time (kick off the
+preview and the first review, then poll), so don't serialize what can run
+concurrently.
 
-Throughout, address the PR by its number `<pr>` (from the `gh pr create` output).
-This whole step is a **bounded loop** — cap it at **~6 fix→push→re-check rounds**.
-If you're still red or still getting blocking findings after that, stop, leave the
-PR open with an honest summary comment of what's unresolved, and report
+**Whose branch — push or take over.** On the **author path** the PR is yours: push
+fix commits freely. On the **review path** the PR is someone else's; whether you
+can land a fix depends on where its branch lives:
+
+- **In-repo PR branch** (the head branch is on `omnigent-ai/omnigent`, not a fork)
+  → you have write access. Push fixes the same as the author path, then re-check.
+  Say in your review comments that you pushed, so the author isn't surprised.
+- **Fork PR** (the head branch is on a contributor's fork, `head.repo.fork ==
+  true`) → you **cannot** push to it. An App installation token is scoped to
+  `omnigent-ai/omnigent` only; GitHub does not honor "allow edits from maintainers"
+  for an App token (that grant is for maintainer *users*), so a push to the fork
+  branch is rejected. **Do not attempt the push** — it will always fail. Instead:
+  - **If the fork PR needs a fix** (repro test fails against it, CI is red from its
+    diff, or Polly flags a real blocking defect) → **take over: open your own PR**
+    that includes their work plus your fix. This is the same mechanic as the
+    "approach is wrong" escape hatch (Step 2A), but the reason is different — the
+    approach is fine, you just can't push the fix to a fork. Build it so the
+    contributor keeps credit:
+    - Branch off `main`, cherry-pick the fork PR's commits (`gh pr checkout <pr>`
+      then replay onto your branch, or `git cherry-pick`), then add your fix on top.
+    - Credit the original author on the commits (`Co-authored-by: <name> <email>`,
+      read from `gh pr view <pr> --json commits`).
+    - In your PR body, link the fork PR (`Builds on #<pr> by @<author>`) and say
+      why you re-opened it (couldn't push to the fork). Post a comment on the fork
+      PR pointing to yours, so the contributor isn't blindsided.
+    - Set `mode: "authored_fix"`, record the fork PR's number in `reviewed_pr_url`,
+      and drive **your** PR through the rest of Step 4 (you can push to it).
+  - **If the fork PR needs no fix** (repro passes against it, CI green, review
+    clean) → there's nothing to push, so keep it. Since you're a pure independent
+    reviewer here, **submit an approving review** (2A.5) with the findings + the
+    try-it-out command, then tag the maintainer. No takeover needed. (The approval
+    is a bot indicator — the maintainer's approval still merges it.)
+
+Throughout, address the PR you're landing by its number `<pr>`. This whole step is
+a **bounded loop** — cap it at **~6 fix→(push-or-takeover)→re-check rounds**. A
+fork **takeover** is not one of those rounds: it opens a fresh PR and restarts CI +
+Polly from scratch on it, so treat it as a **reset** — the ~6-round budget applies
+to the new PR from that point, rather than being consumed by the takeover itself.
+If you're still red or still getting blocking findings after the budget, stop,
+leave the PR open with an honest summary comment of what's unresolved, and report
 `outcome: "partially_fixed"` with the specifics (see Output). Never loosen a test,
 skip a check, or merge to force green.
 
@@ -525,14 +590,17 @@ per-PR preview of the app:
 gh pr edit <pr> --add-label ui-preview
 ```
 
-Do this on **every** PR, right after opening it (so the deploy builds while CI
-runs) — **not only frontend fixes**. Even a backend-only fix can get a deployed app
-a reviewer connects a runner to and validates directly (see the live-validation
-prompt in 4.4), which is the point of standing the preview up. The label is only
-the request, though: the UI Preview workflow deploys **only for PRs authored by an
-`OWNER`/`MEMBER`/`COLLABORATOR`** (and only when the PR is not a draft). If you're
-running under a non-member identity the label applies but no preview appears — that
-is expected; fall back to the "fails / no URL" handling below rather than looping.
+Do this on **every** PR you're landing — the one you opened *and* an existing PR
+you're reviewing and keeping — right after you start Step 4 (so the deploy builds
+while CI runs), and **not only frontend fixes**. Even a backend-only fix can get a
+deployed app a reviewer connects a runner to and validates directly (see the
+live-validation prompt in 4.4), which is the point of standing the preview up. The
+label is only the request, though: the UI Preview workflow deploys **only for PRs
+authored by an `OWNER`/`MEMBER`/`COLLABORATOR`** (and only when the PR is not a
+draft). If the PR's author is a non-member (common for the community PRs you review
+on the review path), or you're running under a non-member identity, the label
+applies but no preview appears — that is expected; fall back to the "fails / no
+URL" handling below rather than looping.
 The workflow posts (and updates) a PR comment marked `<!-- ui-preview -->`; it
 starts as "being deployed" and flips to "ready" with the preview **URL** once the
 Databricks App is up (a few minutes). Poll for the ready comment:
@@ -589,22 +657,27 @@ settles:
   Decide honestly whether the failure is **caused by your diff** or is
   **pre-existing / flaky / infra** (a failure unrelated to the files you touched,
   a known-flaky suite, a runner/secret problem):
-  - **Your diff caused it** → fix the code (not the test), re-run the relevant
-    tests locally to confirm, `git commit` + `git push`. The push re-runs CI.
+  - **The diff caused it** → fix the code (not the test), re-run the relevant
+    tests locally to confirm, then land the fix per the **push-or-take-over rule**:
+    `git commit` + `git push` when it's your PR or an in-repo branch you can push
+    to (the push re-runs CI); on a **fork PR** you can't push to, take over and
+    open your own PR carrying their commits + your fix (see the Step 4 preamble),
+    then continue this loop on **your** PR.
   - **Pre-existing / flaky / infra** → do **not** chase it or paper over it. Note
     it in the handoff (`ci_status`) as an unrelated failure and, if it's a flake,
     you may re-run that job (`gh run rerun <run-id> --failed`) once. Don't loop on
     someone else's red.
 
-Re-poll after each push. Stay in this loop (within the round cap) until the checks
-you're responsible for are green.
+Re-poll after each push (or, if you took over a fork PR, on your own PR's checks).
+Stay in this loop (within the round cap) until the checks you're responsible for
+are green.
 
 ### 4.3 — Address the automated (Polly) review until it's clean
 
 The repo's **Polly AI Review** runs automatically on a ready PR and posts its
 findings as a PR comment marked `<!-- polly-review-bot -->`, structured as
 **Blocking issues**, **Security vulnerabilities**, **Non-blocking notes**, and a
-**Summary**. Each `/review` run posts a **fresh** comment, so always read the
+**Summary**. Each review run posts a **fresh** comment, so always read the
 **most recent** one:
 
 ```
@@ -612,26 +685,36 @@ gh pr view <pr> --json comments \
   --jq '[.comments[] | select(.body | startswith("<!-- polly-review-bot -->"))] | last | .body'
 ```
 
-Wait for the first review to land (it can take a few minutes after opening the
-PR), then triage the newest comment:
+Polly runs automatically when the PR first becomes ready, but on a **reviewed PR**
+that already opened before you arrived it may not have run for the current head —
+so kick off the first review yourself. **Trigger it via the workflow's
+`workflow_dispatch` entry point, not a `/review` comment**: Polly's comment handler
+**ignores `/review` from `[bot]` accounts, and you are one** (`omni-resolve-agent[bot]`),
+so a `/review` comment you post is silently dropped. `workflow_dispatch` has no
+bot/association gate:
+
+```
+gh workflow run polly-review.yml -R omnigent-ai/omnigent -f pr=<pr>
+```
+
+Wait for the review to land (a few minutes), then triage the newest comment:
 
 - **Critical findings present** — anything under **Blocking issues** or **Security
-  vulnerabilities** that is a real defect in *your* diff. Fix each one at the root
+  vulnerabilities** that is a real defect in the PR's diff. Fix each one at the root
   (same fail→pass discipline as Step 2B — add/adjust a targeted test where it
-  makes sense), re-run the affected tests, then `git commit` + `git push`.
-  - After pushing the fix, **re-trigger the review** by posting a PR comment whose
-    body is exactly `/review` (it must be the command, alone on its line — a
-    write-access account triggers it and Polly reacts 👀 to acknowledge):
-    ```
-    gh pr comment <pr> --body '/review'
-    ```
-  - Then poll for a **new** `<!-- polly-review-bot -->` comment (newer than your
-    `/review`) and triage again.
+  makes sense), re-run the affected tests, then land the fix per the
+  **push-or-take-over rule**: `git commit` + `git push` when you can push to the
+  branch; on a **fork PR** you can't push to, take over into your own PR (Step 4
+  preamble) and continue on it.
+  - After **pushing** a fix (to your PR or an in-repo branch), **re-trigger the
+    review** the same way — another `gh workflow run polly-review.yml -f pr=<pr>`
+    (again: not a `/review` comment from you). Then poll for a **new**
+    `<!-- polly-review-bot -->` comment and triage again.
 - **No critical findings** — only non-blocking notes or a clean summary → the
   review is clean; you're done with this loop. You may address cheap non-blocking
   notes if they're clearly right, but they don't gate.
 
-Repeat push → `/review` → re-read within the round cap until no critical Polly
+Repeat push → re-trigger → re-read within the round cap until no critical Polly
 findings remain. Record the final state in the handoff (`polly_review`). If a
 recurring class of bug shows up here, add a one-line check to
 `dev/resolve-agent/review-checklist.md` so the pre-PR reviewer catches it next
@@ -649,9 +732,14 @@ behavior to look for. Keep it copy-pasteable and specific — concrete inputs,
 routes, or clicks; the expected *correct* result for each live facet; and for a
 compound bug, every reproduced facet.
 
-Add it to the PR body under a **"Validate the fix live"** section (edit the body
-with `gh pr edit <pr> --body-file …`, preserving the existing template sections),
-and carry the same text in the `validation_prompt` handoff field.
+Put it where it belongs for the path you're on, and carry the same text in the
+`validation_prompt` handoff field either way:
+- **Author path (your PR):** add it to the PR body under a **"Validate the fix
+  live"** section (`gh pr edit <pr> --body-file …`, preserving the existing
+  template sections).
+- **Review path (someone else's PR):** don't rewrite their PR body — post the
+  **"Validate the fix live"** block as a PR comment (`gh pr comment <pr>`) so the
+  reviewer and author get the command without you editing their description.
 
 **Lead with the one command that runs it against the preview.** When 4.1 produced
 a preview `<url>`, put a ready-to-run `omnigent claude` line first, with the real
@@ -677,13 +765,23 @@ you post. Keep the `validation_prompt` handoff field as the bare prompt text (th
 part inside `-p '…'`), so the workflow can reuse it; the assembled command lives in
 the PR body and the maintainer comment.
 
-### 4.5 — Tag the maintainer to review
+### 4.5 — Submit the final review verdict, then tag the maintainer
 
-When CI is green (4.2) **and** the automated review is clean (4.3), hand the PR to
-a human — the **same maintainer the issue is assigned to**. This applies only when
-`bug_url` is a GitHub issue (Step 1's caveat: it may be some other link). Derive
-`<issue-number>` from `bug_url`, read the issue's assignee, and request their
-review:
+When CI is green (4.2) **and** the automated review is clean (4.3), you're done
+iterating — now record your verdict and hand off to a human.
+
+**First, submit your final review** per the verdict rule in 2A.5 (review path
+only): **approve** when you were a pure reviewer and the PR is `fixed` (you pushed
+nothing); **request-changes** when it's `not_fixed` / `partially_fixed`; a plain
+**comment** when you pushed to or took over the code (no self-approval). On the
+author path, there's no self-review — your own PR just gets tagged. Remember: a bot
+approval is only an indicator; a human maintainer's approval is always what merges.
+
+**Then hand the PR to a human** — the **same maintainer the issue is assigned to**
+— on **both paths** (a PR you authored and an existing PR you reviewed and kept).
+This applies only when `bug_url` is a GitHub issue (Step 1's caveat: it may be some
+other link). Derive `<issue-number>` from `bug_url`, read the issue's assignee, and
+request their review:
 
 ```
 gh issue view <issue-number> --json assignees --jq '.assignees[].login'
@@ -692,12 +790,13 @@ gh pr edit <pr> --add-reviewer <login>
 
 - If there are **multiple assignees**, request all of them.
 - If `bug_url` is **not a GitHub issue** (so there's no assignee to read), the
-  assignee **is the PR author** (you can't request review from the author), or the
-  issue has **no assignee**, don't force a reviewer — instead post an `@mention`
-  comment asking them (or, with no assignee/non-issue bug, noting the PR is ready
-  for a maintainer):
+  assignee **is the PR author** (you can't request review from the author — common
+  on the review path, where the assignee often *is* whoever opened the PR you
+  reviewed), or the issue has **no assignee**, don't force a reviewer — instead
+  post an `@mention` comment asking them (or, with no assignee/non-issue bug,
+  noting the PR is ready for a maintainer):
   ```
-  gh pr comment <pr> --body '@<login> this fixes #<issue-number> — CI is green and the automated review is clean. Ready for your review. Try it live: `omnigent claude -p '\''<validation_prompt>'\'' --server <url>` (the UI preview from the ui-preview comment). See "Validate the fix live" in the PR body.'
+  gh pr comment <pr> --body '@<login> this fixes #<issue-number> — CI is green and the automated review is clean. Ready for your review. Try it live: `omnigent claude -p '\''<validation_prompt>'\'' --server <url>` (the UI preview from the ui-preview comment). See "Validate the fix live" (in the PR body, or the comment above on a reviewed PR).'
   ```
 
 When there is a preview `<url>`, always include the ready-to-run
@@ -761,7 +860,7 @@ the message. Same discipline as repro-agent:
   "reviewed_pr_url": "",
   "pushed_branch": "",
   "ci_status": "green (all required checks pass)",
-  "polly_review": "clean: no blocking/security findings after 1 round (fixed a null-deref Polly flagged, re-ran /review)",
+  "polly_review": "clean: no blocking/security findings after 1 round (fixed a null-deref Polly flagged, re-triggered via workflow_dispatch)",
   "ui_preview": "labeled ui-preview on every PR; preview at https://…; posted connect instructions",
   "validation_prompt": "Reproduce and validate a bug fix. Steps: open the model picker in the catalog view… Before this fix, raw catalog IDs were shown. Confirm the fix by checking that friendly labels appear. Report whether each step now behaves correctly.",
   "maintainer_review": "requested review from @PattaraS (issue assignee)",
@@ -773,9 +872,12 @@ Field meanings:
 
 - `bug_url` — the bug link, carried through from the recovered handoff.
 - `mode` — `reviewed_existing_pr` (Step 2A: a candidate PR existed, you reviewed
-  it) or `authored_fix` (Step 2B: you wrote the fix). Use `authored_fix` when you
-  reviewed an existing PR but its approach wasn't viable and you opened your own
-  (2A.5) — name the reviewed PR in your prose so the two stay linked.
+  it and kept it as the fix) or `authored_fix` (Step 2B: you wrote the fix). Use
+  `authored_fix` when you started from an existing PR but opened your own — for
+  **either** reason: its approach wasn't viable (2A.5), or its approach was fine
+  but it was an unpushable **fork PR that needed a fix** so you took it over (Step
+  4 preamble). In both cases name the reviewed/forked PR in your prose and
+  `reviewed_pr_url` so the two stay linked.
 - `outcome` — overall: `fixed` (every live facet resolved and proven — by your fix
   or by the reviewed PR), `partially_fixed`, `not_fixed` (couldn't resolve, or the
   reviewed PR doesn't fix it), `nothing_to_fix` (recovered verdict was
@@ -815,17 +917,19 @@ Field meanings:
   review mode (there you *are* the independent reviewer on someone else's PR).
 - `pr_url` — the ready-for-review PR you **opened** (author mode). Empty in review
   mode, when `skip_push` was set, or if you stopped before opening one.
-- `reviewed_pr_url` — the existing PR you **reviewed** (review mode). Empty in
-  author mode.
+- `reviewed_pr_url` — the existing PR you **reviewed** (review mode), or the fork
+  PR you **took over** into your own (fork takeover — `pr_url` is then yours).
+  Empty when you authored from scratch with no upstream PR.
 - `pushed_branch` — the local branch holding the committed fix that you did
   **not** push because `skip_push` was set (author mode). Empty otherwise. A human
   pushes and opens the PR from it.
-- `ci_status` — the result of the Step 4.2 CI loop: `green` when the checks you're
-  responsible for pass, otherwise the failing checks and whether each was
-  your-diff vs pre-existing/flaky/infra. Empty in review mode / when `skip_push` /
-  when you stopped before opening a PR.
+- `ci_status` — the result of the Step 4.2 CI loop (run on **both** paths now):
+  `green` when the checks you're responsible for pass, otherwise the failing checks
+  and whether each was diff-caused vs pre-existing/flaky/infra. If a fork PR needed
+  a fix and you took over into your own PR, this reflects **your** PR's checks.
+  Empty when `skip_push` was set or you stopped before there was a PR to land.
 - `polly_review` — the result of the Step 4.3 automated-review loop: `clean` (no
-  blocking/security findings) with how many `/review` rounds it took and what you
+  blocking/security findings) with how many review rounds it took and what you
   fixed, or the unresolved critical findings if you hit the round cap. Empty when
   no PR was opened.
 - `ui_preview` — the result of Step 4.1 (run on every PR, not just frontend fixes):
@@ -841,7 +945,12 @@ Field meanings:
 - `session_id` — the repro session you consumed, carried through so the chain is
   traceable.
 
-In author mode your work ends when the PR is open, CI is green, the automated
-review is clean, and the maintainer is tagged (Step 4) — or when you've hit the
-round cap and left an honest summary. In review mode you comment on the existing
-PR and open nothing. Either way, **you do not merge.**
+Your work ends the same way on **both paths**: the PR you're landing (one you
+opened, or an existing in-repo PR you reviewed and kept) has a preview, green CI, a
+clean automated review, a live-validation command, and the maintainer tagged (Step
+4) — or you've hit the round cap and left an honest summary. The difference is only
+how a fix lands (push directly, or — for an unpushable fork PR that needs changes —
+take over into your own PR carrying the contributor's commits), and that the author
+path opens a PR while the review path adopts an existing one. `skip_push` and
+`needs_more_info` runs end earlier, with no PR to land. Either way, **you do not
+merge.**
