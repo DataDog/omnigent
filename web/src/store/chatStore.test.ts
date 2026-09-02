@@ -50,6 +50,7 @@ import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSe
 import {
   consumePendingInitialPrompt,
   handleSessionEvent,
+  isStaleCompletedResponse,
   reviveStrayCompletedResponse,
   initChatStore,
   pumpStreamEvents,
@@ -2322,6 +2323,7 @@ describe("chatStore — send while streaming (queueing)", () => {
       responseId: "resp_in_flight",
       state: "completed",
       error: null,
+      completedAt: expect.any(Number),
     });
 
     // The turn was actually still live — its next delta revives it, and
@@ -2334,6 +2336,7 @@ describe("chatStore — send while streaming (queueing)", () => {
       responseId: "resp_in_flight",
       state: "streaming",
       error: null,
+      completedAt: expect.any(Number),
     });
     expect(useChatStore.getState().sessionStatus).toBe("running");
     expect(useChatStore.getState().status).toBe("idle");
@@ -2360,6 +2363,7 @@ describe("chatStore — send while streaming (queueing)", () => {
       responseId: "resp_a",
       state: "completed",
       error: null,
+      completedAt: expect.any(Number),
     });
   });
 
@@ -2411,6 +2415,62 @@ describe("chatStore — send while streaming (queueing)", () => {
     reviveStrayCompletedResponse(useChatStore.setState);
     expect(useChatStore.getState().activeResponse).toBeNull();
     expect(useChatStore.getState().sessionStatus).toBe("idle");
+  });
+
+  it("gates the revive to a window after the finalize", () => {
+    // A scheduled wake's first deltas stream ahead of the batch that
+    // names the new turn; reviving the minutes-old finished turn
+    // popped its "Worked for" fold open at every /loop iteration. A
+    // finalize moments ago is a plausible stray idle and still revives.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "idle",
+      activeResponse: {
+        responseId: "resp_prev_iter",
+        state: "completed",
+        error: null,
+        completedAt: Date.now() - 60_000,
+      },
+    });
+    reviveStrayCompletedResponse(useChatStore.setState);
+    expect(useChatStore.getState().activeResponse?.state).toBe("completed");
+    expect(useChatStore.getState().sessionStatus).toBe("idle");
+
+    useChatStore.setState({
+      activeResponse: {
+        responseId: "resp_live",
+        state: "completed",
+        error: null,
+        completedAt: Date.now() - 1_000,
+      },
+    });
+    reviveStrayCompletedResponse(useChatStore.setState);
+    expect(useChatStore.getState().activeResponse?.state).toBe("streaming");
+    expect(useChatStore.getState().sessionStatus).toBe("running");
+  });
+
+  it("isStaleCompletedResponse: only an old finalize is stale", () => {
+    const base = { responseId: "r", error: null } as const;
+    expect(
+      isStaleCompletedResponse({
+        activeResponse: { ...base, state: "completed", completedAt: Date.now() - 60_000 },
+      }),
+    ).toBe(true);
+    expect(
+      isStaleCompletedResponse({
+        activeResponse: { ...base, state: "completed", completedAt: Date.now() - 1_000 },
+      }),
+    ).toBe(false);
+    // No stamp (legacy snapshot) and non-completed states are never stale.
+    expect(isStaleCompletedResponse({ activeResponse: { ...base, state: "completed" } })).toBe(
+      false,
+    );
+    expect(
+      isStaleCompletedResponse({
+        activeResponse: { ...base, state: "streaming", completedAt: Date.now() - 60_000 },
+      }),
+    ).toBe(false);
+    expect(isStaleCompletedResponse({ activeResponse: null })).toBe(false);
   });
 });
 
@@ -3261,6 +3321,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         responseId: "resp_live",
         state: "completed",
         error: null,
+        completedAt: expect.any(Number),
       });
     });
 
@@ -4469,6 +4530,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         responseId: "resp_1",
         state: "cancelled",
         error: null,
+        completedAt: expect.any(Number),
       });
     });
 
@@ -7674,6 +7736,7 @@ describe("chatStore — live delta streaming (claude-native)", () => {
       responseId: "codex_turn_123",
       state: "cancelled",
       error: null,
+      completedAt: expect.any(Number),
     });
     expect(state.interruptedResponseIds).toEqual(["codex_turn_123"]);
     useChatStore.setState({ activeResponse: null });
