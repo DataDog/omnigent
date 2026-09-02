@@ -1052,9 +1052,8 @@ describe("TerminalFirstContext", () => {
   });
 
   it("does not restore terminal view in a fresh tab (sessionStorage scope)", () => {
-    // First-time visitors must still land in chat view — the persistence
-    // is sessionStorage, so a new tab starts with no stored preference.
-    // This is the deliberate default.
+    // First-time visitors still land in chat view when no Appearance override
+    // exists. Per-chat persistence remains scoped to sessionStorage.
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
@@ -1075,6 +1074,60 @@ describe("TerminalFirstContext", () => {
     renderShell("/c/conv_native");
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
     expect(screen.getByRole("button", { name: "Chat" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("opens terminal-first transcripts in Terminal when configured", () => {
+    localStorage.setItem("omnigent:default-transcript-view", "terminal");
+    mockConversations([
+      {
+        id: "conv_native",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+      },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_native");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+  });
+
+  it("remembers an explicit Chat choice over the Terminal default", () => {
+    localStorage.setItem("omnigent:default-transcript-view", "terminal");
+    mockConversations([
+      {
+        id: "conv_native",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+      },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+
+    const { unmount } = renderShell("/c/conv_native");
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+    fireEvent.click(screen.getByRole("button", { name: "Chat" }));
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
+
+    unmount();
+    renderShell("/c/conv_native");
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
+  });
+
+  it("does not apply the Terminal default to regular chat sessions", () => {
+    localStorage.setItem("omnigent:default-transcript-view", "terminal");
+    mockConversations([{ id: "conv_regular", permission_level: null, labels: {} }]);
+
+    renderShell("/c/conv_regular");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
   });
 });
 

@@ -39,6 +39,7 @@ import {
   readDefaultWorkspacePanelOpen,
   writeDefaultWorkspacePanelOpen,
 } from "@/lib/workspacePanelPreferences";
+import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
 import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
 import {
   Dialog,
@@ -152,6 +153,12 @@ import type { RightRailTab } from "./railTabs";
  * open as closable soft tabs in the rail's tab strip. The Agents tab only
  * appears once there's more than one agent (the root has at least one child).
  */
+
+// `null` in panel state means Chat view, but an absent sessionStorage entry
+// means "use the configured default." Keep an explicit marker so choosing Chat
+// can override a Terminal default when the user returns to that conversation.
+const CHAT_VIEW_STORAGE_VALUE = "__chat__";
+
 export function AppShell() {
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
@@ -864,29 +871,25 @@ export function AppShell() {
   );
 
   // Persist the Chat/TUI toggle position per-conversation so leaving and
-  // re-entering a native session doesn't drop the user back into chat
-  // view. sessionStorage scope: same tab, cleared on tab close —
-  // a deliberately narrow scope so a stale "terminal view" preference
-  // can't survive across browser sessions, where the user's mental model
-  // may have moved on.
+  // re-entering a native session restores the view the user chose instead of
+  // reapplying the global default. sessionStorage scope: same tab, cleared on
+  // tab close — a deliberately narrow scope so stale view choices don't carry
+  // into a later browsing session.
   const setPanelInitialKey = useCallback(
     (key: string | null) => {
       setPanelInitialKeyState(key);
       if (!conversationId) return;
       const storageKey = `omnigent.web.panel-key:${conversationId}`;
-      if (key === null) {
-        sessionStorage.removeItem(storageKey);
-      } else {
-        sessionStorage.setItem(storageKey, key);
-      }
+      sessionStorage.setItem(storageKey, key === null ? CHAT_VIEW_STORAGE_VALUE : key);
     },
     [conversationId],
   );
 
   // Restore the per-session workspace state when switching conversations:
   // rail open-state, selected tab, and the open file tabs. The Chat/TUI toggle
-  // is restored from sessionStorage; the Files scope and the active file also
-  // honor URL search params so shared links open to the right view.
+  // is restored from sessionStorage; with no per-tab choice, terminal-first
+  // sessions use the Appearance default. The Files scope and the active file
+  // also honor URL search params so shared links open to the right view.
   useEffect(() => {
     setExecutionLogsKey(null);
     setFilesPanelOpen(false);
@@ -913,8 +916,14 @@ export function AppShell() {
     }
     const persisted = readSessionWorkspaceState(conversationId);
 
-    const stored = sessionStorage.getItem(`omnigent.web.panel-key:${conversationId}`);
-    setPanelInitialKeyState(stored);
+    const storageKey = `omnigent.web.panel-key:${conversationId}`;
+    const stored = sessionStorage.getItem(storageKey);
+    const defaultToTerminal = terminalFirst && readTranscriptViewDefault() === "terminal";
+    setPanelInitialKeyState(
+      stored === CHAT_VIEW_STORAGE_VALUE
+        ? null
+        : (stored ?? (defaultToTerminal ? PANEL_NO_TERMINAL_KEY : null)),
+    );
 
     // Restore the selected rail tab (the Files vs Changes scope is now the tab
     // itself). ``nextTab`` stays null when there's no persisted tab and no file
@@ -967,6 +976,17 @@ export function AppShell() {
 
     stateConvRef.current = conversationId;
   }, [conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Child sessions are absent from the sidebar, so their terminal-first label
+  // can arrive after the conversation restore above. Apply the Terminal default
+  // at that point only when this tab still has no explicit per-chat choice.
+  useEffect(() => {
+    if (!conversationId || !terminalFirst) return;
+    const storageKey = `omnigent.web.panel-key:${conversationId}`;
+    if (sessionStorage.getItem(storageKey) === null && readTranscriptViewDefault() === "terminal") {
+      setPanelInitialKeyState(PANEL_NO_TERMINAL_KEY);
+    }
+  }, [conversationId, terminalFirst]);
 
   // Persist the per-session rail tab + open file tabs whenever they change.
   // Keyed on the state (not conversationId) and targeted at the conversation
