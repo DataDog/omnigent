@@ -339,6 +339,50 @@ describe("Sidebar session list", () => {
     expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "false");
   });
 
+  it("keeps the picked filter across a remount", () => {
+    mockConversations([
+      conv("conv_mine", "Claude Code"),
+      conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
+    ]);
+    renderSidebar();
+
+    selectSessionFilter("mine");
+    expect(screen.queryByText("conv_shared")).toBeNull();
+
+    // Fresh mount re-reads localStorage: still scoped to the viewer's own
+    // sessions. If this fails, the pick lived only in memory and a reload
+    // silently snapped the list back to "All sessions".
+    cleanup();
+    renderSidebar();
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+    expect(screen.queryByText("conv_shared")).toBeNull();
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("drops a persisted Shared filter on a single-user server", () => {
+    // "Shared sessions" isn't in the menu on a loopback-only server, so honoring
+    // a value stored against a multi-user one would scope the list to a slice
+    // the viewer has no option to leave.
+    localStorage.setItem("omnigent:session-filter", "shared");
+    isServerLocalMock.mockReturnValue(true);
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    renderSidebar();
+
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    expect(screen.getByTestId("session-filter-all")).toHaveAttribute("aria-checked", "true");
+    expect(screen.queryByTestId("session-filter-shared")).toBeNull();
+  });
+
   it("shows archived sessions only under the Archived filter", () => {
     mockConversations([
       conv("conv_live", "Claude Code"),
