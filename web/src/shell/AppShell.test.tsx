@@ -635,6 +635,117 @@ describe("AppShell header", () => {
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
   });
 
+  it("restores terminal view from the URL on refresh", () => {
+    mockConversations([
+      {
+        id: "conv_terminal",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+      },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        {
+          id: "terminal_claude_main",
+          name: "claude",
+          session: "main",
+          running: true,
+        },
+      ],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_terminal?file=README.md&view=terminal");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("view=terminal");
+  });
+
+  it("restores an explicit chat view over a stored terminal view", () => {
+    mockConversations([
+      {
+        id: "conv_terminal",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+      },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        {
+          id: "terminal_claude_main",
+          name: "claude",
+          session: "main",
+          running: true,
+        },
+      ],
+      isLoading: false,
+      error: null,
+    });
+    sessionStorage.setItem("omnigent.web.panel-key:conv_terminal", "terminal:terminal_claude_main");
+
+    renderShell("/c/conv_terminal?view=chat");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("view=chat");
+  });
+
+  it("restores terminal view when session labels load after the initial refresh", async () => {
+    mockConversations([]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        {
+          id: "terminal_claude_main",
+          name: "claude",
+          session: "main",
+          running: true,
+        },
+      ],
+      isLoading: false,
+      error: null,
+    });
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const makeTree = () => (
+      <QueryClientProvider client={qc}>
+        <TooltipProvider>
+          <MemoryRouter initialEntries={["/c/conv_terminal?view=terminal"]}>
+            <Routes>
+              <Route element={<AppShell />}>
+                <Route
+                  path="c/:conversationId"
+                  element={
+                    <>
+                      <TerminalFirstViewProbe />
+                      <LocationDisplay />
+                    </>
+                  }
+                />
+              </Route>
+            </Routes>
+          </MemoryRouter>
+        </TooltipProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(makeTree());
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
+
+    mockConversations([
+      {
+        id: "conv_terminal",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+      },
+    ]);
+    rerender(makeTree());
+
+    await waitFor(() =>
+      expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal"),
+    );
+  });
+
   it("shows the terminal-startup spinner while a terminal-first session is coming up", () => {
     // Baseline for the suppression test below: terminalPending (PTY being
     // created) with no terminals available drives terminalStartingUp true.
@@ -863,14 +974,18 @@ describe("TerminalFirstContext", () => {
     fireEvent.click(screen.getByRole("button", { name: "Terminal" }));
 
     // After flip: view is "terminal", drawer still NOT mounted (inline
-    // render lives in ChatPage), and the rail's files panel remains.
+    // render lives in ChatPage), and the rail's files panel remains. The URL
+    // records the view so refreshing returns to the same surface.
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "terminal");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("view=terminal");
     expect(screen.queryByTestId("terminals-panel")).toBeNull();
     expect(screen.getByTestId("files-panel")).toBeInTheDocument();
 
-    // Toggling back to Chat returns the probe to "chat".
+    // Toggling back to Chat returns the probe to "chat" and records that
+    // explicit choice for refreshes where Terminal may be the default.
     fireEvent.click(screen.getByRole("button", { name: "Chat" }));
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("view=chat");
   });
 
   it("flips to an empty Terminal view when a terminal-first session has no terminal resource", () => {

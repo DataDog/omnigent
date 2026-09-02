@@ -872,17 +872,27 @@ export function AppShell() {
 
   // Persist the Chat/TUI toggle position per-conversation so leaving and
   // re-entering a native session restores the view the user chose instead of
-  // reapplying the global default. sessionStorage scope: same tab, cleared on
-  // tab close — a deliberately narrow scope so stale view choices don't carry
-  // into a later browsing session.
+  // reapplying the global default. Keep the explicit choice in the URL too so
+  // a refresh or shared link restores either surface.
   const setPanelInitialKey = useCallback(
     (key: string | null) => {
       setPanelInitialKeyState(key);
-      if (!conversationId) return;
-      const storageKey = `omnigent.web.panel-key:${conversationId}`;
-      sessionStorage.setItem(storageKey, key === null ? CHAT_VIEW_STORAGE_VALUE : key);
+      if (conversationId) {
+        const storageKey = `omnigent.web.panel-key:${conversationId}`;
+        sessionStorage.setItem(storageKey, key === null ? CHAT_VIEW_STORAGE_VALUE : key);
+      }
+      if (terminalFirst) {
+        setSearchParams(
+          (prev) => {
+            const next = new URLSearchParams(prev);
+            next.set("view", key === null ? "chat" : "terminal");
+            return next;
+          },
+          { replace: true },
+        );
+      }
     },
-    [conversationId],
+    [conversationId, setSearchParams, terminalFirst],
   );
 
   // Restore the per-session workspace state when switching conversations:
@@ -918,11 +928,18 @@ export function AppShell() {
 
     const storageKey = `omnigent.web.panel-key:${conversationId}`;
     const stored = sessionStorage.getItem(storageKey);
+    const requestedView = terminalFirst ? searchParams.get("view") : null;
+    const terminalKey =
+      agentTerminal === null ? PANEL_NO_TERMINAL_KEY : terminalTabKey(agentTerminal);
     const defaultToTerminal = terminalFirst && readTranscriptViewDefault() === "terminal";
     setPanelInitialKeyState(
-      stored === CHAT_VIEW_STORAGE_VALUE
+      requestedView === "chat"
         ? null
-        : (stored ?? (defaultToTerminal ? PANEL_NO_TERMINAL_KEY : null)),
+        : requestedView === "terminal"
+          ? terminalKey
+          : stored === CHAT_VIEW_STORAGE_VALUE
+            ? null
+            : (stored ?? (defaultToTerminal ? terminalKey : null)),
     );
 
     // Restore the selected rail tab (the Files vs Changes scope is now the tab
@@ -977,16 +994,27 @@ export function AppShell() {
     stateConvRef.current = conversationId;
   }, [conversationId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Child sessions are absent from the sidebar, so their terminal-first label
-  // can arrive after the conversation restore above. Apply the Terminal default
-  // at that point only when this tab still has no explicit per-chat choice.
+  // Session metadata can arrive after the restore effect above. Once the
+  // terminal-first label is known, apply URL state first, then the per-tab
+  // choice, then the configured default.
   useEffect(() => {
     if (!conversationId || !terminalFirst) return;
-    const storageKey = `omnigent.web.panel-key:${conversationId}`;
-    if (sessionStorage.getItem(storageKey) === null && readTranscriptViewDefault() === "terminal") {
-      setPanelInitialKeyState(PANEL_NO_TERMINAL_KEY);
+    const requestedView = searchParams.get("view");
+    const stored = sessionStorage.getItem(`omnigent.web.panel-key:${conversationId}`);
+    const terminalKey =
+      agentTerminal === null ? PANEL_NO_TERMINAL_KEY : terminalTabKey(agentTerminal);
+    if (requestedView === "chat") {
+      setPanelInitialKeyState(null);
+    } else if (requestedView === "terminal") {
+      setPanelInitialKeyState(terminalKey);
+    } else if (stored === CHAT_VIEW_STORAGE_VALUE) {
+      setPanelInitialKeyState(null);
+    } else if (stored !== null) {
+      setPanelInitialKeyState(stored);
+    } else if (readTranscriptViewDefault() === "terminal") {
+      setPanelInitialKeyState(terminalKey);
     }
-  }, [conversationId, terminalFirst]);
+  }, [agentTerminal, conversationId, searchParams, terminalFirst]);
 
   // Persist the per-session rail tab + open file tabs whenever they change.
   // Keyed on the state (not conversationId) and targeted at the conversation
