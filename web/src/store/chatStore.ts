@@ -53,6 +53,7 @@ import type {
   ToolGroup,
   UserMessageBlock,
 } from "@/lib/blocks";
+import { userInputElicitationKey } from "@/lib/askUserQuestion";
 import { LIVE_ITEM_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
@@ -3157,7 +3158,11 @@ async function bindStream(
       // branches that used to live here served the transcript LRU's revisit
       // path, which no longer exists — a revisit finds a live entry and never
       // re-binds.)
-      const allBlocks = [...unique, ...state.blocks, ...uniquePendingElicitations];
+      const allBlocks = [
+        ...unique,
+        ...withoutRebuiltUserInputCards(state.blocks, unique),
+        ...uniquePendingElicitations,
+      ];
       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
       // Decide the optimistic user bubbles to render after this bind, and
       // (on cold load) keep the per-conversation stash consistent.
@@ -3566,6 +3571,40 @@ function reconcileElicitationBlocks(
 }
 
 /**
+ * Drop live question / plan cards that history has already rebuilt.
+ *
+ * An answered card stays in the block list, and history hydration
+ * reconstructs the same card from the persisted tool call once its
+ * result lands — so a merge that pulls fresh items in alongside the
+ * live tail would show the exchange twice. The two copies carry
+ * different elicitation ids (the live one is minted per prompt and
+ * never persisted), so they pair on what was asked instead. Only
+ * answered cards are dropped: a still-parked prompt is the one the
+ * user can act on, and no persisted item can rebuild it.
+ *
+ * @param liveBlocks - Blocks the live pump produced.
+ * @param historyBlocks - Blocks translated from persisted items.
+ * @returns `liveBlocks` without the copies history now carries.
+ */
+function withoutRebuiltUserInputCards(
+  liveBlocks: AnyBlock[],
+  historyBlocks: AnyBlock[],
+): AnyBlock[] {
+  const rebuilt = new Set<string>();
+  for (const b of historyBlocks) {
+    if (b.type !== "elicitation") continue;
+    const key = userInputElicitationKey(b);
+    if (key !== null) rebuilt.add(key);
+  }
+  if (rebuilt.size === 0) return liveBlocks;
+  return liveBlocks.filter((b) => {
+    if (b.type !== "elicitation" || b.status !== "responded") return true;
+    const key = userInputElicitationKey(b);
+    return key === null || !rebuilt.has(key);
+  });
+}
+
+/**
  * Snapshot the ids of currently rendered elicitation cards, split by
  * answerable state, BEFORE a snapshot fetch. `pending` cards are
  * eligible for the gap-resolved flip; `autoResolved` cards are
@@ -3633,10 +3672,8 @@ async function rehydrateWindowOnReconnect(
     const tailIds = new Set(
       tail.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
-    const merged = [
-      ...freshBlocks.filter((b) => !b.ctx.itemId || !tailIds.has(b.ctx.itemId)),
-      ...tail,
-    ];
+    const windowBlocks = freshBlocks.filter((b) => !b.ctx.itemId || !tailIds.has(b.ctx.itemId));
+    const merged = [...windowBlocks, ...withoutRebuiltUserInputCards(tail, windowBlocks)];
     return {
       ...reconnectStatusPatch(session, s),
       blocks:
@@ -3764,18 +3801,19 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
       // committed blocks, so before-its-first would invert the bubble.
       // No rid blocks at all: append; the later replay lands after.
       const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
+      // A card answered before the gap whose call the gap persisted comes
+      // back rebuilt in `unseen` — drop the live copy before anchoring.
+      const kept = withoutRebuiltUserInputCards(s.blocks, unseen);
       let at = -1;
       if (rid) {
-        at = s.blocks.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);
+        at = kept.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);
         if (at === -1) {
-          const lastRid = s.blocks.findLastIndex((b) => b.ctx.responseId === rid);
+          const lastRid = kept.findLastIndex((b) => b.ctx.responseId === rid);
           if (lastRid !== -1) at = lastRid + 1;
         }
       }
       nextBlocks =
-        at >= 0
-          ? [...s.blocks.slice(0, at), ...unseen, ...s.blocks.slice(at)]
-          : [...s.blocks, ...unseen];
+        at >= 0 ? [...kept.slice(0, at), ...unseen, ...kept.slice(at)] : [...kept, ...unseen];
     }
     // Recover elicitation state the dead socket swallowed: gap-fired
     // prompts, gap-resolved cards, and re-parked prompts whose card
