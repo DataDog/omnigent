@@ -4230,6 +4230,13 @@ def _claude_transcript_record_from_session_item(
     """
     Convert one Omnigent item into one Claude transcript record.
 
+    No ``message.model`` is emitted. An item's wire ``model`` is the
+    Omnigent *agent* name (``MessageData.agent`` serializes under that
+    alias), e.g. ``"claude-native-ui"`` — not a Claude model id. Copying
+    it through made ``--resume`` report "Session model … could not be
+    restored" and silently fall back to another model; omitting it lets
+    Claude keep its configured one.
+
     :param item: Flat Omnigent item dict, e.g.
         ``{"type": "function_call", "name": "Read", ...}``.
     :param session_id: Claude-native session id for the transcript,
@@ -4263,9 +4270,6 @@ def _claude_transcript_record_from_session_item(
                 return None
             record_type = "assistant"
             message = {"role": "assistant", "content": assistant_content}
-            model = item.get("model")
-            if isinstance(model, str) and model:
-                message["model"] = model
         else:
             return None
     elif item_type == "function_call":
@@ -4287,9 +4291,6 @@ def _claude_transcript_record_from_session_item(
                 }
             ],
         }
-        model = item.get("model")
-        if isinstance(model, str) and model:
-            message["model"] = model
     elif item_type == "function_call_output":
         call_id = item.get("call_id")
         if not isinstance(call_id, str) or not call_id:

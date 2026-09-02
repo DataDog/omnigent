@@ -4751,6 +4751,13 @@ async def test_resolve_cold_resume_args_bootstraps_missing_local_claude_transcri
     ]
     assert records[2]["parentUuid"] == records[1]["uuid"]
     assert records[3]["message"]["content"] == [{"type": "text", "text": "TODO.md says contents"}]
+    # An item's wire "model" is the Omnigent agent name, not a Claude model
+    # id. Writing it through makes `--resume` reject it ("Session model
+    # claude-native-ui could not be restored") and silently fall back to a
+    # different model, so no record may carry one.
+    assert all("model" not in record["message"] for record in records), (
+        f"agent name leaked into Claude's model slot: {records!r}"
+    )
     assert all(record["sessionId"] == "claude-uuid-abc" for record in records)
     assert all(record["cwd"] == str(workspace.resolve()) for record in records)
     assert any("after=fc_read_1" in path for path in requested_paths), (
