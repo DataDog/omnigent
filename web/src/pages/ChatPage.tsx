@@ -4549,27 +4549,133 @@ function SubagentComposerTray({ label }: { label: string }) {
 }
 
 /**
- * Pill above the composer tallying background tasks that are running (a dev
- * server, a background shell, a sub-agent). Independent of the "Working…"
- * shimmer: while the turn is active both show — the shimmer for the turn, the
- * pill for the tally — and once the turn ends the pill carries on alone.
- * Label-only: the count spans shells, sub-agents, and tools, so there's no
- * single terminal to open.
+ * Pill above the composer tallying running background tasks (a dev server, a
+ * background shell, a sub-agent), shown independently of the "Working…" shimmer.
+ *
+ * The tally expands into a card listing each running shell by name: on hover
+ * for a mouse, on tap for touch (which focuses it, so a tap outside closes it
+ * via blur), and on focus for the keyboard. It morphs in place — the same
+ * element tweens width and height to the measured content size at a constant
+ * corner radius (CSS can't animate to an `auto` size), growing upward out of an
+ * absolute layer over a hidden spacer so the composer below never shifts. A
+ * count-only edge (older runner, no per-shell detail) stays a plain tally.
  */
 function BackgroundTaskPill() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
+  const bgTasks = useChatStore((s) => s.backgroundTasks);
+  const [open, setOpen] = useState(false);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [box, setBox] = useState<{ width: number; height: number } | null>(null);
+  const canExpand = bgTasks.length > 0;
+
+  useEffect(() => {
+    if (bgCount <= 0 || !canExpand) setOpen(false);
+  }, [bgCount, canExpand]);
+
+  // Measure the current content so the container tweens to a concrete size in
+  // both dimensions. Re-measured whenever the state or the task list changes.
+  useLayoutEffect(() => {
+    const el = contentRef.current;
+    if (el) setBox({ width: el.offsetWidth, height: el.offsetHeight });
+  }, [open, canExpand, bgCount, bgTasks]);
+
   if (bgCount <= 0) return null;
+
+  const showCard = open && canExpand;
+
   return (
     <div className={cn("mx-auto flex w-full px-1 pb-1.5", CHAT_COLUMN_WIDTH)}>
-      <div
-        role="status"
-        data-testid="background-task-pill"
-        className="flex items-center gap-1.5 rounded-full border border-border bg-card px-3 py-1 text-sm text-muted-foreground shadow-sm"
-      >
-        <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
-        <span>
-          {bgCount} background task{bgCount === 1 ? "" : "s"}
-        </span>
+      <div className="relative">
+        {/* Reserves the collapsed footprint so the absolute, upward-growing
+            card never shoves the composer. */}
+        <div aria-hidden className="invisible px-3 py-1.5 text-sm">
+          <div className="flex items-center gap-1.5 whitespace-nowrap">
+            <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+            <span>
+              {bgCount} background task{bgCount === 1 ? "" : "s"}
+            </span>
+          </div>
+        </div>
+        <div
+          role="status"
+          data-testid="background-task-pill"
+          aria-label={`${bgCount} background task${bgCount === 1 ? "" : "s"} still running`}
+          tabIndex={canExpand ? 0 : undefined}
+          // Hover opens ONLY for a real mouse. On touch, opening on emulated
+          // hover triggers iOS's "first tap reveals hover, second tap clicks"
+          // heuristic — which swallows the first tap inconsistently. Touch opens
+          // via onClick instead, so the first tap always lands.
+          onPointerEnter={(e) => {
+            if (e.pointerType === "mouse" && canExpand) setOpen(true);
+          }}
+          onPointerLeave={(e) => {
+            if (e.pointerType === "mouse") setOpen(false);
+          }}
+          // Tap/click: open and focus the pill so onBlur can close it on
+          // tap-out (a gesture-driven focus() works even on iOS, where tapping a
+          // non-button element otherwise won't focus it).
+          onClick={(e) => {
+            if (!canExpand) return;
+            setOpen(true);
+            e.currentTarget.focus({ preventScroll: true });
+          }}
+          onFocus={() => canExpand && setOpen(true)}
+          onBlur={(e) => {
+            // Close when focus leaves the pill entirely (tap/click outside,
+            // Tab away); staying open if it moves to a child.
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false);
+          }}
+          style={box ? { width: box.width, height: box.height } : undefined}
+          className={cn(
+            "absolute bottom-0 left-0 overflow-hidden rounded-2xl bg-card text-sm shadow-sm ring-1 ring-border transition-[width,height,box-shadow] duration-200 ease-out",
+            showCard && "z-10 shadow-menu",
+          )}
+        >
+          <div
+            ref={contentRef}
+            // Cap at Tailwind's `md` container (28rem/448px), but never wider
+            // than the viewport minus a margin so it can't overflow on a narrow
+            // screen. The margin exceeds the composer's own px-4/px-6 inset (this
+            // pill sits at px-1) so the card's right edge, ring included, stays
+            // inside the composer rather than overhanging it.
+            style={
+              showCard ? { maxWidth: "min(var(--container-md, 28rem), 100vw - 3rem)" } : undefined
+            }
+            className={cn("w-max text-left", showCard ? "px-3 py-2" : "px-3 py-1.5")}
+          >
+            {showCard ? (
+              <ul className="flex animate-in flex-col gap-1.5 fade-in-0 duration-200">
+                {bgTasks.map((task, i) => {
+                  const label = task.description || task.command || "Background shell";
+                  const cmd = task.command && task.command !== label ? task.command : null;
+                  return (
+                    <li key={task.id ?? i} className="flex items-start gap-2">
+                      <SquareTerminalIcon
+                        className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
+                        aria-hidden="true"
+                      />
+                      <div className="min-w-0">
+                        <div className="truncate text-foreground">{label}</div>
+                        {cmd ? (
+                          <div className="truncate font-mono text-xs text-muted-foreground">
+                            {cmd}
+                          </div>
+                        ) : null}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : (
+              <div className="flex items-center gap-1.5 whitespace-nowrap text-muted-foreground">
+                <SquareTerminalIcon className="size-3.5 shrink-0" aria-hidden="true" />
+                <span>
+                  {bgCount} background task{bgCount === 1 ? "" : "s"}
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
