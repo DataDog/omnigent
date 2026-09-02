@@ -893,7 +893,6 @@ export function ChatPage() {
     runnerOnline,
     backgroundTaskCount,
   });
-
   // A fork of a coding session carries the source id in this label (set by
   // fork_conversation). It is provenance — it persists after the clone is
   // bound — so it identifies the source (for the picker's prefill) but is
@@ -1675,7 +1674,8 @@ function MainAgentSurface({
   // tool runs, and reasoning gaps — including after a reload that hydrates
   // `running` before any bubbles exist locally. Only a trailing compaction
   // spinner suppresses it (that bubble owns the slot with its own animation).
-  const showWorkingIndicator = shouldShowWorkingIndicator(showsWorking, bubbles);
+  const showWorkingStatus = shouldShowWorkingIndicator(showsWorking, bubbles);
+  const showWorkingIndicator = showWorkingStatus;
 
   if (showTerminal && conversationId) {
     return (
@@ -1790,7 +1790,7 @@ function MainAgentSurface({
                     user's message sits with no sign anything is happening.
                     Self-gates to null off the spin-up window; rendered only
                     when not already showing Working… so the two never stack. */}
-                {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
+                {!showWorkingStatus && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native): renders while the
                     harness boots its MCP servers and, after startup settles,
                     when servers failed or were cancelled. Independent of the
@@ -1809,7 +1809,7 @@ function MainAgentSurface({
           <ConversationScrollButton />
           {/* Outside ConversationContent so it's pinned to the viewport, not the scroll. See WorkingStatusPin.
               Suppressed in a sub-agent session: the composer's "Chatting with sub-agent …" tray owns this slot. */}
-          <WorkingStatusPin show={showWorkingIndicator} suppress={subAgentLabel != null} />
+          <WorkingStatusPin show={showWorkingStatus} suppress={subAgentLabel != null} />
           <UserMessageNavConnected
             goPrev={nav.goPrev}
             goNext={nav.goNext}
