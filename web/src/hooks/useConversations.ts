@@ -35,6 +35,7 @@ import {
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
 import { showToast } from "@/components/ui/toast";
+import { revokePermission } from "@/lib/permissionsApi";
 import { conversationDisplayLabel, setLegacyPinnedConversationId } from "@/shell/sidebarNav";
 import { stopSession } from "@/lib/sessionsApi";
 import { setSessionHost } from "@/lib/sessionHost";
@@ -840,6 +841,49 @@ export function useStopAndDeleteConversation() {
     },
     onSuccess: (_data, { id }) => {
       finalizeDeletedConversations(queryClient, [id]);
+    },
+  });
+}
+
+/**
+ * Leave a session shared with you — revoking your OWN grant via
+ * `DELETE /v1/sessions/{id}/permissions/{viewerId}` — so it drops out of the
+ * sidebar. The server allows a self-revoke with only read access; `viewerId`
+ * must be the caller's own id (the sidebar reads it from the resolved identity
+ * it already uses to decide the row isn't owned).
+ *
+ * The row is spliced out of the cached list pages in place rather than
+ * invalidated, for the same reason delete does it (see
+ * `useStopAndDeleteConversation`): `GET /v1/sessions` may be served from a
+ * search index that catches up asynchronously, so an immediate refetch can
+ * resurrect the row the user just dismissed. Nothing is deleted server-side —
+ * only the caller's grant — so the owner re-sharing brings it back.
+ *
+ * Callers are responsible for navigating away from `/c/{id}` when leaving the
+ * session currently being viewed; it 404s for them afterwards.
+ */
+export function useLeaveSession() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, viewerId }: { id: string; viewerId: string }) =>
+      revokePermission(id, viewerId),
+    onSuccess: (_data, { id }) => {
+      const ids = new Set([id]);
+      for (const queryKey of [["conversations"], ["project-sessions"]]) {
+        for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+          queryKey,
+        })) {
+          const { data: next, removed } = removeIdsFromPages(data, ids);
+          if (removed) queryClient.setQueryData(key, next);
+        }
+      }
+      // Drop the per-session caches too, so the row can't re-enter the sidebar
+      // from a still-fresh backfill entry once it leaves the paginated pages.
+      queryClient.removeQueries({ queryKey: ["conversation-backfill", id] });
+      queryClient.removeQueries({ queryKey: ["session", id] });
+      queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, (old) =>
+        old ? { ...old, conversations: old.conversations.filter((c) => !ids.has(c.id)) } : old,
+      );
     },
   });
 }
