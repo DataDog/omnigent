@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import _server_state
+from tests.e2e_ui.conftest import _server_state, seed_committed_turn
 
 
 def _seed_error_item(session_id: str, *, code: str, message: str) -> None:
@@ -173,3 +174,72 @@ def test_persisted_failure_expands_retries_and_dismisses_locally(
     expect(pill).to_be_visible(timeout=15_000)
     pill.get_by_role("button", name="Dismiss error message").click()
     expect(pill).to_have_count(0)
+
+
+@pytest.mark.parametrize("viewport_width", [1440, 2400])
+def test_error_row_divider_spans_the_chat_column(
+    page: Page,
+    seeded_session: tuple[str, str],
+    viewport_width: int,
+) -> None:
+    """The banner's dashed rule spans the full chat column, not just the pill.
+
+    Regression net for the error-only shrink-wrap: ``MessageContent``
+    defaults to ``w-fit``, so an error-only bubble once clipped the rule to
+    the 560px pill (~592px) instead of the column. Widths are compared
+    against a long-text assistant turn measured in the same viewport — no
+    hardcoded pixel values. Runs at two widths since the column is
+    responsive below its ``max-w-3xl`` cap: 2400px lets the column reach
+    the cap (where the shrink-wrap shows — the pill fits inside it), while
+    1440px squeezes the column below the pill's width (``max-w-full`` caps
+    the pill either way) and locks the invariant against a wrapper that
+    narrows the row below the column.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` from the local server.
+    :param viewport_width: Browser width in CSS pixels for this run.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    seed_committed_turn(
+        session_id,
+        prompt="Write something long.",
+        reply=(
+            "A long assistant answer that stretches the chat column to its full "
+            "width regardless of the viewport size. " * 12
+        ),
+        response_id="resp_geometry_long",
+    )
+    _seed_error_item(
+        session_id,
+        code="required_terminal_exited",
+        message="Required terminal exited unexpectedly; the runtime is no longer available.",
+    )
+
+    page.set_viewport_size({"width": viewport_width, "height": 1080})
+    page.goto(f"{base_url}/c/{session_id}")
+    pill = page.get_by_test_id("error-pill")
+    expect(pill).to_be_visible(timeout=15_000)
+
+    widths = page.evaluate(
+        """() => {
+          const pill = document.querySelector('[data-testid="error-pill"]');
+          const row = pill.parentElement;
+          const divider = row.querySelector('span[aria-hidden="true"]');
+          const bubbles = [...document.querySelectorAll('[data-testid="message-bubble"]')];
+          const textBubble = bubbles.find((b) =>
+            b.textContent.includes('stretches the chat column'));
+          return {
+            row: row.getBoundingClientRect().width,
+            divider: divider.getBoundingClientRect().width,
+            textTurn: textBubble.firstElementChild.getBoundingClientRect().width,
+          };
+        }"""
+    )
+    assert abs(widths["row"] - widths["textTurn"]) <= 2, (
+        f"error row spans {widths['row']:.0f}px but the chat column spans "
+        f"{widths['textTurn']:.0f}px — the banner shrink-wrapped the pill"
+    )
+    assert abs(widths["divider"] - widths["row"]) <= 1, (
+        f"dashed rule spans {widths['divider']:.0f}px of its {widths['row']:.0f}px row"
+    )
