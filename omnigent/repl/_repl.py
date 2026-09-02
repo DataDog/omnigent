@@ -674,9 +674,7 @@ def _humanize_agent_name(agent_name: str) -> str:
 class TimedFormatter(RichBlockFormatter):  # type: ignore[misc]
     """Shows final elapsed time after response completes."""
 
-    def __init__(self, **kwargs: object) -> None:
-        super().__init__(**kwargs)
-        self._start_time: float | None = None
+    _start_time: float | None = None
 
     def format_response_start(self, block: ResponseStartBlock) -> list[FormattedItem]:
         self._start_time = block.ctx.timestamp
