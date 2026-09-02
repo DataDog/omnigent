@@ -55,7 +55,6 @@ import { BlockRenderer, FilePathAwareMessageResponse } from "@/components/blocks
 import { CompactionMarker, RoutingDecisionCard } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
-import { initialWindowComplete } from "@/lib/sessionsApi";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
@@ -2317,6 +2316,9 @@ function historyLoadThreshold(el: HTMLElement): number {
   return Math.max(HISTORY_LOAD_TOP_MIN_PX, el.clientHeight * HISTORY_LOAD_TOP_VIEWPORTS);
 }
 
+/** Finger travel before a touch drag counts as "show me what's above". */
+const TOUCH_DRAG_SLOP_PX = 8;
+
 export function HistoryAutoLoader({
   scrollElement,
 }: {
@@ -2334,11 +2336,25 @@ export function HistoryAutoLoader({
   // prepends its items and clears loadingMoreHistory. Unlike scrollHeight, it
   // still changes when many fetched tool calls collapse into one visual row.
   const oldestItemId = useChatStore((s) => s.oldestItemId);
-  const pagesFetchedRef = useRef(1);
   const generationRef = useRef(historyGeneration);
   const [scrollRevision, setScrollRevision] = useState(0);
   const handledScrollRevisionRef = useRef(scrollRevision);
   const oldestItemIdRef = useRef(oldestItemId);
+  // Whether the reader has asked to move the transcript upward yet.
+  //
+  // "Near the top" alone is not a request for older history: opening a session
+  // scrolls the pane to the bottom, and on a transcript shorter than the fetch
+  // threshold that lands trivially near the top — so the open fetched a page,
+  // the prepend moved the cursor, and that fed the next fetch. Fifteen
+  // requests and a "Loading earlier messages…" row, for someone who never
+  // touched the scrollbar.
+  //
+  // Intent, not movement: a window taller than the transcript has no scroll
+  // range at all, so waiting for scrollTop to fall would strand older history
+  // behind a gesture the pane can never report.
+  const scrolledUpRef = useRef(false);
+  const lastScrollTopRef = useRef<number | null>(null);
+  const touchStartYRef = useRef<number | null>(null);
 
   // Position across a prepend is held by native scroll anchoring, not by this
   // component. Writing scrollTop here instead used to interrupt the reader's
@@ -2349,9 +2365,52 @@ export function HistoryAutoLoader({
   useLayoutEffect(() => {
     const el = scrollElement ?? ctx.scrollRef?.current;
     if (!el) return;
-    const handleScroll = () => setScrollRevision((revision) => revision + 1);
+    // Baseline from where the pane currently sits, so the reader's very first
+    // upward scroll already has something to compare against.
+    lastScrollTopRef.current = el.scrollTop;
+    // Arming has to re-run the paging effect itself: a pane with no scroll
+    // range fires no scroll event, so nothing else would notice the gesture.
+    const armScrollUp = () => {
+      if (scrolledUpRef.current) return;
+      scrolledUpRef.current = true;
+      setScrollRevision((revision) => revision + 1);
+    };
+    const handleScroll = () => {
+      const previous = lastScrollTopRef.current;
+      lastScrollTopRef.current = el.scrollTop;
+      // Only an upward move counts. The open's scroll-to-bottom and a
+      // prepend's native anchor correction both move scrollTop DOWN the
+      // document (larger), so neither can arm paging on its own.
+      if (previous !== null && el.scrollTop < previous - 0.5) scrolledUpRef.current = true;
+      // Every scroll re-runs the paging effect, armed or not: staying near the
+      // top has to keep paging, not just the moment the reader arrives there.
+      setScrollRevision((revision) => revision + 1);
+    };
+    // Wheel/trackpad up, and a touch drag downward (which reveals what is
+    // above). These fire whether or not the pane has anywhere to scroll.
+    const handleWheel = (event: WheelEvent) => {
+      if (event.deltaY < 0) armScrollUp();
+    };
+    const handleTouchStart = (event: TouchEvent) => {
+      touchStartYRef.current = event.touches[0]?.clientY ?? null;
+    };
+    const handleTouchMove = (event: TouchEvent) => {
+      const start = touchStartYRef.current;
+      const current = event.touches[0]?.clientY;
+      if (start !== null && current !== undefined && current > start + TOUCH_DRAG_SLOP_PX) {
+        armScrollUp();
+      }
+    };
     el.addEventListener("scroll", handleScroll, { passive: true });
-    return () => el.removeEventListener("scroll", handleScroll);
+    el.addEventListener("wheel", handleWheel, { passive: true });
+    el.addEventListener("touchstart", handleTouchStart, { passive: true });
+    el.addEventListener("touchmove", handleTouchMove, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", handleScroll);
+      el.removeEventListener("wheel", handleWheel);
+      el.removeEventListener("touchstart", handleTouchStart);
+      el.removeEventListener("touchmove", handleTouchMove);
+    };
   }, [ctx.scrollRef, scrollElement]);
 
   // This is the single paging effect. Fetches are driven by user scrolls or a
@@ -2369,28 +2428,29 @@ export function HistoryAutoLoader({
 
     if (generationChanged) {
       generationRef.current = historyGeneration;
-      pagesFetchedRef.current = 1;
+      // A new window is a new open: require a fresh upward scroll.
+      scrolledUpRef.current = false;
+      lastScrollTopRef.current = el.scrollTop;
     }
 
     const state = useChatStore.getState();
-    const userPromptCount = state.blocks.reduce(
-      (count, block) =>
-        count + (block.type === "user_message" && !isSystemUserContent(block.content) ? 1 : 0),
-      0,
-    );
-    const buildingInitialWindow = !initialWindowComplete(userPromptCount, pagesFetchedRef.current);
 
+    // Reader-driven only. Opening a session used to keep paging from here
+    // until it found the previous prompt, so history kept landing for seconds
+    // after the page had settled and the transcript shifted under someone who
+    // had not scrolled at all. The bind now fetches its whole window in one
+    // request, and this waits for the reader to actually scroll up.
     if (
+      !scrolledUpRef.current ||
       !state.oldestItemId ||
       !state.hasMoreHistory ||
       state.loadingMoreHistory ||
-      (!buildingInitialWindow &&
-        (!(itemsChanged || scrollPositionChanged) || el.scrollTop >= historyLoadThreshold(el)))
+      !(itemsChanged || scrollPositionChanged) ||
+      el.scrollTop >= historyLoadThreshold(el)
     ) {
       return;
     }
 
-    if (buildingInitialWindow) pagesFetchedRef.current += 1;
     void state.loadMoreHistory();
   }, [
     ctx.scrollRef,
@@ -2401,13 +2461,21 @@ export function HistoryAutoLoader({
     scrollRevision,
   ]);
 
-  // No visible control — history loads purely on scroll-up / the initial-window
-  // build above.
+  // No visible control — history loads purely on scroll-up.
   return null;
 }
 
 /** Top inset for a pinned anchor: 16px beyond the fade's fully opaque edge. */
 const PINNED_ANCHOR_TOP_GAP_PX = 96;
+
+/**
+ * Ceiling on the reserved space, as a share of the viewport. Pinning a SHORT
+ * latest turn to the top costs almost a full screen of blank, with readable
+ * history sitting just above the fold. Capping it keeps most of the viewport
+ * showing real messages; a long turn is unaffected, since it already needs
+ * little or no reserved space to reach the top.
+ */
+const MAX_RESERVED_VIEWPORT_FRACTION = 1 / 3;
 
 /**
  * Trailing spacer that pins the initially loaded turn's anchor to the top of
@@ -2494,7 +2562,14 @@ export function LatestTurnSpacer({
     // spacer's top is fixed by the content above it, so this is stable across
     // the height we're about to set — it converges in one pass.
     const anchorToEnd = spacerEl.getBoundingClientRect().top - anchor.getBoundingClientRect().top;
-    const next = Math.max(0, scrollEl.clientHeight - anchorToEnd - PINNED_ANCHOR_TOP_GAP_PX);
+    const viewport = scrollEl.clientHeight;
+    const next = Math.max(
+      0,
+      Math.min(
+        viewport - anchorToEnd - PINNED_ANCHOR_TOP_GAP_PX,
+        viewport * MAX_RESERVED_VIEWPORT_FRACTION,
+      ),
+    );
     const current = Number.parseFloat(spacerEl.style.height) || 0;
     if (Math.abs(current - next) >= 1) spacerEl.style.height = `${next}px`;
   }, [ctx.scrollRef, scrollElement]);
