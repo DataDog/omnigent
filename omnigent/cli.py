@@ -2194,6 +2194,27 @@ _HOST_PID_PATH = Path.home() / ".omnigent" / "host.pid"
 # target (real URLs never collide with the marker).
 _LOCAL_DAEMON_MARKER = "local"
 
+# ``--server`` values that mean "run against a local server" rather than naming a
+# remote one. ``""`` is the historical spelling; ``"local"`` is the readable alias
+# and matches ``_LOCAL_DAEMON_MARKER`` above, the marker local mode already
+# records in host.pid. Neither can be a real target: an empty value has no host,
+# and a bare ``local`` would normalize to the unroutable ``https://local``.
+_LOCAL_SERVER_ALIASES = frozenset({"", _LOCAL_DAEMON_MARKER})
+
+
+def _is_local_server_request(server: str | None) -> bool:
+    """
+    Whether a ``--server`` value asks for a local server.
+
+    :param server: Raw ``--server`` value, e.g. ``""``, ``"local"``, or
+        ``"https://example.databricksapps.com"``. ``None`` (flag absent) is
+        not a request — it leaves the config default free to apply.
+    :returns: ``True`` for a local-server alias, else ``False``.
+    """
+    if server is None:
+        return False
+    return server.strip().casefold() in _LOCAL_SERVER_ALIASES
+
 
 @dataclass(frozen=True)
 class _HostDaemonRecord:
@@ -6985,7 +7006,10 @@ def _dispatch_run(
         )
 
     if target is None:
-        if server_from_cli and server is not None and harness is None:
+        # Truthiness, not ``is not None``: an empty ``--server ""`` selects local
+        # mode (see ``_ensure_backend``), so it must not be treated as a direct
+        # server URL and normalized into the bare scheme ``"https:"``.
+        if server_from_cli and server and harness is None:
             # Normalize like every other entry point: expand a bare workspace
             # URL to its /api/2.0/omnigent mount and strip any ?o= query. Else
             # a direct ``--server`` request hits the root and bounces to /login.
@@ -7402,8 +7426,9 @@ def attach(
         "Remote omnigent URL. Uploads the local YAML as an ephemeral "
         "agent, spawns a LOCAL runner that tunnels to this server (so "
         "terminals/MCPs run on your laptop), and connects the REPL to it. "
-        'Pass --server "" to auto-spawn a persistent local server in the '
-        "background and target that instead of a remote one."
+        "Pass --server local to auto-spawn a persistent local server in the "
+        "background and target that instead of a remote one, overriding any "
+        'configured server default (--server "" does the same).'
     ),
 )
 @click.option(
@@ -7479,6 +7504,7 @@ def run(
       omnigent run examples/hello_world.yaml
       omnigent run examples/hello_world.yaml --harness codex --model gpt-5.4-mini
       omnigent run --server http://localhost:6767
+      omnigent run --server local  # local server, ignoring any configured default
       omnigent run examples/databricks_coding_agent.yaml --server https://<app>.databricksapps.com
       omnigent run --server https://<app>.databricksapps.com --profile my-sp -p "hi"
     """
@@ -7499,6 +7525,17 @@ def run(
     # global config, which provides user-level defaults.
     server_source = click.get_current_context().get_parameter_source("server")
     server_from_cli = server_source is not None and server_source.name == "COMMANDLINE"
+    # ``--server local`` (or ``--server ""``) is the documented "ignore any
+    # configured remote and target a local server" request. Collapse it to the
+    # ``None`` local-mode sentinel every downstream consumer already understands,
+    # and remember that it was explicit so the config fallback below cannot put
+    # the remote back. Without this, the value flowed on as a real server and
+    # normalized to a bogus URL — ``""`` became the bare scheme ``"https:"``,
+    # which then landed in the AGENT slot as "Agent path not found: https:".
+    local_server_requested = server_from_cli and _is_local_server_request(server)
+    if local_server_requested:
+        server = None
+        server_from_cli = False
     model_source = click.get_current_context().get_parameter_source("model")
     model_from_cli = model_source is click.core.ParameterSource.COMMANDLINE
     harness_source = click.get_current_context().get_parameter_source("harness")
@@ -7515,7 +7552,7 @@ def run(
     direct_server_cli = (
         target is None
         and server_from_cli
-        and server is not None
+        and bool(server)
         and not harness_from_cli
         and acp_agent is None
     )
@@ -7528,7 +7565,7 @@ def run(
         # it — but fall back to a built-in launcher when an explicit --harness
         # doesn't match the default agent's harness.
         target = _resolve_default_agent_target(_global_cfg.get("default_agent"), harness)
-    if server is None:
+    if server is None and not local_server_requested:
         server = _global_cfg.get("server")
     if model is None and not direct_server_cli:
         model = _global_cfg.get("model")
@@ -10395,8 +10432,20 @@ def _resolve_server_url(server: str) -> str:
         ``"example.cloud.databricks.com/omnigent"``.
     :returns: The normalized API base URL without a trailing slash, e.g.
         ``"https://example.cloud.databricks.com/api/2.0/omnigent"``.
+    :raises click.ClickException: If *server* is a local-server alias (empty or
+        ``"local"``) rather than a URL. Callers route those to local mode before
+        reaching here (see ``_is_local_server_request`` / ``_ensure_backend``);
+        normalizing one would yield a nonsense target — the bare scheme
+        ``"https:"`` for an empty value, or the unroutable ``https://local``.
     """
     from omnigent.conversation_browser import display_server_url, strip_conversation_path
+
+    if _is_local_server_request(server):
+        raise click.ClickException(
+            f"--server was given {server!r}, which selects a local server, where "
+            "a remote URL is required. Pass `--server local` to the command you "
+            "meant to run locally, or give this one a URL."
+        )
 
     # A URL copied from the browser while a conversation is open carries the
     # SPA's ``/c/<id>`` route. The SPA catch-all answers any GET under it with
