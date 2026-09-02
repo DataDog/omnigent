@@ -270,6 +270,7 @@ from omnigent.server.routes._sessions.helpers import (
     _relay_persist,
     _relay_persist_error_once,
     _remove_session_worktree_best_effort,
+    _repl_terminal_ui_labels,
     _require_declared_subagent,
     _require_external_status_forward,
     _resolve_harness,
@@ -7728,6 +7729,31 @@ async def _create_session_from_existing_agent(
         if updated_conv is None:
             raise OmnigentError(
                 f"Session {conv.id!r} disappeared while setting sub-agent labels",
+                code=ErrorCode.INTERNAL_ERROR,
+            )
+        conv = updated_conv
+    elif (
+        body.sub_agent_name is None
+        and body.host_id is not None
+        and (
+            _repl_labels := _repl_terminal_ui_labels(
+                agent=agent,
+                agent_cache=agent_cache,
+                harness_override=harness_override,
+            )
+        )
+    ):
+        # The runner stamps this label only once its REPL terminal exists,
+        # which leaves the web UI's "Starting up…" window empty; stamping at
+        # creation covers the whole launch. Host-bound only: an in-process
+        # session has no runner to host a terminal.
+        _merged = dict(body.labels) if body.labels else {}
+        _merged.update(_repl_labels)
+        await asyncio.to_thread(conversation_store.set_labels, conv.id, _merged)
+        updated_conv = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        if updated_conv is None:
+            raise OmnigentError(
+                f"Session {conv.id!r} disappeared while setting terminal-view labels",
                 code=ErrorCode.INTERNAL_ERROR,
             )
         conv = updated_conv
