@@ -48,6 +48,8 @@ if [[ "${SKIP_WEB_UI:-}" != "1" ]]; then
     fi
 else
     echo "==> SKIP_WEB_UI=1: skipping web build"
+    # The wheel build hook uses its own opt-out for API-only packages.
+    export OMNIGENT_SKIP_WEB_UI=true
 fi
 
 echo "==> Building omnigent-client wheel"
