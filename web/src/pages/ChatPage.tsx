@@ -1774,6 +1774,7 @@ function MainAgentSurface({
                     bubble={bubble}
                     canApprove={canApprove}
                     isLastAssistant={bubbleIndex === lastAssistantIndex}
+                    showsWorking={showsWorking && bubbleIndex === lastAssistantIndex}
                   />
                 ))}
                 {/* Pending elicitation cards, floated to the bottom of the
@@ -3124,10 +3125,12 @@ export const BubbleView = memo(
     bubble,
     canApprove = true,
     isLastAssistant = false,
+    showsWorking = false,
   }: {
     bubble: Bubble;
     canApprove?: boolean;
     isLastAssistant?: boolean;
+    showsWorking?: boolean;
   }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
@@ -3145,12 +3148,18 @@ export const BubbleView = memo(
       );
     }
     return (
-      <AssistantBubble bubble={bubble} canApprove={canApprove} isLastAssistant={isLastAssistant} />
+      <AssistantBubble
+        bubble={bubble}
+        canApprove={canApprove}
+        isLastAssistant={isLastAssistant}
+        showsWorking={showsWorking}
+      />
     );
   },
   (prev, next) =>
     prev.canApprove === next.canApprove &&
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
+    (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
     bubblesEqual(prev.bubble, next.bubble),
 );
 
@@ -3371,10 +3380,12 @@ function AssistantBubble({
   bubble,
   canApprove,
   isLastAssistant = false,
+  showsWorking = false,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
   canApprove: boolean;
   isLastAssistant?: boolean;
+  showsWorking?: boolean;
 }) {
   // The walker only emits an assistant bubble when at least one
   // assistant-side block exists, so `items` is non-empty here in the
@@ -3423,6 +3434,7 @@ function AssistantBubble({
             isLastAssistant={isLastAssistant}
             hasPendingElicitation={hasPendingElicitation}
             lastActivityAtS={bubble.lastActivityAtS}
+            showsWorking={showsWorking}
           />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (
