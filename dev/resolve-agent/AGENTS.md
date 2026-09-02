@@ -201,13 +201,36 @@ Determine the number now so Step 3 and the maintainer handoff can use it:
 
 - If `bug_url` is a **GitHub issue** in this repo, `closing_issue_number` is its
   number.
-- If `bug_url` is a **Linear ticket**, look for a mirrored GitHub issue: search
-  `gh issue list --repo <repo> --state open --search "<bug title / OMNI key>"`
-  (Linear bugs are often mirrored to a GitHub issue with the same title). If you
-  find one that is clearly the same bug, that is `closing_issue_number`.
-- If neither yields a GitHub issue, there is **no** `closing_issue_number` — the
-  PR body must **not** use a closing keyword against the Linear URL. Reference the
-  Linear ticket in prose instead (e.g. "Resolves OMNI-1234 (Linear)").
+- If `bug_url` is a **Linear ticket**, look for a mirrored GitHub issue.
+  **First, ask Linear for the structured link — don't guess by title.** Linear's
+  GitHub sync records the mirror as an **attachment** on the issue (the "Issue
+  synced with GitHub #NNNN" row you see in the UI), so query it directly with the
+  Linear token you already have (`DATABRICKS_LINEAR_API_KEY`):
+
+  ```
+  # GraphQL: the synced GitHub issue is an attachment whose url is the GH link
+  query { issue(id:"OMNI-1519") { attachments { nodes { url sourceType } } } }
+  ```
+
+  **Discriminate by the URL path, not `sourceType`.** Every GitHub attachment —
+  the synced issue *and* any linked PRs — has `sourceType: "github"`, so that field
+  doesn't tell them apart. The **mirror is the node whose `url` matches
+  `github.com/<owner>/<repo>/issues/<n>`**; nodes matching `/pull/<n>` are PRs
+  (often the fix PRs, including your own once you open one — ignore those here).
+  Take `<n>` from the `/issues/<n>` node as `closing_issue_number`. This is
+  authoritative — prefer it over any search.
+- **Only if the API shows no synced attachment**, fall back to a title search —
+  **not** the OMNI key. The mirror almost never contains the `OMNI-####` string
+  (it's the *same bug reworded*), so an OMNI-key search returns nothing and is not
+  evidence the mirror is absent. Search the ticket's distinctive phrase across
+  **all** states, trying more than one phrasing:
+  `gh issue list --repo <repo> --state all --search "<distinctive words from the title>"`.
+  If you find an issue that is clearly the same bug, that is `closing_issue_number`.
+- Only after **both** the attachment query and the title search come up empty is
+  there **no** `closing_issue_number`. Then the PR body must **not** use a closing
+  keyword against the Linear URL — reference the ticket in prose instead
+  (e.g. "Resolves OMNI-1234 (Linear)"). Do not claim "no mirror exists" off a
+  single OMNI-key search that found nothing.
 
 Record the chosen `closing_issue_number` (or its absence) — you reuse it in the
 PR body (Step 3.4) and the maintainer handoff (Step 4.5).
