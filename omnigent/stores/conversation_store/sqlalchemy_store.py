@@ -704,7 +704,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         :param storage_location: SQLAlchemy database URI for the Omnigent DB,
             e.g. ``"sqlite:///omnigent.db"`` or
-            ``"postgresql://user:pass@host/db"``.
+            ``"postgresql://<user>:<password>@host/db"``.
         :param conversation_storage_location: SQLAlchemy database URI for the Agent
             Platform DB (conversations, items, labels). Defaults to
             ``storage_location`` when ``None`` (single-DB mode).
