@@ -422,46 +422,6 @@ async def test_external_compaction_new_attempt_after_terminal_records_again(
         set_feature_usage_recorder_for_testing(None)
 
 
-@pytest.mark.parametrize(
-    ("raises", "expected_outcome"),
-    [(False, "success"), (True, "failed")],
-)
-@pytest.mark.skip(reason="v0.12.0 removed server-side in-process compaction; compact is runner-owned")
-async def test_server_compaction_records_its_terminal_outcome(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-    raises: bool,
-    expected_outcome: str,
-) -> None:
-    """Server-owned compaction emits only after its actual terminal result."""
-    from omnigent.runtime import set_runner_client
-
-    async def _compact(**_: Any) -> CompactionResult:
-        if raises:
-            raise RuntimeError("summary provider unavailable")
-        return CompactionResult(messages=[], summary_metadata=None, total_tokens=1234)
-
-    monkeypatch.setattr("omnigent.runtime.workflow.compact_conversation_now", _compact)
-    meter = RecordingMeter()
-    runner, _captured = _fake_runner_returning(204)
-    set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
-    set_runner_client(runner)
-    try:
-        agent = await create_test_agent(client)
-        sid = await _create_session(client, agent["id"])
-        response = await client.post(
-            f"/v1/sessions/{sid}/events", json={"type": "compact", "data": {}}
-        )
-        assert response.status_code == (202 if not raises else 500), response.text
-        assert meter.counter.records[0]["omnigent.feature.outcome"] == expected_outcome
-        assert meter.counter.records[0]["omnigent.feature.name"] == "context"
-        assert meter.counter.records[0]["omnigent.feature.operation"] == "compact"
-    finally:
-        set_feature_usage_recorder_for_testing(None)
-        await runner.aclose()
-        set_runner_client(None)
-
-
 async def test_external_compaction_status_rejects_unknown_status(
     client: httpx.AsyncClient,
 ) -> None:
