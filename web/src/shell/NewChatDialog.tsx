@@ -3351,10 +3351,9 @@ export function NewChatLandingScreen() {
               // 14px/20px. (Note: sub-16px inputs make mobile Safari
               // auto-zoom on focus — accepted tradeoff per the design.)
               // Heights are border-box (16px top + 4px bottom padding lives
-              // inside them): min 60px = one 20px line + a spare line of
-              // breathing room; max 200px = the spec's 180px of content.
+              // inside them): max 200px = the spec's 180px of content.
               // useAutoGrowTextarea drives the height between the two.
-              className="max-h-[200px] min-h-[60px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-4 pb-1 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
+              className="max-h-[200px] w-full resize-none overflow-y-auto bg-transparent px-4 pt-4 pb-1 font-['SF_Pro_Text',-apple-system,BlinkMacSystemFont,system-ui,sans-serif] text-ui leading-5 text-foreground outline-none placeholder:text-muted-foreground md:select-text"
             />
             {/* Gated on an empty draft so it reads as the placeholder.
                 pointer-events-none lets clicks fall through to focus the
@@ -3575,12 +3574,12 @@ export function NewChatLandingScreen() {
                           aria-label={creating ? "Starting session" : "Start session"}
                           aria-busy={creating}
                           data-testid="new-chat-landing-submit"
-                          className="size-8 rounded-full bg-foreground text-card transition-opacity hover:opacity-80 disabled:opacity-50"
+                          className="size-8 rounded-lg bg-foreground text-card transition-opacity hover:opacity-80 disabled:opacity-50"
                         >
                           {creating ? (
                             <Loader2Icon className="size-4 animate-spin" />
                           ) : (
-                            <ArrowUpIcon className="size-4" />
+                            <ArrowUpIcon className="size-4" viewBox="4 4 16 16" />
                           )}
                         </Button>
                       </span>
