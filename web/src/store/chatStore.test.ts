@@ -70,6 +70,7 @@ import {
   releaseConversation,
 } from "./chatStore";
 import { conversationRegistry } from "./conversationRegistry";
+import { markSessionCreated, resetInteractionTelemetryForTests } from "./interactionTelemetry";
 import {
   resetStreamSlotManager,
   setStreamSlotManagerForTest,
@@ -6118,6 +6119,31 @@ describe("chatStore — submitApproval", () => {
     }
   });
 
+  it("preserves Codex MCP persistence metadata in the resolve payload", async () => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      blocks: [elicitationBlock("elic_codex_mcp")],
+    });
+
+    await useChatStore
+      .getState()
+      .submitApproval("elic_codex_mcp", "accept", undefined, { persist: "session" });
+
+    const events = fetchMock.mock.calls.filter(([u]) =>
+      String(u).endsWith("/v1/sessions/conv_abc/elicitations/elic_codex_mcp/resolve"),
+    );
+    expect(events).toHaveLength(1);
+    const body = JSON.parse((events[0]![1] as RequestInit).body as string);
+    expect(body).toEqual({ action: "accept", _meta: { persist: "session" } });
+
+    const block = useChatStore.getState().blocks[0];
+    expect(block?.type).toBe("elicitation");
+    if (!block || block.type !== "elicitation") {
+      throw new Error("expected submitApproval to preserve the elicitation block");
+    }
+    expect(block.response).toEqual({ action: "accept", _meta: { persist: "session" } });
+  });
+
   it("preserves Codex execpolicy amendment content when submitting approval", async () => {
     useChatStore.setState({
       conversationId: "conv_abc",
@@ -7518,6 +7544,58 @@ describe("chatStore — pumpStreamEvents frame batching", () => {
     controller.abort();
   });
 
+  it("settles an approval resolved before its buffered card reaches the store", async () => {
+    useChatStore.setState({ conversationId: "conv_fast_elicitation", blocks: [] });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    const manual = manualScheduler();
+    void pumpStreamEvents(
+      "conv_fast_elicitation",
+      sink.stream,
+      controller,
+      setState,
+      getState,
+      manual.scheduler,
+    );
+
+    sink.push(sse("response.created", { id: "resp_fast", status: "in_progress", output: [] }));
+    sink.push(delta("A"));
+    await tick();
+
+    sink.push(
+      sse("response.elicitation_request", {
+        elicitation_id: "elic_fast",
+        params: {
+          mode: "form",
+          message: "Approve fast operation?",
+          phase: "codex_mcp_elicitation",
+          policy_name: "codex_native_mcp_elicitation",
+          content_preview: "",
+        },
+      }),
+    );
+    sink.push(
+      sse("response.elicitation_resolved", {
+        elicitation_id: "elic_fast",
+      }),
+    );
+    await tick();
+
+    expect(manual.pending()).toBe(true);
+    manual.fire();
+
+    const card = useChatStore
+      .getState()
+      .blocks.find(
+        (block): block is ElicitationBlock =>
+          block.type === "elicitation" && block.elicitationId === "elic_fast",
+      );
+    expect(card?.status).toBe("responded");
+    expect(card?.response).toEqual({ action: "auto_resolved" });
+
+    controller.abort();
+  });
+
   it("appends live command output to the running tool card", async () => {
     useChatStore.setState({ conversationId: "conv_tool_delta", blocks: [] });
     const sink = pushableStream();
@@ -8434,6 +8512,46 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("acks an optimistic user bubble when reconnect backfills its committed item", async () => {
+    const before = userMessage("ack_pre", "before the gap");
+    seedSession("conv_reconnect_ack", [before]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_reconnect_ack",
+      abortController: controller,
+      blocks: itemsToBlocks([before]),
+      pendingUserMessages: [
+        {
+          tempId: "pend_gap",
+          content: [{ type: "input_text", text: "only once" }],
+          posted: true,
+        },
+      ],
+    });
+
+    const loop = startStreamPump("conv_reconnect_ack", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    const committed = userMessage("ack_gap", "only once");
+    const reply = assistantMessage("ack_gap", "the reply");
+    seedSessionItems("conv_reconnect_ack", [before, committed, reply]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const state = useChatStore.getState();
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual([before.id, committed.id, reply.id]);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
   it("keeps a heartbeat-alive stream connected across many stall windows", async () => {
     seedSession("conv_hb", []);
     const sinks = routeStreamOpens();
@@ -8778,7 +8896,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
-  it("re-hydrate keeps pending elicitation and synthetic error blocks in the tail", async () => {
+  it("re-hydrate restores itemless blocks at their transcript time", async () => {
     const preGap = Array.from({ length: 30 }, (_, i) => gapUser("kpre", i));
     const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
     seedSession("conv_keep", preGap);
@@ -8806,7 +8924,15 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // both itemId-less with responseId "" (no streaming rid owns them).
     const approvalCard: ElicitationBlock = {
       type: "elicitation",
-      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
+      ctx: {
+        agent: null,
+        depth: 0,
+        turn: 0,
+        timestamp: 0,
+        responseId: "",
+        itemId: null,
+        clientCreatedAtS: 9_260,
+      },
       elicitationId: "elic_keep",
       message: "Allow the tool call?",
       phase: "tool_call",
@@ -8819,7 +8945,15 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     };
     const syntheticError: ErrorBlock = {
       type: "error",
-      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
+      ctx: {
+        agent: null,
+        depth: 0,
+        turn: 0,
+        timestamp: 0,
+        responseId: "",
+        itemId: null,
+        clientCreatedAtS: 9_580,
+      },
       message: "boom",
       source: "",
       code: "task_failed",
@@ -8838,6 +8972,9 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
     // 100 gap items: the backfill cap is outrun, forcing the re-hydrate.
     const gap = Array.from({ length: 100 }, (_, i) => gapUser("kgap", i));
+    gap.forEach((item, i) => {
+      item.created_at = 9_000 + i * 10;
+    });
     seedSessionItems("conv_keep", [...preGap, ...gap]);
     sinks[0]!.error();
     await drainAsync();
@@ -8846,11 +8983,11 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const state = useChatStore.getState();
     // The fresh fetch returns ITEMS only — dropping these blocks would lose
     // the pending ApprovalCard (and the failure reason) with no way back.
-    expect(state.blocks.map((b) => b.ctx.itemId ?? b.type)).toEqual([
-      ...gap.slice(-INITIAL_WINDOW_ITEMS).map((item) => item.id),
-      "elicitation",
-      "error",
-    ]);
+    // Appending them after the fresh window was the ordering bug: a 9:26 card
+    // rendered below messages from 10+ minutes later after reconnect.
+    const ordered = state.blocks.map((b) => b.ctx.itemId ?? b.type);
+    expect(ordered.indexOf("elicitation")).toBeLessThan(ordered.indexOf("msg_kgap_0080_user"));
+    expect(ordered.indexOf("error")).toBeLessThan(ordered.indexOf("msg_kgap_0080_user"));
     const card = state.blocks.find((b): b is ElicitationBlock => b.type === "elicitation");
     expect(card?.elicitationId).toBe("elic_keep");
     expect(card?.status).toBe("pending");
@@ -11508,6 +11645,9 @@ describe("chatStore — interaction_phase analytics", () => {
   let events: OmnigentAnalyticsEvent[];
 
   beforeEach(() => {
+    // The projector is a module singleton; clear its in-flight tracking so an
+    // un-terminated run from a prior case can't be swept (as "cancelled") here.
+    resetInteractionTelemetryForTests();
     events = [];
     setOmnigentHostConfig({ analytics: (e) => events.push(e) });
   });
@@ -11651,6 +11791,43 @@ describe("chatStore — interaction_phase analytics", () => {
       name: "shell",
     });
     expect(typeof tools[1]!.durationMs).toBe("number");
+    // No reliable success/failure signal on a tool result — the completion must
+    // carry no status rather than a fabricated one.
+    expect(tools[1]).not.toHaveProperty("status");
+
+    controller.abort();
+  });
+
+  it("completes create_session on the first live activity, not on response.created alone", async () => {
+    markSessionCreated("conv_ip_create", "computer");
+    useChatStore.setState({ conversationId: "conv_ip_create", blocks: [] });
+    const sink = pushableStream();
+    const controller = new AbortController();
+    void pumpStreamEvents("conv_ip_create", sink.stream, controller, setState, getState, immediate);
+
+    sink.push(sse("response.created", { id: "resp_ip_c", status: "in_progress", output: [] }));
+    await tick();
+    // The turn started but produced no assistant output yet — span stays open.
+    expect(phases("create_session_computer").some((e) => e.phase === "complete")).toBe(false);
+
+    sink.push(
+      sse("response.output_item.done", {
+        item: {
+          id: "fc_ip_c",
+          type: "function_call",
+          response_id: "resp_ip_c",
+          call_id: "call_ip_c",
+          name: "shell",
+          arguments: "{}",
+          status: "in_progress",
+        },
+      }),
+    );
+    await tick();
+
+    const create = phases("create_session_computer");
+    expect(create[0]).toMatchObject({ phase: "start" });
+    expect(create.at(-1)).toMatchObject({ phase: "complete", status: "success" });
 
     controller.abort();
   });
