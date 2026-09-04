@@ -2813,6 +2813,12 @@ async def launch_managed_host(
             status_code=502,
             detail=f"managed sandbox launch failed: {exc.message}",
         ) from exc
+    except RuntimeError as exc:
+        # External providers use RuntimeError for per-session failures.
+        raise HTTPException(
+            status_code=502,
+            detail=f"managed sandbox launch failed: {exc}",
+        ) from exc
     workspace = await _arm_and_start_host(
         launcher=launcher,
         config=entry,
@@ -2896,6 +2902,11 @@ async def relaunch_managed_host(
         raise HTTPException(
             status_code=502,
             detail=f"managed sandbox relaunch failed: {exc.message}",
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"managed sandbox relaunch failed: {exc}",
         ) from exc
     workspace = await _arm_and_start_host(
         launcher=launcher,
