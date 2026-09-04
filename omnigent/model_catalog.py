@@ -150,6 +150,8 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     # mirroring the claude-native -> claude-sdk rule above.
     "antigravity-native": "antigravity",
     "native-antigravity": "antigravity",
+    "agy-native": "antigravity",
+    "native-agy": "antigravity",
 }
 
 # cursor-agent always routes through its own stored login — there is no
@@ -511,7 +513,7 @@ def resolve_model_provider(spec: object, harness: str | None) -> ResolvedModelPr
     """
     try:
         return _resolve_model_provider_unsafe(spec, harness)
-    except Exception as exc:  # noqa: BLE001 — total-function boundary: config/spec failures → "none"
+    except Exception as exc:
         from omnigent.errors import OmnigentError
 
         _logger.debug("model provider resolution failed for harness %r", harness, exc_info=True)
@@ -878,7 +880,7 @@ def _worker_row(
     harness = spec_harness(spec)
     try:
         listing = list_models_for_worker(spec, harness, transport=transport)
-    except Exception as exc:  # noqa: BLE001 — per-worker isolation: fail informative, never crash the tool
+    except Exception as exc:
         _logger.debug("worker model enumeration failed", exc_info=True)
         listing = ModelListing(
             source=NONE_KIND,
@@ -1019,6 +1021,22 @@ def _listing_for_provider(
         _logger.debug(
             "model enumeration failed for %s", provider.detail or provider.kind, exc_info=True
         )
+        if provider.kind == SUBSCRIPTION_KIND:
+            # A failed cursor-agent listing probe says nothing about
+            # dispatchability: the CLI brings its own stored login, so the
+            # worker still runs. Degrade to the usable pre-launch shape the
+            # other subscription CLI logins report, not the dead-worker
+            # "none" that tells orchestrators the worker cannot run here.
+            return ModelListing(
+                source="static",
+                verified=False,
+                models=(),
+                note=(
+                    f"model listing failed for {provider.detail or provider.kind} "
+                    f"({_redacted_failure_reason(exc)}); the CLI launches with its "
+                    "own stored login, so dispatches to this worker can still run"
+                ),
+            )
         return ModelListing(
             source=NONE_KIND,
             verified=False,

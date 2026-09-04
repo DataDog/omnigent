@@ -211,6 +211,21 @@ _DEBBY_AGENT_NAME = "debby"
 _POLLY_AGENT_NAME = "polly"
 _UNMATCHED_ROUTE_TEMPLATE = "<unmatched>"
 _SESSION_PATH_RE = re.compile(r"/v1/sessions/([^/]+)")
+
+
+def _session_id_from_request(request: Request) -> str | None:
+    """Best-effort session id parsed from a ``/v1/sessions/<id>/…`` request path.
+
+    Threaded into exception-handler logs (``extra={"session_id": …}``) so a 500
+    on a session route carries its conversation id in the debug-logs table. Read
+    from the request explicitly per-invocation — no ambient/request-scoped
+    session ContextVar exists on the server, deliberately, to avoid
+    cross-request mis-attribution.
+    """
+    match = _SESSION_PATH_RE.search(request.url.path)
+    return match.group(1) if match else None
+
+
 # polly's and debby's multi-file bundles are packaged under
 # omnigent.resources.examples (see pyproject package-data), so they resolve
 # in both a repo checkout and an installed wheel. The presence check in each
@@ -498,8 +513,10 @@ def _ensure_builtin_agent(
       update the row in place (keeps the ``agent_id`` stable so task
       history isn't cascade-deleted; bumps ``version`` so the runner's
       version-keyed spec cache re-fetches), then warm-swap the cache.
-    - **Row exists, content hash matches** → evict the local cache so
-      the next load re-fetches from ``bundle_location``, then return.
+    - **Row exists, content hash matches** → re-``put`` the bundle if
+      the artifact store is missing the blob (self-heals a lost
+      bundle), evict the local cache so the next load re-fetches from
+      ``bundle_location``, then return.
 
     The evict on the matching-hash path matters because
     :meth:`AgentCache.load` is keyed by ``agent_id`` and trusts its
@@ -530,7 +547,13 @@ def _ensure_builtin_agent(
         # Sha-segment compare: legacy rows keep an ``ag_``-prefixed left
         # segment (physical artifact key); only the sha encodes content.
         if existing.bundle_location.rsplit("/", 1)[-1] == bundle_hash:
-            # Row current; evict so a lagging replica's stale cache reloads the bundle.
+            # Blob can vanish while the row survives (pruned artifacts, DB
+            # restored without the store); re-put so boot self-heals. Keyed on
+            # the row's location, not ``new_loc``: this path never rewrites the
+            # row, so a legacy ``ag_``-prefixed value is what the loader reads.
+            if not artifact_store.exists(existing.bundle_location):
+                artifact_store.put(existing.bundle_location, bundle_bytes)
+            # Evict so a lagging replica's stale cache reloads the bundle.
             agent_cache.evict(existing.id)
             return
         artifact_store.put(new_loc, bundle_bytes)
@@ -776,16 +799,23 @@ def _ensure_default_acp_agents(
     agent_cache: Any,
 ) -> None:
     """
-    Seed a picker agent for each ACP harness set up on THIS server's host.
+    Seed a picker agent per builtin ACP CLI row and per configured ``acp:`` agent.
 
     Native harnesses seed a fixed ``<harness>-ui`` agent each
-    (:func:`_ensure_default_native_agents`). ACP agents are host config rather
-    than a fixed catalog, so seed one agent per user-configured ``acp:<slug>``
-    agent (``harness_is_configured("acp:...")`` treats "in config" as set up) and
-    per builtin ACP CLI harness whose binary is on PATH (its readiness gate). On a
-    host with no ACP setup — the common remote-server case, where the server holds
-    no ``acp:`` config — this seeds nothing. When both sources name the same
-    harness, the configured agent wins (see :func:`shadowed_builtin_acp_rows`).
+    (:func:`_ensure_default_native_agents`) unconditionally; the picker hides a row
+    the selected host cannot launch, reading that host's ``configured_harnesses``
+    readiness map. Builtin ACP CLI harnesses follow the same model, because the
+    vendor CLI runs on the *executing* host (the attached runner) rather than on the
+    server: gating the row on the server's own PATH left Devin and Grok missing from
+    the picker on every remote server, even when the runner had them installed.
+
+    User-configured ``acp:<slug>`` agents stay config-gated. Their launch command is
+    resolved from the *host's* own ``acp:`` block at spawn time, so a row naming a
+    slug the executing host does not define could never launch; surfacing those on a
+    remote server first needs the host to advertise its configured slugs.
+
+    When both sources name the same harness, the configured agent wins (see
+    :func:`shadowed_builtin_acp_rows`).
 
     Purely additive: it only adds picker rows and never touches native seeding.
     A malformed ``acp:`` block is logged and skipped, never fatal to startup
@@ -799,7 +829,6 @@ def _ensure_default_acp_agents(
     :param artifact_store: Store for agent bundles.
     :param agent_cache: Cache for loaded agent specs.
     """
-    from omnigent._platform import resolve_cli_binary
     from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 
     # (1) User-configured acp:<slug> agents — "set up" == present in config.
@@ -808,7 +837,7 @@ def _ensure_default_acp_agents(
 
         configured = list(acp_agents())
         shadowed: frozenset[str] = shadowed_builtin_acp_rows(configured)
-    except Exception:  # noqa: BLE001 — a malformed acp: block must never break startup
+    except Exception:
         _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
         configured = []
         shadowed = frozenset()
@@ -825,12 +854,12 @@ def _ensure_default_acp_agents(
             bundle_bytes=_build_acp_bundle(harness=f"acp:{agent.slug}", name=agent.slug),
         )
 
-    # (2) Builtin ACP CLI harnesses (e.g. grok) — "set up" == binary on PATH. Keyed
-    # by the catalog id (already a valid slug), not the display label. A row a
-    # configured agent already claims is skipped: both seed the same
-    # ``builtin_agent_id``, so the row would overwrite the user's chosen command.
-    for key, row in ACP_CLI_HARNESSES.items():
-        if key in shadowed or resolve_cli_binary(row.binary) is None:
+    # (2) Builtin ACP CLI harnesses — one row each, seeded like the natives because
+    # the vendor CLI runs on the executing host, not here. Keyed by the catalog id
+    # (already a valid slug), not the display label. A row a configured agent already
+    # claims is skipped: both seed the same ``builtin_agent_id``.
+    for key in ACP_CLI_HARNESSES:
+        if key in shadowed:
             continue
         _ensure_builtin_agent(
             agent_store,
@@ -1086,6 +1115,9 @@ def create_app(
         falsy — ``0``/``false``/``no``/``off``), failing open to enabled
         when unset. Reported by ``GET /v1/info`` as
         ``public_sharing_enabled``.
+    :param server_config: Resolved non-secret server settings. The optional
+        ``session_title_instructions`` string augments the isolated automatic
+        title prompt. ``None`` loads the standard server config.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
@@ -1093,9 +1125,15 @@ def create_app(
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
 
-    from omnigent.server.server_config import load_branding_snapshot
+    from omnigent.server.server_config import (
+        load_branding_snapshot,
+        load_server_config,
+        session_title_instructions,
+    )
 
-    branding_snapshot = load_branding_snapshot(server_config)
+    resolved_server_config = load_server_config() if server_config is None else server_config
+    branding_snapshot = load_branding_snapshot(resolved_server_config)
+    title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
 
     # First-boot admin bootstrap for the accounts auth provider.
@@ -1154,6 +1192,7 @@ def create_app(
     background_title_coordinator = BackgroundSessionTitleCoordinator(
         conversation_store,
         RunnerBackgroundTitleGenerator(runner_router),
+        additional_instructions=title_instructions,
     )
     # Shared between the host tunnel (which records ``host.runner_exited``
     # reports from daemons) and the runner status endpoint (which surfaces
@@ -1611,15 +1650,24 @@ def create_app(
         """
         Convert application errors to structured JSON responses.
 
-        :param request: The incoming request (unused — FastAPI signature requirement).
+        :param request: The incoming request; its path supplies the session id
+            threaded into the error log.
         :param exc: The application error.
         :returns: A JSON response with the error code and message.
         """
         if exc.http_status >= 500:
-            _logger.error("Internal error: %s", exc.message, exc_info=exc)
+            _logger.error(
+                "Internal error: %s",
+                exc.message,
+                exc_info=exc,
+                extra={"session_id": _session_id_from_request(request)},
+            )
         elif exc.http_status == 400 and request.url.path.endswith("/policies/evaluate"):
             _logger.warning(
-                "Policy evaluate rejected 400 on %s: %s", request.url.path, exc.message
+                "Policy evaluate rejected 400 on %s: %s",
+                request.url.path,
+                exc.message,
+                extra={"session_id": _session_id_from_request(request)},
             )
         return JSONResponse(
             status_code=exc.http_status,
@@ -1628,7 +1676,7 @@ def create_app(
 
     @app.exception_handler(StatementError)
     async def _handle_statement_error(
-        request: Request,  # noqa: ARG001 — FastAPI exception-handler signature requires (request, exc); we only use exc
+        request: Request,
         exc: StatementError,
     ) -> JSONResponse:
         """
@@ -1641,7 +1689,8 @@ def create_app(
         not-found instead of an internal error. Any other statement error (real
         DB failure) falls through to the standard 500 shape.
 
-        :param request: The incoming request (unused — FastAPI signature requirement).
+        :param request: The incoming request; its path supplies the session id
+            threaded into the error log.
         :param exc: The SQLAlchemy statement error.
         :returns: 404 for a malformed id, otherwise a 500 JSON response.
         """
@@ -1654,7 +1703,12 @@ def create_app(
                 status_code=404,
                 content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found."}},
             )
-        _logger.error("Database error: %s", exc, exc_info=exc)
+        _logger.error(
+            "Database error: %s",
+            exc,
+            exc_info=exc,
+            extra={"session_id": _session_id_from_request(request)},
+        )
         return JSONResponse(
             status_code=500,
             content={
@@ -1667,7 +1721,7 @@ def create_app(
 
     @app.exception_handler(Exception)
     async def _handle_unhandled_exception(
-        request: Request,  # noqa: ARG001 — FastAPI exception-handler signature requires (request, exc); we only use exc
+        request: Request,
         exc: Exception,
     ) -> JSONResponse:
         """
@@ -1675,11 +1729,17 @@ def create_app(
         OperationalError). Returns the standard JSON error schema
         so clients always get a consistent response format.
 
-        :param request: The incoming request (unused — FastAPI signature requirement).
+        :param request: The incoming request; its path supplies the session id
+            threaded into the error log.
         :param exc: The unhandled exception.
         :returns: A 500 JSON response with ``internal_error`` code.
         """
-        _logger.error("Unhandled exception: %s", exc, exc_info=exc)
+        _logger.error(
+            "Unhandled exception: %s",
+            exc,
+            exc_info=exc,
+            extra={"session_id": _session_id_from_request(request)},
+        )
         return JSONResponse(
             status_code=500,
             content={
@@ -2305,6 +2365,9 @@ def create_app(
             agent_store,
             auth_provider=auth_provider,
             permission_store=permission_store,
+            project_store=project_store,
+            host_registry=host_registry,
+            host_store=host_store,
         ),
         prefix="/v1",
         tags=["imports"],
@@ -2844,6 +2907,7 @@ def create_app(
                     account_store,
                     admin_list,
                     permission_store,
+                    device_grant_store,
                 ),
                 prefix="/auth",
                 tags=["auth"],

@@ -172,7 +172,9 @@ _INIT_CONTAINER_NAME: str = "workspace-prep"
 # Pod-start wait budget, consumed inside start_host BEFORE the
 # shared _wait_for_host_online poll, so a Pod that can't schedule / pull its
 # image / clone its repo fails fast with a clear reason instead of as a generic
-# online timeout. Kept tight; a cold image pull is the usual slow case.
+# online timeout. Kept tight; a cold image pull is the usual slow case —
+# deployments whose host image regularly takes longer to pull can raise the
+# budget via ``sandbox.kubernetes.pod_ready_timeout_s``.
 _POD_READY_TIMEOUT_S: int = 90
 _POD_READY_POLL_S: float = 2.0
 
@@ -526,6 +528,7 @@ def build_job_manifest(
     agent_name: str | None = None,
     backoff_limit: int = _JOB_BACKOFF_LIMIT,
     active_deadline_seconds: int = _JOB_ACTIVE_DEADLINE_S,
+    runtime_class: str | None = None,
 ) -> dict[str, object]:
     """
     Build the sandbox Job manifest as a plain dict.
@@ -585,6 +588,10 @@ def build_job_manifest(
       container start. Refresh is eventually consistent (kubelet sync, up to
       ~1 min), so the in-sandbox consumer must re-read the file each use — a
       value cached at start defeats the rotation.
+    - An operator *runtime_class* becomes ``spec.runtimeClassName``, scheduling
+      the Pod onto a sandboxed container runtime the cluster provides via a
+      ``RuntimeClass`` object (e.g. Kata Containers micro-VMs, gVisor). Unset
+      keeps the cluster's default runtime — today's behaviour exactly.
 
     :param job_name: DNS-label-safe Job name (see :func:`_new_pod_name`).
     :param namespace: Namespace the Job is created in.
@@ -628,6 +635,8 @@ def build_job_manifest(
     :param backoff_limit: Maximum container restart attempts before the Job
         is marked Failed.
     :param active_deadline_seconds: Hard lifetime cap for the Job.
+    :param runtime_class: ``RuntimeClass`` name set as ``spec.runtimeClassName``,
+        or ``None`` to keep the cluster's default container runtime.
     :returns: The Job manifest dict.
     """
     pod_resources = _resolve_pod_resources(resources)
@@ -786,6 +795,10 @@ def build_job_manifest(
                 _AGENT_LABEL,
                 job_name,
             )
+    if runtime_class is not None:
+        # Opt-in only: an absent key (not an explicit None/null) keeps the
+        # manifest byte-compatible with pre-runtime_class deployments.
+        pod_spec["runtimeClassName"] = runtime_class
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -1021,6 +1034,8 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         resources: dict[str, object] | None = None,
         pvc_mounts: Sequence[Mapping[str, object]] | None = None,
         secret_mounts: Sequence[Mapping[str, object]] | None = None,
+        pod_ready_timeout_s: int | None = None,
+        runtime_class: str | None = None,
     ) -> None:
         """
         Store provider config for lazy use by :meth:`start_host` / :meth:`terminate`.
@@ -1042,6 +1057,8 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         self._resources = resources
         self._pvc_mounts = list(pvc_mounts) if pvc_mounts else None
         self._secret_mounts = list(secret_mounts) if secret_mounts else None
+        self._pod_ready_timeout_s = pod_ready_timeout_s
+        self._runtime_class = runtime_class
         self._core: k8s_client.CoreV1Api | None = None
         self._batch: k8s_client.BatchV1Api | None = None
         self._api_client: k8s_client.ApiClient | None = None
@@ -1333,6 +1350,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     pvc_mounts=self._pvc_mounts,
                     secret_mounts=self._secret_mounts,
                     agent_name=agent_name,
+                    runtime_class=self._runtime_class,
                 )
                 # Secret before Job so the Pod's secretKeyRef resolves
                 # immediately.
@@ -1373,7 +1391,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         Filters out Pods with a ``deletionTimestamp`` (being torn down) and
         prefers a running Pod over a pending one when a replacement exists.
         Re-raises 401/403 so RBAC misconfigurations surface immediately
-        instead of masquerading as a 90s timeout.
+        instead of masquerading as a readiness timeout.
 
         :param namespace: Namespace the Job lives in.
         :param job_name: The Job whose child Pod to find.
@@ -1430,7 +1448,12 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         from urllib3.exceptions import HTTPError
 
         core = self._load_core()
-        deadline = time.monotonic() + _POD_READY_TIMEOUT_S
+        timeout_s = (
+            self._pod_ready_timeout_s
+            if self._pod_ready_timeout_s is not None
+            else _POD_READY_TIMEOUT_S
+        )
+        deadline = time.monotonic() + timeout_s
         last_reason: str | None = None
         pod_name: str | None = None
         while True:
@@ -1441,7 +1464,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     if time.monotonic() >= deadline:
                         raise click.ClickException(
                             f"Kubernetes sandbox job '{job_name}' did not create a "
-                            f"child pod within {_POD_READY_TIMEOUT_S}s."
+                            f"child pod within {timeout_s}s."
                         )
                     time.sleep(_POD_READY_POLL_S)
                     continue
@@ -1458,7 +1481,17 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 if getattr(exc, "status", None) == 404:
                     # Under OnFailure the Job may replace the Pod (eviction,
                     # preemption, node drain) — re-discover instead of failing.
+                    replaced_pod_name = pod_name
                     pod_name = None
+                    if time.monotonic() >= deadline:
+                        raise click.ClickException(
+                            self._pod_failure_message(
+                                namespace,
+                                replaced_pod_name,
+                                "disappeared and could not be rediscovered before the "
+                                f"{timeout_s}s deadline",
+                            )
+                        ) from exc
                     time.sleep(_POD_READY_POLL_S)
                     continue
                 last_reason = _api_reason(exc)
@@ -1467,8 +1500,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                         self._pod_failure_message(
                             namespace,
                             pod_name,
-                            "could not be read before the "
-                            f"{_POD_READY_TIMEOUT_S}s deadline ({last_reason})",
+                            f"could not be read before the {timeout_s}s deadline ({last_reason})",
                         )
                     ) from exc
                 time.sleep(_POD_READY_POLL_S)
@@ -1480,8 +1512,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                         self._pod_failure_message(
                             namespace,
                             pod_name,
-                            "could not be read before the "
-                            f"{_POD_READY_TIMEOUT_S}s deadline ({last_reason})",
+                            f"could not be read before the {timeout_s}s deadline ({last_reason})",
                         )
                     ) from exc
                 time.sleep(_POD_READY_POLL_S)
@@ -1515,7 +1546,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     self._pod_failure_message(
                         namespace,
                         pod_name,
-                        f"did not start within {_POD_READY_TIMEOUT_S}s "
+                        f"did not start within {timeout_s}s "
                         f"(last phase '{phase or 'unknown'}'{detail})",
                     )
                 )

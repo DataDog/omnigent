@@ -273,6 +273,18 @@ def test_build_job_manifest_node_selector_can_override_arch() -> None:
     assert selector["disktype"] == "ssd"
 
 
+def test_build_job_manifest_omits_runtime_class_by_default() -> None:
+    """No runtime_class → no runtimeClassName key: the cluster default runtime."""
+    manifest = build_job_manifest(**_MANIFEST_KW)
+    assert "runtimeClassName" not in _pod_spec(manifest)
+
+
+def test_build_job_manifest_runtime_class_sets_runtime_class_name() -> None:
+    """An operator runtime_class lands verbatim as spec.runtimeClassName."""
+    manifest = build_job_manifest(**{**_MANIFEST_KW, "runtime_class": "kata"})
+    assert _pod_spec(manifest)["runtimeClassName"] == "kata"
+
+
 def test_build_job_manifest_pvc_mounts_land_on_host_container_only() -> None:
     """Each pvc_mounts entry becomes a persistentVolumeClaim volume mounted on host only."""
     manifest = build_job_manifest(
@@ -918,6 +930,47 @@ def test_launch_host_times_out_with_reason(
             host_name="managed-5",
             server_url="http://srv.example.com",
         )
+
+
+@pytest.mark.parametrize(
+    ("wait_state", "expected"),
+    [
+        ("undiscovered", "did not create a child pod within 1s"),
+        ("replaced", "could not be rediscovered before the 1s deadline"),
+        ("read-error", "could not be read before the 1s deadline"),
+        ("pending", "did not start within 1s"),
+    ],
+)
+def test_configured_pod_ready_timeout_bounds_entire_job_wait(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    monkeypatch: pytest.MonkeyPatch,
+    wait_state: str,
+    expected: str,
+) -> None:
+    """The configured budget bounds discovery, replacement, reads, and Pending."""
+    core, _batch = fake_clients
+    pod = _pod(phase="Pending")
+    if wait_state != "undiscovered":
+        core.pod_list_items = [pod]
+    if wait_state == "replaced":
+        core.read_default = _FakeApiException(status=404, reason="Not Found")
+    elif wait_state == "read-error":
+        core.read_default = _FakeApiException(status=500, reason="Internal Server Error")
+    else:
+        core.read_default = pod
+
+    ticks = iter((0.0, 1.0))
+    monkeypatch.setattr(k8s.time, "monotonic", lambda: next(ticks))
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        secret_name="omnigent-creds",
+        env=(),
+        pod_ready_timeout_s=1,
+    )
+
+    with pytest.raises(click.ClickException, match=expected):
+        launcher._wait_for_pod_running("omnigent-sandboxes", "omnigent-job-timeout")
 
 
 def test_terminate_deletes_job_and_secret(

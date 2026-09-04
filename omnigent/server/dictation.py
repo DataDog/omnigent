@@ -380,7 +380,7 @@ class SherpaDictationEngine:
                         )
                     )
                 )
-            except Exception:  # noqa: BLE001 - punctuation is best-effort
+            except Exception:
                 _logger.warning(
                     "dictation punctuation model failed to load from %s; "
                     "emitting raw recognizer output",

@@ -44,6 +44,7 @@ from typing import Any, Protocol, TypeAlias, cast
 
 from omnigent import model_catalog
 from omnigent._platform import resolve_cli_binary, stable_user_id
+from omnigent.cli_invocation import cli_invocation
 from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
@@ -970,7 +971,7 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
             servable = families.get(tier)
             if servable:
                 return servable
-    except Exception:  # noqa: BLE001 — the bundled catalog is the last resort
+    except Exception:
         logger.warning(
             "claude-sdk: live Databricks model discovery failed for profile %r; "
             "falling back to the bundled catalog",
@@ -1507,7 +1508,7 @@ class ClaudeSDKExecutor(Executor):
                 f"Model {model!r} is a Databricks-hosted model but gateway "
                 "routing is disabled (gateway=False). "
                 "Set executor.profile in the agent spec, or configure a "
-                "Databricks provider with `omnigent setup`, to route through "
+                f"Databricks provider with `{cli_invocation()} setup`, to route through "
                 "the Databricks Anthropic gateway."
             )
         self._cwd = cwd
@@ -3026,7 +3027,7 @@ class ClaudeSDKExecutor(Executor):
                         "summary instead of the harness's real compacted state.",
                         claude_session_id,
                     )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 # WARNING, not DEBUG: a swallowed read here silently degrades
                 # EVERY later resume of this conversation. The runner persists a
                 # compaction item with no ``compacted_messages``, so resume

@@ -679,6 +679,44 @@ def test_session_create_git_requires_host_id() -> None:
         )
 
 
+def test_session_title_request_limits() -> None:
+    """User titles allow 200 characters, while default generated titles allow 100."""
+    from omnigent.entities import (
+        DEFAULT_GENERATED_TITLE_MAX_CHARS,
+        USER_SESSION_TITLE_MAX_CHARS,
+    )
+    from omnigent.server.schemas import (
+        AutomaticSessionRenameRequest,
+        SessionCreateMetadata,
+        SessionCreateRequest,
+        SessionForkRequest,
+        UpdateSessionRequest,
+    )
+
+    user_title = "x" * USER_SESSION_TITLE_MAX_CHARS
+    user_requests = (
+        SessionCreateRequest(agent_id="ag_x", title=user_title),
+        SessionCreateMetadata(title=user_title),
+        SessionForkRequest(title=user_title),
+        UpdateSessionRequest(title=user_title),
+    )
+    assert all(request.title == user_title for request in user_requests)
+
+    for request_type, kwargs in (
+        (SessionCreateRequest, {"agent_id": "ag_x"}),
+        (SessionCreateMetadata, {}),
+        (SessionForkRequest, {}),
+        (UpdateSessionRequest, {}),
+    ):
+        with pytest.raises(ValidationError, match="at most 200 characters"):
+            request_type(title=user_title + "x", **kwargs)
+
+    generated_title = "x" * DEFAULT_GENERATED_TITLE_MAX_CHARS
+    assert AutomaticSessionRenameRequest(title=generated_title).title == generated_title
+    with pytest.raises(ValidationError, match="at most 100 characters"):
+        AutomaticSessionRenameRequest(title=generated_title + "x")
+
+
 def test_session_create_git_with_host_id_ok() -> None:
     """``git`` with ``host_id`` validates cleanly."""
     from omnigent.server.schemas import SessionCreateRequest, SessionGitOptions
@@ -722,6 +760,43 @@ def test_session_git_existing_worktree_rejects_base_branch() -> None:
         ValidationError, match="base_branch cannot be set when existing_worktree is true"
     ):
         SessionGitOptions(branch_name="feature/x", base_branch="main", existing_worktree=True)
+
+
+def test_session_git_existing_branch_rejects_base_branch() -> None:
+    """Recreate mode + ``base_branch`` is contradictory and rejected (422).
+
+    An existing branch has no base to fork; sending both would be an
+    ambiguous request.
+    """
+    from omnigent.server.schemas import SessionGitOptions
+
+    with pytest.raises(
+        ValidationError, match="base_branch cannot be set when existing_branch is true"
+    ):
+        SessionGitOptions(branch_name="fix-1", base_branch="main", existing_branch=True)
+
+
+def test_session_git_existing_branch_rejects_existing_worktree() -> None:
+    """``existing_branch`` and ``existing_worktree`` are distinct modes (422).
+
+    Bind mode reuses a directory that exists; recreate mode makes a new
+    directory for a branch that exists — both at once is contradictory.
+    """
+    from omnigent.server.schemas import SessionGitOptions
+
+    with pytest.raises(
+        ValidationError, match="existing_branch and existing_worktree cannot both be true"
+    ):
+        SessionGitOptions(branch_name="fix-1", existing_branch=True, existing_worktree=True)
+
+
+def test_session_git_existing_branch_ok() -> None:
+    """Recreate mode alone validates cleanly and round-trips the flag."""
+    from omnigent.server.schemas import SessionGitOptions
+
+    git = SessionGitOptions(branch_name="fix-1", existing_branch=True)
+    assert git.existing_branch is True
+    assert git.base_branch is None
 
 
 def test_session_git_existing_worktree_with_host_id_ok() -> None:
@@ -837,6 +912,92 @@ def test_session_create_external_rejects_repo_url_workspace() -> None:
             host_id="host_abc",
             workspace="https://github.com/org/repo",
         )
+
+
+def test_session_metadata_host_type_defaults_external() -> None:
+    """
+    Multipart ``SessionCreateMetadata.host_type`` defaults to
+    ``"external"`` — every existing bundle-upload client that omits the
+    field keeps its current external-host behaviour (backcompat).
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    assert SessionCreateMetadata().host_type == "external"
+
+
+def test_session_metadata_managed_rejects_host_id() -> None:
+    """
+    Multipart ``host_type="managed"`` + a caller-supplied ``host_id`` is
+    a contradiction (the server provisions the host) — mirrors the JSON
+    path's contract.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError, match="host_id must not be set"):
+        SessionCreateMetadata(host_type="managed", host_id="host_abc")
+
+
+def test_session_metadata_managed_rejects_path_workspace() -> None:
+    """
+    Multipart ``host_type="managed"`` + a PATH workspace 422s — a
+    managed workspace is a repository URL cloned into the sandbox.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError, match="takes a git repository URL"):
+        SessionCreateMetadata(host_type="managed", workspace="/tmp/w")
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    [
+        "https://github.com/org/repo",
+        "https://github.com/org/repo.git#release-1.2",
+        "git@github.com:org/repo.git",
+    ],
+)
+def test_session_metadata_managed_accepts_repo_url_workspace(workspace: str) -> None:
+    """
+    Multipart ``host_type="managed"`` accepts the ``<repo>[#<branch>]``
+    workspace forms verbatim for the launch path to clone.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    meta = SessionCreateMetadata(host_type="managed", workspace=workspace)
+    assert meta.workspace == workspace
+
+
+def test_session_metadata_managed_accepts_sandbox_provider() -> None:
+    """
+    ``sandbox_provider`` is accepted with ``host_type="managed"`` (chooses
+    which configured provider the server provisions).
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    meta = SessionCreateMetadata(host_type="managed", sandbox_provider="lakebox")
+    assert meta.sandbox_provider == "lakebox"
+
+
+def test_session_metadata_external_rejects_sandbox_provider() -> None:
+    """
+    ``sandbox_provider`` without ``host_type="managed"`` 422s — external
+    hosts are not server-provisioned.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError, match="sandbox_provider only applies"):
+        SessionCreateMetadata(sandbox_provider="lakebox")
+
+
+def test_session_metadata_external_rejects_repo_url_workspace() -> None:
+    """
+    A repository-URL workspace on an external multipart create 422s —
+    there, ``workspace`` is an absolute path on the host.
+    """
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError, match="requires host_type 'managed'"):
+        SessionCreateMetadata(workspace="https://github.com/org/repo")
 
 
 @pytest.mark.parametrize("status", ["idle", "running", "waiting", "failed"])

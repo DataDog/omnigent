@@ -11,8 +11,8 @@ import os
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.background_titles.service import (
     BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS,
-    BACKGROUND_TITLE_INSTRUCTIONS,
     BackgroundTitleContext,
+    build_background_title_instructions,
 )
 
 _logger = logging.getLogger("omnigent.runner.background_titles.claude_native")
@@ -29,7 +29,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
 
     try:
         claude_config = resolve_native_claude_config(spec=None)
-    except Exception:  # noqa: BLE001 - match the native terminal's auth fallback
+    except Exception:
         _logger.warning(
             "background Claude Code title could not resolve provider config; "
             "falling back to Claude Code's native login",
@@ -45,7 +45,7 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     args = [
         "--safe-mode",
         "--system-prompt",
-        BACKGROUND_TITLE_INSTRUCTIONS,
+        build_background_title_instructions(context.additional_instructions),
         "-p",
         f"<user_message>\n{context.prompt}\n</user_message>",
         "--tools",

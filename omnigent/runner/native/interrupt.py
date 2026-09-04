@@ -518,7 +518,7 @@ class NativeInterruptRunner:
                     },
                     timeout=10.0,
                 )
-            except Exception:  # noqa: BLE001 - the bridge flip already took effect locally.
+            except Exception:
                 self._logger.warning(
                     "Failed to publish cancelled MCP startup for %s", conv_id, exc_info=True
                 )
@@ -535,7 +535,7 @@ class NativeInterruptRunner:
                         "turn/interrupt",
                         {"threadId": state.thread_id, "turnId": ""},
                     )
-                except Exception:  # noqa: BLE001 - the local cancel already took effect.
+                except Exception:
                     self._logger.warning(
                         "Codex-native MCP startup interrupt failed for session=%s thread=%s",
                         conv_id,
@@ -550,7 +550,7 @@ class NativeInterruptRunner:
                         "turnId": state.active_turn_id,
                     },
                 )
-        except Exception as exc:  # noqa: BLE001 - surface active-turn interrupt failures.
+        except Exception as exc:
             self._logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",
                 conv_id,

@@ -145,7 +145,7 @@ def _pick_with_tty_input(
     import threading
     import time
 
-    result_queue: _queue.Queue[str | None | BaseException] = _queue.Queue()
+    result_queue: _queue.Queue[str | BaseException | None] = _queue.Queue()
     master_fd, slave_fd = _os.openpty()
     slave_check_fd = _os.dup(slave_fd)
     out = io.StringIO()

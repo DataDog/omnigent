@@ -44,6 +44,7 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import type { Conversation } from "@/hooks/useConversations";
 import { setOmnigentHostConfig } from "@/lib/host";
+import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import {
   controlHost,
   getHostIdentity,
@@ -115,6 +116,9 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   // Empty projects list → no ?project= name resolves to an id, so the project
   // prefill stays inert and the generic host/workspace defaults under test apply.
   useProjects: () => ({ data: [] }),
+  // The landing reads useConversations for hasNoSessions; stub it so it doesn't
+  // fire an authenticatedFetch that skews create-POST call assertions.
+  useConversations: () => ({ data: undefined }),
 }));
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.
@@ -676,9 +680,10 @@ function host(status: "online" | "offline", i = 1): Host {
   return { host_id: `host_${i}`, name: `machine-${i}`, owner: "me", status };
 }
 
-function mockHosts(hosts: Host[]) {
+function mockHosts(hosts: Host[], queryState: Partial<ReturnType<typeof useHosts>> = {}) {
   useHostsMock.mockReturnValue({
     data: hosts,
+    ...queryState,
   } as unknown as ReturnType<typeof useHosts>);
 }
 
@@ -793,6 +798,12 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}, route = "/") {
         </TooltipProvider>
       </CapabilitiesProvider>
     </QueryClientProvider>,
+  );
+}
+
+function tooltipKeys(tooltip: HTMLElement): string[] {
+  return Array.from(tooltip.querySelectorAll('[data-slot="kbd"]')).map(
+    (key) => key.textContent ?? "",
   );
 }
 
@@ -966,6 +977,46 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-input")).toBeTruthy();
   });
 
+  it("does not replace a missing remembered host with the first cached host", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_2");
+    // The shared query cache can render an older host list first while a
+    // background refresh is already fetching the continuously-live VM.
+    mockHosts([host("online", 1)], { isFetching: true });
+    renderLanding();
+
+    const chip = screen.getByTestId("new-chat-landing-host-chip");
+    await waitFor(() => expect(chip).toHaveTextContent("Choose host"));
+
+    // Model the fresh /v1/hosts response. Because the stale Mac never filled
+    // selectedHostId, the remembered VM can still win when it appears.
+    mockHosts([host("online", 1), host("online", 2)], { isFetching: false });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "rerender" },
+    });
+
+    await waitFor(() => expect(chip).toHaveTextContent("machine-2"));
+  });
+
+  it("does not silently replace an unavailable remembered host", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_2");
+    mockHosts([host("online", 1)], { isFetching: false });
+    renderLanding();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveTextContent("Choose host"),
+    );
+  });
+
+  it("does not replace an unavailable remembered host with the managed sandbox", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_2");
+    mockHosts([host("online", 1)], { isFetching: false });
+    renderLanding({ managed_sandboxes_enabled: true });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveTextContent("Choose host"),
+    );
+  });
+
   it("uses a home-specific focus shadow without a resting shadow or focus border", () => {
     renderLanding();
 
@@ -982,6 +1033,7 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     expect(screen.getByTestId("new-chat-landing-input")).toHaveClass(
+      "block",
       "min-h-[60px]",
       "max-h-[200px]",
       "overflow-y-auto",
@@ -990,6 +1042,9 @@ describe("NewChatLandingScreen", () => {
       "pb-2",
       "[scrollbar-width:none]",
       "[&::-webkit-scrollbar]:hidden",
+    );
+    expect(screen.getByTestId("new-chat-landing-input").parentElement).toHaveClass(
+      "overflow-hidden",
     );
     expect(screen.getByTestId("new-chat-landing-actions")).toHaveClass("px-2", "pb-2");
     const footer = screen.getByTestId("new-chat-landing-footer");
@@ -1083,6 +1138,35 @@ describe("NewChatLandingScreen", () => {
     // (e.g. dropped the workspace gate), the blank cases above would have
     // enabled too.
     expect(submit.disabled).toBe(false);
+  });
+
+  it("keeps the disabled reason tooltip on the new-chat submit button", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    const submit = screen.getByTestId("new-chat-landing-submit");
+
+    fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Enter a message to get started");
+  });
+
+  it("shows the default shortcut in the new-chat submit tooltip", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "inspect the repo" },
+    });
+    const submit = screen.getByTestId("new-chat-landing-submit");
+
+    fireEvent.pointerMove(submit.parentElement!, { pointerType: "mouse" });
+    const tooltip = await screen.findByRole("tooltip");
+
+    expect(within(tooltip).getByText("Start session")).toBeInTheDocument();
+    expect(tooltipKeys(tooltip)).toEqual(["↵"]);
   });
 
   it("keeps submit disabled when no agents exist", () => {
@@ -1548,6 +1632,46 @@ describe("NewChatLandingScreen", () => {
     expect(body.model_override).toBe("databricks-gpt-5-6");
     expect(body.reasoning_effort).toBeUndefined();
     expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex-native", true);
+  });
+
+  it("keeps legacy Mod+Enter as a default-mode send alias", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), {
+      key: "Enter",
+      ctrlKey: true,
+    });
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    expect(analytics).toHaveBeenCalledWith({
+      type: "click",
+      componentId: "new_chat.start_session",
+      componentKind: "button",
+    });
+  });
+
+  it("uses Mod+Enter to start a session when the alternate composer behavior is enabled", async () => {
+    localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.change(input, { target: { value: "run the build" } });
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Enter", metaKey: true });
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
   });
 
   it("arms codex full bypass as a plain Approval option, with no warning banner", () => {
@@ -2477,6 +2601,46 @@ describe("NewChatLandingScreen", () => {
     expect("git" in body).toBe(false);
   });
 
+  it("clears a drafted sandbox repository when remounting under another project", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    // Project Alpha's composer: stage a sandbox repo + branch, then navigate
+    // away (unmount parks them in the module-scoped landing draft).
+    renderLanding({ managed_sandboxes_enabled: true }, "/?project=Alpha");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "https://github.com/org/alpha-repo" },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-branch-input"), {
+      target: { value: "alpha-main" },
+    });
+    // Unmount WITHOUT resetting the draft — the leak under test rides in it.
+    cleanup();
+
+    // Project Beta's composer: the repo inputs compose the managed create's
+    // workspace string, so Alpha's repo/branch must not survive — otherwise
+    // Beta's sandbox silently clones another project's repository.
+    renderLanding({ managed_sandboxes_enabled: true }, "/?project=Beta");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("Repository"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "start fresh" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.host_type).toBe("managed");
+    // Blank repo inputs compose to an omitted workspace (empty server-created
+    // one) — not Alpha's repo#branch.
+    expect(body.workspace).toBeUndefined();
+  });
+
   it("carries the picked provider in the managed create when several are offered", async () => {
     // A multi-provider server renders one row per provider. Picking the
     // second (non-default) row must ride into the POST as sandbox_provider,
@@ -2669,6 +2833,24 @@ describe("NewChatLandingScreen skills menu", () => {
     );
   });
 
+  it("does not accept a highlighted skill when Enter is pressed on mobile", () => {
+    const restoreViewport = forceMobileViewport();
+    try {
+      mockAgents([skilledAgent()]);
+      renderLanding();
+      typeMessage("/rev");
+
+      fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
+
+      expect((screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement).value).toBe(
+        "/rev",
+      );
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    } finally {
+      restoreViewport();
+    }
+  });
+
   it("Tab completes a match found only mid-name (exercises slashMenuMatches, not just the render filter)", () => {
     mockAgents([skilledAgent()]);
     renderLanding();
@@ -2748,6 +2930,17 @@ describe("NewChatLandingScreen skill pills", () => {
     // fed from GET /v1/agents bundled skills.
     expect(screen.getByTestId("skill-pill-debate").textContent).toBe("/debate");
     expect(screen.getByTestId("skill-pill-compare").textContent).toBe("/compare");
+  });
+
+  it("lets the textarea and skill prompt inherit the app font family", () => {
+    mockAgents([debbyAgent()]);
+    renderLanding();
+
+    const localFontFamily = /(^|\s)font-(sans|serif|mono|\[)/;
+    for (const element of [input(), screen.getByText("Describe a task, or try a skill")]) {
+      expect(element.className).not.toMatch(localFontFamily);
+      expect(element.style.fontFamily).toBe("");
+    }
   });
 
   it("hides pills for agents outside the allowlist even when they carry skills", () => {
@@ -2985,6 +3178,27 @@ describe("NewChatLandingScreen @-file-mention", () => {
     // Host absolute paths are shown as workspace-relative rows (folders first).
     expect(screen.getByTitle("Open omnigent")).toBeInTheDocument();
     expect(screen.getByTitle("Attach README.md")).toBeInTheDocument();
+  });
+
+  it("does not accept the highlighted mention when Enter is pressed on mobile", async () => {
+    const restoreViewport = forceMobileViewport();
+    try {
+      renderLanding();
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+      );
+      fireEvent.change(input(), {
+        target: { value: "@README", selectionStart: 7 },
+      });
+
+      fireEvent.keyDown(input(), { key: "Enter" });
+
+      expect((input() as HTMLTextAreaElement).value).toBe("@README");
+      expect(screen.queryByText("@README.md")).not.toBeInTheDocument();
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    } finally {
+      restoreViewport();
+    }
   });
 
   it("does NOT open the menu for a non-native (SDK) agent", () => {
@@ -3386,13 +3600,6 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
   }
 
-  const SMART_ROUTING_ROW = "new-chat-landing-harness-smart-routing";
-
-  function selectSmartRoutingHarness(): void {
-    openPicker();
-    fireEvent.click(screen.getByTestId(SMART_ROUTING_ROW));
-  }
-
   it("drills into the Custom agents page in place and returns via Back", () => {
     // A custom (non-builtin) agent lands in the Custom agents group.
     mockAgents([
@@ -3448,450 +3655,15 @@ describe("NewChatLandingScreen agent picker (mobile drill-in)", () => {
         skills: [],
       },
     ]);
-    authenticatedFetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: "conv_degraded" }),
-    } as unknown as Response);
-    renderLanding({ smart_routing_enabled: true });
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
-    );
-    const { body } = await submitAndReadBody();
-    expect(body.agent_id).toBe("a1");
-    expect(body.harness_override).toBeUndefined();
-    expect(body.smart_routing_message).toBeUndefined();
-    expect(body.cost_control_mode_override).toBeUndefined();
-  });
-
-  it("forgets the pick once an explicit harness row replaces it", () => {
-    renderLanding({ smart_routing_enabled: true });
-    selectSmartRoutingHarness();
-    // The wrapper the sentinel is stored under: clicking its row is a pick of
-    // the wrapper, so the sentinel must not come back on the next visit.
-    selectAgent("a2");
-    selectAgent("a1");
-    expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({});
-
-    remountLanding({ smart_routing_enabled: true });
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain(
-      "Claude Code",
-    );
-  });
-
-  it("leaves a bundle agent's remembered brain harness alone", () => {
-    // The sentinel shares the store with per-agent brain-harness picks, so
-    // writing/degrading it must not disturb another agent's entry.
-    localStorage.setItem(LAST_HARNESS_KEY, JSON.stringify({ ag_polly: "openai-agents" }));
-    renderLanding({ smart_routing_enabled: true });
-    selectSmartRoutingHarness();
-    expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({
-      ag_polly: "openai-agents",
-      a1: "auto-native",
-    });
-  });
-});
-
-describe("claude-code default permission mode (payload anchor for Auto)", () => {
-  beforeEach(setupLandingMocks);
-  afterEach(() => {
-    cleanup();
-    localStorage.clear();
-  });
-
-  it("omits terminal_launch_args when the permission mode is left on Default", async () => {
-    // The behavior Auto matches: Default = inherit the machine's own config, so
-    // the create call carries no permission flag at all.
-    authenticatedFetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: "conv_claude" }),
-    } as unknown as Response);
     renderLanding();
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
-    );
-    selectAgent("a1");
-    const { raw } = await submitAndReadBody();
-    expect(JSON.parse(raw).agent_id).toBe("a1");
-    expect(JSON.parse(raw).terminal_launch_args).toBeUndefined();
-    expect(raw).not.toContain("permission");
+    openPicker();
+    expect(screen.queryByTestId("new-chat-landing-agent-a_cursor")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    expect(screen.getByTestId("new-chat-landing-agent-a_cursor")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("new-chat-landing-page-back"));
+    expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeTruthy();
   });
 });
-// ---------------------------------------------------------------------------
-// Smart Routing on a BUNDLE agent (Debby / Polly). Their brain runs on
-// claude-sdk — not one of the two routable native harnesses — so the per-turn
-// "Smart Routing" Model option never applies to them. Their whole routing story
-// is the gear modal's Agent Harness row, where picking Smart Routing hands the
-// harness AND the model to the router. These cover the config menu that pick
-// leaves behind: what stays selectable, what goes away, and what the create
-// call carries.
-// ---------------------------------------------------------------------------
-
-describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
-  // The real shape of examples/debby and examples/polly: a bundle agent whose
-  // brain harness (claude-sdk) is overridable per session.
-  const BUNDLE_AGENTS: AvailableAgent[] = [
-    {
-      id: "ag_debby",
-      name: "debby",
-      display_name: "Debby",
-      description: null,
-      harness: "claude-sdk",
-      skills: [],
-    },
-    {
-      id: "ag_polly",
-      name: "polly",
-      display_name: "Polly",
-      description: null,
-      harness: "claude-sdk",
-      skills: [],
-    },
-  ];
-
-  beforeEach(() => {
-    setupLandingMocks();
-    mockAgents(BUNDLE_AGENTS);
-  });
-  afterEach(() => {
-    cleanup();
-    localStorage.clear();
-  });
-
-  /** Open <agentId>'s gear modal and turn Smart Routing on (draft, not saved). */
-  function draftSmartRouting(agentId: string): void {
-    openAgentConfig(agentId);
-    pickSelectOption("new-chat-landing-config-harness", "Smart Routing");
-  }
-
-  const BOTH_BUNDLES = [
-    ["Debby", "ag_debby"],
-    ["Polly", "ag_polly"],
-  ] as const;
-
-  it.each(BOTH_BUNDLES)(
-    "%s's config menu is the brain-harness row alone, led by Smart Routing",
-    (name, agentId) => {
-      renderLanding({ smart_routing_enabled: true });
-      openAgentConfig(agentId);
-      expect(screen.getByTestId("new-chat-landing-config-modal").textContent).toContain(
-        `Configure ${name}`,
-      );
-      // claude-sdk isn't a routable native harness, so none of the per-harness
-      // knobs (which is where the per-turn routing Model option lives) apply.
-      expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
-      expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
-      expect(screen.queryByTestId("new-chat-landing-config-approval")).toBeNull();
-      const harness = screen.getByTestId("new-chat-landing-config-harness");
-      expect(harness.textContent).toContain("Claude SDK");
-      openSelect("new-chat-landing-config-harness");
-      const auto = screen.getByTestId("new-chat-landing-harness-auto");
-      expect(auto.textContent).toContain("Smart Routing");
-      expect(auto.textContent).toContain("Harness and model picked per task by smart routing");
-      // Leads the list — it's the recommended pick, not a footnote.
-      const sdk = screen.getByTestId("new-chat-landing-harness-claude-sdk");
-      expect(auto.compareDocumentPosition(sdk) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    },
-  );
-
-  it("offers no Smart Routing row when the server flag is off", () => {
-    renderLanding({ smart_routing_enabled: false });
-    openAgentConfig("ag_debby");
-    openSelect("new-chat-landing-config-harness");
-    expect(screen.queryByTestId("new-chat-landing-harness-auto")).toBeNull();
-    // The ordinary brains are still listed, so this isn't vacuous.
-    expect(screen.getByTestId("new-chat-landing-harness-codex")).toBeTruthy();
-  });
-
-  // The fully-auto brain routes across the same two arms as the top-level
-  // row, so it needs both on the workspace AI gateway — a codex pane running
-  // off a personal subscription cannot run a routed pick.
-  it.each([
-    ["codex isn't gateway-backed", { "claude-native": true, "codex-native": false }],
-    ["claude isn't gateway-backed", { "claude-native": false, "codex-native": true }],
-  ])("offers no Smart Routing brain when %s", (_case, gateway) => {
-    mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
-    renderLanding({ smart_routing_enabled: true });
-    openAgentConfig("ag_debby");
-    openSelect("new-chat-landing-config-harness");
-    expect(screen.queryByTestId("new-chat-landing-harness-auto")).toBeNull();
-    // The explicit brains stay — only the routed option needs the gateway.
-    expect(screen.getByTestId("new-chat-landing-harness-codex")).toBeTruthy();
-    expect(screen.getByTestId("new-chat-landing-harness-claude-sdk")).toBeTruthy();
-  });
-
-  it("keeps the Smart Routing brain when both arms are gateway-backed", () => {
-    mockHosts([
-      {
-        ...host("online"),
-        gateway_inference: { "claude-native": true, "codex-native": true },
-      } as Host,
-    ]);
-    renderLanding({ smart_routing_enabled: true });
-    openAgentConfig("ag_debby");
-    openSelect("new-chat-landing-config-harness");
-    expect(screen.getByTestId("new-chat-landing-harness-auto")).toBeTruthy();
-  });
-
-  // The split-credential states — one family on the workspace gateway, the other
-  // on a personal subscription. The external router can't reach the off-gateway
-  // arm, but the built-in judge can, so the fully-auto brain survives both.
-  it.each([
-    ["codex is off the gateway", { "claude-native": true, "codex-native": false }],
-    ["claude is off the gateway", { "claude-native": false, "codex-native": true }],
-  ])(
-    "keeps the Smart Routing brain when %s and the built-in judge can answer",
-    (_case, gateway) => {
-      mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
-      renderLanding({
-        smart_routing_enabled: true,
-        smart_routing_sources: { external: true, oss: true },
-      });
-      openAgentConfig("ag_debby");
-      openSelect("new-chat-landing-config-harness");
-      expect(screen.getByTestId("new-chat-landing-harness-auto")).toBeTruthy();
-    },
-  );
-
-  // The judge-only deployment. A bundle agent's routed brain runs the judge's
-  // harness pick, so this surface must NOT follow the native-pane row off a
-  // server with no external router — whatever the gateway map says.
-  it.each([
-    ["both arms gateway-backed", { "claude-native": true, "codex-native": true }],
-    ["neither arm gateway-backed", { "claude-native": false, "codex-native": false }],
-    ["the host reports nothing", undefined],
-  ])("keeps the Smart Routing brain on a judge-only server with %s", (_case, gateway) => {
-    mockHosts([{ ...host("online"), gateway_inference: gateway } as Host]);
-    renderLanding({
-      smart_routing_enabled: true,
-      smart_routing_sources: { external: false, oss: true },
-    });
-    openAgentConfig("ag_debby");
-    openSelect("new-chat-landing-config-harness");
-    expect(screen.getByTestId("new-chat-landing-harness-auto")).toBeTruthy();
-  });
-
-  // Sources decide, not the gateway map: with neither router configured the
-  // fully-auto brain goes even on a fully gateway-backed host.
-  it("offers no Smart Routing brain when the server reports neither source", () => {
-    mockHosts([
-      {
-        ...host("online"),
-        gateway_inference: { "claude-native": true, "codex-native": true },
-      } as Host,
-    ]);
-    renderLanding({
-      smart_routing_enabled: true,
-      smart_routing_sources: { external: false, oss: false },
-    });
-    openAgentConfig("ag_debby");
-    openSelect("new-chat-landing-config-harness");
-    expect(screen.queryByTestId("new-chat-landing-harness-auto")).toBeNull();
-    expect(screen.getByTestId("new-chat-landing-harness-claude-sdk")).toBeTruthy();
-  });
-
-  it.each(BOTH_BUNDLES)(
-    "keeps %s's harness row on the Smart Routing pick, and the modal still names the agent",
-    (name, agentId) => {
-      renderLanding({ smart_routing_enabled: true });
-      draftSmartRouting(agentId);
-      // The control that made the pick must not vanish under the cursor: it
-      // reads the choice back and is the way to switch away.
-      expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
-        "Smart Routing",
-      );
-      // The pick is a knob on this agent, so the modal is still hers — only the
-      // top-level Smart Routing harness retitles.
-      expect(screen.getByTestId("new-chat-landing-config-modal").textContent).toContain(
-        `Configure ${name}`,
-      );
-      // Select it and that's it: nothing else is decidable, and a claude-sdk
-      // create carries no permission field, so no locked row is offered.
-      expect(screen.queryByTestId("new-chat-landing-config-permission")).toBeNull();
-      expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
-      expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
-    },
-  );
-
-  it("switches back to an explicit brain harness without leaving the modal", () => {
-    renderLanding({ smart_routing_enabled: true });
-    draftSmartRouting("ag_debby");
-    pickSelectOption("new-chat-landing-config-harness", "Codex");
-    expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain("Codex");
-    // A brain pick never adds rows, so the row set is the same either way.
-    expect(screen.queryByTestId("new-chat-landing-config-permission")).toBeNull();
-    expect(screen.getByTestId("new-chat-landing-config-modal").textContent).toContain(
-      "Configure Debby",
-    );
-  });
-
-  it("discards a Smart Routing draft on Cancel", () => {
-    renderLanding({ smart_routing_enabled: true });
-    draftSmartRouting("ag_debby");
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Debby");
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
-      "Claude SDK",
-    );
-  });
-
-  it("reopens on the committed Smart Routing pick after Save", () => {
-    renderLanding({ smart_routing_enabled: true });
-    draftSmartRouting("ag_debby");
-    saveConfig();
-    // The chip still names Debby — the routed brain is her knob, not a different
-    // selection. (This is the leak the whole scope fix is about.)
-    const chip = screen.getByTestId("new-chat-landing-agent-select");
-    expect(chip.textContent).toContain("Debby");
-    expect(chip.textContent).not.toContain("Smart Routing");
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    expect(screen.getByTestId("new-chat-landing-config-modal").textContent).toContain(
-      "Configure Debby",
-    );
-    expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
-      "Smart Routing",
-    );
-    expect(screen.queryByTestId("new-chat-landing-config-permission")).toBeNull();
-  });
-
-  it("mirrors the modal's rows in the gear tooltip", async () => {
-    renderLanding({ smart_routing_enabled: true });
-    draftSmartRouting("ag_debby");
-    saveConfig();
-    fireEvent.focus(screen.getByTestId("new-chat-landing-config-gear"));
-    await waitFor(() =>
-      expect(screen.getAllByTestId("new-chat-landing-config-gear-tooltip").length).toBeGreaterThan(
-        0,
-      ),
-    );
-    const tooltip = screen.getAllByTestId("new-chat-landing-config-gear-tooltip")[0];
-    expect(tooltip.textContent).toContain("Agent Harness: Smart Routing");
-    // The modal has no Permissions row for a routed brain, so the tooltip that
-    // mirrors it must not invent one.
-    expect(tooltip.textContent).not.toContain("Permissions");
-  });
-
-  it.each(BOTH_BUNDLES)(
-    "sends harness_override 'auto' with routing on and no pinned model for %s",
-    async (_name, agentId) => {
-      authenticatedFetchMock.mockResolvedValue({
-        ok: true,
-        json: async () => ({ id: "conv_bundle_auto" }),
-      } as unknown as Response);
-      renderLanding({ smart_routing_enabled: true });
-      await waitFor(() =>
-        expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
-      );
-      draftSmartRouting(agentId);
-      saveConfig();
-      const { raw, body } = await submitAndReadBody();
-      expect(body.agent_id).toBe(agentId);
-      expect(body.harness_override).toBe("auto");
-      expect(body.cost_control_mode_override).toBe("on");
-      // A pinned model would silently disable routing for the whole session.
-      expect(body.model_override).toBeUndefined();
-      expect(body.reasoning_effort).toBeUndefined();
-      expect(body.labels).toBeUndefined();
-      expect(body.terminal_launch_args).toBeUndefined();
-      // A bundle agent arms at create and routes on the first message event —
-      // its harness isn't decided yet, so there is nothing to route here.
-      expect(body.smart_routing_message).toBeUndefined();
-      expect(raw).not.toContain("permission");
-    },
-  );
-
-  it("sends the explicit brain with no routing once the pick moves off Smart Routing", async () => {
-    authenticatedFetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: "conv_bundle_codex" }),
-    } as unknown as Response);
-    renderLanding({ smart_routing_enabled: true });
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
-    );
-    draftSmartRouting("ag_debby");
-    pickSelectOption("new-chat-landing-config-harness", "Codex");
-    saveConfig();
-    const { body } = await submitAndReadBody();
-    expect(body.harness_override).toBe("codex");
-    expect(body.cost_control_mode_override).toBeUndefined();
-  });
-
-  // Sticky Smart Routing: the pick is a brain-harness pick like any other, so it
-  // lands in the per-agent last-harness store and a return visit starts on it.
-  it("remembers the pick per bundle agent", () => {
-    renderLanding({ smart_routing_enabled: true });
-    draftSmartRouting("ag_debby");
-    saveConfig();
-    // Polly's own brain is untouched — the store is keyed per agent.
-    expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({
-      ag_debby: "auto",
-    });
-    selectAgent("ag_polly");
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Polly");
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
-      "Claude SDK",
-    );
-  });
-
-  it("preselects Smart Routing on a later visit", () => {
-    localStorage.setItem(LAST_AGENT_KEY, "ag_debby");
-    localStorage.setItem(LAST_HARNESS_KEY, JSON.stringify({ ag_debby: "auto" }));
-    renderLanding({ smart_routing_enabled: true });
-    // Restored as Debby-with-a-routed-brain, so the chip is hers; the gear row is
-    // where the restored pick shows.
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Debby");
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
-      "Smart Routing",
-    );
-  });
-
-  it("drops a remembered Smart Routing pick when the server has routing off", async () => {
-    // No "auto" row exists to select, so a restored pick would leave the harness
-    // select blank with no way back — while the create still asked the server to
-    // route. Degrade to the agent's own brain instead, silently: the user did
-    // nothing this visit to lose it.
-    localStorage.setItem(LAST_AGENT_KEY, "ag_debby");
-    localStorage.setItem(LAST_HARNESS_KEY, JSON.stringify({ ag_debby: "auto" }));
-    authenticatedFetchMock.mockResolvedValue({
-      ok: true,
-      json: async () => ({ id: "conv_bundle_degraded" }),
-    } as unknown as Response);
-    renderLanding({ smart_routing_enabled: false });
-    await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
-    );
-    // The chip names Debby whether or not the pick degraded (a routed brain never
-    // renames the selection), so it can't carry this test — the gear row and the
-    // create payload below are what pin the degrade.
-    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("Debby");
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-gear"));
-    expect(screen.getByTestId("new-chat-landing-config-harness").textContent).toContain(
-      "Claude SDK",
-    );
-    fireEvent.click(screen.getByTestId("new-chat-landing-config-cancel"));
-
-    const { body } = await submitAndReadBody();
-    expect(body.agent_id).toBe("ag_debby");
-    expect(body.harness_override).toBeUndefined();
-    expect(body.cost_control_mode_override).toBeUndefined();
-    // The flag may come back on, so the stored pick stays put.
-    expect(JSON.parse(localStorage.getItem(LAST_HARNESS_KEY) ?? "{}")).toEqual({
-      ag_debby: "auto",
-    });
-  });
-});
-
-// ---------------------------------------------------------------------------
-// The two Smart Routing flavors share a label and must not share a scope. A
-// bundle agent's routed brain (the "auto" sentinel, stored per agent) is a knob
-// on that agent; the top-level Smart Routing harness ("auto-native", riding a
-// placeholder wrapper) replaces the selection outright. These need one fixture
-// carrying both — the two native wrappers AND a bundle agent — so a pick of one
-// flavor can be shown not to move the other.
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Smart Routing (per-harness Model option) + the fully-auto Auto harness
