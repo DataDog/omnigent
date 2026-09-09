@@ -2,9 +2,50 @@
 
 from __future__ import annotations
 
+import io
+import json
+import subprocess
+
 import pytest
 
 from omnigent.onboarding import harness_readiness as hr
+
+
+class _FakeStdin:
+    def __init__(self) -> None:
+        self.text = ""
+
+    def write(self, value: str) -> int:
+        self.text += value
+        return len(value)
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+class _FakePiProcess:
+    def __init__(self, stdout: str) -> None:
+        self.stdin = _FakeStdin()
+        self.stdout = io.StringIO(stdout)
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        del timeout
+        if self.returncode is None:
+            self.returncode = 0
+        return self.returncode
 
 
 @pytest.mark.parametrize("harness", ["pi", "pi-native", "native-pi"])
@@ -65,36 +106,124 @@ def test_configured_harness_map_exposes_pi_native(monkeypatch: pytest.MonkeyPatc
     gained the credential axis) rather than a bare ``False``.
     """
     monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: False)
+    monkeypatch.setattr(hr, "resolve_cli_binary", lambda *_args, **_kwargs: None)
     cmap = hr.configured_harness_map()
     assert cmap.get("pi-native") == "binary-missing"
     assert cmap.get("pi") == "binary-missing"
 
 
-def test_configured_harness_map_pi_installed_no_provider_needs_auth(
+def test_configured_harness_map_pi_installed_without_any_models_needs_auth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pi installed but with no configured provider reports ``"needs-auth"``.
+    """Pi installed but with no usable model source reports ``"needs-auth"``.
 
-    Pi has no CLI login — its only credential is an omnigent-managed provider —
-    so an installed binary with no provider is the yellow "installed but not
-    configured" state the setup dialog offers an "Add key" action for.
+    Neither an Omnigent-managed provider nor a model backed by Pi's own
+    credentials is available, so the picker should retain its yellow warning.
     """
     monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: True)
     monkeypatch.setattr(hr, "_family_provider_configured", lambda _h: False)
+    monkeypatch.setattr(hr, "_pi_cli_has_available_models", lambda: False)
     cmap = hr.configured_harness_map()
     assert cmap.get("pi") == "needs-auth"
     assert cmap.get("pi-native") == "needs-auth"
 
 
-def test_configured_harness_map_pi_installed_with_provider_ready(
+def test_configured_harness_map_pi_installed_with_native_models_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pi installed AND a provider configured reports ready (``True``)."""
+    """Pi's own available models make it ready without an Omnigent provider."""
     monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: True)
-    monkeypatch.setattr(hr, "_family_provider_configured", lambda _h: True)
+    monkeypatch.setattr(hr, "_family_provider_configured", lambda _h: False)
+    monkeypatch.setattr(hr, "_pi_cli_has_available_models", lambda: True)
     cmap = hr.configured_harness_map()
     assert cmap.get("pi") is True
     assert cmap.get("pi-native") is True
+
+
+def test_configured_harness_map_pi_installed_with_provider_skips_rpc_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An Omnigent provider remains the fast path and avoids spawning Pi."""
+    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: True)
+    monkeypatch.setattr(hr, "_family_provider_configured", lambda _h: True)
+
+    def _must_not_probe() -> bool:
+        raise AssertionError("Pi RPC probed despite a configured provider")
+
+    monkeypatch.setattr(hr, "_pi_cli_has_available_models", _must_not_probe)
+    cmap = hr.configured_harness_map()
+    assert cmap.get("pi") is True
+    assert cmap.get("pi-native") is True
+
+
+def test_configured_harness_map_probes_pi_readiness_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All Pi aliases share one potentially expensive RPC probe per refresh."""
+    calls = 0
+    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: True)
+    monkeypatch.setattr(hr, "_family_provider_configured", lambda _h: False)
+
+    def _models_available() -> bool:
+        nonlocal calls
+        calls += 1
+        return True
+
+    monkeypatch.setattr(hr, "_pi_cli_has_available_models", _models_available)
+    cmap = hr.configured_harness_map()
+    assert calls == 1
+    assert cmap["pi"] is True
+    assert cmap["pi-native"] is True
+    assert cmap["native-pi"] is True
+
+
+@pytest.mark.parametrize(("models", "expected"), [([], False), ([{"id": "model-1"}], True)])
+def test_pi_rpc_probe_uses_available_models_json(
+    monkeypatch: pytest.MonkeyPatch,
+    models: list[dict[str, str]],
+    expected: bool,
+) -> None:
+    """Pi's structured RPC response is parsed without scraping table output."""
+    response = json.dumps(
+        {
+            "id": "omnigent-readiness",
+            "type": "response",
+            "command": "get_available_models",
+            "success": True,
+            "data": {"models": models},
+        }
+    )
+    process = _FakePiProcess("not-json\n" + response + "\n")
+    spawned: list[tuple[list[str], dict[str, object]]] = []
+    monkeypatch.setattr(hr, "resolve_cli_binary", lambda *_args, **_kwargs: "/bin/pi")
+
+    def _popen(argv: list[str], **kwargs: object) -> _FakePiProcess:
+        spawned.append((argv, kwargs))
+        return process
+
+    monkeypatch.setattr(hr.subprocess, "Popen", _popen)
+
+    assert hr._pi_cli_has_available_models(timeout=1.0) is expected
+    assert spawned[0][0] == [
+        "/bin/pi",
+        "--mode",
+        "rpc",
+        "--no-extensions",
+        "--offline",
+        "--no-session",
+    ]
+    assert spawned[0][1] == {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.DEVNULL,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    assert json.loads(process.stdin.text) == {
+        "id": "omnigent-readiness",
+        "type": "get_available_models",
+    }
 
 
 def test_configured_harness_map_exposes_kiro_native(monkeypatch: pytest.MonkeyPatch) -> None:
