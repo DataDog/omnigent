@@ -24,9 +24,13 @@ that would actually work.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import subprocess
+import threading
 from collections.abc import Callable
+from contextlib import suppress
 
 import omnigent.onboarding.gemini_auth as _gemini_auth
 import omnigent.onboarding.kimi_auth as _kimi_auth
@@ -306,9 +310,9 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
 # the same two-step signal Codex already provides. This is picker-facing ONLY;
 # the launch gate (:func:`harness_is_configured`) stays binary-only, so a
 # not-signed-in harness is never blocked from launching (its login surfaces at
-# run time). Pi is handled separately in :func:`_harness_availability` (it has
-# no CLI login, so it can't use the login-command path here — its credential is
-# an omnigent-managed provider). Qwen is absent on purpose: its key lives in the
+# run time). Pi is handled separately in :func:`_harness_availability`: it has
+# no login-status command, but its RPC API reports models backed by Pi's own
+# credentials. Qwen is absent on purpose: its key lives in the
 # harness's own env / interactive ``/auth``, which the daemon can't reduce to a
 # provider check, so it reports binary presence only.
 # Cursor native is included here too: ``cursor-agent`` has its own login command,
@@ -385,6 +389,102 @@ def _claude_managed_gateway_configured() -> bool:
     except Exception:
         _logger.debug("readiness: claude managed-settings check failed", exc_info=True)
         return False
+
+
+_PI_READINESS_REQUEST_ID = "omnigent-readiness"
+
+
+def _pi_cli_has_available_models(timeout: float = READINESS_CLI_PROBE_TIMEOUT_S) -> bool:
+    """Return whether Pi's own credential store exposes at least one model.
+
+    Pi has no login-status command. Its RPC ``get_available_models`` command is
+    the authoritative local signal used by the TUI itself: configured auth
+    yields model objects and an unconfigured install yields an empty list. The
+    RPC process must keep stdin open until it responds, so this cannot use
+    :func:`subprocess.run`; closing stdin immediately can race Pi's shutdown.
+
+    Any spawn, protocol, or timeout failure returns ``False``. Readiness is a
+    picker hint, and the launch gate remains binary-only.
+    """
+    spec = harness_install_spec(PI_KEY)
+    if spec is None:
+        return False
+    binary = resolve_cli_binary(spec.binary, env_var="OMNIGENT_PI_PATH")
+    if binary is None:
+        return False
+    try:
+        process = subprocess.Popen(
+            [
+                binary,
+                "--mode",
+                "rpc",
+                "--no-extensions",
+                "--offline",
+                "--no-session",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError:
+        return False
+
+    def _kill_on_timeout() -> None:
+        with suppress(OSError):
+            process.kill()
+
+    timer = threading.Timer(timeout, _kill_on_timeout)
+    timer.daemon = True
+    timer.start()
+    try:
+        if process.stdin is None or process.stdout is None:
+            return False
+        request = {
+            "id": _PI_READINESS_REQUEST_ID,
+            "type": "get_available_models",
+        }
+        process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
+        process.stdin.flush()
+        for line in process.stdout:
+            try:
+                response = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(response, dict) or response.get("id") != _PI_READINESS_REQUEST_ID:
+                continue
+            data = response.get("data")
+            models = data.get("models") if isinstance(data, dict) else None
+            return (
+                response.get("type") == "response"
+                and response.get("command") == "get_available_models"
+                and response.get("success") is True
+                and isinstance(models, list)
+                and bool(models)
+            )
+        return False
+    except (OSError, ValueError):
+        return False
+    finally:
+        timer.cancel()
+        with suppress(OSError):
+            if process.stdin is not None:
+                process.stdin.close()
+        if process.poll() is None:
+            with suppress(OSError):
+                process.terminate()
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            with suppress(OSError):
+                process.kill()
+            with suppress(OSError):
+                process.wait()
+        with suppress(OSError):
+            if process.stdout is not None:
+                process.stdout.close()
 
 
 def _installer_only_availability(install_key: str) -> HarnessAvailability:
@@ -471,11 +571,9 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
         # warning copy uniform across every CLI-backed native harness.
         return _cli_family_availability(canonical, install_key)
     if canonical in _PI_HARNESSES:
-        # pi has no CLI login — its only credential is either an omnigent-managed
-        # provider (an API key / gateway) or a pi-subscription ("Pi original auth",
-        # which signals "use Pi's own ~/.pi/agent as-is"). So the two-step signal
-        # is binary + provider: installed-but-no-provider is the yellow "needs-auth"
-        # state the setup dialog acts on.
+        # Pi is ready through either an Omnigent-managed provider (including
+        # the "Pi original auth" subscription sentinel) or models backed by
+        # Pi's own credential store. Check config before spawning Pi.
         binary_state = _binary_availability_reason(PI_KEY)
         if binary_state is not True:
             return binary_state
@@ -494,7 +592,7 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
                 return True
         except Exception:
             pass
-        return "needs-auth"
+        return True if _pi_cli_has_available_models() else "needs-auth"
     return _harness_availability_core(canonical)
 
 
@@ -566,7 +664,12 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     result: dict[str, HarnessAvailability] = {}
     for spelling in spellings:
         canonical = _canonical_harness(spelling)
-        cache_key = ("codex",) if _is_codex_family_harness(canonical) else ("harness", canonical)
+        if _is_codex_family_harness(canonical):
+            cache_key = ("codex",)
+        elif canonical in _PI_HARNESSES:
+            cache_key = ("pi",)
+        else:
+            cache_key = ("harness", canonical)
         if cache_key not in availability_cache:
             availability_cache[cache_key] = _harness_availability(canonical)
         result[spelling] = availability_cache[cache_key]
