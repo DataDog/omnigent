@@ -4106,7 +4106,20 @@ def server(
         )
         os.environ.setdefault("OMNIGENT_ACCOUNTS_BASE_URL", f"http://{host}:{port}")
 
-    auth_provider = create_auth_provider()
+    # OIDC mode persists provider credentials in the encrypted session
+    # store; other modes pass None and keep self-contained JWT cookies.
+    from omnigent.server.auth import resolve_auth_source
+
+    oidc_session_store = None
+    if resolve_auth_source() == "oidc":
+        from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
+        from omnigent.server.oidc_session_store import OidcSessionStore
+
+        oidc_session_store = OidcSessionStore(
+            make_managed_session_maker(get_or_create_engine(db_uri))
+        )
+
+    auth_provider = create_auth_provider(oidc_session_store=oidc_session_store)
 
     # Accounts mode: construct the AccountStore (sibling to PermissionStore)
     # here and pass it to create_app explicitly. Any deploy that doesn't run

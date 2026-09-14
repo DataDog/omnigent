@@ -137,7 +137,8 @@ class OIDCConfig:
     :param issuer: OIDC issuer URL, e.g.
         ``"https://accounts.google.com"``.
     :param client_id: OAuth client ID registered with the IdP.
-    :param client_secret: OAuth client secret.
+    :param client_secret: OAuth client secret. ``None`` for public
+        clients (PKCE without a secret); GitHub always requires one.
     :param redirect_uri: Full callback URL, e.g.
         ``"https://myapp.example.com/auth/callback"``.
     :param cookie_secret: HMAC key for session cookie signing
@@ -171,7 +172,7 @@ class OIDCConfig:
 
     issuer: str
     client_id: str
-    client_secret: str
+    client_secret: str | None
     redirect_uri: str
     cookie_secret: bytes
     scopes: str
@@ -251,7 +252,14 @@ class OIDCConfig:
 
         issuer = _require("OMNIGENT_OIDC_ISSUER")
         client_id = _require("OMNIGENT_OIDC_CLIENT_ID")
-        client_secret = _require("OMNIGENT_OIDC_CLIENT_SECRET")
+        # Standard OIDC public clients (e.g. Ticino) use PKCE without a
+        # client secret. GitHub remains a confidential client and always
+        # requires one.
+        is_github = issuer.rstrip("/") == _GITHUB_ISSUER
+        if is_github:
+            client_secret: str | None = _require("OMNIGENT_OIDC_CLIENT_SECRET")
+        else:
+            client_secret = os.environ.get("OMNIGENT_OIDC_CLIENT_SECRET", "").strip() or None
         # Redirect URI: an explicit value wins; otherwise derive it from
         # OMNIGENT_DOMAIN (the same var the Caddy HTTPS overlay uses) as
         # ``https://<domain>/auth/callback``. A domain-based deploy then
@@ -331,8 +339,6 @@ class OIDCConfig:
                 )
 
         # Determine provider type and resolve endpoints.
-        is_github = issuer.rstrip("/") == _GITHUB_ISSUER
-
         if is_github:
             # Empty string (forwarded by `${VAR:-}` wrappers) → default.
             scopes = (os.environ.get("OMNIGENT_OIDC_SCOPES") or _GITHUB_SCOPES).strip()

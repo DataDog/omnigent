@@ -407,9 +407,20 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     # None for non-accounts deploys (matching the structural
     # contract used on the hosted product).
     from omnigent.server.auth import UnifiedAuthProvider as _UAP
-    from omnigent.server.auth import create_auth_provider
+    from omnigent.server.auth import create_auth_provider, resolve_auth_source
 
-    auth_provider = create_auth_provider()
+    # OIDC mode persists provider credentials in the encrypted session
+    # store; other modes pass None and keep self-contained JWT cookies.
+    oidc_session_store = None
+    if resolve_auth_source() == "oidc":
+        from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
+        from omnigent.server.oidc_session_store import OidcSessionStore
+
+        oidc_session_store = OidcSessionStore(
+            make_managed_session_maker(get_or_create_engine(database_url))
+        )
+
+    auth_provider = create_auth_provider(oidc_session_store=oidc_session_store)
     account_store = None
     if isinstance(auth_provider, _UAP) and auth_provider._source == "accounts":
         from omnigent.server.accounts_store import SqlAlchemyAccountStore
