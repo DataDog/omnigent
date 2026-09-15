@@ -47,6 +47,7 @@ _CLIENT_ID = "cid"
 def _oidc_config(
     skip_email_verification: bool = False,
     email_claim: str = "email",
+    client_secret: str | None = "secret",
 ) -> OIDCConfig:
     """Build a generic-OIDC config over plain HTTP (so TestClient cookies stick).
 
@@ -61,7 +62,7 @@ def _oidc_config(
     return OIDCConfig(
         issuer=_ISSUER,
         client_id=_CLIENT_ID,
-        client_secret="secret",
+        client_secret=client_secret,
         redirect_uri="http://localhost:8000/auth/callback",
         cookie_secret=_TEST_SECRET,
         scopes="openid email profile",
@@ -96,8 +97,13 @@ class _IdpKeys:
         jwk_dict["alg"] = "RS256"
         self.signing_key = jwt.PyJWK.from_dict(jwk_dict)
 
-    def sign_id_token(self, claims: dict[str, object]) -> str:
-        """Sign ``claims`` into an RS256 ``id_token``, filling iss/aud/exp.
+    def sign_id_token(
+        self,
+        claims: dict[str, object],
+        *,
+        algorithm: str = "RS256",
+    ) -> str:
+        """Sign ``claims`` into an ``id_token``, filling iss/aud/exp.
 
         :param claims: Claims to embed, e.g.
             ``{"email": "alice@example.com", "email_verified": True}``.
@@ -113,7 +119,7 @@ class _IdpKeys:
             "sub": "idp-subject-123",
             **claims,
         }
-        return jwt.encode(payload, self.private_key, algorithm="RS256")
+        return jwt.encode(payload, self.private_key, algorithm=algorithm)
 
 
 @pytest.fixture
@@ -149,6 +155,7 @@ def callback_client(
     # The signed id_token the mocked token endpoint will return. Each
     # test sets this before calling /auth/callback.
     pending_id_token: list[str] = [""]
+    token_requests: list[dict[str, str]] = []
 
     async def _fake_post(
         self: httpx.AsyncClient,
@@ -159,6 +166,7 @@ def callback_client(
         timeout: float | None = None,
     ) -> httpx.Response:
         """Stand in for the IdP token endpoint, returning the test's id_token."""
+        token_requests.append(dict(data or {}))
         return httpx.Response(200, json={"id_token": pending_id_token[0]})
 
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
@@ -177,6 +185,7 @@ def callback_client(
         prefix="/auth",
     )
     app.state.pending_id_token = pending_id_token
+    app.state.token_requests = token_requests
 
     with TestClient(app) as client:
         yield client, keys
@@ -211,6 +220,37 @@ def _do_callback(client: TestClient, id_token: str) -> httpx.Response:
         f"/auth/callback?code=auth-code&state={state}",
         follow_redirects=False,
     )
+
+
+def test_callback_accepts_ps256_id_token(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """Ticino's PS256-signed ID tokens are accepted."""
+    client, keys = callback_client
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True},
+        algorithm="PS256",
+    )
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 302, resp.text
+    assert resp.cookies.get("ap_session") is not None
+
+
+@pytest.mark.parametrize("callback_client", [{"client_secret": None}], indirect=True)
+def test_callback_public_client_omits_client_secret(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A public client's code exchange uses PKCE without a secret field."""
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 302, resp.text
+    assert client.app.state.token_requests
+    assert "client_secret" not in client.app.state.token_requests[-1]
 
 
 def test_callback_verified_email_mints_session(
