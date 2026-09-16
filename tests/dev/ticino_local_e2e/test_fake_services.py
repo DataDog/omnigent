@@ -72,3 +72,10 @@ def test_down_rejects_an_unsafe_state_directory() -> None:
     result = subprocess.run([str(script), "down"], env=env, capture_output=True, text=True)
     assert result.returncode != 0
     assert "must use /tmp/omnigent-ticino-token-handoff-e2e" in result.stderr
+
+
+def test_run_script_keeps_database_password_out_of_process_arguments() -> None:
+    script = (_MODULE_PATH.parents[0] / "run.sh").read_text()
+    assert "--database-uri" not in script
+    assert '--config "$server_config"' in script
+    assert "psycopg[binary]" in script
