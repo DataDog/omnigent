@@ -26,7 +26,7 @@ from omnigent.onboarding.sandboxes.base import (
     render_host_config_write_command,
 )
 from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s as blaxel_managed_token_ttl_s
-from omnigent.onboarding.sandboxes.context import ManagedSandboxContext
+from omnigent.onboarding.sandboxes.context import IdentityToken, ManagedSandboxContext
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.onboarding.sandboxes.registry import (
     COMMUNITY_MODULE_PREFIX,
@@ -58,6 +58,7 @@ from omnigent.server.managed_hosts import (
     resume_managed_host,
     terminate_managed_host,
 )
+from omnigent.server.managed_sandbox_identity import ManagedSandboxIdentityResolver
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -79,6 +80,32 @@ from tests.server.helpers import (
 pytestmark = pytest.mark.asyncio
 
 _OWNER = "alice@example.com"
+_TEST_CREDENTIAL_SESSION_ID = "credential-session-owner"
+
+
+class _TestLifecycleIdentityTokenProvider:
+    """Minimal renewable owner credential for lifecycle task wiring tests."""
+
+    credential_session_id = _TEST_CREDENTIAL_SESSION_ID
+
+    def get_identity_token(self) -> IdentityToken:
+        return IdentityToken(value="test-owner-token", expires_at=2_000_000_000)
+
+
+class _TestLifecycleAuthProvider:
+    """Resolve only the persisted test owner binding."""
+
+    def get_identity_token_provider_for_credential_session(
+        self, credential_session_id: str, expected_user_id: str
+    ) -> _TestLifecycleIdentityTokenProvider | None:
+        if credential_session_id == _TEST_CREDENTIAL_SESSION_ID and expected_user_id == _OWNER:
+            return _TestLifecycleIdentityTokenProvider()
+        return None
+
+
+def _test_lifecycle_identity_resolver() -> ManagedSandboxIdentityResolver:
+    """Build an explicit owner-bound resolver for relaunch task tests."""
+    return ManagedSandboxIdentityResolver(_TestLifecycleAuthProvider())
 
 
 def _injected_config(
@@ -3485,12 +3512,19 @@ async def test_kick_managed_relaunch_defers_the_classifier_to_the_launch_task(
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
         conv=conv,
-        host=SimpleNamespace(user_id=_OWNER),
+        host=SimpleNamespace(
+            user_id=_OWNER,
+            sandbox_session_id="conv_1",
+            sandbox_credential_session_id=_TEST_CREDENTIAL_SESSION_ID,
+        ),
         sandbox_config=SimpleNamespace(),
         tracker=tracker,
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
-        app_state=SimpleNamespace(agent_store=store),
+        app_state=SimpleNamespace(
+            agent_store=store,
+            managed_sandbox_identity_resolver=_test_lifecycle_identity_resolver(),
+        ),
     )
     scheduled = set(orchestration._managed_launch_tasks) - before
     assert scheduled, "the claim was taken but no task was scheduled to settle it"
@@ -3498,6 +3532,7 @@ async def test_kick_managed_relaunch_defers_the_classifier_to_the_launch_task(
     assert reads == [], "the kick must not read the agent store; the launch task does"
     assert captured["agent_store"] is store
     assert captured["agent_id"] == builtin.id
+    assert captured["operation_context"].credential_session_id == _TEST_CREDENTIAL_SESSION_ID
 
 
 async def test_relaunch_claim_and_launch_task_are_one_synchronous_step(
@@ -3537,12 +3572,19 @@ async def test_relaunch_claim_and_launch_task_are_one_synchronous_step(
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
         conv=conv,
-        host=SimpleNamespace(user_id=_OWNER),
+        host=SimpleNamespace(
+            user_id=_OWNER,
+            sandbox_session_id="conv_1",
+            sandbox_credential_session_id=_TEST_CREDENTIAL_SESSION_ID,
+        ),
         sandbox_config=SimpleNamespace(),
         tracker=tracker,
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
-        app_state=SimpleNamespace(agent_store=_StubAgentStore()),
+        app_state=SimpleNamespace(
+            agent_store=_StubAgentStore(),
+            managed_sandbox_identity_resolver=_test_lifecycle_identity_resolver(),
+        ),
     )
     scheduled = set(orchestration._managed_launch_tasks) - before
     assert scheduled, "the claim was taken but no task was scheduled to settle it"
@@ -3570,12 +3612,18 @@ async def test_kick_managed_relaunch_without_agent_store_threads_none(
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
         conv=conv,
-        host=SimpleNamespace(user_id=_OWNER),
+        host=SimpleNamespace(
+            user_id=_OWNER,
+            sandbox_session_id="conv_1",
+            sandbox_credential_session_id=_TEST_CREDENTIAL_SESSION_ID,
+        ),
         sandbox_config=SimpleNamespace(),
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
-        app_state=SimpleNamespace(),
+        app_state=SimpleNamespace(
+            managed_sandbox_identity_resolver=_test_lifecycle_identity_resolver()
+        ),
     )
     scheduled = set(orchestration._managed_launch_tasks) - before
     await asyncio.gather(*scheduled)
@@ -3771,7 +3819,12 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
         session_id=None,
     )
     dead_host = SimpleNamespace(
-        sandbox_provider="modal", user_id=_OWNER, status="offline", updated_at=0
+        sandbox_provider="modal",
+        user_id=_OWNER,
+        status="offline",
+        updated_at=0,
+        sandbox_session_id="conv_1",
+        sandbox_credential_session_id=_TEST_CREDENTIAL_SESSION_ID,
     )
     app_state = SimpleNamespace(
         host_store=SimpleNamespace(get_host=lambda _hid: dead_host, is_online=lambda _hid: False),
@@ -3780,6 +3833,7 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
         agent_store=_StubAgentStore({builtin.id: builtin}),
         host_registry=None,
         tunnel_registry=None,
+        managed_sandbox_identity_resolver=_test_lifecycle_identity_resolver(),
     )
     conv = SimpleNamespace(labels={}, host_id="host_1", agent_id=builtin.id)
 
