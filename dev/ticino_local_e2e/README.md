@@ -172,12 +172,34 @@ Only after it passes may you start the local server:
 dev/ticino_local_e2e/run.sh up
 ```
 
+### Reconfigure an existing signed-in fake run
+
+To retain the local browser/OIDC session while swapping the downstream fake
+services for real Habitat, export the real-mode settings above and run:
+
+```sh
+dev/ticino_local_e2e/run.sh reconfigure-real
+```
+
+This is intentionally not `up`: it requires the existing `runtime.env`,
+server configuration, virtual environment, and running Docker Postgres. It
+runs `real-check` before stopping anything, verifies the existing Postgres
+volume is ready, then stops only the harness-recorded server/fake-service PIDs
+whose command belongs to the selected state directory. It reuses the database,
+cookie key, OIDC credential-encryption key, artifacts, and registry; it does
+not recreate Docker resources, regenerate local credentials, or perform remote
+Hab cleanup. If the original run used source-mode launcher imports, leave
+`HAB_LAUNCHER_SOURCE_DIR` set; newer runs record that non-secret source path in
+the protected harness state.
+
 `up` runs the same preflight again before it creates Docker state. It writes a
 secret-free local readiness receipt; `status` can display it but it is not a
 remote cleanup receipt. A real run can create external state. Keep the owner
 session and exact Hab ID available until deletion is confirmed through
 Habitat. `down` stops local processes and Docker Postgres, removes the
-recorded workload-token file when it is still a safe regular file, and warns
+recorded workload-token file only when it remains a current-user-owned,
+single-link, private regular `/tmp/omnigent-workload-bearer*.jwt` exporter
+target, and warns
 that it has neither deleted nor verified any remote Hab. Do not interpret
 local teardown as remote cleanup.
 
