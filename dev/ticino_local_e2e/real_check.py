@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import json
 import os
 import shutil
@@ -25,6 +26,9 @@ from urllib.request import urlopen
 
 _HABITAT_API = "https://nickisaacs.habvm.dev"
 _MIN_TOKEN_TTL_S = 300
+_MAX_TOKEN_SIZE = 32 * 1024
+_WORKLOAD_TOKEN_PREFIX = "omnigent-workload-bearer"
+_WORKLOAD_TOKEN_SUFFIX = ".jwt"
 
 
 def _decode_jwt_claims(value: bytes) -> dict[str, object] | None:
@@ -41,24 +45,50 @@ def _decode_jwt_claims(value: bytes) -> dict[str, object] | None:
     return claims if isinstance(claims, dict) else None
 
 
+def _open_secure_workload_token_file(
+    path_value: str,
+) -> tuple[bytes | None, os.stat_result | None, str | None]:
+    """Open a private regular file without a path-check/read race."""
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        file_descriptor = os.open(path_value, flags)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            return None, None, "HAB_WORKLOAD_TOKEN_FILE must be a regular file"
+        return None, None, "HAB_WORKLOAD_TOKEN_FILE is not safely readable"
+    try:
+        file_stat = os.fstat(file_descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            return None, None, "HAB_WORKLOAD_TOKEN_FILE must be a regular file"
+        if file_stat.st_uid != os.getuid():
+            return None, None, "HAB_WORKLOAD_TOKEN_FILE must be owned by the current user"
+        if stat.S_IMODE(file_stat.st_mode) & 0o077:
+            return None, None, "HAB_WORKLOAD_TOKEN_FILE must not allow group or other access"
+        if file_stat.st_nlink != 1:
+            return None, None, "HAB_WORKLOAD_TOKEN_FILE must not have multiple hard links"
+        if not 0 < file_stat.st_size <= _MAX_TOKEN_SIZE:
+            return None, None, "HAB_WORKLOAD_TOKEN_FILE has an invalid size"
+        value = os.read(file_descriptor, file_stat.st_size + 1)
+    except OSError:
+        return None, None, "HAB_WORKLOAD_TOKEN_FILE is not safely readable"
+    finally:
+        os.close(file_descriptor)
+    if len(value) != file_stat.st_size:
+        return None, None, "HAB_WORKLOAD_TOKEN_FILE changed while being read"
+    return value, file_stat, None
+
+
 def validate_workload_token_file(path_value: str, *, now: float | None = None) -> str | None:
     """Return a safe failure reason, or ``None`` for a usable local file."""
-    try:
-        path = Path(path_value)
-        file_stat = path.lstat()
-        if not stat.S_ISREG(file_stat.st_mode) or stat.S_ISLNK(file_stat.st_mode):
-            return "HAB_WORKLOAD_TOKEN_FILE must be a regular file"
-        if file_stat.st_uid != os.getuid():
-            return "HAB_WORKLOAD_TOKEN_FILE must be owned by the current user"
-        if stat.S_IMODE(file_stat.st_mode) & 0o077:
-            return "HAB_WORKLOAD_TOKEN_FILE must not allow group or other access"
-        if file_stat.st_nlink != 1:
-            return "HAB_WORKLOAD_TOKEN_FILE must not have multiple hard links"
-        if not 0 < file_stat.st_size <= 32 * 1024:
-            return "HAB_WORKLOAD_TOKEN_FILE has an invalid size"
-        value = path.read_bytes()
-    except OSError:
-        return "HAB_WORKLOAD_TOKEN_FILE is not safely readable"
+    value, _, file_error = _open_secure_workload_token_file(path_value)
+    if file_error:
+        return file_error
+    assert value is not None
 
     claims = _decode_jwt_claims(value)
     if claims is None:
@@ -71,6 +101,50 @@ def validate_workload_token_file(path_value: str, *, now: float | None = None) -
         return "HAB_WORKLOAD_TOKEN_FILE has no valid expiration"
     if expires_at - (time.time() if now is None else now) < _MIN_TOKEN_TTL_S:
         return "HAB_WORKLOAD_TOKEN_FILE expires too soon for a real run"
+    return None
+
+
+def _is_permitted_cleanup_path(path_value: str) -> bool:
+    """Allow deletion only for the fixed, local exporter filename convention."""
+    try:
+        path = Path(path_value)
+        temporary_directory = Path("/tmp").resolve(strict=True)
+        return (
+            path.is_absolute()
+            and path.name.startswith(_WORKLOAD_TOKEN_PREFIX)
+            and path.name.endswith(_WORKLOAD_TOKEN_SUFFIX)
+            and path.parent.resolve(strict=True) == temporary_directory
+        )
+    except OSError:
+        return False
+
+
+def remove_workload_token_file(path_value: str) -> str | None:
+    """Delete one validated exporter file without trusting the marker path."""
+    if not _is_permitted_cleanup_path(path_value):
+        return "recorded workload bearer path is not an allowed /tmp exporter target"
+    value, file_stat, file_error = _open_secure_workload_token_file(path_value)
+    if file_error:
+        return file_error
+    assert value is not None and file_stat is not None
+
+    # Revalidate the directory entry immediately before unlinking it.  The
+    # restricted name and /tmp parent keep the destructive scope narrow.
+    path = Path(path_value)
+    try:
+        before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_dev != file_stat.st_dev
+            or before.st_ino != file_stat.st_ino
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) & 0o077
+            or before.st_nlink != 1
+        ):
+            return "recorded workload bearer file is no longer safe to remove"
+        path.unlink()
+    except OSError:
+        return "recorded workload bearer file could not be safely removed"
     return None
 
 
@@ -154,7 +228,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--network", action="store_true", help="perform read-only HTTPS checks")
+    parser.add_argument("--remove-workload-file", metavar="PATH")
     args = parser.parse_args()
+    if args.remove_workload_file:
+        removal_error = remove_workload_token_file(args.remove_workload_file)
+        if removal_error:
+            print(f"error: {removal_error}", file=sys.stderr)
+            raise SystemExit(1)
+        print("PASS: removed the validated local workload bearer file.")
+        return
     errors = run_check(os.environ, port=args.port, check_network=args.network)
     if errors:
         for error in errors:
