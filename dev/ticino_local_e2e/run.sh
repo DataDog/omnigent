@@ -225,7 +225,14 @@ import sys
 receipt = json.load(open(sys.argv[1]))
 required = (
     "exchange_route_matched",
+    "exchange_used_post",
+    "exchange_form_urlencoded",
+    "workload_authorization_present",
+    "workload_authorization_distinct_from_subject_token",
+    "exchange_grant_type_matches",
     "exchange_requested_hab_audience",
+    "exchange_subject_token_type_matches",
+    "exchange_requested_token_type_matches",
     "subject_token_present",
     "subject_token_is_jwt",
     "subject_token_audience_matches_client",
@@ -235,7 +242,7 @@ missing = [field for field in required if not receipt.get(field)]
 if missing:
     print("NOT YET PROVEN: " + ", ".join(missing))
     raise SystemExit(1)
-print("PASS: browser OIDC ID token reached the launcher exchange seam and its exchanged output reached fake Habitat.")
+print("PASS: RFC 8693 workload/subject-token exchange reached fake Habitat without persisting credentials.")
 PY
 }
 

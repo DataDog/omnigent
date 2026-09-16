@@ -13,9 +13,11 @@ Ticino public client:
 It establishes the narrow handoff we need before using Habitat: a browser
 login produces a signed Ticino ID token, Omnigent persists it in its encrypted
 OIDC provider session, the managed-session context gives it to the launcher,
-and the launcher sends it to the shared Ticino exchange client with
-`audience=hab`. The fake service records only booleans; it never writes,
-prints, or hashes any token.
+and the launcher exchanges it with RFC 8693. The fake service accepts only a
+form-encoded `POST /ticino/agent/v1/issuer/sycamore/oauth/token` with the
+workload bearer in `Authorization`, the browser ID token in `subject_token`,
+the exact ID/access-token type URNs, and `audience=hab`. It records only
+booleans; it never writes, prints, or hashes any token.
 
 The fake Habitat fails the create request on purpose. It cannot create a Hab,
 and it makes the successful receipt stronger: the static fake exchange output
@@ -71,12 +73,12 @@ dev/ticino_local_e2e/run.sh down
 
 `status` passes only when all of these were observed without saving values:
 
-1. the launcher reached `/ticino/agent/...` through the Emissary selection
-   path;
-2. it asked for `desired_audience=hab`;
+1. the launcher sent the RFC 8693 POST through the Emissary selection path;
+2. its workload bearer was present in `Authorization` and its form used the
+   exact grant, subject-token type, requested-token type, and `audience=hab`;
 3. its subject token was JWT-shaped and had `aud=omnigent-local`;
-4. the launcher used the exchange response as the fake Habitat authorization
-   bearer.
+4. the launcher used the JSON `access_token` response as the fake Habitat
+   authorization bearer.
 
 All state, including the random Postgres password, cookie-signing key,
 credential-encryption key, and fake workload-bearer file is in a mode-0700
