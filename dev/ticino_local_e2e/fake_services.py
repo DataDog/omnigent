@@ -25,7 +25,6 @@ from urllib.parse import parse_qs, urlparse
 _EXCHANGE_PATH = "/ticino/agent/v1/issuer/sycamore/oauth/token"
 _TOKEN_EXCHANGE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange"
 _ID_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:id_token"
-_ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 
 
 @dataclass
@@ -36,6 +35,7 @@ class Receipt:
     exchange_route_matched: bool = False
     exchange_used_post: bool = False
     exchange_form_urlencoded: bool = False
+    emissary_request_header_matches: bool = False
     workload_authorization_present: bool = False
     workload_authorization_distinct_from_subject_token: bool = False
     exchange_grant_type_matches: bool = False
@@ -64,6 +64,7 @@ class ReceiptStore:
         route_matched: bool,
         used_post: bool,
         form_urlencoded: bool,
+        emissary_request: str | None,
         workload_authorization: str | None,
         grant_type: str | None,
         audience: str | None,
@@ -78,6 +79,9 @@ class ReceiptStore:
             receipt.exchange_route_matched = receipt.exchange_route_matched or route_matched
             receipt.exchange_used_post = receipt.exchange_used_post or used_post
             receipt.exchange_form_urlencoded = receipt.exchange_form_urlencoded or form_urlencoded
+            receipt.emissary_request_header_matches = (
+                receipt.emissary_request_header_matches or emissary_request == "true"
+            )
             receipt.workload_authorization_present = (
                 receipt.workload_authorization_present or bool(workload_bearer)
             )
@@ -96,7 +100,7 @@ class ReceiptStore:
             )
             receipt.exchange_requested_token_type_matches = (
                 receipt.exchange_requested_token_type_matches
-                or requested_token_type == _ACCESS_TOKEN_TYPE
+                or requested_token_type == _ID_TOKEN_TYPE
             )
             receipt.subject_token_present = receipt.subject_token_present or bool(subject_token)
             is_jwt, expected_audience = inspect_untrusted_jwt(
@@ -173,6 +177,7 @@ def make_exchange_handler(receipts: ReceiptStore) -> type[BaseHTTPRequestHandler
                 route_matched=route_matched,
                 used_post=True,
                 form_urlencoded=form_urlencoded,
+                emissary_request=self.headers.get("X-Emissary-Request"),
                 workload_authorization=self.headers.get("Authorization"),
                 grant_type=_form_value(form, "grant_type"),
                 audience=_form_value(form, "audience"),
@@ -183,6 +188,7 @@ def make_exchange_handler(receipts: ReceiptStore) -> type[BaseHTTPRequestHandler
             if not _is_valid_exchange_request(
                 route_matched=route_matched,
                 form_urlencoded=form_urlencoded,
+                emissary_request=self.headers.get("X-Emissary-Request"),
                 workload_authorization=self.headers.get("Authorization"),
                 grant_type=_form_value(form, "grant_type"),
                 audience=_form_value(form, "audience"),
@@ -198,7 +204,7 @@ def make_exchange_handler(receipts: ReceiptStore) -> type[BaseHTTPRequestHandler
             body = json.dumps(
                 {
                     "access_token": "fake-habitat-obo-bearer",
-                    "issued_token_type": _ACCESS_TOKEN_TYPE,
+                    "issued_token_type": _ID_TOKEN_TYPE,
                     "token_type": "Bearer",
                 }
             ).encode()
@@ -225,6 +231,7 @@ def _is_valid_exchange_request(
     *,
     route_matched: bool,
     form_urlencoded: bool,
+    emissary_request: str | None,
     workload_authorization: str | None,
     grant_type: str | None,
     audience: str | None,
@@ -235,11 +242,12 @@ def _is_valid_exchange_request(
     return (
         route_matched
         and form_urlencoded
+        and emissary_request == "true"
         and bool(_bearer_from_header(workload_authorization))
         and grant_type == _TOKEN_EXCHANGE_GRANT_TYPE
         and audience == "hab"
         and subject_token_type == _ID_TOKEN_TYPE
-        and requested_token_type == _ACCESS_TOKEN_TYPE
+        and requested_token_type == _ID_TOKEN_TYPE
         and bool(subject_token)
     )
 
