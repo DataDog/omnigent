@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import importlib.util
 import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
+from urllib.parse import urlencode
 
 _MODULE_PATH = Path(__file__).parents[3] / "dev/ticino_local_e2e/fake_services.py"
 _SPEC = importlib.util.spec_from_file_location("ticino_fake_services", _MODULE_PATH)
@@ -49,21 +52,120 @@ def test_receipt_stores_only_boolean_handoff_evidence(tmp_path: Path) -> None:
     receipt_path = tmp_path / "receipt.json"
     store = fake_services.ReceiptStore(receipt_path)
     token = _jwt_with_audience("omnigent-local")
-    store.observe_exchange(route_matched=True, audience="hab", bearer=token)
+    store.observe_exchange(
+        route_matched=True,
+        used_post=True,
+        form_urlencoded=True,
+        workload_authorization="Bearer fake-workload-bearer",
+        grant_type=fake_services._TOKEN_EXCHANGE_GRANT_TYPE,
+        audience="hab",
+        subject_token_type=fake_services._ID_TOKEN_TYPE,
+        requested_token_type=fake_services._ACCESS_TOKEN_TYPE,
+        subject_token=token,
+    )
     store.observe_habitat_create("Bearer fake-habitat-obo-bearer")
 
     receipt = json.loads(receipt_path.read_text())
     assert receipt == {
+        "exchange_form_urlencoded": True,
+        "exchange_grant_type_matches": True,
         "exchange_requested_hab_audience": True,
         "exchange_requests": 1,
         "exchange_route_matched": True,
+        "exchange_requested_token_type_matches": True,
+        "exchange_subject_token_type_matches": True,
+        "exchange_used_post": True,
         "habitat_authorization_present": True,
         "habitat_create_requests": 1,
         "subject_token_audience_matches_client": True,
         "subject_token_is_jwt": True,
         "subject_token_present": True,
+        "workload_authorization_distinct_from_subject_token": True,
+        "workload_authorization_present": True,
     }
     assert token not in receipt_path.read_text()
+
+
+def test_exchange_handler_requires_rfc8693_form_and_returns_json_access_token(
+    tmp_path: Path,
+) -> None:
+    receipt_path = tmp_path / "receipt.json"
+    store = fake_services.ReceiptStore(receipt_path)
+    server = fake_services.ThreadingHTTPServer(
+        ("127.0.0.1", 0), fake_services.make_exchange_handler(store)
+    )
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        token = _jwt_with_audience("omnigent-local")
+        form = urlencode(
+            {
+                "grant_type": fake_services._TOKEN_EXCHANGE_GRANT_TYPE,
+                "audience": "hab",
+                "subject_token_type": fake_services._ID_TOKEN_TYPE,
+                "requested_token_type": fake_services._ACCESS_TOKEN_TYPE,
+                "subject_token": token,
+            }
+        )
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+        connection.request(
+            "POST",
+            fake_services._EXCHANGE_PATH,
+            body=form,
+            headers={
+                "Authorization": "Bearer fake-workload-bearer",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.getheader("Content-Type") == "application/json"
+        assert json.loads(response.read()) == {
+            "access_token": "fake-habitat-obo-bearer",
+            "issued_token_type": fake_services._ACCESS_TOKEN_TYPE,
+            "token_type": "Bearer",
+        }
+        connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+    receipt = json.loads(receipt_path.read_text())
+    assert all(
+        receipt[key]
+        for key in (
+            "exchange_route_matched",
+            "exchange_used_post",
+            "exchange_form_urlencoded",
+            "workload_authorization_present",
+            "workload_authorization_distinct_from_subject_token",
+            "exchange_grant_type_matches",
+            "exchange_requested_hab_audience",
+            "exchange_subject_token_type_matches",
+            "exchange_requested_token_type_matches",
+            "subject_token_present",
+            "subject_token_is_jwt",
+            "subject_token_audience_matches_client",
+        )
+    )
+    assert receipt["habitat_create_requests"] == 0
+    assert receipt["habitat_authorization_present"] is False
+    assert receipt["exchange_requests"] == 1
+    assert token not in receipt_path.read_text()
+
+
+def test_exchange_handler_rejects_a_legacy_get_shaped_request() -> None:
+    assert not fake_services._is_valid_exchange_request(
+        route_matched=True,
+        form_urlencoded=False,
+        workload_authorization="Bearer fake-workload-bearer",
+        grant_type=None,
+        audience="hab",
+        subject_token_type=None,
+        requested_token_type=None,
+        subject_token=None,
+    )
 
 
 def test_down_rejects_an_unsafe_state_directory() -> None:
