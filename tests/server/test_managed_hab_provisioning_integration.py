@@ -29,23 +29,38 @@ import threading
 import uuid
 from collections.abc import Iterator
 from concurrent import futures
+from dataclasses import replace
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from jwt.algorithms import RSAAlgorithm
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, update
 from sqlalchemy.orm import sessionmaker
 
 from omnigent.db.db_models import OmnigentBase, SqlOidcSession
+from omnigent.onboarding.sandboxes.context import managed_sandbox_context_scope
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
-from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+from omnigent.server.managed_hosts import (
+    ManagedSandboxConfig,
+    ManagedSandboxDeployment,
+    host_sandbox_is_running,
+    relaunch_managed_host,
+    terminate_managed_host,
+)
+from omnigent.server.managed_sandbox_identity import (
+    ManagedSandboxIdentityResolver,
+    ManagedSandboxIdentityUnavailable,
+)
 from omnigent.server.oidc import OIDCConfig
 from omnigent.server.oidc_session_store import OidcSessionStore
 from omnigent.server.routes._sessions.common import _managed_launch_tasks
@@ -75,7 +90,6 @@ _ISSUER = "https://idp.example.com"
 _CLIENT_ID = "public-client"
 _ALICE = "alice@example.com"
 _BOB = "bob@example.com"
-_WORKLOAD_BEARER = "workload-bearer-INTEGRATION-SECRET"
 _SETTLE_TIMEOUT_S = 15.0
 
 
@@ -109,6 +123,17 @@ def _sign(keys: _IdpKeys, email: str, subject: str, ttl_s: int = 3600) -> str:
         "email_verified": True,
     }
     return jwt.encode(payload, keys.private_key, algorithm="RS256")
+
+
+def _workload_bearer(name: str) -> str:
+    """Make a non-secret, locally-valid workload JWT for the file boundary."""
+    import time as _time
+
+    return jwt.encode(
+        {"aud": "identity", "exp": int(_time.time()) + 3600, "sub": name},
+        key="local-test-workload-signing-key-32x",
+        algorithm="HS256",
+    )
 
 
 @pytest.fixture()
@@ -176,6 +201,9 @@ def _fake_hab_servicer(hab: Any) -> Any:
             self._lock = threading.Lock()
             self._counter = 0
             self.createhab_calls: list[dict[str, Any]] = []
+            self.gethab_calls: list[dict[str, Any]] = []
+            self.deletehab_calls: list[dict[str, Any]] = []
+            self.fail_next_delete = False
 
         def CreateHab(self, request: Any, context: Any) -> Iterator[Any]:
             metadata = dict(context.invocation_metadata())
@@ -197,6 +225,13 @@ def _fake_hab_servicer(hab: Any) -> Any:
             yield hab.pb2.CreateHabResponse(hab_id=hab_id, phase="created", terminal=True)
 
         def GetHab(self, request: Any, context: Any) -> Any:
+            with self._lock:
+                self.gethab_calls.append(
+                    {
+                        "hab_id": request.hab_id,
+                        "authorization": dict(context.invocation_metadata()).get("authorization"),
+                    }
+                )
             return hab.pb2.GetHabResponse(
                 hab_id=request.hab_id,
                 status=hab.pb2.HAB_STATUS_RUNNING,
@@ -211,6 +246,18 @@ def _fake_hab_servicer(hab: Any) -> Any:
             yield hab.pb2.ExecResponse(exit=hab.pb2.ExecExit(exit_code=0))
 
         def DeleteHab(self, request: Any, context: Any) -> Iterator[Any]:
+            with self._lock:
+                self.deletehab_calls.append(
+                    {
+                        "hab_id": request.hab_id,
+                        "authorization": dict(context.invocation_metadata()).get("authorization"),
+                    }
+                )
+                fail = self.fail_next_delete
+                self.fail_next_delete = False
+            if fail:
+                yield hab.pb2.DeleteHabResponse(hab_id=request.hab_id, error="temporary failure")
+                return
             yield hab.pb2.DeleteHabResponse(hab_id=request.hab_id, terminal=True)
 
         def ListHabs(self, request: Any, context: Any) -> Any:
@@ -220,32 +267,62 @@ def _fake_hab_servicer(hab: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Fake exchange client
+# Local RFC 8693 exchange boundary
 # ---------------------------------------------------------------------------
 
 
-class _RecordingExchange:
-    """Exchange fake recording every RFC 8693 call.
-
-    Returns a bearer stable per subject — like the real exchange, one
-    subject maps to one OBO token, so the launcher's per-build exchange
-    and its credential-keyed client cache compose like production.
-    """
+class _Rfc8693Exchange:
+    """A local HTTP Ticino stand-in recording the exact exchange contract."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.calls: list[dict[str, str]] = []
+        exchange = self
 
-    def exchange(self, *, subject_token: str, workload_bearer: str, audience: str) -> str:
-        with self._lock:
-            self.calls.append(
-                {
-                    "subject_token": subject_token,
-                    "workload_bearer": workload_bearer,
-                    "audience": audience,
-                }
-            )
-        return self.bearer_for(subject_token)
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("content-length", "0"))
+                form = parse_qs(self.rfile.read(length).decode(), keep_blank_values=True)
+                subject_token = form.get("subject_token", [""])[0]
+                with exchange._lock:
+                    exchange.calls.append(
+                        {
+                            "path": self.path,
+                            "authorization": self.headers.get("authorization", ""),
+                            "emissary": self.headers.get("x-emissary-request", ""),
+                            "grant_type": form.get("grant_type", [""])[0],
+                            "subject_token": subject_token,
+                            "subject_token_type": form.get("subject_token_type", [""])[0],
+                            "requested_token_type": form.get("requested_token_type", [""])[0],
+                            "audience": form.get("audience", [""])[0],
+                        }
+                    )
+                payload = json.dumps(
+                    {
+                        "access_token": exchange.bearer_for(subject_token),
+                        "token_type": "Bearer",
+                        "issued_token_type": "urn:ietf:params:oauth:token-type:id_token",
+                        "expires_in": 300,
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self.address = f"http://127.0.0.1:{self._server.server_port}"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._thread.join()
+        self._server.server_close()
 
     @staticmethod
     def bearer_for(subject_token: str) -> str:
@@ -256,6 +333,13 @@ class _RecordingExchange:
         matching = [call for call in self.calls if call["subject_token"] == subject]
         assert matching, f"no exchange call for subject {subject!r}"
         return matching[0]
+
+
+@pytest.fixture()
+def exchange_server() -> Iterator[_Rfc8693Exchange]:
+    exchange = _Rfc8693Exchange()
+    yield exchange
+    exchange.close()
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +375,8 @@ class _Harness:
         app: Any,
         oidc_config: OIDCConfig,
         store: OidcSessionStore,
-        exchange: _RecordingExchange,
+        session_factory: Any,
+        exchange: _Rfc8693Exchange,
         hab_service: Any,
         context_records: list[dict[str, Any]],
         workload_file: Path,
@@ -299,6 +384,7 @@ class _Harness:
         self.app = app
         self.oidc_config = oidc_config
         self.store = store
+        self.session_factory = session_factory
         self.exchange = exchange
         self.hab_service = hab_service
         self.context_records = context_records
@@ -334,13 +420,21 @@ class _Harness:
 async def harness(
     hab: Any,
     db_uri: str,
+    exchange_server: _Rfc8693Exchange,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[_Harness]:
     """Real app + real production hab launcher + fake Habitat gRPC service."""
-    # The launch settles as failed at the online wait: the fake Hab never
-    # dials back. CreateHab (and the exchange) happen during provision.
-    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 0.2)
+
+    # A real guest would register over the host tunnel after its bootstrap
+    # command. The local gRPC service cannot run that guest, so make that
+    # boundary explicit while keeping provisioning and lifecycle RPCs real.
+    async def _register_fake_host(host_store: HostStore, host_id: str) -> None:
+        host = host_store.get_host(host_id)
+        assert host is not None
+        host_store.upsert_on_connect(host_id=host_id, name=host.name, user_id=host.user_id)
+
+    monkeypatch.setattr("omnigent.server.managed_hosts._wait_for_host_online", _register_fake_host)
     monkeypatch.setattr(
         "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
     )
@@ -359,15 +453,34 @@ async def harness(
     hab_service = _fake_hab_servicer(hab)
     grpc_server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
     hab.pb2_grpc.add_HabServiceServicer_to_server(hab_service, grpc_server)
-    port = grpc_server.add_insecure_port("localhost:0")
+    port = grpc_server.add_secure_port("localhost:0", grpc.local_server_credentials())
     grpc_server.start()
 
+    def _open_local_channel(apiserver: str) -> Any:
+        """Keep the launcher's HTTPS-only production contract hermetic."""
+        return grpc.secure_channel(urlparse(apiserver).netloc, grpc.local_channel_credentials())
+
+    monkeypatch.setattr(
+        hab.production.HabClient,
+        "_open_channel",
+        staticmethod(_open_local_channel),
+    )
+    # The fake Habitat service has no direct SSH endpoint. The launcher unit
+    # suite verifies private-file staging; this boundary test only needs the
+    # following simulated guest registration to keep lifecycle state alive.
+    monkeypatch.setattr(
+        hab.production.HabClient,
+        "write_private_file",
+        lambda *_args, **_kwargs: None,
+    )
+
     workload_file = tmp_path / "workload-bearer"
-    workload_file.write_text(f"{_WORKLOAD_BEARER}\n")
+    workload_file.write_text(f"{_workload_bearer('initial')}\n")
+    workload_file.chmod(0o600)
 
     hab_config = hab.config.HabConfig(
         enabled=True,
-        apiserver=f"http://localhost:{port}",
+        apiserver=f"https://localhost:{port}",
         token_file=None,  # the service identity is deliberately absent
         image="docker.io/test/omnigent-host:latest",
         profile="default",
@@ -385,11 +498,12 @@ async def harness(
         max_idle_lifetime_s=3600,
         orphan_grace_period_s=60,
         allow_all_egress=False,
+        exchange_mode=hab.config.EXCHANGE_MODE_FILE,
         workload_token_file=str(workload_file),
+        ticino_address=exchange_server.address,
     )
     registry = hab.registry.HabRegistry(tmp_path / "hab-registry.json")
     lifecycle = hab.lifecycle.LifecycleManager(hab_config, registry)
-    exchange = _RecordingExchange()
     context_records: list[dict[str, Any]] = []
     records_lock = threading.Lock()
 
@@ -402,12 +516,14 @@ async def harness(
                 context_records.append({"name": name, "context": context})
             return super().provision(name)
 
-    launcher = _ContextRecordingProductionLauncher(
-        config=hab_config,
-        registry=registry,
-        lifecycle=lifecycle,
-        exchange=exchange,
-    )
+    def _launcher_factory() -> _ContextRecordingProductionLauncher:
+        # Production constructs a provider launcher per managed operation;
+        # sharing one would race its per-operation gRPC client cache.
+        return _ContextRecordingProductionLauncher(
+            config=hab_config,
+            registry=registry,
+            lifecycle=lifecycle,
+        )
 
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     app = create_app(
@@ -422,7 +538,7 @@ async def harness(
         sandbox_config=ManagedSandboxDeployment.single(
             ManagedSandboxConfig(
                 server_url="https://srv.example.com",
-                launcher_factory=lambda: launcher,
+                launcher_factory=_launcher_factory,
                 token_ttl_s=3600,
             )
         ),
@@ -432,7 +548,8 @@ async def harness(
         app=app,
         oidc_config=oidc_config,
         store=store,
-        exchange=exchange,
+        session_factory=session_factory,
+        exchange=exchange_server,
         hab_service=hab_service,
         context_records=context_records,
         workload_file=workload_file,
@@ -471,6 +588,27 @@ def _assert_no_token_material(caplog: pytest.LogCaptureFixture, *secrets: str) -
             assert secret not in message, f"token material leaked into logs: {message!r}"
 
 
+def _reconstructed_identity_resolver(harness: _Harness) -> ManagedSandboxIdentityResolver:
+    """Model a server restart by rebuilding the encrypted-session access layer."""
+    reconstructed_store = OidcSessionStore(harness.session_factory, credential_key=_TEST_KEY)
+    reconstructed_auth = UnifiedAuthProvider(
+        source="oidc",
+        oidc_config=harness.oidc_config,
+        oidc_session_store=reconstructed_store,
+    )
+    return ManagedSandboxIdentityResolver(reconstructed_auth)
+
+
+def _replace_workload_bearer(path: Path, name: str) -> str:
+    """Atomically rotate the local-only workload file between operations."""
+    value = _workload_bearer(name)
+    replacement = path.with_name(f"{path.name}.replacement")
+    replacement.write_text(f"{value}\n")
+    replacement.chmod(0o600)
+    replacement.replace(path)
+    return value
+
+
 # ---------------------------------------------------------------------------
 # The chain, end to end
 # ---------------------------------------------------------------------------
@@ -494,18 +632,24 @@ async def test_createhab_receives_exchanged_obo_bearer(
     # as the RFC 8693 subject, the workload bearer supplied separately,
     # and exactly the Habitat audience.
     assert harness.exchange.calls, "the exchange never ran"
+    workload_bearer = harness.workload_file.read_text().strip()
     for call in harness.exchange.calls:
+        assert call["path"] == "/v1/issuer/sycamore/oauth/token"
+        assert call["authorization"] == f"Bearer {workload_bearer}"
+        assert call["emissary"] == "true"
+        assert call["grant_type"] == "urn:ietf:params:oauth:grant-type:token-exchange"
         assert call["subject_token"] == alice_token
-        assert call["workload_bearer"] == _WORKLOAD_BEARER
+        assert call["subject_token_type"] == "urn:ietf:params:oauth:token-type:id_token"
+        assert call["requested_token_type"] == "urn:ietf:params:oauth:token-type:id_token"
         assert call["audience"] == "hab"
 
     # Habitat received ONLY the exchanged OBO bearer.
     assert len(harness.hab_service.createhab_calls) == 1
     authorization = harness.hab_service.createhab_calls[0]["authorization"]
-    expected_obo = _RecordingExchange.bearer_for(alice_token)
+    expected_obo = _Rfc8693Exchange.bearer_for(alice_token)
     assert authorization == f"Bearer {expected_obo}"
     assert authorization != f"Bearer {alice_token}", "raw ID token reached Habitat"
-    assert _WORKLOAD_BEARER not in (authorization or ""), "workload bearer reached Habitat"
+    assert workload_bearer not in (authorization or ""), "workload bearer reached Habitat"
 
     # The launcher observed the created session and its verified owner.
     assert len(harness.context_records) == 1
@@ -515,7 +659,7 @@ async def test_createhab_receives_exchanged_obo_bearer(
     assert context.user_id == _ALICE
 
     # No credential material leaked into logs.
-    _assert_no_token_material(caplog, alice_token, _WORKLOAD_BEARER, expected_obo)
+    _assert_no_token_material(caplog, alice_token, workload_bearer, expected_obo)
 
 
 async def test_two_users_never_share_credentials(
@@ -545,21 +689,22 @@ async def test_two_users_never_share_credentials(
 
     # Every exchange call belongs to exactly one user's subject.
     assert harness.exchange.calls
+    workload_bearer = harness.workload_file.read_text().strip()
     for call in harness.exchange.calls:
         assert call["subject_token"] in (alice_token, bob_token)
-        assert call["workload_bearer"] == _WORKLOAD_BEARER
+        assert call["authorization"] == f"Bearer {workload_bearer}"
         assert call["audience"] == "hab"
     alice_call = harness.exchange.by_subject(alice_token)
     bob_call = harness.exchange.by_subject(bob_token)
-    assert alice_call["workload_bearer"] == _WORKLOAD_BEARER
-    assert bob_call["workload_bearer"] == _WORKLOAD_BEARER
+    assert alice_call["authorization"] == f"Bearer {workload_bearer}"
+    assert bob_call["authorization"] == f"Bearer {workload_bearer}"
 
     # Habitat saw two creates, each authorized by its own exchanged bearer.
     assert len(harness.hab_service.createhab_calls) == 2
     authorizations = {entry["authorization"] for entry in harness.hab_service.createhab_calls}
     expected = {
-        f"Bearer {_RecordingExchange.bearer_for(alice_token)}",
-        f"Bearer {_RecordingExchange.bearer_for(bob_token)}",
+        f"Bearer {_Rfc8693Exchange.bearer_for(alice_token)}",
+        f"Bearer {_Rfc8693Exchange.bearer_for(bob_token)}",
     }
     assert authorizations == expected
     assert f"Bearer {alice_token}" not in authorizations
@@ -574,4 +719,153 @@ async def test_two_users_never_share_credentials(
     assert by_user[_ALICE] is not by_user[_BOB], "the two users shared one context"
 
     # Neither user's material appears in the other's credentials or the logs.
-    _assert_no_token_material(caplog, alice_token, bob_token, _WORKLOAD_BEARER, "obo-INTEGRATION-")
+    _assert_no_token_material(caplog, alice_token, bob_token, workload_bearer, "obo-INTEGRATION-")
+
+
+async def test_lifecycle_operations_rebuild_the_exact_owner_context_and_reread_workload_file(
+    harness: _Harness,
+    keys: _IdpKeys,
+) -> None:
+    """Later status/relaunch/delete use the persisted owner, not request context."""
+    handle, alice_token = harness.login(keys, _ALICE)
+    async with harness.client_for(handle) as client:
+        agent = await create_test_agent(client, name="hab-int-lifecycle")
+        before = set(_managed_launch_tasks)
+        session_id = await _create_managed_session(client, agent["id"])
+        await _await_settled(before)
+
+        host = harness.app.state.host_store.list_hosts(_ALICE)[0]
+        initial_hab_id = host.sandbox_id
+        initial_workload = harness.workload_file.read_text().strip()
+        resolver = _reconstructed_identity_resolver(harness)
+        status_context = resolver.for_host(host)
+        assert status_context.credential_session_id == host.sandbox_credential_session_id
+        with managed_sandbox_context_scope(status_context):
+            assert (
+                await asyncio.to_thread(
+                    host_sandbox_is_running,
+                    host,
+                    harness.app.state.sandbox_config,
+                )
+                is True
+            )
+
+        rotated_workload = _replace_workload_bearer(harness.workload_file, "after-status")
+        relaunch_context = _reconstructed_identity_resolver(harness).for_host(host)
+        with managed_sandbox_context_scope(relaunch_context):
+            relaunched = await relaunch_managed_host(
+                config=harness.app.state.sandbox_config,
+                host=host,
+                host_store=harness.app.state.host_store,
+            )
+
+        refreshed_host = harness.app.state.host_store.get_host(relaunched.host_id)
+        assert refreshed_host is not None
+        assert refreshed_host.host_id == host.host_id
+        assert refreshed_host.sandbox_id != initial_hab_id
+        assert refreshed_host.sandbox_credential_session_id == host.sandbox_credential_session_id
+
+        response = await client.delete(f"/v1/sessions/{session_id}")
+        assert response.status_code == 200, response.text
+        assert response.json()["cleanup_pending"] is False
+
+    # The boundary was used for independent create, status, relaunch, and
+    # delete calls. Workload rotation applies only to later operations.
+    authorizations = {call["authorization"] for call in harness.exchange.calls}
+    assert f"Bearer {initial_workload}" in authorizations
+    assert f"Bearer {rotated_workload}" in authorizations
+    assert all(call["subject_token"] == alice_token for call in harness.exchange.calls)
+    assert [call["hab_id"] for call in harness.hab_service.deletehab_calls] == [
+        initial_hab_id,
+        refreshed_host.sandbox_id,
+    ]
+
+
+async def test_failed_cleanup_keeps_exact_tombstone_and_blocks_duplicate_generation(
+    harness: _Harness,
+    keys: _IdpKeys,
+) -> None:
+    """An ambiguous delete retries only the recorded UUID and never provisions again."""
+    handle, _ = harness.login(keys, _ALICE)
+    async with harness.client_for(handle) as client:
+        agent = await create_test_agent(client, name="hab-int-cleanup")
+        before = set(_managed_launch_tasks)
+        session_id = await _create_managed_session(client, agent["id"])
+        await _await_settled(before)
+
+        host = harness.app.state.host_store.list_hosts(_ALICE)[0]
+        exact_hab_id = host.sandbox_id
+        create_calls_before_delete = len(harness.hab_service.createhab_calls)
+        harness.hab_service.fail_next_delete = True
+        response = await client.delete(f"/v1/sessions/{session_id}")
+        assert response.status_code == 200, response.text
+        assert response.json()["cleanup_pending"] is True
+
+    tombstone = harness.app.state.host_store.get_host(host.host_id)
+    assert tombstone is not None
+    assert tombstone.sandbox_id == exact_hab_id
+    assert tombstone.sandbox_lifecycle_state == "cleanup_pending"
+    assert tombstone.sandbox_cleanup_attempts == 1
+
+    with pytest.raises(HTTPException, match="cleanup is pending"):
+        await relaunch_managed_host(
+            config=harness.app.state.sandbox_config,
+            host=tombstone,
+            host_store=harness.app.state.host_store,
+        )
+    assert len(harness.hab_service.createhab_calls) == create_calls_before_delete
+
+    retry_context = _reconstructed_identity_resolver(harness).for_host(tombstone)
+    with managed_sandbox_context_scope(retry_context):
+        assert await terminate_managed_host(
+            tombstone,
+            harness.app.state.host_store,
+            harness.app.state.sandbox_config,
+        )
+    assert harness.app.state.host_store.get_host(host.host_id) is None
+    assert [call["hab_id"] for call in harness.hab_service.deletehab_calls] == [
+        exact_hab_id,
+        exact_hab_id,
+    ]
+
+
+async def test_missing_revoked_or_expired_owner_session_fails_before_lifecycle_exchange(
+    harness: _Harness,
+    keys: _IdpKeys,
+) -> None:
+    """A reconstructed lifecycle cannot fall back to a different credential."""
+    handle, _ = harness.login(keys, _ALICE)
+    async with harness.client_for(handle) as client:
+        agent = await create_test_agent(client, name="hab-int-revoked-owner")
+        before = set(_managed_launch_tasks)
+        await _create_managed_session(client, agent["id"])
+        await _await_settled(before)
+
+    host = harness.app.state.host_store.list_hosts(_ALICE)[0]
+    assert host.sandbox_credential_session_id is not None
+    exchange_count = len(harness.exchange.calls)
+    harness.store.revoke(host.sandbox_credential_session_id)
+
+    with pytest.raises(ManagedSandboxIdentityUnavailable, match="reauthentication"):
+        _reconstructed_identity_resolver(harness).for_host(host)
+    with pytest.raises(ManagedSandboxIdentityUnavailable, match="reauthentication"):
+        _reconstructed_identity_resolver(harness).for_host(
+            replace(host, sandbox_credential_session_id=uuid.uuid4().hex)
+        )
+
+    fresh_handle, _ = harness.login(keys, _ALICE)
+    resolved = harness.store.resolve(fresh_handle)
+    assert resolved is not None
+    expired_session_id = resolved[1]
+    with harness.session_factory() as session:
+        session.execute(
+            update(SqlOidcSession)
+            .where(SqlOidcSession.id == expired_session_id)
+            .values(absolute_expiry=0)
+        )
+        session.commit()
+    with pytest.raises(ManagedSandboxIdentityUnavailable, match="reauthentication"):
+        _reconstructed_identity_resolver(harness).for_host(
+            replace(host, sandbox_credential_session_id=expired_session_id)
+        )
+    assert len(harness.exchange.calls) == exchange_count
