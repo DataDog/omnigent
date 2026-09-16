@@ -45,7 +45,7 @@ from omnigent.db.db_models import OmnigentBase, SqlOidcSession
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
-from omnigent.server.managed_hosts import ManagedSandboxConfig
+from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
 from omnigent.server.oidc import OIDCConfig
 from omnigent.server.oidc_session_store import OidcSessionStore
 from omnigent.server.routes._sessions.common import _managed_launch_tasks
@@ -417,10 +417,12 @@ async def harness(
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
         auth_provider=auth_provider,
-        sandbox_config=ManagedSandboxConfig(
-            server_url="https://srv.example.com",
-            launcher_factory=lambda: launcher,
-            token_ttl_s=3600,
+        sandbox_config=ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="https://srv.example.com",
+                launcher_factory=lambda: launcher,
+                token_ttl_s=3600,
+            )
         ),
     )
 
