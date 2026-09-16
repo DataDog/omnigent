@@ -38,6 +38,8 @@ from typing import TYPE_CHECKING
 
 from starlette.requests import HTTPConnection
 
+from omnigent.onboarding.sandboxes.context import IdentityToken, IdentityTokenProvider
+
 logger = logging.getLogger(__name__)
 
 # Opt-in multi-user switch.
@@ -410,6 +412,50 @@ class AuthProvider(ABC):
         """
         return None
 
+    def get_identity_token_provider(
+        self,
+        request: HTTPConnection,  # noqa: ARG002
+        expected_user_id: str,  # noqa: ARG002
+    ) -> IdentityTokenProvider | None:
+        """Return a renewable ID-token provider for this request, or ``None``.
+
+        The managed-sandbox path uses this to hand provider code the
+        signed-in user's identity without exposing refresh credentials.
+        Default: ``None`` — sources with no renewable IdP credential
+        session (header, accounts) never delegate identity.
+
+        :param request: The authenticated request.
+        :param expected_user_id: The verified session owner the provider
+            must be bound to; a mismatch never yields a provider.
+        """
+        return None
+
+
+class _OidcIdentityTokenProvider:
+    """IdentityTokenProvider bound to one encrypted OIDC credential session.
+
+    Every call re-validates the bound session and returns the current
+    signed ID token, refreshing near expiry. The refresh token stays
+    inside the session store; only the ID token crosses this boundary.
+    """
+
+    def __init__(
+        self,
+        token_manager: OidcTokenManager,
+        session_id: str,
+        expected_user_id: str,
+    ) -> None:
+        self._token_manager = token_manager
+        self._session_id = session_id
+        self._expected_user_id = expected_user_id
+
+    def get_identity_token(self) -> IdentityToken:
+        result = self._token_manager.get_current_id_token(
+            self._session_id,
+            self._expected_user_id,
+        )
+        return IdentityToken(value=result.id_token, expires_at=result.expiry)
+
 
 class UnifiedAuthProvider(AuthProvider):
     """Unified authentication provider that supports header-based,
@@ -571,6 +617,77 @@ class UnifiedAuthProvider(AuthProvider):
             self._source,
         )
 
+    def get_identity_token_provider(
+        self,
+        request: HTTPConnection,
+        expected_user_id: str,
+    ) -> IdentityTokenProvider | None:
+        """Return an ID-token provider bound to the request's credential session.
+
+        Only OIDC mode with a wired session store can delegate identity: the
+        request's ``sess_…`` handle is resolved through the same validated
+        path as :meth:`get_user_id`, and the session's verified user must
+        match *expected_user_id* (fail closed on any mismatch or missing
+        session). The returned provider serves only that session's current
+        ID token; refresh credentials never leave the store.
+
+        :returns: A bound :class:`IdentityTokenProvider`, or ``None``.
+        """
+        # Lazy import: oidc_token_manager pulls in routes.auth, which
+        # imports this module at load time.
+        from omnigent.server.oidc_token_manager import OidcTokenManager
+
+        if self._source != "oidc" or self._oidc_config is None or self._oidc_session_store is None:
+            return None
+        token = self._session_token(request)
+        if not token:
+            return None
+        resolved = self._resolved_credential_session(token)
+        if resolved is None:
+            return None
+        user_id, session_id = resolved
+        if user_id.lower() != expected_user_id.lower():
+            return None
+        token_manager = OidcTokenManager(self._oidc_session_store, self._oidc_config)
+        return _OidcIdentityTokenProvider(
+            token_manager=token_manager,
+            session_id=session_id,
+            expected_user_id=expected_user_id,
+        )
+
+    def _session_token(self, request: HTTPConnection) -> str | None:
+        """The raw session cookie or Bearer token, or ``None``.
+
+        Shared by :meth:`_check_cookie` and
+        :meth:`get_identity_token_provider` so user extraction and
+        identity delegation always read the same credential.
+        """
+        cookie_config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        if cookie_config is None:
+            return None
+        token = request.cookies.get(cookie_config.session_cookie_name)
+        if not token:
+            # Fall back to Bearer token for CLI clients.
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:]
+        return token
+
+    def _resolved_credential_session(self, token: str) -> tuple[str, str] | None:
+        """Resolve a ``sess_…`` handle to ``(user_id, session_id)``, or ``None``.
+
+        Unknown, revoked, or expired handles resolve to ``None`` (fail
+        closed). Non-``sess_`` tokens (self-contained JWTs) also return
+        ``None`` — they carry no durable credential session.
+        """
+        if not token.startswith("sess_") or self._oidc_session_store is None:
+            return None
+        result = self._oidc_session_store.resolve(token)
+        if result is None:
+            return None
+        user_id, session_id, _provider_subject = result
+        return user_id, session_id
+
     def _check_cookie(self, request: HTTPConnection) -> str | None:
         """Validate the session cookie or Bearer token and return the
         user ID.
@@ -599,24 +716,16 @@ class UnifiedAuthProvider(AuthProvider):
         cookie_config = self._oidc_config if self._source == "oidc" else self._accounts_config
         if cookie_config is None:
             return None
-        cookie_name = cookie_config.session_cookie_name
-        token = request.cookies.get(cookie_name)
-        if not token:
-            # Fall back to Bearer token for CLI clients.
-            auth_header = request.headers.get("Authorization", "")
-            if auth_header.startswith("Bearer "):
-                token = auth_header[7:]
+        token = self._session_token(request)
         if not token:
             return None
 
         # sess_ opaque handles are resolved via the encrypted session
         # store when one is configured. Managed-runner JWTs and legacy
         # self-contained cookies fall through to JWT decode below.
-        if token.startswith("sess_") and self._oidc_session_store is not None:
-            result = self._oidc_session_store.resolve(token)
-            if result is None:
-                return None
-            return result[0]  # user_id
+        resolved = self._resolved_credential_session(token)
+        if resolved is not None:
+            return resolved[0]  # user_id
 
         cache_key = hmac_digest(token, cookie_config.cookie_secret)
         cached = self._cookie_cache.get(cache_key)
@@ -807,3 +916,4 @@ if TYPE_CHECKING:
     from omnigent.server.accounts_config import AccountsConfig
     from omnigent.server.oidc import OIDCConfig
     from omnigent.server.oidc_session_store import OidcSessionStore
+    from omnigent.server.oidc_token_manager import OidcTokenManager
