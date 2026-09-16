@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -62,3 +64,11 @@ def test_receipt_stores_only_boolean_handoff_evidence(tmp_path: Path) -> None:
         "subject_token_present": True,
     }
     assert token not in receipt_path.read_text()
+
+
+def test_down_rejects_an_unsafe_state_directory() -> None:
+    script = _MODULE_PATH.parents[0] / "run.sh"
+    env = os.environ | {"TICINO_E2E_STATE_DIR": "/"}
+    result = subprocess.run([str(script), "down"], env=env, capture_output=True, text=True)
+    assert result.returncode != 0
+    assert "must use /tmp/omnigent-ticino-token-handoff-e2e" in result.stderr
