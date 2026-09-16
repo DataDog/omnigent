@@ -28,9 +28,7 @@ def upgrade() -> None:
             sa.Column("sandbox_lifecycle_state", sa.String(length=32), nullable=True)
         )
         batch_op.add_column(
-            sa.Column(
-                "sandbox_cleanup_attempts", sa.Integer(), nullable=False, server_default="0"
-            )
+            sa.Column("sandbox_cleanup_attempts", sa.Integer(), nullable=False, server_default="0")
         )
 
 

@@ -31,7 +31,9 @@ class _Auth:
         return self.result
 
 
-def _host(*, owner: str = "alice@example.com", credential_session_id: str | None = "oidc-session-alice") -> Host:
+def _host(
+    *, owner: str = "alice@example.com", credential_session_id: str | None = "oidc-session-alice"
+) -> Host:
     return Host(
         host_id="host-a",
         name="managed-a",
