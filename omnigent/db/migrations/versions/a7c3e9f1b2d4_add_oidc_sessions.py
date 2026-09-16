@@ -1,7 +1,7 @@
 """Add oidc_sessions table for encrypted provider session storage.
 
 Revision ID: a7c3e9f1b2d4
-Revises: e5d9bc8ac650
+Revises: ga1b2c3d4e5f
 Create Date: 2026-08-31
 """
 
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "a7c3e9f1b2d4"
-down_revision: str | None = "c4d5e6f7a8b9"
+down_revision: str | None = "ga1b2c3d4e5f"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
