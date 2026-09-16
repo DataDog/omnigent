@@ -1288,6 +1288,22 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
+        # Failed managed-resource deletes leave durable tombstones.  A single
+        # local reconciler retries only those exact recorded ids, under the
+        # owner-bound credential session captured at creation time.  It is
+        # intentionally absent when managed sandboxes are disabled; in that
+        # state there is no provider launcher that can safely service debt.
+        managed_sandbox_cleanup_reconciler = None
+        if host_store is not None and sandbox_config is not None:
+            from omnigent.server.managed_sandbox_cleanup import ManagedSandboxCleanupReconciler
+
+            managed_sandbox_cleanup_reconciler = ManagedSandboxCleanupReconciler(
+                host_store=host_store,
+                config=sandbox_config,
+                identity_resolver=app_inst.state.managed_sandbox_identity_resolver,
+            )
+            app_inst.state.managed_sandbox_cleanup_reconciler = managed_sandbox_cleanup_reconciler
+            await managed_sandbox_cleanup_reconciler.start()
         # Runner ``runner_last_seen`` is refreshed per-tunnel from each
         # runner tunnel's ping loop (``runner_tunnel._ping_loop``), inside
         # that handler's ``workspace_scope`` — not from a lifespan sweep,
@@ -1350,6 +1366,8 @@ def create_app(
         try:
             yield
         finally:
+            if managed_sandbox_cleanup_reconciler is not None:
+                await managed_sandbox_cleanup_reconciler.stop()
             # Run completion is event-driven (the _publish_status hook) plus a
             # lazy-on-read stale backstop — there is no run-reconciler task to
             # cancel. Only the per-job scheduler holds timers that need stopping.
