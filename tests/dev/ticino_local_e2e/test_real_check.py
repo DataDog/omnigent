@@ -122,6 +122,18 @@ def test_workload_file_rejects_symlink(tmp_path: Path) -> None:
     )
 
 
+def test_workload_file_validation_uses_fd_based_nofollow_read(tmp_path: Path) -> None:
+    workload_file = tmp_path / "workload.jwt"
+    _write_workload_file(workload_file)
+
+    assert real_check.validate_workload_token_file(str(workload_file)) is None
+    source = _MODULE_PATH.read_text()
+    assert "os.open(path_value, flags)" in source
+    assert 'getattr(os, "O_NOFOLLOW", 0)' in source
+    assert "os.fstat(file_descriptor)" in source
+    assert ".read_bytes()" not in source
+
+
 def test_harness_keeps_fake_mode_and_invokes_real_check_before_state_creation() -> None:
     script = (Path(__file__).parents[3] / "dev/ticino_local_e2e/run.sh").read_text()
 
@@ -132,13 +144,13 @@ def test_harness_keeps_fake_mode_and_invokes_real_check_before_state_creation() 
     assert "OMNIGENT_HAB_EXCHANGE_MODE=file" in script
     assert "EMISSARY_ENABLED=false" in script
     assert "real-check) real_check ;;" in script
-    assert 'rm -f -- "$workload_file"' in script
+    assert '--remove-workload-file "$workload_file"' in script
 
 
 def test_down_removes_recorded_real_bearer_and_warns_about_remote_cleanup(tmp_path: Path) -> None:
     state_dir = Path("/tmp") / f"omnigent-ticino-token-handoff-e2e-test-{tmp_path.name}"
     state_dir.mkdir(mode=0o700)
-    workload_file = tmp_path / "workload.jwt"
+    workload_file = Path("/tmp") / f"omnigent-workload-bearer-test-{tmp_path.name}.jwt"
     _write_workload_file(workload_file)
     (state_dir / "real-workload-token-file").write_text(str(workload_file) + "\n")
 
@@ -155,3 +167,41 @@ def test_down_removes_recorded_real_bearer_and_warns_about_remote_cleanup(tmp_pa
     assert not workload_file.exists()
     assert "did not delete or verify any remote Hab" in result.stderr
     assert not state_dir.exists()
+
+
+def test_down_never_removes_arbitrary_recorded_user_file(tmp_path: Path) -> None:
+    state_dir = Path("/tmp") / f"omnigent-ticino-token-handoff-e2e-test-{tmp_path.name}"
+    state_dir.mkdir(mode=0o700)
+    arbitrary_file = tmp_path / "important-user-file.jwt"
+    _write_workload_file(arbitrary_file)
+    (state_dir / "real-workload-token-file").write_text(str(arbitrary_file) + "\n")
+
+    script = Path(__file__).parents[3] / "dev/ticino_local_e2e/run.sh"
+    result = subprocess.run(
+        [str(script), "down"],
+        env=os.environ | {"TICINO_E2E_STATE_DIR": str(state_dir)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert arbitrary_file.exists()
+    assert "could not safely remove" in result.stderr
+    assert not state_dir.exists()
+
+
+def test_reconfigure_real_preserves_state_and_checks_before_stopping_pids() -> None:
+    script = (Path(__file__).parents[3] / "dev/ticino_local_e2e/run.sh").read_text()
+    start = script.index("reconfigure_real()")
+    command = script[start : script.index('case "${1:-}"', start)]
+
+    assert '[[ -f "$runtime_env" && -f "$server_config" && -f "$pgpass_file" ]]' in command
+    assert "load_runtime_env" in command
+    assert "pg_isready" in command
+    assert command.index("real_check") < command.index("stop_recorded_pid")
+    assert 'stop_recorded_pid "$state_dir/server.pid" "Omnigent server"' in command
+    assert 'stop_recorded_pid "$state_dir/fake-services.pid" "fake service"' in command
+    assert "start_real_server" in command
+    assert "docker compose" in command
+    assert " down" not in command
