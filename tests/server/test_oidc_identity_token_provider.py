@@ -331,6 +331,23 @@ def test_cross_user_request_yields_no_provider(session_factory, keys) -> None:
     assert provider.get_identity_token_provider(request, _ALICE) is None
 
 
+def test_persisted_credential_session_resolves_only_its_active_owner(
+    session_factory, keys
+) -> None:
+    """Restart recovery cannot substitute another owner or a revoked credential."""
+    store = OidcSessionStore(session_factory, credential_key=_TEST_KEY)
+    provider = _make_provider(store)
+    alice_token = keys.sign_id_token({})
+    _, session_id = _create_session(store, keys, user_id=_ALICE, id_token=alice_token)
+
+    recovered = provider.get_identity_token_provider_for_credential_session(session_id, _ALICE)
+    assert recovered is not None
+    assert recovered.get_identity_token().value == alice_token
+    assert provider.get_identity_token_provider_for_credential_session(session_id, _BOB) is None
+    assert store.revoke(session_id)
+    assert provider.get_identity_token_provider_for_credential_session(session_id, _ALICE) is None
+
+
 def test_refresh_credentials_never_leave_provider(session_factory, keys) -> None:
     """The refresh token never crosses the provider boundary."""
     config = _make_config()
