@@ -78,4 +78,12 @@ def test_run_script_keeps_database_password_out_of_process_arguments() -> None:
     script = (_MODULE_PATH.parents[0] / "run.sh").read_text()
     assert "--database-uri" not in script
     assert '--config "$server_config"' in script
+    assert 'PGPASSFILE="$pgpass_file"' in script
+    assert "postgresql+psycopg://%s@127.0.0.1" in script
     assert "psycopg[binary]" in script
+
+
+def test_run_script_detaches_long_running_processes() -> None:
+    script = (_MODULE_PATH.parents[0] / "run.sh").read_text()
+    assert "nohup env PYTHONPATH=" in script
+    assert "exec nohup env" in script
