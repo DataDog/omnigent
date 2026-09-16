@@ -33,7 +33,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import grpc
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -61,6 +60,16 @@ from tests.server.helpers import create_test_agent
 pytestmark = pytest.mark.asyncio
 
 _HAB_PATH_ENV = "OMNIGENT_HAB_LAUNCHER_PATH"
+
+if not os.environ.get(_HAB_PATH_ENV):
+    pytest.skip(
+        "OMNIGENT_HAB_LAUNCHER_PATH is not set — point it at the directory "
+        "containing the hab_launcher package (dd-source checkout)",
+        allow_module_level=True,
+    )
+
+grpc = pytest.importorskip("grpc")
+
 _TEST_KEY = bytes.fromhex("aa" * 32)
 _ISSUER = "https://idp.example.com"
 _CLIENT_ID = "public-client"
