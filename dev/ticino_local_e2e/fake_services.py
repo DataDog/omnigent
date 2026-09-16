@@ -204,6 +204,7 @@ def make_exchange_handler(receipts: ReceiptStore) -> type[BaseHTTPRequestHandler
             body = json.dumps(
                 {
                     "access_token": "fake-habitat-obo-bearer",
+                    "expires_in": 60,
                     "issued_token_type": _ID_TOKEN_TYPE,
                     "token_type": "Bearer",
                 }

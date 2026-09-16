@@ -112,34 +112,77 @@ Override all four only when testing a different issuer: `TICINO_ISSUER`,
 
 ## Real Habitat switch
 
-The default is always fake and cannot provision a Hab. A real-Habitat run is
-available only with two explicit opt-ins: `TICINO_E2E_HABITAT_MODE=real` and
-`TICINO_E2E_ALLOW_REAL_HABITAT=1`. It reuses the same local browser/OIDC and
-Docker Postgres setup, but it does not start either fake service. The caller
-must supply approved values for `HAB_APISERVER`, `EMISSARY_BIND_ADDRESS`, and
-the readable `HAB_WORKLOAD_TOKEN_FILE` mount:
+The default is always `fake` and cannot provision a Hab. Real mode is an
+intentional local-only escape hatch for Nick's Habitat DevEnv at
+`https://nickisaacs.habvm.dev`; it fails closed unless **both** of these are
+set exactly:
 
 ```sh
 export TICINO_E2E_HABITAT_MODE=real
 export TICINO_E2E_ALLOW_REAL_HABITAT=1
-export HAB_APISERVER='https://<approved Habitat API endpoint>'
-export EMISSARY_BIND_ADDRESS='<approved local Emissary bind address>'
-export HAB_WORKLOAD_TOKEN_FILE='/approved/private/workload-token-file'
+```
+
+Real mode uses the browser's loopback callback separately from the guest's
+public callback. Do not register the tunnel URL as an OAuth redirect and do
+not use a loopback URL for the guest callback. The launcher must be the
+file-backed exchange implementation from the corresponding dd-source change.
+
+```sh
+export HAB_APISERVER='https://nickisaacs.habvm.dev'
+export OMNIGENT_OIDC_REDIRECT_URI='http://127.0.0.1:6767/auth/callback'
+export OMNIGENT_PUBLIC_URL='https://<approved-temporary-https-wss-tunnel>'
+export OMNIGENT_HAB_EXCHANGE_MODE='file'
+export HAB_WORKLOAD_TOKEN_FILE='/tmp/omnigent-workload-bearer.jwt'
+export OMNIGENT_HAB_PROFILE='<verified-non-fake-profile>'
+export OMNIGENT_HAB_IMAGE='<pinned-image-reference>@sha256:<digest>'
+# Airlock is currently off in this test tenant. This broad egress setting is
+# temporary and is deliberately required rather than silently defaulted.
+export OMNIGENT_HAB_ALLOW_ALL_EGRESS='true'
+```
+
+Generate the workload bearer immediately before the run with the reviewed
+temporary exporter. It must atomically write a current-user-owned regular
+file with mode `0600`; never put its value in an environment variable, command
+argument, receipt, issue, or chat.
+
+```sh
+KUBE_NAMESPACE=workspaces \
+KUBE_POD=omnigent-server-0 \
+KUBE_CONTAINER=omnigent-server \
+TOKEN_OUTPUT="$HAB_WORKLOAD_TOKEN_FILE" \
+OVERWRITE=1 \
+/tmp/get-sycamore-workload-token.sh
+```
+
+Before Docker or Omnigent starts, run the secret-safe, read-only preflight:
+
+```sh
+dev/ticino_local_e2e/run.sh real-check
+```
+
+It verifies the dual opt-in, exact API endpoint, loopback OIDC callback,
+file-exchange mode, user-owned private JWT file (including `aud=identity` and
+freshness), immutable non-fake image, real profile, explicit broad egress,
+local `ssh`, and TLS reachability of the Habitat API and public tunnel. It
+does not create, list, or delete a Hab, and never prints bearer content.
+
+Only after it passes may you start the local server:
+
+```sh
 dev/ticino_local_e2e/run.sh up
 ```
 
-This mode can create external state. Run it only with the approved workload
-identity, Habitat policy, and operator authorization; `down` removes local
-state but does not delete any externally provisioned Hab.
+`up` runs the same preflight again before it creates Docker state. It writes a
+secret-free local readiness receipt; `status` can display it but it is not a
+remote cleanup receipt. A real run can create external state. Keep the owner
+session and exact Hab ID available until deletion is confirmed through
+Habitat. `down` stops local processes and Docker Postgres, removes the
+recorded workload-token file when it is still a safe regular file, and warns
+that it has neither deleted nor verified any remote Hab. Do not interpret
+local teardown as remote cleanup.
 
-The source launcher currently calls `dd_internal_authentication.ticino.Client`.
-With `EMISSARY_ENABLED=true` and a reachable `EMISSARY_BIND_ADDRESS`, that
-client routes to `http://<bind>/ticino/agent`; the actual workload identity is
-attached by Emissary. `HAB_WORKLOAD_TOKEN_FILE` is read by the launcher at
-request time and is fail-closed when absent, but the current shared client API
-does not send that file's value explicitly. A loopback fake proves the route
-and user-token handoff, not genuine Emissary workload attestation.
-
-`pup` is not a local Emissary provisioner (it is the Datadog API CLI), and no
-local Emissary binary or injection workflow was found in dd-source. This is
-the remaining blocker for a full local real-Habitat test.
+The public tunnel must support HTTPS and WSS from the guest and should be
+removed after confirmed cleanup. Real mode does not drive a local Emissary;
+the launcher reads `HAB_WORKLOAD_TOKEN_FILE` for each exchange. The temporary
+file workflow is short-lived test scaffolding, not a production renewal
+mechanism.
