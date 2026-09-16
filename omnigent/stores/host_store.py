@@ -79,6 +79,10 @@ class Host:
     status: str
     created_at: int
     updated_at: int
+    # Kept on the entity because background lifecycle work runs outside a
+    # request's workspace ContextVar and must restore the owning tenant before
+    # mutating the row.
+    workspace_id: int = 0
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
     sandbox_session_id: str | None = None
@@ -151,6 +155,7 @@ def _row_to_host(row: SqlHost) -> Host:
         status=decode_host_status(row.status),
         created_at=row.created_at,
         updated_at=row.updated_at,
+        workspace_id=row.workspace_id,
         sandbox_provider=row.sandbox_provider,
         sandbox_id=row.sandbox_id,
         sandbox_session_id=row.sandbox_session_id,
@@ -864,3 +869,33 @@ class HostStore:
             row.sandbox_lifecycle_state = "cleanup_pending"
             row.sandbox_cleanup_attempts += 1
             row.updated_at = now_epoch()
+
+    def list_managed_cleanup_pending_all_workspaces(self, *, limit: int) -> list[Host]:
+        """Return a bounded page of exact-resource cleanup tombstones.
+
+        This is deliberately the only background enumeration for managed
+        resources.  It returns persisted rows, never provider-side listings,
+        so reconciliation can issue a delete solely for the recorded provider
+        and sandbox id.  Callers restore each returned row's ``workspace_id``
+        before doing any follow-up store operation.
+
+        :param limit: Maximum number of tombstones to inspect in one pass.
+        :returns: Cleanup-pending managed hosts ordered stably for bounded
+            single-process reconciliation.
+        """
+        if limit <= 0:
+            return []
+        with self._session("list_managed_cleanup_pending_all_workspaces") as session:
+            rows = (
+                session.execute(
+                    select(SqlHost)
+                    .where(SqlHost.sandbox_lifecycle_state == "cleanup_pending")
+                    .where(SqlHost.sandbox_provider.is_not(None))
+                    .where(SqlHost.sandbox_id.is_not(None))
+                    .order_by(SqlHost.workspace_id, SqlHost.updated_at, SqlHost.host_id)
+                    .limit(limit)
+                )
+                .scalars()
+                .all()
+            )
+            return [_row_to_host(row) for row in rows]
