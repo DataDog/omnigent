@@ -26,17 +26,16 @@ the actual ID token.
 
 - Docker Desktop with `docker compose`
 - `uv`, `openssl`, and `curl`
-- A locally built wheel from dd-source PR #91876. Build it in a separate
-  dd-source worktree, then set `HAB_LAUNCHER_WHEEL` to that wheel's absolute
-  path. Do not use a wheel built from unrelated launcher code.
-- The real Ticino issuer URL in `TICINO_ISSUER`. The client must be configured
-  for the redirect URI above. The default domain allowlist is `datadoghq.com`;
-  set `TICINO_ALLOWED_DOMAINS` only if the issuer returns a different allowed
-  address domain.
+- Either a locally built wheel from dd-source PR #91876 in
+  `HAB_LAUNCHER_WHEEL`, or the matching source directory in
+  `HAB_LAUNCHER_SOURCE_DIR` (for example,
+  `/path/to/dd-source/domains/ai-devx/omnigent`). Source mode adds that
+  directory and its sibling `dd_internal_authentication` library to the
+  isolated harness process only; it does not modify the source checkout.
 
-The launcher wheel's import module is expected to be
-`omnigent_hab_launcher`. If its built distribution exposes `hab_launcher`
-instead, set `HAB_LAUNCHER_MODULE=hab_launcher` for all commands below.
+The PR #91876 launcher imports as `hab_launcher`, which is the harness
+default. Set `HAB_LAUNCHER_MODULE` only when validating a deliberately
+different package layout.
 
 For example, from a clean dd-source worktree checked out at the PR's current
 head (`9ce4ffa9fc4abb691a23e08f85431ec440f6ec44` when this harness was
@@ -48,14 +47,15 @@ bzl cquery --output=files //domains/ai-devx/omnigent/hab_launcher:omnigent_hab_l
 ```
 
 Use the resulting `.whl` path as `HAB_LAUNCHER_WHEEL`. Do not build from the
-shared dirty dd-source checkout.
+shared dirty dd-source checkout. Source mode is preferred while a Bazel wheel
+build is unavailable or slow.
 
 ## Run the fake-Habitat proof
 
 ```sh
 cd /Users/nick.isaacs/go/src/github.com/DataDog/omnigent-token-handoff-e2e
-export TICINO_ISSUER='https://<Ticino issuer>'
-export HAB_LAUNCHER_WHEEL='/absolute/path/to/omnigent_hab_launcher-*.whl'
+export HAB_LAUNCHER_SOURCE_DIR='/path/to/dd-source/domains/ai-devx/omnigent'
+# Or: export HAB_LAUNCHER_WHEEL='/absolute/path/to/omnigent_hab_launcher-*.whl'
 dev/ticino_local_e2e/run.sh up
 ```
 
@@ -82,7 +82,28 @@ All state, including the random Postgres password, cookie-signing key,
 credential-encryption key, and fake workload-bearer file is in a mode-0700
 directory under `/tmp` by default. `down` stops the processes, removes the
 Docker volume, and deletes that directory. Override the location only with
-`TICINO_E2E_STATE_DIR` pointing to a private, disposable directory.
+`TICINO_E2E_STATE_DIR` under `/tmp/omnigent-ticino-token-handoff-e2e-`.
+Teardown rejects empty, broad, workspace, home-directory, symlink, and other
+out-of-prefix targets before it can delete anything.
+
+## Ticino endpoints
+
+The harness defaults to the known staging layout. It keeps the canonical
+Fabric issuer (the expected `iss` claim) while explicitly using
+browser-reachable staging endpoints, because discovery at the canonical Fabric
+issuer is not reachable from a local browser. It also sets
+`OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION=1`, required for this Ticino setup.
+
+```text
+issuer:                  https://ticino.identity.local-cluster.local-dc.fabric.dog:8443/v1/issuer/sycamore
+authorization endpoint:  https://ticino.us1.ddbuild.staging.dog/v1/issuer/sycamore/oauth/authorize
+token endpoint:          https://ticino.us1.ddbuild.staging.dog/v1/issuer/sycamore/oauth/token
+JWKS URI:                https://ticino.us1.ddbuild.staging.dog/v1/issuer/sycamore/.well-known/keys
+```
+
+Override all four only when testing a different issuer: `TICINO_ISSUER`,
+`TICINO_AUTHORIZATION_ENDPOINT`, `TICINO_TOKEN_ENDPOINT`, and
+`TICINO_JWKS_URI`.
 
 ## Real Habitat switch
 
