@@ -11,7 +11,7 @@ port=${TICINO_E2E_PORT:-6767}
 exchange_port=${TICINO_E2E_EXCHANGE_PORT:-6768}
 habitat_port=${TICINO_E2E_HABITAT_PORT:-6769}
 postgres_port=${TICINO_E2E_POSTGRES_PORT:-6770}
-launcher_module=${HAB_LAUNCHER_MODULE:-omnigent_hab_launcher}
+launcher_module=${HAB_LAUNCHER_MODULE:-hab_launcher}
 habitat_mode=${TICINO_E2E_HABITAT_MODE:-fake}
 venv="$state_dir/venv"
 
@@ -22,6 +22,17 @@ die() {
 
 require_tool() {
   command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"
+}
+
+validate_state_dir() {
+  # Restrict cleanup to a dedicated /tmp prefix so a typo cannot turn `down`
+  # into a broad deletion.
+  case "$state_dir" in
+    /tmp/omnigent-ticino-token-handoff-e2e|/tmp/omnigent-ticino-token-handoff-e2e-*) ;;
+    *) die "TICINO_E2E_STATE_DIR must use /tmp/omnigent-ticino-token-handoff-e2e[-<suffix>]" ;;
+  esac
+  [[ "/$state_dir/" != *"/../"* ]] || die "TICINO_E2E_STATE_DIR must not contain '..'"
+  [[ ! -L "$state_dir" ]] || die "TICINO_E2E_STATE_DIR must not be a symlink"
 }
 
 pid_running() {
@@ -78,9 +89,13 @@ up() {
   require_tool uv
   require_tool curl
   require_tool openssl
-  [[ -n ${TICINO_ISSUER:-} ]] || die "set TICINO_ISSUER to the Ticino issuer URL"
-  [[ -n ${HAB_LAUNCHER_WHEEL:-} ]] || die "set HAB_LAUNCHER_WHEEL to the wheel built from dd-source PR #91876"
-  [[ -r ${HAB_LAUNCHER_WHEEL:-} ]] || die "HAB_LAUNCHER_WHEEL is not readable"
+  validate_state_dir
+  local ticino_issuer=${TICINO_ISSUER:-https://ticino.identity.local-cluster.local-dc.fabric.dog:8443/v1/issuer/sycamore}
+  local ticino_authorization_endpoint=${TICINO_AUTHORIZATION_ENDPOINT:-https://ticino.us1.ddbuild.staging.dog/v1/issuer/sycamore/oauth/authorize}
+  local ticino_token_endpoint=${TICINO_TOKEN_ENDPOINT:-https://ticino.us1.ddbuild.staging.dog/v1/issuer/sycamore/oauth/token}
+  local ticino_jwks_uri=${TICINO_JWKS_URI:-https://ticino.us1.ddbuild.staging.dog/v1/issuer/sycamore/.well-known/keys}
+  [[ -n ${HAB_LAUNCHER_WHEEL:-} || -n ${HAB_LAUNCHER_SOURCE_DIR:-} ]] || die \
+    "set HAB_LAUNCHER_WHEEL or HAB_LAUNCHER_SOURCE_DIR from dd-source PR #91876"
   [[ ! -e "$runtime_env" ]] || die "state already exists at $state_dir; use status or down first"
 
   write_runtime_env
@@ -101,7 +116,21 @@ up() {
     cd "$root_dir"
     UV_PROJECT_ENVIRONMENT="$venv" OMNIGENT_SKIP_WEB_UI=true uv sync --frozen --extra all --no-dev
   )
-  uv pip install --python "$venv/bin/python" --force-reinstall "$HAB_LAUNCHER_WHEEL"
+  local launcher_pythonpath=""
+  if [[ -n ${HAB_LAUNCHER_SOURCE_DIR:-} ]]; then
+    local launcher_source=${HAB_LAUNCHER_SOURCE_DIR%/}
+    local dd_source_root
+    dd_source_root=$(cd "$launcher_source/../../.." && pwd)
+    [[ -f "$launcher_source/hab_launcher/production.py" ]] || die \
+      "HAB_LAUNCHER_SOURCE_DIR must be dd-source/domains/ai-devx/omnigent"
+    [[ -f "$dd_source_root/libs/py/dd_internal_authentication/dd_internal_authentication/ticino.py" ]] || die \
+      "HAB_LAUNCHER_SOURCE_DIR must belong to a dd-source checkout with dd_internal_authentication"
+    launcher_pythonpath="$launcher_source:$dd_source_root/libs/py/dd_internal_authentication"
+    uv pip install --python "$venv/bin/python" grpcio protobuf cryptography click
+  else
+    [[ -r ${HAB_LAUNCHER_WHEEL:-} ]] || die "HAB_LAUNCHER_WHEEL is not readable"
+    uv pip install --python "$venv/bin/python" --force-reinstall "$HAB_LAUNCHER_WHEEL"
+  fi
 
   local habitat_api emissary_bind workload_file
   case "$habitat_mode" in
@@ -109,7 +138,8 @@ up() {
       habitat_api="http://127.0.0.1:$habitat_port"
       emissary_bind="127.0.0.1:$exchange_port"
       workload_file="$state_dir/workload-bearer"
-      "$venv/bin/python" "$harness_dir/fake_services.py" \
+      PYTHONPATH="$launcher_pythonpath${PYTHONPATH:+:$PYTHONPATH}" \
+        "$venv/bin/python" "$harness_dir/fake_services.py" \
         --receipt "$state_dir/receipt.json" \
         --exchange-port "$exchange_port" \
         --habitat-port "$habitat_port" \
@@ -135,9 +165,14 @@ up() {
     exec env \
       OMNIGENT_AUTH_ENABLED=1 \
       OMNIGENT_AUTH_PROVIDER=oidc \
-      OMNIGENT_OIDC_ISSUER="$TICINO_ISSUER" \
+      PYTHONPATH="$launcher_pythonpath${PYTHONPATH:+:$PYTHONPATH}" \
+      OMNIGENT_OIDC_ISSUER="$ticino_issuer" \
       OMNIGENT_OIDC_CLIENT_ID=omnigent-local \
       OMNIGENT_OIDC_REDIRECT_URI="http://127.0.0.1:$port/auth/callback" \
+      OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT="$ticino_authorization_endpoint" \
+      OMNIGENT_OIDC_TOKEN_ENDPOINT="$ticino_token_endpoint" \
+      OMNIGENT_OIDC_JWKS_URI="$ticino_jwks_uri" \
+      OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION=1 \
       OMNIGENT_OIDC_COOKIE_SECRET="$OMNIGENT_OIDC_COOKIE_SECRET" \
       OMNIGENT_OIDC_CREDENTIAL_KEY="$OMNIGENT_OIDC_CREDENTIAL_KEY" \
       OMNIGENT_OIDC_ALLOWED_DOMAINS="${TICINO_ALLOWED_DOMAINS:-datadoghq.com}" \
@@ -170,6 +205,7 @@ up() {
 }
 
 status() {
+  validate_state_dir
   [[ "$habitat_mode" == fake ]] || die "status receipts exist only in fake-Habitat mode"
   [[ -f "$state_dir/receipt.json" ]] || die "no receipt found; run '$0 up' first"
   "$venv/bin/python" - "$state_dir/receipt.json" <<'PY'
@@ -194,6 +230,7 @@ PY
 }
 
 down() {
+  validate_state_dir
   if pid_running "$state_dir/server.pid"; then
     kill "$(<"$state_dir/server.pid")" || true
   fi
