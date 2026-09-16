@@ -6,6 +6,7 @@ root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 harness_dir="$root_dir/dev/ticino_local_e2e"
 state_dir=${TICINO_E2E_STATE_DIR:-/tmp/omnigent-ticino-token-handoff-e2e}
 runtime_env="$state_dir/runtime.env"
+server_config="$state_dir/server-config.yaml"
 compose_file="$harness_dir/docker-compose.postgres.yml"
 port=${TICINO_E2E_PORT:-6767}
 exchange_port=${TICINO_E2E_EXCHANGE_PORT:-6768}
@@ -44,21 +45,26 @@ write_runtime_env() {
   mkdir -p "$state_dir"
   chmod 700 "$state_dir"
   umask 077
+  local db_name=omnigent db_user=omnigent
   local db_password cookie_key credential_key workload_bearer
   db_password=$(openssl rand -hex 24)
   cookie_key=$(openssl rand -hex 32)
   credential_key=$(openssl rand -hex 32)
   workload_bearer=$(openssl rand -hex 32)
   {
-    printf 'E2E_POSTGRES_DB=omnigent\n'
-    printf 'E2E_POSTGRES_USER=omnigent\n'
+    printf 'E2E_POSTGRES_DB=%s\n' "$db_name"
+    printf 'E2E_POSTGRES_USER=%s\n' "$db_user"
     printf 'E2E_POSTGRES_PASSWORD=%s\n' "$db_password"
     printf 'E2E_POSTGRES_PORT=%s\n' "$postgres_port"
     printf 'OMNIGENT_OIDC_COOKIE_SECRET=%s\n' "$cookie_key"
     printf 'OMNIGENT_OIDC_CREDENTIAL_KEY=%s\n' "$credential_key"
   } >"$runtime_env"
+  {
+    printf 'database_uri: "postgresql+psycopg://%s:%s@127.0.0.1:%s/%s"\n' \
+      "$db_user" "$db_password" "$postgres_port" "$db_name"
+  } >"$server_config"
   printf '%s' "$workload_bearer" >"$state_dir/workload-bearer"
-  chmod 600 "$runtime_env" "$state_dir/workload-bearer"
+  chmod 600 "$runtime_env" "$server_config" "$state_dir/workload-bearer"
 }
 
 load_runtime_env() {
@@ -116,6 +122,7 @@ up() {
     cd "$root_dir"
     UV_PROJECT_ENVIRONMENT="$venv" OMNIGENT_SKIP_WEB_UI=true uv sync --frozen --extra all --no-dev
   )
+  uv pip install --python "$venv/bin/python" 'psycopg[binary]>=3.1,<4'
   local launcher_pythonpath=""
   if [[ -n ${HAB_LAUNCHER_SOURCE_DIR:-} ]]; then
     local launcher_source=${HAB_LAUNCHER_SOURCE_DIR%/}
@@ -191,7 +198,7 @@ up() {
       OMNIGENT_DATA_DIR="$state_dir/data" \
       "$venv/bin/omnigent" server \
         --host 127.0.0.1 --port "$port" --no-open \
-        --database-uri "postgresql+psycopg://$E2E_POSTGRES_USER:$E2E_POSTGRES_PASSWORD@127.0.0.1:$postgres_port/$E2E_POSTGRES_DB" \
+        --config "$server_config" \
         --artifact-location "$state_dir/artifacts"
   ) >"$state_dir/server.log" 2>&1 &
   printf '%s\n' "$!" >"$state_dir/server.pid"
