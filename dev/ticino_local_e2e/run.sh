@@ -7,6 +7,7 @@ harness_dir="$root_dir/dev/ticino_local_e2e"
 state_dir=${TICINO_E2E_STATE_DIR:-/tmp/omnigent-ticino-token-handoff-e2e}
 runtime_env="$state_dir/runtime.env"
 server_config="$state_dir/server-config.yaml"
+pgpass_file="$state_dir/pgpass"
 compose_file="$harness_dir/docker-compose.postgres.yml"
 port=${TICINO_E2E_PORT:-6767}
 exchange_port=${TICINO_E2E_EXCHANGE_PORT:-6768}
@@ -59,12 +60,12 @@ write_runtime_env() {
     printf 'OMNIGENT_OIDC_COOKIE_SECRET=%s\n' "$cookie_key"
     printf 'OMNIGENT_OIDC_CREDENTIAL_KEY=%s\n' "$credential_key"
   } >"$runtime_env"
-  {
-    printf 'database_uri: "postgresql+psycopg://%s:%s@127.0.0.1:%s/%s"\n' \
-      "$db_user" "$db_password" "$postgres_port" "$db_name"
-  } >"$server_config"
+  printf 'database_uri: "postgresql+psycopg://%s@127.0.0.1:%s/%s"\n' \
+    "$db_user" "$postgres_port" "$db_name" >"$server_config"
+  printf '127.0.0.1:%s:%s:%s:%s\n' \
+    "$postgres_port" "$db_name" "$db_user" "$db_password" >"$pgpass_file"
   printf '%s' "$workload_bearer" >"$state_dir/workload-bearer"
-  chmod 600 "$runtime_env" "$server_config" "$state_dir/workload-bearer"
+  chmod 600 "$runtime_env" "$server_config" "$pgpass_file" "$state_dir/workload-bearer"
 }
 
 load_runtime_env() {
@@ -145,12 +146,13 @@ up() {
       habitat_api="http://127.0.0.1:$habitat_port"
       emissary_bind="127.0.0.1:$exchange_port"
       workload_file="$state_dir/workload-bearer"
-      PYTHONPATH="$launcher_pythonpath${PYTHONPATH:+:$PYTHONPATH}" \
+      nohup env PYTHONPATH="$launcher_pythonpath${PYTHONPATH:+:$PYTHONPATH}" \
         "$venv/bin/python" "$harness_dir/fake_services.py" \
         --receipt "$state_dir/receipt.json" \
         --exchange-port "$exchange_port" \
         --habitat-port "$habitat_port" \
-        --launcher-module "$launcher_module" >"$state_dir/fake-services.log" 2>&1 &
+        --launcher-module "$launcher_module" \
+        </dev/null >"$state_dir/fake-services.log" 2>&1 &
       printf '%s\n' "$!" >"$state_dir/fake-services.pid"
       ;;
     real)
@@ -169,7 +171,7 @@ up() {
 
   (
     cd "$root_dir"
-    exec env \
+    exec nohup env \
       OMNIGENT_AUTH_ENABLED=1 \
       OMNIGENT_AUTH_PROVIDER=oidc \
       PYTHONPATH="$launcher_pythonpath${PYTHONPATH:+:$PYTHONPATH}" \
@@ -196,11 +198,12 @@ up() {
       EMISSARY_ENABLED=true \
       EMISSARY_BIND_ADDRESS="$emissary_bind" \
       OMNIGENT_DATA_DIR="$state_dir/data" \
+      PGPASSFILE="$pgpass_file" \
       "$venv/bin/omnigent" server \
         --host 127.0.0.1 --port "$port" --no-open \
         --config "$server_config" \
         --artifact-location "$state_dir/artifacts"
-  ) >"$state_dir/server.log" 2>&1 &
+  ) </dev/null >"$state_dir/server.log" 2>&1 &
   printf '%s\n' "$!" >"$state_dir/server.pid"
   wait_for_url "http://127.0.0.1:$port/health" "$state_dir/server.pid"
   printf '%s\n' "Ready: open http://127.0.0.1:$port, sign in, then create a Hab Sandbox session."
