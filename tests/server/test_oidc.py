@@ -950,3 +950,72 @@ def test_oidc_redirect_uri_required_without_domain(monkeypatch: pytest.MonkeyPat
 
     with pytest.raises(RuntimeError, match="OMNIGENT_OIDC_REDIRECT_URI"):
         OIDCConfig.from_env()
+
+
+def _set_generic_oidc_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set the generic OIDC environment shared by config tests."""
+    monkeypatch.setenv("OMNIGENT_OIDC_ISSUER", "https://issuer.example.com")
+    monkeypatch.setenv("OMNIGENT_OIDC_CLIENT_ID", "public-client")
+    monkeypatch.delenv("OMNIGENT_OIDC_CLIENT_SECRET", raising=False)
+    monkeypatch.setenv("OMNIGENT_OIDC_REDIRECT_URI", "http://127.0.0.1:6767/auth/callback")
+    monkeypatch.setenv("OMNIGENT_OIDC_COOKIE_SECRET", "aa" * 32)
+
+
+def test_oidc_config_allows_public_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Generic OIDC clients may use PKCE without a client secret."""
+    _set_generic_oidc_env(monkeypatch)
+    discovery = MagicMock()
+    discovery.json.return_value = {
+        "authorization_endpoint": "https://idp.example.com/authorize",
+        "token_endpoint": "https://idp.example.com/token",
+        "jwks_uri": "https://idp.example.com/jwks",
+    }
+    monkeypatch.setattr("omnigent.server.oidc.httpx.get", MagicMock(return_value=discovery))
+
+    config = OIDCConfig.from_env()
+
+    assert config.client_secret is None
+
+
+def test_oidc_config_github_still_requires_client_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GitHub's confidential OAuth client cannot omit its secret."""
+    _set_generic_oidc_env(monkeypatch)
+    monkeypatch.setenv("OMNIGENT_OIDC_ISSUER", "https://github.com")
+
+    with pytest.raises(RuntimeError, match="GitHub OAuth requires a confidential client"):
+        OIDCConfig.from_env()
+
+
+def test_oidc_endpoint_overrides_preserve_canonical_issuer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Browser-reachable endpoints can differ from the token issuer."""
+    _set_generic_oidc_env(monkeypatch)
+    monkeypatch.setenv(
+        "OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT", "https://public.example.com/authorize"
+    )
+    monkeypatch.setenv("OMNIGENT_OIDC_TOKEN_ENDPOINT", "https://public.example.com/token")
+    monkeypatch.setenv("OMNIGENT_OIDC_JWKS_URI", "https://public.example.com/jwks")
+    get = MagicMock(side_effect=AssertionError("discovery should not be fetched"))
+    monkeypatch.setattr("omnigent.server.oidc.httpx.get", get)
+
+    config = OIDCConfig.from_env()
+
+    assert config.issuer == "https://issuer.example.com"
+    assert config.authorization_endpoint == "https://public.example.com/authorize"
+    assert config.token_endpoint == "https://public.example.com/token"
+    assert config.jwks_uri == "https://public.example.com/jwks"
+    get.assert_not_called()
+
+
+def test_oidc_endpoint_overrides_must_be_complete(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Partial transport overrides fail at startup instead of mixing hosts."""
+    _set_generic_oidc_env(monkeypatch)
+    monkeypatch.setenv(
+        "OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT", "https://public.example.com/authorize"
+    )
+
+    with pytest.raises(RuntimeError, match="must be configured together"):
+        OIDCConfig.from_env()
