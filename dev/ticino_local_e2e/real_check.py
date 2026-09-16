@@ -152,7 +152,13 @@ def _is_public_https_url(value: str) -> bool:
     parsed = urlparse(value)
     if parsed.scheme != "https" or not parsed.hostname:
         return False
-    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+    if (
+        parsed.username
+        or parsed.password
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
         return False
     hostname = parsed.hostname.lower()
     return hostname not in {"localhost", "127.0.0.1", "::1"} and not hostname.endswith(
@@ -212,15 +218,40 @@ def _check_https(url: str) -> str | None:
     return None
 
 
+def _https_status(url: str) -> int | None:
+    """Return an HTTPS response status without reading or exposing its body."""
+    try:
+        with urlopen(url, timeout=5, context=ssl.create_default_context()) as response:
+            return response.status
+    except HTTPError as error:
+        return error.code
+    except (OSError, URLError):
+        return None
+
+
+def _check_public_callback_origin(public_url: str) -> list[str]:
+    """Verify that the tunnel reaches this app and does not expose its API."""
+    origin = public_url.rstrip("/")
+    health_status = _https_status(f"{origin}/health")
+    errors: list[str] = []
+    if health_status is None or not 200 <= health_status < 300:
+        errors.append("OMNIGENT_PUBLIC_URL/health is not HTTPS-reachable")
+    protected_status = _https_status(f"{origin}/v1/sessions")
+    if protected_status not in (401, 403):
+        errors.append("OMNIGENT_PUBLIC_URL/v1/sessions must return 401 or 403 without credentials")
+    return errors
+
+
 def run_check(environment: Mapping[str, str], *, port: int, check_network: bool) -> list[str]:
     errors = validate_real_environment(environment, port=port)
     if errors or not check_network:
         return errors
     if shutil.which("ssh") is None:
         errors.append("ssh is required for real Habitat direct-connect validation")
-    for name in ("HAB_APISERVER", "OMNIGENT_PUBLIC_URL"):
+    for name in ("HAB_APISERVER",):
         if _check_https(environment[name]):
             errors.append(f"{name} is not HTTPS-reachable")
+    errors.extend(_check_public_callback_origin(environment["OMNIGENT_PUBLIC_URL"]))
     return errors
 
 
@@ -243,7 +274,7 @@ def main() -> None:
             print(f"error: {error}", file=sys.stderr)
         raise SystemExit(1)
     checks = (
-        "local configuration, bearer-file safety, and HTTPS reachability"
+        "local configuration, bearer-file safety, and HTTPS callback-origin checks"
         if args.network
         else "local configuration and bearer-file safety"
     )

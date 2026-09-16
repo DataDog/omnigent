@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from starlette.requests import Request
 
+from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.onboarding.sandboxes.context import IdentityTokenProvider, ManagedSandboxContext
 from omnigent.server.auth import AuthProvider
 from omnigent.stores.host_store import Host
@@ -18,6 +19,16 @@ class ManagedSandboxIdentityUnavailable(RuntimeError):
 def _credential_session_id(provider: IdentityTokenProvider | None) -> str | None:
     value = getattr(provider, "credential_session_id", None)
     return value if isinstance(value, str) and value else None
+
+
+def _canonical_credential_session_id(value: object) -> str | None:
+    """Return the canonical OIDC session UUID, or ``None`` for stale bindings."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return uuid_to_bytes(value).hex()
+    except InvalidUuidError:
+        return None
 
 
 def context_for_managed_sandbox_create(
@@ -44,8 +55,10 @@ class ManagedSandboxIdentityResolver:
     auth_provider: AuthProvider | None
 
     def for_host(self, host: Host) -> ManagedSandboxContext:
-        credential_session_id = getattr(host, "sandbox_credential_session_id", None)
-        if not isinstance(credential_session_id, str) or not credential_session_id:
+        credential_session_id = _canonical_credential_session_id(
+            getattr(host, "sandbox_credential_session_id", None)
+        )
+        if credential_session_id is None:
             raise ManagedSandboxIdentityUnavailable(
                 "owner reauthentication is required before this managed sandbox can be operated"
             )

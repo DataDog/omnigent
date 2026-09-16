@@ -130,6 +130,7 @@ file-backed exchange implementation from the corresponding dd-source change.
 ```sh
 export HAB_APISERVER='https://nickisaacs.habvm.dev'
 export OMNIGENT_OIDC_REDIRECT_URI='http://127.0.0.1:6767/auth/callback'
+# Use the tunnel origin only (no path; an optional trailing / is allowed).
 export OMNIGENT_PUBLIC_URL='https://<approved-temporary-https-wss-tunnel>'
 export OMNIGENT_HAB_EXCHANGE_MODE='file'
 export HAB_WORKLOAD_TOKEN_FILE='/tmp/omnigent-workload-bearer.jwt'
@@ -144,6 +145,9 @@ Generate the workload bearer immediately before the run with the reviewed
 temporary exporter. It must atomically write a current-user-owned regular
 file with mode `0600`; never put its value in an environment variable, command
 argument, receipt, issue, or chat.
+
+The networked preflight checks the tunnel's `/health` route and verifies that
+an unauthenticated `/v1/sessions` request receives `401` or `403`.
 
 ```sh
 KUBE_NAMESPACE=workspaces \
