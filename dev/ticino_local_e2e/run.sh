@@ -227,6 +227,7 @@ required = (
     "exchange_route_matched",
     "exchange_used_post",
     "exchange_form_urlencoded",
+    "emissary_request_header_matches",
     "workload_authorization_present",
     "workload_authorization_distinct_from_subject_token",
     "exchange_grant_type_matches",
