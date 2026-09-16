@@ -10,6 +10,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.error import HTTPError
+
+import pytest
 
 _MODULE_PATH = Path(__file__).parents[3] / "dev/ticino_local_e2e/real_check.py"
 _SPEC = importlib.util.spec_from_file_location("ticino_real_check", _MODULE_PATH)
@@ -84,6 +87,118 @@ def test_real_environment_rejects_fake_and_loopback_launch_inputs(tmp_path: Path
         "OMNIGENT_HAB_ALLOW_ALL_EGRESS must be explicitly true for this temporary test" in errors
     )
     assert "OMNIGENT_PUBLIC_URL must be a non-loopback HTTPS tunnel origin" in errors
+
+
+@pytest.mark.parametrize("path", ["/callback", "/nested/path"])
+def test_real_environment_rejects_public_url_paths(tmp_path: Path, path: str) -> None:
+    workload_file = tmp_path / "workload.jwt"
+    _write_workload_file(workload_file)
+    environment = _real_environment(workload_file)
+    environment["OMNIGENT_PUBLIC_URL"] = f"https://approved-tunnel.example{path}"
+
+    errors = real_check.validate_real_environment(environment, port=6767)
+
+    assert "OMNIGENT_PUBLIC_URL must be a non-loopback HTTPS tunnel origin" in errors
+
+
+def test_real_environment_allows_a_root_public_url_path(tmp_path: Path) -> None:
+    workload_file = tmp_path / "workload.jwt"
+    _write_workload_file(workload_file)
+    environment = _real_environment(workload_file)
+    environment["OMNIGENT_PUBLIC_URL"] = "https://approved-tunnel.example/"
+
+    assert real_check.validate_real_environment(environment, port=6767) == []
+
+
+class _Response:
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+    def __enter__(self) -> _Response:
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        return False
+
+
+def _status_responder(statuses: dict[str, int], calls: list[str]):
+    def responder(url: str, **_kwargs: object) -> _Response:
+        calls.append(url)
+        status = statuses[url]
+        if status >= 400:
+            raise HTTPError(url, status, "test status", hdrs=None, fp=None)
+        return _Response(status)
+
+    return responder
+
+
+def test_network_check_verifies_the_callback_origin_is_healthy_and_protected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workload_file = tmp_path / "workload.jwt"
+    _write_workload_file(workload_file)
+    environment = _real_environment(workload_file)
+    public_url = environment["OMNIGENT_PUBLIC_URL"]
+    calls: list[str] = []
+    monkeypatch.setattr(
+        real_check,
+        "urlopen",
+        _status_responder(
+            {
+                environment["HAB_APISERVER"]: 200,
+                f"{public_url}/health": 200,
+                f"{public_url}/v1/sessions": 401,
+            },
+            calls,
+        ),
+    )
+
+    assert real_check.run_check(environment, port=6767, check_network=True) == []
+    assert calls == [
+        environment["HAB_APISERVER"],
+        f"{public_url}/health",
+        f"{public_url}/v1/sessions",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("health_status", "protected_status", "expected_error"),
+    [
+        (404, 401, "OMNIGENT_PUBLIC_URL/health is not HTTPS-reachable"),
+        (
+            200,
+            200,
+            "OMNIGENT_PUBLIC_URL/v1/sessions must return 401 or 403 without credentials",
+        ),
+    ],
+)
+def test_network_check_rejects_a_wrong_or_unprotected_callback_origin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    health_status: int,
+    protected_status: int,
+    expected_error: str,
+) -> None:
+    workload_file = tmp_path / "workload.jwt"
+    _write_workload_file(workload_file)
+    environment = _real_environment(workload_file)
+    public_url = environment["OMNIGENT_PUBLIC_URL"]
+    monkeypatch.setattr(
+        real_check,
+        "urlopen",
+        _status_responder(
+            {
+                environment["HAB_APISERVER"]: 200,
+                f"{public_url}/health": health_status,
+                f"{public_url}/v1/sessions": protected_status,
+            },
+            [],
+        ),
+    )
+
+    errors = real_check.run_check(environment, port=6767, check_network=True)
+
+    assert expected_error in errors
 
 
 def test_workload_file_rejects_insecure_or_near_expiry_tokens(tmp_path: Path) -> None:
