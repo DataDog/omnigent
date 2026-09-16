@@ -16,6 +16,7 @@ postgres_port=${TICINO_E2E_POSTGRES_PORT:-6770}
 launcher_module=${HAB_LAUNCHER_MODULE:-hab_launcher}
 habitat_mode=${TICINO_E2E_HABITAT_MODE:-fake}
 venv="$state_dir/venv"
+launcher_pythonpath_file="$state_dir/launcher-pythonpath"
 
 die() {
   printf '%s\n' "error: $*" >&2
@@ -40,6 +41,32 @@ validate_state_dir() {
 pid_running() {
   local pid_file=$1
   [[ -f "$pid_file" ]] && kill -0 "$(<"$pid_file")" 2>/dev/null
+}
+
+recorded_pid_is_owned() {
+  local pid=$1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ $(ps -o uid= -p "$pid" 2>/dev/null | tr -d ' ') == "$UID" ]] || return 1
+  local command
+  command=$(ps -o command= -p "$pid" 2>/dev/null) || return 1
+  [[ "$command" == *"$state_dir"* ]]
+}
+
+stop_recorded_pid() {
+  local pid_file=$1
+  local label=$2
+  if ! pid_running "$pid_file"; then
+    return
+  fi
+  local pid
+  pid=$(<"$pid_file")
+  recorded_pid_is_owned "$pid" || die "refusing to stop an unowned $label PID"
+  kill "$pid"
+  for _ in $(seq 1 10); do
+    ! kill -0 "$pid" 2>/dev/null && return
+    sleep 1
+  done
+  die "recorded $label PID did not stop"
 }
 
 write_runtime_env() {
@@ -138,6 +165,73 @@ PY
   chmod 600 "$state_dir/real-readiness.json" "$state_dir/real-workload-token-file"
 }
 
+source_launcher_pythonpath() {
+  local launcher_source=${HAB_LAUNCHER_SOURCE_DIR%/}
+  local dd_source_root
+  dd_source_root=$(cd "$launcher_source/../../.." && pwd)
+  [[ -f "$launcher_source/hab_launcher/production.py" ]] || die \
+    "HAB_LAUNCHER_SOURCE_DIR must be dd-source/domains/ai-devx/omnigent"
+  [[ -f "$dd_source_root/libs/py/dd_internal_authentication/dd_internal_authentication/ticino.py" ]] || die \
+    "HAB_LAUNCHER_SOURCE_DIR must belong to a dd-source checkout with dd_internal_authentication"
+  printf '%s:%s' "$launcher_source" "$dd_source_root/libs/py/dd_internal_authentication"
+}
+
+existing_launcher_pythonpath() {
+  if [[ -n ${HAB_LAUNCHER_SOURCE_DIR:-} ]]; then
+    source_launcher_pythonpath
+    return
+  fi
+  [[ -f "$launcher_pythonpath_file" ]] || die \
+    "missing launcher state; set HAB_LAUNCHER_SOURCE_DIR used for the existing server"
+  cat "$launcher_pythonpath_file"
+}
+
+start_real_server() {
+  local launcher_pythonpath=$1
+  local ticino_issuer=${TICINO_ISSUER:-https://ticino.identity.local-cluster.local-dc.fabric.dog:8443/v1/issuer/sycamore}
+  local ticino_authorization_endpoint=${TICINO_AUTHORIZATION_ENDPOINT:-https://ticino.us1.ddbuild.staging.dog/v1/issuer/sycamore/oauth/authorize}
+  local ticino_token_endpoint=${TICINO_TOKEN_ENDPOINT:-https://ticino.us1.ddbuild.staging.dog/v1/issuer/sycamore/oauth/token}
+  local ticino_jwks_uri=${TICINO_JWKS_URI:-https://ticino.us1.ddbuild.staging.dog/v1/issuer/sycamore/.well-known/keys}
+  (
+    cd "$root_dir"
+    exec nohup env \
+      OMNIGENT_AUTH_ENABLED=1 \
+      OMNIGENT_AUTH_PROVIDER=oidc \
+      PYTHONPATH="$launcher_pythonpath${PYTHONPATH:+:$PYTHONPATH}" \
+      OMNIGENT_OIDC_ISSUER="$ticino_issuer" \
+      OMNIGENT_OIDC_CLIENT_ID=omnigent-local \
+      OMNIGENT_OIDC_REDIRECT_URI="http://127.0.0.1:$port/auth/callback" \
+      OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT="$ticino_authorization_endpoint" \
+      OMNIGENT_OIDC_TOKEN_ENDPOINT="$ticino_token_endpoint" \
+      OMNIGENT_OIDC_JWKS_URI="$ticino_jwks_uri" \
+      OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION=1 \
+      OMNIGENT_OIDC_COOKIE_SECRET="$OMNIGENT_OIDC_COOKIE_SECRET" \
+      OMNIGENT_OIDC_CREDENTIAL_KEY="$OMNIGENT_OIDC_CREDENTIAL_KEY" \
+      OMNIGENT_OIDC_ALLOWED_DOMAINS="${TICINO_ALLOWED_DOMAINS:-datadoghq.com}" \
+      OMNIGENT_HAB_ENABLED=1 \
+      OMNIGENT_SANDBOX_PROVIDER_MODULE="$launcher_module" \
+      OMNIGENT_HAB_IMAGE="$OMNIGENT_HAB_IMAGE" \
+      OMNIGENT_HAB_PROFILE="$OMNIGENT_HAB_PROFILE" \
+      OMNIGENT_HAB_RUNTIME=firecracker \
+      OMNIGENT_HAB_ALLOW_ALL_EGRESS=true \
+      OMNIGENT_PUBLIC_URL="$OMNIGENT_PUBLIC_URL" \
+      OMNIGENT_HAB_REGISTRY_PATH="$state_dir/hab-registry.json" \
+      HAB_APISERVER="$HAB_APISERVER" \
+      OMNIGENT_HAB_EXCHANGE_MODE=file \
+      HAB_WORKLOAD_TOKEN_FILE="$HAB_WORKLOAD_TOKEN_FILE" \
+      OMNIGENT_HAB_TICINO_ADDRESS="${OMNIGENT_HAB_TICINO_ADDRESS:-}" \
+      EMISSARY_ENABLED=false \
+      OMNIGENT_DATA_DIR="$state_dir/data" \
+      PGPASSFILE="$pgpass_file" \
+      "$venv/bin/omnigent" server \
+        --host 127.0.0.1 --port "$port" --no-open \
+        --config "$server_config" \
+        --artifact-location "$state_dir/artifacts"
+  ) </dev/null >"$state_dir/server.log" 2>&1 &
+  printf '%s\n' "$!" >"$state_dir/server.pid"
+  wait_for_url "http://127.0.0.1:$port/health" "$state_dir/server.pid"
+}
+
 up() {
   require_tool docker
   require_tool uv
@@ -184,19 +278,14 @@ up() {
   uv pip install --python "$venv/bin/python" 'psycopg[binary]>=3.1,<4'
   local launcher_pythonpath=""
   if [[ -n ${HAB_LAUNCHER_SOURCE_DIR:-} ]]; then
-    local launcher_source=${HAB_LAUNCHER_SOURCE_DIR%/}
-    local dd_source_root
-    dd_source_root=$(cd "$launcher_source/../../.." && pwd)
-    [[ -f "$launcher_source/hab_launcher/production.py" ]] || die \
-      "HAB_LAUNCHER_SOURCE_DIR must be dd-source/domains/ai-devx/omnigent"
-    [[ -f "$dd_source_root/libs/py/dd_internal_authentication/dd_internal_authentication/ticino.py" ]] || die \
-      "HAB_LAUNCHER_SOURCE_DIR must belong to a dd-source checkout with dd_internal_authentication"
-    launcher_pythonpath="$launcher_source:$dd_source_root/libs/py/dd_internal_authentication"
+    launcher_pythonpath=$(source_launcher_pythonpath)
     uv pip install --python "$venv/bin/python" grpcio protobuf cryptography click
   else
     [[ -r ${HAB_LAUNCHER_WHEEL:-} ]] || die "HAB_LAUNCHER_WHEEL is not readable"
     uv pip install --python "$venv/bin/python" --force-reinstall "$HAB_LAUNCHER_WHEEL"
   fi
+  printf '%s\n' "$launcher_pythonpath" >"$launcher_pythonpath_file"
+  chmod 600 "$launcher_pythonpath_file"
 
   local habitat_api exchange_address workload_file hab_image hab_profile hab_egress public_url
   case "$habitat_mode" in
@@ -318,12 +407,8 @@ PY
 
 down() {
   validate_state_dir
-  if pid_running "$state_dir/server.pid"; then
-    kill "$(<"$state_dir/server.pid")" || true
-  fi
-  if pid_running "$state_dir/fake-services.pid"; then
-    kill "$(<"$state_dir/fake-services.pid")" || true
-  fi
+  stop_recorded_pid "$state_dir/server.pid" "Omnigent server"
+  stop_recorded_pid "$state_dir/fake-services.pid" "fake service"
   if [[ -f "$runtime_env" ]]; then
     load_runtime_env
     docker compose --env-file "$runtime_env" -f "$compose_file" -p omnigent_ticino_e2e down -v
@@ -331,8 +416,8 @@ down() {
   if [[ -f "$state_dir/real-workload-token-file" ]]; then
     local workload_file
     workload_file=$(<"$state_dir/real-workload-token-file")
-    if [[ -n "$workload_file" && ! -L "$workload_file" && -f "$workload_file" ]]; then
-      rm -f -- "$workload_file"
+    if [[ -n "$workload_file" ]] && python3 "$harness_dir/real_check.py" \
+      --port "$port" --remove-workload-file "$workload_file"; then
       printf '%s\n' "Removed the real-mode workload bearer file."
     else
       printf '%s\n' "WARNING: could not safely remove the recorded real-mode workload bearer file." >&2
@@ -343,13 +428,42 @@ down() {
   printf '%s\n' "Removed local harness state and its ephemeral credentials."
 }
 
+reconfigure_real() {
+  require_tool docker
+  require_tool python3
+  validate_state_dir
+  [[ "$habitat_mode" == real && ${TICINO_E2E_ALLOW_REAL_HABITAT:-} == 1 ]] || die \
+    "reconfigure-real requires TICINO_E2E_HABITAT_MODE=real and TICINO_E2E_ALLOW_REAL_HABITAT=1"
+  [[ -f "$runtime_env" && -f "$server_config" && -f "$pgpass_file" ]] || die \
+    "missing persistent runtime state; run fake mode first"
+  [[ -x "$venv/bin/omnigent" ]] || die "missing existing harness virtual environment"
+
+  # Do every fail-closed check before touching the signed-in local server.
+  real_check
+  load_runtime_env
+  docker compose --env-file "$runtime_env" -f "$compose_file" -p omnigent_ticino_e2e \
+    exec -T postgres pg_isready -U "$E2E_POSTGRES_USER" -d "$E2E_POSTGRES_DB" >/dev/null || die \
+    "the existing Docker Postgres is not ready; reconfigure-real will not recreate it"
+  local launcher_pythonpath
+  launcher_pythonpath=$(existing_launcher_pythonpath)
+
+  # The PID ownership check requires the command to be in this harness state
+  # directory; no arbitrary process or Docker resource is stopped here.
+  stop_recorded_pid "$state_dir/server.pid" "Omnigent server"
+  stop_recorded_pid "$state_dir/fake-services.pid" "fake service"
+  write_real_receipt
+  start_real_server "$launcher_pythonpath"
+  printf '%s\n' "Reconfigured the existing signed-in local runtime for real Habitat mode without recreating Postgres or credential state."
+}
+
 case "${1:-}" in
   up) up ;;
   real-check) real_check ;;
+  reconfigure-real) reconfigure_real ;;
   status) status ;;
   down) down ;;
   *)
-    printf '%s\n' "Usage: $0 {up|real-check|status|down}" >&2
+    printf '%s\n' "Usage: $0 {up|real-check|reconfigure-real|status|down}" >&2
     exit 2
     ;;
 esac
