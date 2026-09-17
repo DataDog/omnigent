@@ -106,9 +106,12 @@ token endpoint:          https://ticino.us1.ddbuild.staging.dog/v1/issuer/sycamo
 JWKS URI:                https://ticino.us1.ddbuild.staging.dog/v1/issuer/sycamore/.well-known/keys
 ```
 
-Override all four only when testing a different issuer: `TICINO_ISSUER`,
-`TICINO_AUTHORIZATION_ENDPOINT`, `TICINO_TOKEN_ENDPOINT`, and
-`TICINO_JWKS_URI`.
+Override all five only when testing a different issuer: `TICINO_ISSUER`,
+`TICINO_AUTHORIZATION_ENDPOINT`, `TICINO_TOKEN_ENDPOINT`,
+`TICINO_JWKS_URI`, and `OMNIGENT_HAB_TICINO_ADDRESS`. The last setting is the
+origin used for the OBO exchange and defaults to
+`https://ticino.us1.ddbuild.staging.dog`; leaving it empty does not fall back
+to Ticino's laptop-unreachable in-cluster DNS name.
 
 ## Real Habitat switch
 
