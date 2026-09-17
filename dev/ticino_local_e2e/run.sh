@@ -192,6 +192,7 @@ start_real_server() {
   local ticino_authorization_endpoint=${TICINO_AUTHORIZATION_ENDPOINT:-https://ticino.us1.ddbuild.staging.dog/v1/issuer/sycamore/oauth/authorize}
   local ticino_token_endpoint=${TICINO_TOKEN_ENDPOINT:-https://ticino.us1.ddbuild.staging.dog/v1/issuer/sycamore/oauth/token}
   local ticino_jwks_uri=${TICINO_JWKS_URI:-https://ticino.us1.ddbuild.staging.dog/v1/issuer/sycamore/.well-known/keys}
+  local ticino_exchange_address=${OMNIGENT_HAB_TICINO_ADDRESS:-https://ticino.us1.ddbuild.staging.dog}
   (
     cd "$root_dir"
     exec nohup env \
@@ -219,7 +220,7 @@ start_real_server() {
       HAB_APISERVER="$HAB_APISERVER" \
       OMNIGENT_HAB_EXCHANGE_MODE=file \
       HAB_WORKLOAD_TOKEN_FILE="$HAB_WORKLOAD_TOKEN_FILE" \
-      OMNIGENT_HAB_TICINO_ADDRESS="${OMNIGENT_HAB_TICINO_ADDRESS:-}" \
+      OMNIGENT_HAB_TICINO_ADDRESS="$ticino_exchange_address" \
       EMISSARY_ENABLED=false \
       OMNIGENT_DATA_DIR="$state_dir/data" \
       PGPASSFILE="$pgpass_file" \
@@ -311,7 +312,7 @@ up() {
         "real Habitat requires TICINO_E2E_ALLOW_REAL_HABITAT=1"
       habitat_api="$HAB_APISERVER"
       workload_file="$HAB_WORKLOAD_TOKEN_FILE"
-      exchange_address=${OMNIGENT_HAB_TICINO_ADDRESS:-}
+      exchange_address=${OMNIGENT_HAB_TICINO_ADDRESS:-https://ticino.us1.ddbuild.staging.dog}
       hab_image="$OMNIGENT_HAB_IMAGE"
       hab_profile="$OMNIGENT_HAB_PROFILE"
       hab_egress=true
