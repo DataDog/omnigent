@@ -70,6 +70,8 @@ class ManagedSandboxIdentityResolver:
             raise ManagedSandboxIdentityUnavailable(
                 "owner reauthentication is required before this managed sandbox can be operated"
             )
+        # TODO(POC): Rebind after verified owner reauthentication; today an
+        # expired original credential session permanently strands the sandbox.
         provider = (
             self.auth_provider.get_identity_token_provider_for_credential_session(
                 credential_session_id, host.user_id
