@@ -43,15 +43,15 @@ pid_running() {
 }
 
 write_runtime_env() {
+  local mode=$1
   mkdir -p "$state_dir"
   chmod 700 "$state_dir"
   umask 077
   local db_name=omnigent db_user=omnigent
-  local db_password cookie_key credential_key workload_bearer
+  local db_password cookie_key credential_key
   db_password=$(openssl rand -hex 24)
   cookie_key=$(openssl rand -hex 32)
   credential_key=$(openssl rand -hex 32)
-  workload_bearer=$(openssl rand -hex 32)
   {
     printf 'E2E_POSTGRES_DB=%s\n' "$db_name"
     printf 'E2E_POSTGRES_USER=%s\n' "$db_user"
@@ -64,8 +64,23 @@ write_runtime_env() {
     "$db_user" "$postgres_port" "$db_name" >"$server_config"
   printf '127.0.0.1:%s:%s:%s:%s\n' \
     "$postgres_port" "$db_name" "$db_user" "$db_password" >"$pgpass_file"
-  printf '%s' "$workload_bearer" >"$state_dir/workload-bearer"
-  chmod 600 "$runtime_env" "$server_config" "$pgpass_file" "$state_dir/workload-bearer"
+  chmod 600 "$runtime_env" "$server_config" "$pgpass_file"
+  if [[ "$mode" == fake ]]; then
+    # This is deliberately non-secret fake data, but its JWT shape lets the
+    # current file-exchange launcher exercise the same local readiness path.
+    python3 - "$state_dir/workload-bearer" <<'PY'
+import base64
+import json
+import sys
+import time
+
+payload = base64.urlsafe_b64encode(
+    json.dumps({"aud": "identity", "exp": int(time.time()) + 3600}).encode()
+).rstrip(b"=").decode()
+open(sys.argv[1], "w").write(f"fake.{payload}.signature")
+PY
+    chmod 600 "$state_dir/workload-bearer"
+  fi
 }
 
 load_runtime_env() {
@@ -91,6 +106,38 @@ wait_for_url() {
   die "timed out waiting for $url; inspect $state_dir/server.log"
 }
 
+real_check() {
+  require_tool python3
+  validate_state_dir
+  OMNIGENT_OIDC_REDIRECT_URI="http://127.0.0.1:$port/auth/callback" \
+    python3 "$harness_dir/real_check.py" --port "$port" --network
+}
+
+write_real_receipt() {
+  # A local, secret-free marker makes it clear that down cannot claim remote
+  # cleanup merely because it stopped the laptop-side process.
+  python3 - "$state_dir/real-readiness.json" <<'PY'
+import json
+import os
+import sys
+
+receipt = {
+    "habitat_api": os.environ["HAB_APISERVER"],
+    "image": os.environ["OMNIGENT_HAB_IMAGE"],
+    "mode": "real",
+    "preflight": "passed",
+    "profile": os.environ["OMNIGENT_HAB_PROFILE"],
+    "public_url": os.environ["OMNIGENT_PUBLIC_URL"],
+    "remote_cleanup": "unconfirmed",
+}
+with open(sys.argv[1], "w") as output:
+    json.dump(receipt, output, sort_keys=True)
+    output.write("\n")
+PY
+  printf '%s\n' "$HAB_WORKLOAD_TOKEN_FILE" >"$state_dir/real-workload-token-file"
+  chmod 600 "$state_dir/real-readiness.json" "$state_dir/real-workload-token-file"
+}
+
 up() {
   require_tool docker
   require_tool uv
@@ -104,8 +151,19 @@ up() {
   [[ -n ${HAB_LAUNCHER_WHEEL:-} || -n ${HAB_LAUNCHER_SOURCE_DIR:-} ]] || die \
     "set HAB_LAUNCHER_WHEEL or HAB_LAUNCHER_SOURCE_DIR from dd-source PR #91876"
   [[ ! -e "$runtime_env" ]] || die "state already exists at $state_dir; use status or down first"
+  case "$habitat_mode" in
+    fake|real) ;;
+    *) die "TICINO_E2E_HABITAT_MODE must be fake or real" ;;
+  esac
 
-  write_runtime_env
+  if [[ "$habitat_mode" == real ]]; then
+    # Fail before Docker or a server process starts.  This is read-only and
+    # rejects missing opt-in, insecure credentials, fake launch inputs, and
+    # a loopback guest callback tunnel.
+    real_check
+  fi
+
+  write_runtime_env "$habitat_mode"
   load_runtime_env
   docker compose --env-file "$runtime_env" -f "$compose_file" -p omnigent_ticino_e2e up -d postgres
   local postgres_ready=false
@@ -140,12 +198,16 @@ up() {
     uv pip install --python "$venv/bin/python" --force-reinstall "$HAB_LAUNCHER_WHEEL"
   fi
 
-  local habitat_api emissary_bind workload_file
+  local habitat_api exchange_address workload_file hab_image hab_profile hab_egress public_url
   case "$habitat_mode" in
     fake)
       habitat_api="http://127.0.0.1:$habitat_port"
-      emissary_bind="127.0.0.1:$exchange_port"
+      exchange_address="http://127.0.0.1:$exchange_port/ticino/agent"
       workload_file="$state_dir/workload-bearer"
+      hab_image="local-fake-image"
+      hab_profile="local-fake-profile"
+      hab_egress=false
+      public_url="http://127.0.0.1:$port"
       nohup env PYTHONPATH="$launcher_pythonpath${PYTHONPATH:+:$PYTHONPATH}" \
         "$venv/bin/python" "$harness_dir/fake_services.py" \
         --receipt "$state_dir/receipt.json" \
@@ -158,13 +220,14 @@ up() {
     real)
       [[ ${TICINO_E2E_ALLOW_REAL_HABITAT:-} == 1 ]] || die \
         "real Habitat requires TICINO_E2E_ALLOW_REAL_HABITAT=1"
-      [[ -n ${HAB_APISERVER:-} ]] || die "real Habitat requires HAB_APISERVER"
-      [[ -n ${EMISSARY_BIND_ADDRESS:-} ]] || die "real Habitat requires EMISSARY_BIND_ADDRESS"
-      [[ -n ${HAB_WORKLOAD_TOKEN_FILE:-} && -r ${HAB_WORKLOAD_TOKEN_FILE:-} ]] || die \
-        "real Habitat requires a readable HAB_WORKLOAD_TOKEN_FILE"
       habitat_api="$HAB_APISERVER"
-      emissary_bind="$EMISSARY_BIND_ADDRESS"
       workload_file="$HAB_WORKLOAD_TOKEN_FILE"
+      exchange_address=${OMNIGENT_HAB_TICINO_ADDRESS:-}
+      hab_image="$OMNIGENT_HAB_IMAGE"
+      hab_profile="$OMNIGENT_HAB_PROFILE"
+      hab_egress=true
+      public_url="$OMNIGENT_PUBLIC_URL"
+      write_real_receipt
       ;;
     *) die "TICINO_E2E_HABITAT_MODE must be fake or real" ;;
   esac
@@ -187,16 +250,17 @@ up() {
       OMNIGENT_OIDC_ALLOWED_DOMAINS="${TICINO_ALLOWED_DOMAINS:-datadoghq.com}" \
       OMNIGENT_HAB_ENABLED=1 \
       OMNIGENT_SANDBOX_PROVIDER_MODULE="$launcher_module" \
-      OMNIGENT_HAB_IMAGE=local-fake-image \
-      OMNIGENT_HAB_PROFILE=local-fake-profile \
+      OMNIGENT_HAB_IMAGE="$hab_image" \
+      OMNIGENT_HAB_PROFILE="$hab_profile" \
       OMNIGENT_HAB_RUNTIME=firecracker \
-      OMNIGENT_HAB_ALLOW_ALL_EGRESS=false \
-      OMNIGENT_PUBLIC_URL="http://127.0.0.1:$port" \
+      OMNIGENT_HAB_ALLOW_ALL_EGRESS="$hab_egress" \
+      OMNIGENT_PUBLIC_URL="$public_url" \
       OMNIGENT_HAB_REGISTRY_PATH="$state_dir/hab-registry.json" \
       HAB_APISERVER="$habitat_api" \
+      OMNIGENT_HAB_EXCHANGE_MODE=file \
       HAB_WORKLOAD_TOKEN_FILE="$workload_file" \
-      EMISSARY_ENABLED=true \
-      EMISSARY_BIND_ADDRESS="$emissary_bind" \
+      OMNIGENT_HAB_TICINO_ADDRESS="$exchange_address" \
+      EMISSARY_ENABLED=false \
       OMNIGENT_DATA_DIR="$state_dir/data" \
       PGPASSFILE="$pgpass_file" \
       "$venv/bin/omnigent" server \
@@ -210,13 +274,18 @@ up() {
   if [[ "$habitat_mode" == fake ]]; then
     printf '%s\n' "The local fake Habitat will reject the launch after observing the exchange; run '$0 status' for the secret-free receipt."
   else
-    printf '%s\n' "Real-Habitat mode is enabled; use only an approved Emissary/workload-identity environment."
+    printf '%s\n' "Real-Habitat mode is enabled with the explicit file-backed workload identity; local cleanup does not confirm remote Hab deletion."
   fi
 }
 
 status() {
   validate_state_dir
-  [[ "$habitat_mode" == fake ]] || die "status receipts exist only in fake-Habitat mode"
+  if [[ "$habitat_mode" == real ]]; then
+    [[ -f "$state_dir/real-readiness.json" ]] || die "no real-mode readiness receipt found; run '$0 up' first"
+    cat "$state_dir/real-readiness.json"
+    printf '%s\n' "WARNING: this receipt does not prove remote Hab cleanup."
+    return
+  fi
   [[ -f "$state_dir/receipt.json" ]] || die "no receipt found; run '$0 up' first"
   "$venv/bin/python" - "$state_dir/receipt.json" <<'PY'
 import json
@@ -259,16 +328,28 @@ down() {
     load_runtime_env
     docker compose --env-file "$runtime_env" -f "$compose_file" -p omnigent_ticino_e2e down -v
   fi
+  if [[ -f "$state_dir/real-workload-token-file" ]]; then
+    local workload_file
+    workload_file=$(<"$state_dir/real-workload-token-file")
+    if [[ -n "$workload_file" && ! -L "$workload_file" && -f "$workload_file" ]]; then
+      rm -f -- "$workload_file"
+      printf '%s\n' "Removed the real-mode workload bearer file."
+    else
+      printf '%s\n' "WARNING: could not safely remove the recorded real-mode workload bearer file." >&2
+    fi
+    printf '%s\n' "WARNING: real mode removed local state only; it did not delete or verify any remote Hab." >&2
+  fi
   rm -rf "$state_dir"
   printf '%s\n' "Removed local harness state and its ephemeral credentials."
 }
 
 case "${1:-}" in
   up) up ;;
+  real-check) real_check ;;
   status) status ;;
   down) down ;;
   *)
-    printf '%s\n' "Usage: $0 {up|status|down}" >&2
+    printf '%s\n' "Usage: $0 {up|real-check|status|down}" >&2
     exit 2
     ;;
 esac
