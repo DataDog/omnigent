@@ -7,6 +7,7 @@ from typing import cast
 import pytest
 
 from omnigent.onboarding.sandboxes.context import IdentityToken
+from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.managed_sandbox_identity import (
     ManagedSandboxIdentityResolver,
     ManagedSandboxIdentityUnavailable,
@@ -62,6 +63,16 @@ def test_later_operation_resolves_the_exact_owner_credential_session() -> None:
     assert context.session_id == "conv-a"
     assert context.user_id == "alice@example.com"
     assert context.credential_session_id == _CREDENTIAL_SESSION_ID
+
+
+def test_local_owner_does_not_require_oidc_credentials() -> None:
+    context = ManagedSandboxIdentityResolver(None).for_host(
+        _host(owner=RESERVED_USER_LOCAL, credential_session_id=None)
+    )
+
+    assert context.user_id == RESERVED_USER_LOCAL
+    assert context.credential_session_id is None
+    assert context.identity_token_provider is None
 
 
 def test_later_operation_canonicalizes_a_dashed_credential_session_id() -> None:

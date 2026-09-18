@@ -27,6 +27,7 @@ and closed over by route factories — no per-request import cost.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -36,6 +37,7 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 from starlette.requests import HTTPConnection
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from omnigent.onboarding.sandboxes.context import IdentityToken, IdentityTokenProvider
 
@@ -48,6 +50,9 @@ RESERVED_USER_LOCAL = "local"
 RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
+
+_OIDC_SESSION_SCOPE_KEY = "omnigent.oidc_session"
+_OIDC_SESSION_PREPARED_SCOPE_KEY = "omnigent.oidc_session_prepared"
 
 # Path prefixes a delegated (device-grant) access token may reach.
 # Fail-closed allowlist: a token carrying a ``scope`` claim is rejected on
@@ -327,6 +332,10 @@ class AuthProvider(ABC):
         """Return the authenticated user ID, or ``None``."""
         ...
 
+    async def prepare_connection(self, request: HTTPConnection) -> None:
+        """Perform any asynchronous authentication work before routing."""
+        del request
+
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:  # noqa: ARG002
         """
         Mint a short-lived bearer a managed-sandbox runner presents as *user_id*.
@@ -534,6 +543,18 @@ class UnifiedAuthProvider(AuthProvider):
             return self._check_cookie(request)
         return self._check_header(request)
 
+    async def prepare_connection(self, request: HTTPConnection) -> None:
+        """Resolve an opaque OIDC session without blocking the event loop."""
+        if self._source != "oidc" or self._oidc_session_store is None:
+            return
+        token = self._session_token(request)
+        if not token or not token.startswith("sess_"):
+            return
+        resolved = await asyncio.to_thread(self._oidc_session_store.resolve, token)
+        state = request.scope.setdefault("state", {})
+        state[_OIDC_SESSION_SCOPE_KEY] = resolved
+        state[_OIDC_SESSION_PREPARED_SCOPE_KEY] = True
+
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:
         """
         Mint a short-lived owner JWT for a managed-sandbox runner.
@@ -591,7 +612,7 @@ class UnifiedAuthProvider(AuthProvider):
         token = self._session_token(request)
         if not token:
             return None
-        resolved = self._resolved_credential_session(token)
+        resolved = self._resolved_credential_session(token, request)
         if resolved is None:
             return None
         user_id, session_id = resolved
@@ -645,7 +666,11 @@ class UnifiedAuthProvider(AuthProvider):
                 token = auth_header[7:]
         return token
 
-    def _resolved_credential_session(self, token: str) -> tuple[str, str] | None:
+    def _resolved_credential_session(
+        self,
+        token: str,
+        request: HTTPConnection | None = None,
+    ) -> tuple[str, str] | None:
         """Resolve a ``sess_…`` handle to ``(user_id, session_id)``, or ``None``.
 
         Unknown, revoked, or expired handles resolve to ``None`` (fail
@@ -654,7 +679,14 @@ class UnifiedAuthProvider(AuthProvider):
         """
         if not token.startswith("sess_") or self._oidc_session_store is None:
             return None
-        result = self._oidc_session_store.resolve(token)
+        scope = request.scope if request is not None else None
+        state = scope.get("state", {}) if isinstance(scope, dict) else {}
+        if state.get(_OIDC_SESSION_PREPARED_SCOPE_KEY):
+            result = state.get(_OIDC_SESSION_SCOPE_KEY)
+        else:
+            # Direct, non-ASGI callers (primarily unit tests) retain the
+            # synchronous API. Production requests are prepared by middleware.
+            result = self._oidc_session_store.resolve(token)
         if result is None:
             return None
         user_id, session_id, _provider_subject = result
@@ -695,7 +727,7 @@ class UnifiedAuthProvider(AuthProvider):
         # sess_ opaque handles are resolved via the encrypted session
         # store when one is configured. Managed-runner JWTs and legacy
         # self-contained cookies fall through to JWT decode below.
-        resolved = self._resolved_credential_session(token)
+        resolved = self._resolved_credential_session(token, request)
         if resolved is not None:
             return resolved[0]  # user_id
 
@@ -785,6 +817,19 @@ class UnifiedAuthProvider(AuthProvider):
         if self._local_single_user:
             return RESERVED_USER_LOCAL
         return None
+
+
+class AuthPreparationMiddleware:
+    """Prepare async authentication state for HTTP and WebSocket requests."""
+
+    def __init__(self, app: ASGIApp, auth_provider: AuthProvider | None) -> None:
+        self._app = app
+        self._auth_provider = auth_provider
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if self._auth_provider is not None and scope["type"] in ("http", "websocket"):
+            await self._auth_provider.prepare_connection(HTTPConnection(scope))
+        await self._app(scope, receive, send)
 
 
 def create_auth_provider(

@@ -134,7 +134,7 @@ class ManagedSandboxCleanupReconciler:
         # by the cross-workspace read; it does not search any other tenant.
         with workspace_scope(tombstone.workspace_id):
             try:
-                context = self._identity_resolver.for_host(tombstone)
+                context = await asyncio.to_thread(self._identity_resolver.for_host, tombstone)
             except ManagedSandboxIdentityUnavailable:
                 # No current credential is an authorization failure, not a
                 # reason to guess another login.  Persist it as a failed pass

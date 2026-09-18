@@ -7,14 +7,17 @@ encryption key changes invalidate stored credentials.
 
 from __future__ import annotations
 
+import hashlib
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from omnigent.db.db_models import OmnigentBase, SqlOidcSession
+from omnigent.db.db_models import OmnigentBase, SqlOidcSession, workspace_scope
+from omnigent.server import oidc_session_store as oidc_session_store_module
 from omnigent.server.oidc_session_store import OidcSessionStore
 
 _TEST_KEY = bytes.fromhex("aa" * 32)
@@ -93,6 +96,61 @@ def test_handle_resolves_to_one_user_and_session(session_factory) -> None:
     assert user_id == "alice@example.com"
     assert session_id  # non-empty
     assert provider_subject == "sub-1"
+
+
+def test_sessions_are_isolated_by_workspace(session_factory, monkeypatch) -> None:
+    """Identical opaque identifiers resolve only inside their owning workspace."""
+    store = _make_store(session_factory)
+    handle = "sess_" + "ab" * 32
+    digest = hashlib.sha256(handle.encode()).hexdigest()
+    session_id = "cd" * 16
+    monkeypatch.setattr(
+        oidc_session_store_module,
+        "_generate_handle",
+        lambda: (handle, digest),
+    )
+    monkeypatch.setattr(
+        oidc_session_store_module.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex=session_id),
+    )
+
+    now = int(time.time())
+    with workspace_scope(101):
+        store.create(
+            user_id="alice@example.com",
+            provider_subject="alice-sub",
+            provider_issuer=_TEST_ISSUER,
+            provider_client_id=_TEST_CLIENT_ID,
+            id_token="alice-id-token",
+            refresh_token="alice-refresh-token",
+            id_token_expiry=now + 3600,
+            absolute_expiry=now + 86400,
+        )
+    with workspace_scope(202):
+        store.create(
+            user_id="bob@example.com",
+            provider_subject="bob-sub",
+            provider_issuer=_TEST_ISSUER,
+            provider_client_id=_TEST_CLIENT_ID,
+            id_token="bob-id-token",
+            refresh_token="bob-refresh-token",
+            id_token_expiry=now + 3600,
+            absolute_expiry=now + 86400,
+        )
+
+    with workspace_scope(101):
+        assert store.resolve(handle) == ("alice@example.com", session_id, "alice-sub")
+        assert store.get_credentials(session_id, "alice@example.com") is not None
+        assert store.get_credentials(session_id, "bob@example.com") is None
+        assert store.revoke(session_id)
+        assert store.resolve(handle) is None
+
+    with workspace_scope(202):
+        assert store.resolve(handle) == ("bob@example.com", session_id, "bob-sub")
+        credentials = store.get_credentials(session_id, "bob@example.com")
+        assert credentials is not None
+        assert credentials[0] == "bob-id-token"
 
 
 def test_unknown_handle_fails_closed(session_factory) -> None:
