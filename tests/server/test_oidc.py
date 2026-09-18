@@ -977,6 +977,77 @@ def test_oidc_config_allows_public_client(monkeypatch: pytest.MonkeyPatch) -> No
     assert config.client_secret is None
 
 
+# ── sess_ handle resolution via the encrypted session store ────────
+
+
+def test_oidc_source_check_cookie_resolves_sess_handle() -> None:
+    """_check_cookie resolves a sess_ handle via the session store."""
+    config = _make_oidc_config()
+    mock_store = MagicMock()
+    mock_store.resolve.return_value = ("alice@example.com", "session-123", "sub-1")
+    provider = UnifiedAuthProvider(
+        source="oidc", oidc_config=config, oidc_session_store=mock_store
+    )
+    request = _mock_request(cookies={config.session_cookie_name: "sess_handle123"})
+    assert provider.get_user_id(request) == "alice@example.com"
+
+
+def test_oidc_source_check_cookie_returns_none_for_unknown_sess_handle() -> None:
+    """_check_cookie returns None for an unresolvable sess_ handle."""
+    config = _make_oidc_config()
+    mock_store = MagicMock()
+    mock_store.resolve.return_value = None
+    provider = UnifiedAuthProvider(
+        source="oidc", oidc_config=config, oidc_session_store=mock_store
+    )
+    request = _mock_request(cookies={config.session_cookie_name: "sess_unknown"})
+    assert provider.get_user_id(request) is None
+
+
+# ── Public PKCE client (no client secret) ──────────────────────────
+
+
+def test_oidc_config_standard_oidc_without_client_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Standard OIDC starts without OMNIGENT_OIDC_CLIENT_SECRET.
+
+    A public OAuth client (e.g. Ticino) uses authorization code + PKCE
+    with no client secret. The config must accept the absence and set
+    client_secret to None.
+    """
+    _discovery = {
+        "authorization_endpoint": "https://idp.example.com/authorize",
+        "token_endpoint": "https://idp.example.com/token",
+        "jwks_uri": "https://idp.example.com/jwks",
+        "userinfo_endpoint": "https://idp.example.com/userinfo",
+    }
+
+    import httpx
+
+    class _FakeResponse:
+        def __init__(self, data: dict) -> None:
+            self._data = data
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return self._data
+
+    monkeypatch.setattr(httpx, "get", lambda url, timeout=10.0: _FakeResponse(_discovery))
+    monkeypatch.setenv("OMNIGENT_OIDC_ISSUER", "https://idp.example.com")
+    monkeypatch.setenv("OMNIGENT_OIDC_CLIENT_ID", "public-client")
+    monkeypatch.delenv("OMNIGENT_OIDC_CLIENT_SECRET", raising=False)
+    monkeypatch.setenv("OMNIGENT_OIDC_REDIRECT_URI", "https://app/callback")
+    monkeypatch.setenv("OMNIGENT_OIDC_COOKIE_SECRET", "aa" * 32)
+
+    config = OIDCConfig.from_env()
+
+    assert config.provider_type == "oidc"
+    assert config.client_secret is None
+
+
 def test_oidc_config_github_still_requires_client_secret(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
