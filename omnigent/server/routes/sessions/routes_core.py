@@ -39,10 +39,7 @@ from omnigent.entities import (
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.model_override import validate_model_override
-from omnigent.onboarding.sandboxes.context import (
-    ManagedSandboxContext,
-    managed_sandbox_context_scope,
-)
+from omnigent.onboarding.sandboxes.context import managed_sandbox_context_scope
 from omnigent.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     EFFORT_VALUES,
@@ -76,6 +73,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.managed_sandbox_identity import context_for_managed_sandbox_create
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_approval_access as _get_approval_access,
@@ -416,15 +414,8 @@ def register_core_routes(
             # registers under the reserved local owner, same as a
             # directly-connected host would.
             owner = user_id if user_id is not None else RESERVED_USER_LOCAL
-            identity_token_provider = (
-                auth_provider.get_identity_token_provider(request, expected_user_id=owner)
-                if auth_provider is not None
-                else None
-            )
-            launch_context = ManagedSandboxContext(
-                session_id=resp.id,
-                user_id=owner,
-                identity_token_provider=identity_token_provider,
+            launch_context = context_for_managed_sandbox_create(
+                request, auth_provider, session_id=resp.id, owner=owner
             )
             with managed_sandbox_context_scope(launch_context):
                 launch_task = asyncio.create_task(

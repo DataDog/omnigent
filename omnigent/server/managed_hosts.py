@@ -138,6 +138,7 @@ import click
 from fastapi import HTTPException
 
 from omnigent.db.utils import now_epoch
+from omnigent.onboarding.sandboxes.context import current_managed_sandbox_context
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -2222,6 +2223,11 @@ async def relaunch_managed_host(
         longer matches the configured launcher; 502 when
         provisioning, cloning, host startup, or registration fails.
     """
+    if host.sandbox_lifecycle_state == "cleanup_pending":
+        raise HTTPException(
+            status_code=409,
+            detail="managed sandbox cleanup is pending; refusing to create another generation",
+        )
     launcher = _launcher_for_teardown(host, config)
     if launcher is None:
         raise HTTPException(
@@ -2234,7 +2240,14 @@ async def relaunch_managed_host(
     # The old generation is normally already dead (that is why we are
     # here), but terminate defensively so a transient tunnel outage
     # can never leave two live sandboxes claiming one host identity.
-    await _terminate_sandbox_best_effort(launcher, host)
+    terminated = await _terminate_sandbox_best_effort(launcher, host)
+    if not terminated:
+        await asyncio.to_thread(host_store.revoke_launch_token, host.host_id)
+        await asyncio.to_thread(host_store.mark_managed_cleanup_pending, host.host_id)
+        raise HTTPException(
+            status_code=409,
+            detail="managed sandbox cleanup is pending; refusing to create another generation",
+        )
     try:
         await asyncio.to_thread(launcher.prepare)
         sandbox_id = await asyncio.to_thread(launcher.provision, host.name)
@@ -2374,6 +2387,7 @@ async def _arm_and_start_host(
         registration fails.
     """
     token = secrets.token_urlsafe(32)
+    context = current_managed_sandbox_context()
     record = await asyncio.to_thread(
         host_store.register_managed_host,
         host_id=host_id,
@@ -2383,6 +2397,8 @@ async def _arm_and_start_host(
         provider=launcher.provider,
         sandbox_id=sandbox_id,
         token_expires_at=now_epoch() + config.token_ttl_s,
+        session_id=context.session_id if context is not None else None,
+        credential_session_id=context.credential_session_id if context is not None else None,
     )
     try:
         # Uniform across providers: provision() fixed the sandbox id and the
@@ -2413,8 +2429,10 @@ async def _arm_and_start_host(
         # cap. Cleanup-then-reraise at a system boundary, not a
         # swallow: every path below re-raises as an HTTPException.
         if keep_host_on_failure:
-            await _terminate_sandbox_best_effort(launcher, record)
+            terminated = await _terminate_sandbox_best_effort(launcher, record)
             await asyncio.to_thread(host_store.revoke_launch_token, host_id)
+            if not terminated:
+                await asyncio.to_thread(host_store.mark_managed_cleanup_pending, host_id)
         else:
             await terminate_managed_host(record, host_store, config)
         if isinstance(exc, HTTPException):
@@ -2585,6 +2603,11 @@ async def resume_managed_host(
     host = await asyncio.to_thread(host_store.get_host, host_id)
     if host is None:
         return
+    if host.sandbox_lifecycle_state == "cleanup_pending":
+        raise HTTPException(
+            status_code=409,
+            detail="managed sandbox cleanup is pending; refusing to resume an ambiguous resource",
+        )
     # Provider-matched launcher (None if config dropped / provider changed).
     # Resume needs a reattachable volume; others (e.g. Modal) fall through to
     # the caller's host-offline path (the user starts a new session).
@@ -2649,17 +2672,13 @@ async def terminate_managed_host(
     host: Host,
     host_store: HostStore,
     config: ManagedSandboxConfig | None,
-) -> None:
+) -> bool:
     """
-    Terminate a managed host's sandbox and delete its host row.
+    Terminate a managed host's sandbox and delete its row only after provider confirmation.
 
-    Deleting the row is both teardown and revocation in one operation:
-    the host disappears from the picker AND its launch token stops
-    resolving. Best-effort on the sandbox side: termination failures
-    (or a missing/mismatched launcher after a config change) are
-    logged, not raised — the provider's lifetime cap reaps stragglers,
-    and the caller (session delete / launch-failure cleanup) must not
-    be blocked by provider hiccups.
+    Revoke the local token before contacting the provider. A failure retains
+    the exact-resource row as a cleanup-pending tombstone so relaunch cannot
+    create a second generation while the old one is ambiguous.
 
     :param host: The managed host to tear down (``sandbox_provider`` /
         ``sandbox_id`` set; callers guard on that).
@@ -2668,15 +2687,25 @@ async def terminate_managed_host(
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
     """
+    # Re-read so a repeated delete after confirmed cleanup is idempotent and
+    # never sends another provider operation for a resource we no longer own.
+    persisted = await asyncio.to_thread(host_store.get_host, host.host_id)
+    if persisted is None:
+        return True
+    host = persisted
+    await asyncio.to_thread(host_store.revoke_launch_token, host.host_id)
     launcher = _launcher_for_teardown(host, config)
-    await _terminate_sandbox_best_effort(launcher, host)
-    await asyncio.to_thread(host_store.delete_host, host.host_id)
+    if await _terminate_sandbox_best_effort(launcher, host):
+        await asyncio.to_thread(host_store.delete_host, host.host_id)
+        return True
+    await asyncio.to_thread(host_store.mark_managed_cleanup_pending, host.host_id)
+    return False
 
 
 async def _terminate_sandbox_best_effort(
     launcher: SandboxHostLauncher | None,
     host: Host,
-) -> None:
+) -> bool:
     """
     Terminate a managed host's sandbox without touching its row.
 
@@ -2694,6 +2723,7 @@ async def _terminate_sandbox_best_effort(
     if launcher is not None and host.sandbox_id is not None:
         try:
             await asyncio.to_thread(launcher.terminate, host.sandbox_id)
+            return True
         except Exception:  # noqa: BLE001 — deliberate broad catch: this is a
             # provider-API boundary on a cleanup path. The provider SDK can
             # fail here in many shapes (auth/config ClickException, network
@@ -2708,6 +2738,7 @@ async def _terminate_sandbox_best_effort(
                 host.host_id,
                 exc_info=True,
             )
+            return False
     else:
         _logger.warning(
             "No launcher available for managed sandbox provider %s; "
@@ -2715,3 +2746,4 @@ async def _terminate_sandbox_best_effort(
             host.sandbox_provider,
             host.sandbox_id,
         )
+    return False
