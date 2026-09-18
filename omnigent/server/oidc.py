@@ -137,7 +137,9 @@ class OIDCConfig:
     :param issuer: OIDC issuer URL, e.g.
         ``"https://accounts.google.com"``.
     :param client_id: OAuth client ID registered with the IdP.
-    :param client_secret: OAuth client secret.
+    :param client_secret: OAuth client secret. ``None`` for public
+        clients that authenticate with PKCE and
+        ``token_endpoint_auth_method=none``.
     :param redirect_uri: Full callback URL, e.g.
         ``"https://myapp.example.com/auth/callback"``.
     :param cookie_secret: HMAC key for session cookie signing
@@ -171,7 +173,7 @@ class OIDCConfig:
 
     issuer: str
     client_id: str
-    client_secret: str
+    client_secret: str | None
     redirect_uri: str
     cookie_secret: bytes
     scopes: str
@@ -251,7 +253,7 @@ class OIDCConfig:
 
         issuer = _require("OMNIGENT_OIDC_ISSUER")
         client_id = _require("OMNIGENT_OIDC_CLIENT_ID")
-        client_secret = _require("OMNIGENT_OIDC_CLIENT_SECRET")
+        client_secret = os.environ.get("OMNIGENT_OIDC_CLIENT_SECRET", "").strip() or None
         # Redirect URI: an explicit value wins; otherwise derive it from
         # OMNIGENT_DOMAIN (the same var the Caddy HTTPS overlay uses) as
         # ``https://<domain>/auth/callback``. A domain-based deploy then
@@ -334,6 +336,11 @@ class OIDCConfig:
         is_github = issuer.rstrip("/") == _GITHUB_ISSUER
 
         if is_github:
+            if client_secret is None:
+                raise RuntimeError(
+                    "Missing required environment variable OMNIGENT_OIDC_CLIENT_SECRET "
+                    "(GitHub OAuth requires a confidential client)"
+                )
             # Empty string (forwarded by `${VAR:-}` wrappers) → default.
             scopes = (os.environ.get("OMNIGENT_OIDC_SCOPES") or _GITHUB_SCOPES).strip()
             return OIDCConfig(
@@ -355,28 +362,54 @@ class OIDCConfig:
                 skip_email_verification=skip_email_verification,
             )
 
-        # Standard OIDC: fetch discovery document.
+        # Standard OIDC: public clients use PKCE without a client secret.
         scopes = (os.environ.get("OMNIGENT_OIDC_SCOPES") or "openid email profile").strip()
-        discovery_url = issuer.rstrip("/") + "/.well-known/openid-configuration"
-        try:
-            resp = httpx.get(discovery_url, timeout=10.0)
-            resp.raise_for_status()
-            doc = resp.json()
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to fetch OIDC discovery document from {discovery_url}: {exc}"
-            ) from exc
 
-        authorization_endpoint = doc.get("authorization_endpoint")
-        token_endpoint = doc.get("token_endpoint")
-        jwks_uri = doc.get("jwks_uri")
-
-        if not authorization_endpoint or not token_endpoint or not jwks_uri:
-            raise RuntimeError(
-                f"OIDC discovery document at {discovery_url} missing "
-                f"required fields (authorization_endpoint, "
-                f"token_endpoint, jwks_uri)"
+        # Some providers expose browser-reachable endpoints through a
+        # different hostname than the canonical issuer in their tokens.
+        # Supplying all three endpoint overrides makes that transport
+        # topology explicit while preserving strict issuer validation.
+        endpoint_env_names = (
+            "OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT",
+            "OMNIGENT_OIDC_TOKEN_ENDPOINT",
+            "OMNIGENT_OIDC_JWKS_URI",
+        )
+        endpoint_overrides = tuple(os.environ.get(name, "").strip() for name in endpoint_env_names)
+        if any(endpoint_overrides) and not all(endpoint_overrides):
+            missing = ", ".join(
+                name
+                for name, value in zip(endpoint_env_names, endpoint_overrides, strict=True)
+                if not value
             )
+            raise RuntimeError(
+                f"OIDC endpoint overrides must be configured together; missing {missing}"
+            )
+
+        userinfo_endpoint = None
+        if all(endpoint_overrides):
+            authorization_endpoint, token_endpoint, jwks_uri = endpoint_overrides
+        else:
+            discovery_url = issuer.rstrip("/") + "/.well-known/openid-configuration"
+            try:
+                resp = httpx.get(discovery_url, timeout=10.0)
+                resp.raise_for_status()
+                doc = resp.json()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to fetch OIDC discovery document from {discovery_url}: {exc}"
+                ) from exc
+
+            authorization_endpoint = doc.get("authorization_endpoint")
+            token_endpoint = doc.get("token_endpoint")
+            jwks_uri = doc.get("jwks_uri")
+            userinfo_endpoint = doc.get("userinfo_endpoint")
+
+            if not authorization_endpoint or not token_endpoint or not jwks_uri:
+                raise RuntimeError(
+                    f"OIDC discovery document at {discovery_url} missing "
+                    f"required fields (authorization_endpoint, "
+                    f"token_endpoint, jwks_uri)"
+                )
 
         return OIDCConfig(
             issuer=issuer,
@@ -392,7 +425,7 @@ class OIDCConfig:
             authorization_endpoint=authorization_endpoint,
             token_endpoint=token_endpoint,
             jwks_uri=jwks_uri,
-            userinfo_endpoint=doc.get("userinfo_endpoint"),
+            userinfo_endpoint=userinfo_endpoint,
             allow_invites=allow_invites,
             skip_email_verification=skip_email_verification,
             email_claim=email_claim,
