@@ -8,6 +8,7 @@ absolute-session capping.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -16,7 +17,7 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from jwt.algorithms import RSAAlgorithm
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, update
 from sqlalchemy.orm import sessionmaker
 
 from omnigent.db.db_models import OmnigentBase, SqlOidcSession
@@ -80,7 +81,7 @@ def _make_config() -> OIDCConfig:
 @pytest.fixture()
 def session_factory(tmp_path: Path):
     db_path = tmp_path / "test_token_manager.db"
-    engine = create_engine(f"sqlite:///{db_path}")
+    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
     OmnigentBase.metadata.create_all(engine, tables=[SqlOidcSession.__table__])
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     yield factory
@@ -122,6 +123,8 @@ def _create_session(
     handle = store.create(
         user_id="alice@example.com",
         provider_subject="idp-subject-123",
+        provider_issuer=_ISSUER,
+        provider_client_id=_CLIENT_ID,
         id_token=id_token,
         refresh_token=refresh_token,
         id_token_expiry=id_token_expiry,
@@ -285,6 +288,42 @@ def test_invalid_grant_clears_credentials(session_factory, keys, monkeypatch) ->
     assert store.get_credentials(session_id, "alice@example.com") is None
 
 
+@pytest.mark.parametrize("status_code", [400, 408, 425, 429])
+def test_nonpermanent_refresh_http_failure_releases_lease_for_retry(
+    session_factory, keys, monkeypatch, status_code: int
+) -> None:
+    """Non-permanent HTTP failures leave the encrypted refresh token usable."""
+    store = OidcSessionStore(session_factory, credential_key=_TEST_KEY)
+    manager = OidcTokenManager(store, _make_config())
+    now = int(time.time())
+    old_token = keys.sign_id_token({"exp": now + 30})
+    _, session_id = _create_session(
+        store,
+        keys,
+        id_token=old_token,
+        id_token_expiry=now + 30,
+        refresh_token="rt-retryable",
+    )
+    refreshed_token = keys.sign_id_token({})
+    responses = [
+        httpx.Response(status_code, json={"error": "temporarily_unavailable"}),
+        httpx.Response(200, json={"id_token": refreshed_token}),
+    ]
+
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: responses.pop(0))
+
+    with pytest.raises(ReauthenticationError, match="retry"):
+        manager.get_current_id_token(session_id, "alice@example.com")
+
+    credentials = store.get_refresh_credentials(session_id, "alice@example.com")
+    assert credentials is not None
+    assert credentials.refresh_token == "rt-retryable"
+    assert credentials.refresh_lease_expires_at is None
+
+    result = manager.get_current_id_token(session_id, "alice@example.com")
+    assert result.id_token == refreshed_token
+
+
 def test_identity_change_clears_credentials(session_factory, keys, monkeypatch) -> None:
     """An identity change during refresh clears credentials."""
     store = OidcSessionStore(session_factory, credential_key=_TEST_KEY)
@@ -331,6 +370,8 @@ def test_absolute_expiry_caps_use(session_factory, keys) -> None:
     handle = store.create(
         user_id="alice@example.com",
         provider_subject="idp-subject-123",
+        provider_issuer=_ISSUER,
+        provider_client_id=_CLIENT_ID,
         id_token=keys.sign_id_token({}),
         refresh_token="rt-initial",
         id_token_expiry=now + 3600,
@@ -439,3 +480,234 @@ def test_malformed_response_clears_credentials(session_factory, keys, monkeypatc
 
     with pytest.raises(ReauthenticationError):
         manager.get_current_id_token(session_id, "alice@example.com")
+
+
+def test_legacy_session_binds_verified_provider_identity(
+    session_factory, keys, monkeypatch
+) -> None:
+    """A pre-migration row is bound only after its current JWT validates."""
+    store = OidcSessionStore(session_factory, credential_key=_TEST_KEY)
+    manager = OidcTokenManager(store, _make_config())
+    _, session_id = _create_session(store, keys)
+
+    with session_factory() as session:
+        session.execute(
+            update(SqlOidcSession)
+            .where(SqlOidcSession.id == session_id)
+            .values(
+                provider_subject="",
+                provider_issuer=None,
+                provider_client_id=None,
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: pytest.fail("must not refresh"))
+    result = manager.get_current_id_token(session_id, "alice@example.com")
+
+    assert result.id_token
+    credentials = store.get_refresh_credentials(session_id, "alice@example.com")
+    assert credentials is not None
+    assert credentials.provider_subject == "idp-subject-123"
+    assert credentials.provider_issuer == _ISSUER
+    assert credentials.provider_client_id == _CLIENT_ID
+
+
+def test_legacy_session_with_conflicting_subject_requires_reauthentication(
+    session_factory, keys, monkeypatch
+) -> None:
+    """A nullable issuer/client never overrides a conflicting stored subject."""
+    store = OidcSessionStore(session_factory, credential_key=_TEST_KEY)
+    manager = OidcTokenManager(store, _make_config())
+    _, session_id = _create_session(store, keys)
+
+    with session_factory() as session:
+        session.execute(
+            update(SqlOidcSession)
+            .where(SqlOidcSession.id == session_id)
+            .values(
+                provider_subject="different-subject",
+                provider_issuer=None,
+                provider_client_id=None,
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: pytest.fail("must not refresh"))
+    with pytest.raises(ReauthenticationError, match="verified provider identity"):
+        manager.get_current_id_token(session_id, "alice@example.com")
+
+
+def test_changed_subject_with_same_email_clears_credentials(
+    session_factory, keys, monkeypatch
+) -> None:
+    """Refresh rejects a different provider subject even when email is unchanged."""
+    store = OidcSessionStore(session_factory, credential_key=_TEST_KEY)
+    manager = OidcTokenManager(store, _make_config())
+    now = int(time.time())
+    old_token = keys.sign_id_token({"exp": now + 30})
+    _, session_id = _create_session(
+        store,
+        keys,
+        id_token=old_token,
+        id_token_expiry=now + 30,
+    )
+    changed_subject_token = keys.sign_id_token({"sub": "different-idp-subject"})
+
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda *args, **kwargs: httpx.Response(200, json={"id_token": changed_subject_token}),
+    )
+
+    with pytest.raises(ReauthenticationError, match="Identity changed"):
+        manager.get_current_id_token(session_id, "alice@example.com")
+    assert store.get_credentials(session_id, "alice@example.com") is None
+
+
+def test_concurrent_rotating_refresh_has_one_owner_and_loser_rereads_winner(
+    session_factory, keys, monkeypatch
+) -> None:
+    """Separate managers share a DB lease instead of consuming a token twice."""
+    store1 = OidcSessionStore(session_factory, credential_key=_TEST_KEY)
+    now = int(time.time())
+    old_token = keys.sign_id_token({"exp": now + 30})
+    _, session_id = _create_session(
+        store1,
+        keys,
+        id_token=old_token,
+        id_token_expiry=now + 30,
+        refresh_token="rotating-rt",
+    )
+    # A reconstructed store/manager represents a second server process.
+    store2 = OidcSessionStore(session_factory, credential_key=_TEST_KEY)
+    manager1 = OidcTokenManager(store1, _make_config())
+    manager2 = OidcTokenManager(store2, _make_config())
+    request_started = threading.Event()
+    release_response = threading.Event()
+    calls: list[int] = []
+    calls_lock = threading.Lock()
+    refreshed_token = keys.sign_id_token({})
+
+    def _fake_post(*args, **kwargs):
+        with calls_lock:
+            calls.append(1)
+        leased = store2.get_refresh_credentials(session_id, "alice@example.com")
+        assert leased is not None
+        assert leased.refresh_lease_expires_at is not None
+        request_started.set()
+        assert release_response.wait(timeout=5)
+        return httpx.Response(
+            200,
+            json={"id_token": refreshed_token, "refresh_token": "rotated-rt"},
+        )
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+    results: list[IdTokenResult] = []
+    errors: list[BaseException] = []
+
+    def _get_token(manager: OidcTokenManager) -> None:
+        try:
+            results.append(manager.get_current_id_token(session_id, "alice@example.com"))
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    first = threading.Thread(target=_get_token, args=(manager1,))
+    second = threading.Thread(target=_get_token, args=(manager2,))
+    first.start()
+    assert request_started.wait(timeout=5)
+    second.start()
+    time.sleep(0.1)
+    release_response.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert calls == [1]
+    assert [result.id_token for result in results] == [refreshed_token, refreshed_token]
+    credentials = store1.get_credentials(session_id, "alice@example.com")
+    assert credentials is not None
+    assert credentials[1] == "rotated-rt"
+
+
+def test_revoke_during_refresh_does_not_resurrect_credentials(
+    session_factory, keys, monkeypatch
+) -> None:
+    """A refresh commit loses to logout and cannot write its returned tokens."""
+    store = OidcSessionStore(session_factory, credential_key=_TEST_KEY)
+    manager = OidcTokenManager(store, _make_config())
+    now = int(time.time())
+    old_token = keys.sign_id_token({"exp": now + 30})
+    _, session_id = _create_session(store, keys, id_token=old_token, id_token_expiry=now + 30)
+    refreshed_token = keys.sign_id_token({})
+
+    def _fake_post(*args, **kwargs):
+        assert store.revoke(session_id)
+        return httpx.Response(200, json={"id_token": refreshed_token})
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+    with pytest.raises(ReauthenticationError, match="revoked during refresh"):
+        manager.get_current_id_token(session_id, "alice@example.com")
+    assert store.get_credentials(session_id, "alice@example.com") is None
+
+
+def test_absolute_expiry_during_refresh_does_not_resurrect_credentials(
+    session_factory, keys, monkeypatch
+) -> None:
+    """Commit rechecks absolute expiry after the remote refresh returns."""
+    store = OidcSessionStore(session_factory, credential_key=_TEST_KEY)
+    now = int(time.time())
+    clock = [now]
+    manager = OidcTokenManager(store, _make_config(), clock=lambda: clock[0])
+    old_token = keys.sign_id_token({"exp": now + 30})
+    _, session_id = _create_session(
+        store,
+        keys,
+        id_token=old_token,
+        id_token_expiry=now + 30,
+        absolute_expiry=now + 120,
+    )
+    refreshed_token = keys.sign_id_token({})
+
+    def _fake_post(*args, **kwargs):
+        clock[0] = now + 121
+        return httpx.Response(200, json={"id_token": refreshed_token})
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+    with pytest.raises(ReauthenticationError, match="revoked during refresh"):
+        manager.get_current_id_token(session_id, "alice@example.com")
+    assert (
+        store.get_refresh_credentials(
+            session_id,
+            "alice@example.com",
+            now_epoch_seconds=clock[0],
+        )
+        is None
+    )
+    # The rejected refresh never overwrites the old encrypted credentials.
+    credentials = store.get_credentials(session_id, "alice@example.com")
+    assert credentials is not None
+    assert credentials[0] == old_token
+
+
+def test_refresh_survives_store_reconstruction(session_factory, keys, monkeypatch) -> None:
+    """A restarted process can coordinate and commit from persisted state."""
+    store1 = OidcSessionStore(session_factory, credential_key=_TEST_KEY)
+    now = int(time.time())
+    old_token = keys.sign_id_token({"exp": now + 30})
+    _, session_id = _create_session(store1, keys, id_token=old_token, id_token_expiry=now + 30)
+    store_after_restart = OidcSessionStore(session_factory, credential_key=_TEST_KEY)
+    manager = OidcTokenManager(store_after_restart, _make_config())
+    refreshed_token = keys.sign_id_token({})
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda *args, **kwargs: httpx.Response(200, json={"id_token": refreshed_token}),
+    )
+
+    result = manager.get_current_id_token(session_id, "alice@example.com")
+    assert result.id_token == refreshed_token
