@@ -52,7 +52,6 @@ from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
-    ManagedSandboxDeployment,
     host_sandbox_is_running,
     relaunch_managed_host,
     terminate_managed_host,
@@ -535,12 +534,10 @@ async def harness(
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
         auth_provider=auth_provider,
-        sandbox_config=ManagedSandboxDeployment.single(
-            ManagedSandboxConfig(
-                server_url="https://srv.example.com",
-                launcher_factory=_launcher_factory,
-                token_ttl_s=3600,
-            )
+        sandbox_config=ManagedSandboxConfig(
+            server_url="https://srv.example.com",
+            launcher_factory=_launcher_factory,
+            token_ttl_s=3600,
         ),
     )
 

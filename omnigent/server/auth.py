@@ -27,6 +27,7 @@ and closed over by route factories — no per-request import cost.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import os

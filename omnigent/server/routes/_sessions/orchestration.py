@@ -3226,6 +3226,7 @@ async def _run_managed_launch(
         built-in gate into the runner Pod's ``omnigent.ai/agent``
         classifier, or ``None`` to leave it unstamped.
     """
+
     async def _provision_and_bind() -> None:
         from omnigent.server.managed_hosts import resolve_managed_agent_label
 

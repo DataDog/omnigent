@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from omnigent.db.db_models import workspace_scope
 from omnigent.db.utils import now_epoch
 from omnigent.onboarding.sandboxes.context import managed_sandbox_context_scope
-from omnigent.server.managed_hosts import ManagedSandboxConfig, terminate_managed_host
+from omnigent.server.managed_hosts import ManagedSandboxDeployment, terminate_managed_host
 from omnigent.server.managed_sandbox_identity import (
     ManagedSandboxIdentityResolver,
     ManagedSandboxIdentityUnavailable,
@@ -55,7 +55,7 @@ class ManagedSandboxCleanupReconciler:
         self,
         *,
         host_store: HostStore,
-        config: ManagedSandboxConfig,
+        config: ManagedSandboxDeployment,
         identity_resolver: ManagedSandboxIdentityResolver,
         batch_size: int = MANAGED_CLEANUP_BATCH_SIZE,
         poll_interval_s: float = MANAGED_CLEANUP_POLL_INTERVAL_S,

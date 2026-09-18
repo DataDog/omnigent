@@ -4532,12 +4532,19 @@ async def test_kick_managed_relaunch_defers_the_classifier_to_the_launch_task(
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
         conv=conv,
-        host=SimpleNamespace(user_id=_OWNER),
+        host=SimpleNamespace(
+            user_id=_OWNER,
+            sandbox_credential_session_id=_TEST_CREDENTIAL_SESSION_ID,
+            sandbox_session_id="conv_1",
+        ),
         sandbox_config=SimpleNamespace(),
         tracker=tracker,
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
-        app_state=SimpleNamespace(agent_store=store),
+        app_state=SimpleNamespace(
+            agent_store=store,
+            managed_sandbox_identity_resolver=_test_lifecycle_identity_resolver(),
+        ),
     )
     scheduled = set(orchestration._managed_launch_tasks) - before
     assert scheduled, "the claim was taken but no task was scheduled to settle it"
@@ -4584,7 +4591,11 @@ async def test_relaunch_claim_and_launch_task_are_one_synchronous_step(
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
         conv=conv,
-        host=SimpleNamespace(user_id=_OWNER),
+        host=SimpleNamespace(
+            user_id=_OWNER,
+            sandbox_credential_session_id=_TEST_CREDENTIAL_SESSION_ID,
+            sandbox_session_id="conv_1",
+        ),
         sandbox_config=SimpleNamespace(),
         tracker=tracker,
         conversation_store=SimpleNamespace(),
@@ -4617,12 +4628,18 @@ async def test_kick_managed_relaunch_without_agent_store_threads_none(
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
         conv=conv,
-        host=SimpleNamespace(user_id=_OWNER),
+        host=SimpleNamespace(
+            user_id=_OWNER,
+            sandbox_credential_session_id=_TEST_CREDENTIAL_SESSION_ID,
+            sandbox_session_id="conv_1",
+        ),
         sandbox_config=SimpleNamespace(),
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
-        app_state=SimpleNamespace(),
+        app_state=SimpleNamespace(
+            managed_sandbox_identity_resolver=_test_lifecycle_identity_resolver(),
+        ),
     )
     scheduled = set(orchestration._managed_launch_tasks) - before
     await asyncio.gather(*scheduled)
@@ -4950,13 +4967,19 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
         session_id=None,
     )
     dead_host = SimpleNamespace(
-        sandbox_provider="modal", user_id=_OWNER, status="offline", updated_at=0
+        sandbox_provider="modal",
+        user_id=_OWNER,
+        status="offline",
+        updated_at=0,
+        sandbox_credential_session_id=_TEST_CREDENTIAL_SESSION_ID,
+        sandbox_session_id="conv_1",
     )
     app_state = SimpleNamespace(
         host_store=SimpleNamespace(get_host=lambda _hid: dead_host, is_online=lambda _hid: False),
         sandbox_config=SimpleNamespace(),
         managed_launches=tracker,
         agent_store=_StubAgentStore({builtin.id: builtin}),
+        managed_sandbox_identity_resolver=_test_lifecycle_identity_resolver(),
         host_registry=None,
         tunnel_registry=None,
     )
