@@ -144,6 +144,8 @@ def _create_session(
     handle = store.create(
         user_id=user_id,
         provider_subject="idp-subject-123",
+        provider_issuer=_ISSUER,
+        provider_client_id=_CLIENT_ID,
         id_token=id_token,
         refresh_token=refresh_token,
         id_token_expiry=id_token_expiry if id_token_expiry is not None else now + 3600,
