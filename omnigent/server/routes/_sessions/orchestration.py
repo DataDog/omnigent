@@ -61,6 +61,10 @@ from omnigent.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
 )
+from omnigent.onboarding.sandboxes.context import (
+    ManagedSandboxContext,
+    managed_sandbox_context_scope,
+)
 from omnigent.policies.types import (
     ElicitationRequest,
     EvaluationContext,
@@ -121,6 +125,10 @@ from omnigent.server.managed_hosts import (
     RepoWorkspace,
     host_resume_supported,
     host_sandbox_is_running,
+)
+from omnigent.server.managed_sandbox_identity import (
+    ManagedSandboxIdentityResolver,
+    ManagedSandboxIdentityUnavailable,
 )
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
@@ -2896,6 +2904,7 @@ async def _run_managed_launch(
     provider: str | None = None,
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
+    operation_context: ManagedSandboxContext | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -2971,29 +2980,37 @@ async def _run_managed_launch(
             agent_id,
             session_id=session_id,
         )
-    managed = await _provision_managed_sandbox(
-        session_id=session_id,
-        owner=owner,
-        sandbox_config=sandbox_config,
-        repo=repo,
-        tracker=tracker,
-        host_store=host_store,
-        relaunch_host=relaunch_host,
-        provider=provider,
-        agent_name=agent_name,
-    )
-    if managed is None:
-        return
-    await _bind_and_launch_managed_runner(
-        session_id=session_id,
-        managed=managed,
-        sandbox_config=sandbox_config,
-        tracker=tracker,
-        conversation_store=conversation_store,
-        host_store=host_store,
-        host_registry=host_registry,
-        tunnel_registry=tunnel_registry,
-    )
+
+    async def _provision_and_bind() -> None:
+        managed = await _provision_managed_sandbox(
+            session_id=session_id,
+            owner=owner,
+            sandbox_config=sandbox_config,
+            repo=repo,
+            tracker=tracker,
+            host_store=host_store,
+            relaunch_host=relaunch_host,
+            provider=provider,
+            agent_name=agent_name,
+        )
+        if managed is None:
+            return
+        await _bind_and_launch_managed_runner(
+            session_id=session_id,
+            managed=managed,
+            sandbox_config=sandbox_config,
+            tracker=tracker,
+            conversation_store=conversation_store,
+            host_store=host_store,
+            host_registry=host_registry,
+            tunnel_registry=tunnel_registry,
+        )
+
+    if operation_context is None:
+        await _provision_and_bind()
+    else:
+        with managed_sandbox_context_scope(operation_context):
+            await _provision_and_bind()
 
 
 async def _bind_and_launch_managed_runner(
@@ -3164,6 +3181,7 @@ async def _maybe_relaunch_managed_sandbox(
             _kick_managed_wake(
                 session_id=session_id,
                 conv=conv,
+                host=host,
                 sandbox_config=sandbox_config,
                 tracker=tracker,
                 conversation_store=conversation_store,
@@ -3264,7 +3282,17 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
         )
 
     host_row_online = host_is_live(host)
-    sandbox_running = await asyncio.to_thread(host_sandbox_is_running, host, sandbox_config)
+    try:
+        resolver = getattr(app_state, "managed_sandbox_identity_resolver", None)
+        operation_context = (
+            resolver.for_host(host)
+            if resolver is not None
+            else ManagedSandboxIdentityResolver(None).for_host(host)
+        )
+    except ManagedSandboxIdentityUnavailable as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    with managed_sandbox_context_scope(operation_context):
+        sandbox_running = await asyncio.to_thread(host_sandbox_is_running, host, sandbox_config)
     if (
         sandbox_running is not False
         and host_row_online
@@ -3562,6 +3590,17 @@ def _kick_managed_relaunch(
             session_id,
             extra={"session_id": session_id},
         )
+    try:
+        resolver = getattr(app_state, "managed_sandbox_identity_resolver", None)
+        operation_context = (
+            resolver.for_host(host)
+            if resolver is not None
+            else ManagedSandboxIdentityResolver(None).for_host(host)
+        )
+    except ManagedSandboxIdentityUnavailable as exc:
+        tracker.fail(session_id, str(exc))
+        _publish_sandbox_status(session_id, "failed", str(exc))
+        return
     relaunch_task = asyncio.create_task(
         _run_managed_launch(
             session_id=session_id,
@@ -3576,6 +3615,7 @@ def _kick_managed_relaunch(
             relaunch_host=host,
             agent_store=agent_store,
             agent_id=conv.agent_id,
+            operation_context=operation_context,
         )
     )
     _managed_launch_tasks.add(relaunch_task)
@@ -3586,6 +3626,7 @@ def _kick_managed_wake(
     *,
     session_id: str,
     conv: Conversation,
+    host: Host,
     sandbox_config: ManagedSandboxDeployment,
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
@@ -3603,6 +3644,7 @@ def _kick_managed_wake(
     return _facade._kick_managed_wake(
         session_id=session_id,
         conv=conv,
+        host=host,
         sandbox_config=sandbox_config,
         tracker=tracker,
         conversation_store=conversation_store,
@@ -3615,6 +3657,7 @@ def _kick_managed_wake_impl(
     *,
     session_id: str,
     conv: Conversation,
+    host: Host,
     sandbox_config: ManagedSandboxDeployment,
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
@@ -3650,6 +3693,17 @@ def _kick_managed_wake_impl(
     # session page when the wake fires (the composer let them send into a
     # host_asleep session).
     _publish_sandbox_status(session_id, "provisioning")
+    try:
+        resolver = getattr(app_state, "managed_sandbox_identity_resolver", None)
+        operation_context = (
+            resolver.for_host(host)
+            if resolver is not None
+            else ManagedSandboxIdentityResolver(None).for_host(host)
+        )
+    except ManagedSandboxIdentityUnavailable as exc:
+        tracker.fail(session_id, str(exc))
+        _publish_sandbox_status(session_id, "failed", str(exc))
+        return
     wake_task = asyncio.create_task(
         _run_managed_wake(
             session_id=session_id,
@@ -3660,6 +3714,7 @@ def _kick_managed_wake_impl(
             host_store=host_store,
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
+            operation_context=operation_context,
         )
     )
     _managed_launch_tasks.add(wake_task)
@@ -3676,6 +3731,7 @@ async def _run_managed_wake(
     host_store: HostStore,
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
+    operation_context: ManagedSandboxContext | None = None,
 ) -> None:
     """
     Wake a dormant resumable managed host in the background, settling the
@@ -3729,9 +3785,15 @@ async def _run_managed_wake(
     try:
         # Wake the same sandbox in place; resume_managed_host is single-flight
         # per host and a no-op if it's already online.
-        await resume_managed_host(
-            host_id, host_store, sandbox_config, force=True, on_stage=_on_stage
-        )
+        if operation_context is None:
+            await resume_managed_host(
+                host_id, host_store, sandbox_config, force=True, on_stage=_on_stage
+            )
+        else:
+            with managed_sandbox_context_scope(operation_context):
+                await resume_managed_host(
+                    host_id, host_store, sandbox_config, force=True, on_stage=_on_stage
+                )
         _publish_sandbox_status(session_id, "connecting")
         refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if refreshed is None:

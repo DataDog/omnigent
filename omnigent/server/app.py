@@ -1396,6 +1396,12 @@ def create_app(
     app.state.host_store = host_store
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
+    # Later lifecycle operations have no request ContextVar. This resolver
+    # recreates only the exact owner-bound credential session persisted with a
+    # managed resource; it never searches for another user's current login.
+    from omnigent.server.managed_sandbox_identity import ManagedSandboxIdentityResolver
+
+    app.state.managed_sandbox_identity_resolver = ManagedSandboxIdentityResolver(auth_provider)
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
