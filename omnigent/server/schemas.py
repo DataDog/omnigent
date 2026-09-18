@@ -700,11 +700,14 @@ class ConversationDeleted(BaseModel):
     :param object: Fixed resource type, always
         ``"conversation.deleted"``.
     :param deleted: Always ``True``.
+    :param cleanup_pending: ``True`` when the remote managed resource could
+        not be confirmed deleted and its local tombstone was retained.
     """
 
     id: str
     object: str = "conversation.deleted"
     deleted: bool = True
+    cleanup_pending: bool = False
 
 
 class ConversationRef(BaseModel):
