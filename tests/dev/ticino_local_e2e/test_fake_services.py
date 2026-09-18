@@ -125,6 +125,7 @@ def test_exchange_handler_requires_rfc8693_form_and_returns_json_access_token(
         assert response.getheader("Content-Type") == "application/json"
         assert json.loads(response.read()) == {
             "access_token": "fake-habitat-obo-bearer",
+            "expires_in": 60,
             "issued_token_type": fake_services._ID_TOKEN_TYPE,
             "token_type": "Bearer",
         }
