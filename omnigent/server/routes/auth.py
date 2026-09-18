@@ -273,6 +273,7 @@ def create_auth_router(
         if config.client_secret is not None:
             token_data["client_secret"] = config.client_secret
 
+        oidc_claims: dict[str, object] | None = None
         async with httpx.AsyncClient() as client:
             # GitHub requires Accept: application/json to get JSON
             # response from the token endpoint.
@@ -285,11 +286,7 @@ def create_auth_router(
             )
 
             if token_resp.status_code != 200:
-                _logger.error(
-                    "Token exchange failed: %d %s",
-                    token_resp.status_code,
-                    token_resp.text,
-                )
+                _logger.error("Token exchange failed: %d", token_resp.status_code)
                 return JSONResponse(
                     status_code=400,
                     content={"error": "Token exchange failed"},
@@ -311,6 +308,9 @@ def create_auth_router(
                     access_token if isinstance(access_token, str) else "",
                 )
             else:
+                # Keep the established wrapper as the single email admission
+                # path. Credential-backed sessions validate once more below to
+                # persist the verified identity claims needed for refresh.
                 email = _resolve_oidc_email(token_json, config)
 
         if not email:
@@ -321,6 +321,30 @@ def create_auth_router(
 
         # Normalize email to lowercase.
         email = email.lower()
+
+        # OIDC Core requires a stable ``sub``. Persist it with the issuer and
+        # client so refresh cannot silently switch identities that share an
+        # email address.
+        provider_subject = ""
+        provider_id_token_expiry = 0
+        if oidc_session_store is not None and config.provider_type == "oidc":
+            oidc_claims = _validate_oidc_id_token(token_json, config)
+            provider_subject_value = oidc_claims.get("sub") if oidc_claims is not None else None
+            if not isinstance(provider_subject_value, str) or not provider_subject_value:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "OIDC ID token is missing a subject"},
+                )
+            provider_subject = provider_subject_value
+            provider_expiry_value = oidc_claims.get("exp") if oidc_claims is not None else None
+            if isinstance(provider_expiry_value, bool) or not isinstance(
+                provider_expiry_value, int
+            ):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "OIDC ID token is missing a valid expiry"},
+                )
+            provider_id_token_expiry = provider_expiry_value
 
         # Redeem an OIDC invite (if one rode along in the signed state)
         # BEFORE the admission check, so the just-bound email passes the
@@ -376,11 +400,13 @@ def create_auth_router(
             now = int(time.time())
             session_credential = oidc_session_store.create(
                 user_id=email,
-                provider_subject="",
+                provider_subject=provider_subject,
                 id_token=id_token_val,
                 refresh_token=refresh_token_val,
-                id_token_expiry=now + 3600,
+                id_token_expiry=provider_id_token_expiry,
                 absolute_expiry=now + config.session_ttl_hours * 3600,
+                provider_issuer=config.issuer,
+                provider_client_id=config.client_id,
             )
         else:
             session_credential = mint_session_cookie(

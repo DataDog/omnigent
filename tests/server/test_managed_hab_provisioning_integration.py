@@ -320,6 +320,8 @@ class _Harness:
         handle = self.store.create(
             user_id=email,
             provider_subject=f"idp-subject-{email}",
+            provider_issuer=_ISSUER,
+            provider_client_id=_CLIENT_ID,
             id_token=id_token,
             refresh_token=f"refresh-SECRET-{email}",
             id_token_expiry=now + 3600,
