@@ -1,0 +1,44 @@
+# Repository metadata and local worktree state.
+.git
+.venv
+.pytest_cache
+.ruff_cache
+.pyrefly
+.mypy_cache
+.coverage
+.codex
+.codex-tmp
+.worktrees
+.claude/worktrees
+.tmp*
+reviews
+
+# Dependency caches and generated Python state.
+node_modules
+**/node_modules
+.pnpm-store
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+
+# Generated application, build, and test output.
+omnigent/server/static/web-ui
+build
+dist
+**/build
+**/dist
+htmlcov
+test-results
+output/playwright
+web/storybook-static
+web/coverage
+
+# Host-local files that must never enter the release image.
+.DS_Store
+**/.DS_Store
+.env
+**/.env
+*.db
+*.db-wal
+*.db-shm
+artifacts

@@ -1,0 +1,4 @@
+apiVersion: v2
+name: omnigent-server
+version: 0.4.0
+description: A Helm chart for Omnigent's server (github.com/omnigent-ai/omnigent)

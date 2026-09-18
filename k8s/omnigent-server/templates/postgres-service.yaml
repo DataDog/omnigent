@@ -1,0 +1,22 @@
+---
+# In-cluster PostgreSQL endpoint used by the server StatefulSet.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $.Chart.Name }}-postgres
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $.Chart.Name }}-postgres
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    tags.datadoghq.com/service: {{ $.Chart.Name }}
+    team: {{ $.Values.team }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ $.Chart.Name }}-postgres
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP

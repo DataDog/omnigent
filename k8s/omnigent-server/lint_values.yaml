@@ -1,0 +1,45 @@
+global:
+  docker:
+    registry: PLACEHOLDER
+    pullPolicy: IfNotPresent
+  consulTemplate:
+    image:
+      name: PLACEHOLDER
+      tag: PLACEHOLDER
+    init:
+      resources: {}
+
+cnab:
+  images:
+    main:
+      registry: "registry.ddbuild.io"
+      repository: "images/omnigent-server"
+      tag: "lint"
+      digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+deployMeta:
+  k8s_cluster:
+    isCnpEnforced: false
+
+# Habitat provider lint configuration. All values are placeholders; no secret
+# material is present.
+hab:
+  apiServer: "https://hab.example.internal"
+  profile: "staging"
+  runtime: "firecracker"
+  hostImage: "registry.ddbuild.io/images/omnigent-host@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  publicUrl: "https://omnigent.us1.ddbuild.staging.dog"
+  registryPath: "/data/hab-registry"
+  cleanupMode: "drain"
+  vaultPath: "kv/k8s/workspaces/shared/omnigent/hab"
+  vaultKey: "HAB_TOKEN"
+  tokenMountPath: "/etc/hab/token"
+  allowAllEgress: true
+  timeout:
+    create: 120
+    connect: 60
+    start: 300
+  quota:
+    perUser: 3
+    serviceWide: 20
+    global: 50

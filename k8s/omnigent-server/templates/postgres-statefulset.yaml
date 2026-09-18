@@ -1,0 +1,97 @@
+---
+# Durable single-replica PostgreSQL backing the Omnigent server.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $.Chart.Name }}-postgres
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $.Chart.Name }}-postgres
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    tags.datadoghq.com/service: {{ $.Chart.Name }}
+    team: {{ $.Values.team }}
+spec:
+  serviceName: {{ $.Chart.Name }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $.Chart.Name }}-postgres
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ $.Chart.Name }}-postgres
+        app.kubernetes.io/instance: {{ $.Release.Name }}
+        tags.datadoghq.com/service: {{ $.Chart.Name }}
+        team: {{ $.Values.team }}
+    spec:
+      {{- with $.Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- with $.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      containers:
+        - name: postgres
+          image: "{{ $.Values.postgres.image.repo }}:{{ $.Values.postgres.image.tag }}"
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          resources:
+            requests:
+              cpu: {{ $.Values.postgres.resources.requests.cpu }}
+              memory: {{ $.Values.postgres.resources.requests.memory }}
+            limits:
+              cpu: {{ $.Values.postgres.resources.limits.cpu }}
+              memory: {{ $.Values.postgres.resources.limits.memory }}
+          env:
+            - name: POSTGRES_DB
+              value: "omnigent"
+            - name: POSTGRES_USER
+              value: "omnigent"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Chart.Name }}-postgres
+                  key: POSTGRES_PASSWORD
+            # Keep PostgreSQL data below the PVC mount root.
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - "omnigent"
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - "omnigent"
+            periodSeconds: 10
+            timeoutSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+        labels:
+          app.kubernetes.io/name: {{ $.Chart.Name }}-postgres
+          app.kubernetes.io/instance: {{ $.Release.Name }}
+      spec:
+        storageClassName: {{ $.Values.postgres.persistence.storageClassName }}
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: {{ $.Values.postgres.persistence.dataSize }}

@@ -1,0 +1,58 @@
+{{- if $.Values.deployMeta.k8s_cluster.isCnpEnforced }}
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ $.Chart.Name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    team: {{ $.Values.team }}
+specs:
+  # PostgreSQL is self-hosted; this policy controls external traffic.
+  - description: Allow egress to the AI Gateway
+    endpointSelector:
+      matchLabels:
+        app.kubernetes.io/name: {{ $.Chart.Name }}
+    egress:
+      - toFQDNs:
+          - matchName: "ai-gateway.us1.ddbuild.io"
+        toPorts:
+          - ports:
+              - port: "443"
+                protocol: TCP
+  - description: Allow egress to DNS resolvers
+    endpointSelector:
+      matchLabels:
+        app.kubernetes.io/name: {{ $.Chart.Name }}
+    egress:
+      - toEntities:
+          - host
+        toPorts:
+          - ports:
+              - port: "53"
+      - toCIDR:
+          - 169.254.20.10/32
+        toPorts:
+          - ports:
+              - port: "53"
+      - toEndpoints:
+          - matchLabels:
+              app: coredns
+              k8s:io.kubernetes.pod.namespace: cluster-dns
+              service: cluster-dns
+        toPorts:
+          - ports:
+              - port: "53"
+  # Fabric Developer Gateway reaches backends through host networking.
+  - description: Allow ingress from the Fabric Developer Gateway
+    endpointSelector:
+      matchLabels:
+        app.kubernetes.io/name: {{ $.Chart.Name }}
+    ingress:
+      - fromEntities:
+          - host
+          - remote-node
+        toPorts:
+          - ports:
+              - port: "{{ $.Values.port }}"
+                protocol: TCP
+{{- end }}
