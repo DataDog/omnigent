@@ -1,4 +1,4 @@
-"""Tests for the connections migration (ga1b2c3d4e5f).
+"""Tests for the connected migration head.
 
 The single-head test is the guard: a stacked PR whose migration chains off a
 revision that isn't a real ancestor leaves the tree with two heads, and
@@ -34,7 +34,7 @@ def _downgrade(uri: str, engine: sa.Engine, revision: str) -> None:
 def test_single_alembic_head() -> None:
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
     heads = script.get_heads()
-    assert heads == ["ga1b2c3d4e5f"], f"expected a single head, got {heads!r}"
+    assert heads == ["h2a4b6c8d0e2"], f"expected a single head, got {heads!r}"
 
 
 def test_upgrade_creates_table_downgrade_drops_it(tmp_path: Path) -> None:
