@@ -95,6 +95,10 @@ class Host:
     updated_at: int
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
+    sandbox_session_id: str | None = None
+    sandbox_credential_session_id: str | None = None
+    sandbox_lifecycle_state: str | None = None
+    sandbox_cleanup_attempts: int = 0
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
@@ -169,8 +173,10 @@ def _row_to_host(row: SqlHost) -> Host:
         updated_at=row.updated_at,
         sandbox_provider=row.sandbox_provider,
         sandbox_id=row.sandbox_id,
-        terminating_sandbox_id=row.terminating_sandbox_id,
-        deleted_at=row.deleted_at,
+        sandbox_session_id=row.sandbox_session_id,
+        sandbox_credential_session_id=row.sandbox_credential_session_id,
+        sandbox_lifecycle_state=row.sandbox_lifecycle_state,
+        sandbox_cleanup_attempts=row.sandbox_cleanup_attempts,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
     )
 
@@ -428,7 +434,10 @@ class HostStore:
         token_expires_at = row.token_expires_at
         sandbox_provider = row.sandbox_provider
         sandbox_id = row.sandbox_id
-        terminating_sandbox_id = row.terminating_sandbox_id
+        sandbox_session_id = row.sandbox_session_id
+        sandbox_credential_session_id = row.sandbox_credential_session_id
+        sandbox_lifecycle_state = row.sandbox_lifecycle_state
+        sandbox_cleanup_attempts = row.sandbox_cleanup_attempts
 
         bound_ids = list(
             session.execute(
@@ -470,7 +479,10 @@ class HostStore:
             token_expires_at=token_expires_at,
             sandbox_provider=sandbox_provider,
             sandbox_id=sandbox_id,
-            terminating_sandbox_id=terminating_sandbox_id,
+            sandbox_session_id=sandbox_session_id,
+            sandbox_credential_session_id=sandbox_credential_session_id,
+            sandbox_lifecycle_state=sandbox_lifecycle_state,
+            sandbox_cleanup_attempts=sandbox_cleanup_attempts,
             configured_harnesses=harnesses_json,
         )
         session.add(new_row)
@@ -838,6 +850,8 @@ class HostStore:
         provider: str,
         sandbox_id: str,
         token_expires_at: int,
+        session_id: str | None = None,
+        credential_session_id: str | None = None,
     ) -> Host:
         """
         Create a server-managed sandbox host with its credential.
@@ -867,8 +881,35 @@ class HostStore:
         """
         now = now_epoch()
         token_hash = hash_host_launch_token(token)
-
-        def write(session: Session) -> Host:
+        with self._session("register_managed_host") as session:
+            existing = session.execute(
+                select(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                if existing.user_id != user_id:
+                    # Fail closed (W2-class boundary): re-crediting a host
+                    # row hands its launch token holder the row owner's
+                    # identity, so a cross-owner overwrite would be a host
+                    # hijack. host_id is server-generated today (uuid4 per
+                    # launch), so this can only fire on a bug or a forged
+                    # id — refuse rather than re-own.
+                    raise ValueError(
+                        f"host {host_id!r} is registered to a different user; "
+                        "refusing to re-credential it"
+                    )
+                existing.token_hash = token_hash
+                existing.token_expires_at = token_expires_at
+                existing.sandbox_provider = provider
+                existing.sandbox_id = sandbox_id
+                if session_id is not None:
+                    existing.sandbox_session_id = session_id
+                if credential_session_id is not None:
+                    existing.sandbox_credential_session_id = credential_session_id
+                existing.sandbox_lifecycle_state = "active"
+                existing.updated_at = now
+                return _row_to_host(existing)
             row = SqlHost(
                 user_id=user_id,
                 name=name,
@@ -880,6 +921,10 @@ class HostStore:
                 token_expires_at=token_expires_at,
                 sandbox_provider=provider,
                 sandbox_id=sandbox_id,
+                sandbox_session_id=session_id,
+                sandbox_credential_session_id=credential_session_id,
+                sandbox_lifecycle_state="active",
+                sandbox_cleanup_attempts=0,
             )
             session.add(row)
             return _row_to_host(row)
@@ -1192,6 +1237,20 @@ class HostStore:
                 return
             row.token_hash = None
             row.token_expires_at = None
-            row.updated_at = updated_at
+            row.updated_at = now_epoch()
 
-        run_write_transaction(self._session_immediate, "revoke_launch_token", write)
+    def mark_managed_cleanup_pending(self, host_id: str) -> None:
+        """Persist a failed exact-resource cleanup without dropping its tombstone."""
+        with self._session("mark_managed_cleanup_pending") as session:
+            row = session.execute(
+                select(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return
+            row.token_hash = None
+            row.token_expires_at = None
+            row.sandbox_lifecycle_state = "cleanup_pending"
+            row.sandbox_cleanup_attempts += 1
+            row.updated_at = now_epoch()
