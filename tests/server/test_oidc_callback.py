@@ -32,10 +32,14 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from jwt.algorithms import ECAlgorithm, RSAAlgorithm
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+from omnigent.db.db_models import OmnigentBase, SqlOidcSession
 from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.oidc import OIDCConfig
+from omnigent.server.oidc_session_store import OidcSessionStore
 from omnigent.server.routes.auth import (
     _AUTH_STATE_COOKIE_PLAIN,
     _resolve_oidc_email,
@@ -224,6 +228,64 @@ def _do_callback(client: TestClient, id_token: str) -> httpx.Response:
         f"/auth/callback?code=auth-code&state={state}",
         follow_redirects=False,
     )
+
+
+def test_callback_persists_provider_binding_in_encrypted_session(
+    tmp_path: Path,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new encrypted session stores the verified subject, issuer, and client."""
+    engine = create_engine(db_uri)
+    OmnigentBase.metadata.create_all(engine, tables=[SqlOidcSession.__table__])
+    store = OidcSessionStore(
+        sessionmaker(bind=engine, expire_on_commit=False),
+        credential_key=_TEST_SECRET,
+    )
+    keys = _IdpKeys()
+    config = _oidc_config()
+    provider = UnifiedAuthProvider(
+        source="oidc",
+        oidc_config=config,
+        oidc_session_store=store,
+    )
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    admins = tmp_path / "admins"
+    admins.write_text("")
+    pending_id_token: list[str] = [""]
+
+    async def _fake_post(*args, **kwargs) -> httpx.Response:
+        return httpx.Response(200, json={"id_token": pending_id_token[0]})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+    monkeypatch.setattr(
+        jwt.PyJWKClient,
+        "get_signing_key_from_jwt",
+        lambda self, token: keys.signing_key,
+    )
+    app = FastAPI()
+    app.include_router(
+        create_auth_router(provider, perm_store, AdminList(admins), oidc_session_store=store),
+        prefix="/auth",
+    )
+    app.state.pending_id_token = pending_id_token
+
+    try:
+        with TestClient(app) as client:
+            token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+            response = _do_callback(client, token)
+            assert response.status_code == 302
+            handle = response.cookies.get("ap_session")
+            assert handle is not None
+            resolved = store.resolve(handle)
+            assert resolved is not None
+            credentials = store.get_refresh_credentials(resolved[1], "alice@example.com")
+            assert credentials is not None
+            assert credentials.provider_subject == "idp-subject-123"
+            assert credentials.provider_issuer == _ISSUER
+            assert credentials.provider_client_id == _CLIENT_ID
+    finally:
+        engine.dispose()
 
 
 def test_oidc_accepts_es384_id_token(monkeypatch: pytest.MonkeyPatch) -> None:
