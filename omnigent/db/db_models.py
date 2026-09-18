@@ -1295,6 +1295,13 @@ class SqlHost(OmnigentBase):
     token_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sandbox_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Non-secret lifecycle binding for a managed resource. The OIDC credential
+    # session is an opaque FK-like reference to encrypted credentials; no
+    # bearer, cookie, refresh token, or browser handle is stored here.
+    sandbox_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sandbox_credential_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sandbox_lifecycle_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    sandbox_cleanup_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
 
