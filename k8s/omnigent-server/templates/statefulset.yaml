@@ -1,0 +1,244 @@
+{{- if gt (int $.Values.replicas) 1 }}
+{{- fail (printf "Habitat requires replicas=1 (got %d); Omnigent's in-memory runner registry is not safe for multiple replicas" (int $.Values.replicas)) }}
+{{- end }}
+{{- $authSecret := required "auth.existingSecret is required" $.Values.auth.existingSecret -}}
+{{- $imageRegistry := required "cnab.images.main.registry is required" $.Values.cnab.images.main.registry -}}
+{{- $imageRepository := required "cnab.images.main.repository is required" $.Values.cnab.images.main.repository -}}
+{{- $imageDigest := required "cnab.images.main.digest is required" $.Values.cnab.images.main.digest -}}
+{{- $habApiServer := required "hab.apiServer is required" $.Values.hab.apiServer -}}
+{{- $habProfile := required "hab.profile is required" $.Values.hab.profile -}}
+{{- $habHostImage := required "hab.hostImage is required" $.Values.hab.hostImage -}}
+{{- $habPublicUrl := required "hab.publicUrl is required" $.Values.hab.publicUrl -}}
+{{- $habRuntime := required "hab.runtime is required" $.Values.hab.runtime -}}
+{{- $habRegistryPath := required "hab.registryPath is required" $.Values.hab.registryPath -}}
+{{- $habCleanupMode := required "hab.cleanupMode is required" $.Values.hab.cleanupMode -}}
+{{- $habTokenMountPath := required "hab.tokenMountPath is required" $.Values.hab.tokenMountPath -}}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $.Chart.Name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $.Chart.Name }}
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    tags.datadoghq.com/service: {{ $.Chart.Name }}
+    team: {{ $.Values.team }}
+spec:
+  serviceName: {{ $.Chart.Name }}
+  replicas: {{ $.Values.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $.Chart.Name }}
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+  template:
+    metadata:
+      annotations:
+        ad.datadoghq.com/omnigent-server.logs: '[{"source":"omnigent","service":"{{ $.Chart.Name }}"}]'
+        admission.datadoghq.com/enabled: "true"
+        admission.datadoghq.com/config.mode: "socket"
+        # Built-in agents are seeded only at server startup. Roll the pod when
+        # their ConfigMap changes so the content-aware seed refresh runs.
+        checksum/agents: {{ include (print $.Template.BasePath "/agent-configmap.yaml") . | sha256sum }}
+        # Vault value rotation requires an explicit restart; template changes
+        # restart automatically because the token is read only at startup.
+        checksum/hab-vault-template: {{ include (print $.Template.BasePath "/hab-vault-template.yaml") . | sha256sum }}
+      labels:
+        app.kubernetes.io/name: {{ $.Chart.Name }}
+        app.kubernetes.io/instance: {{ $.Release.Name }}
+        tags.datadoghq.com/service: {{ $.Chart.Name }}
+        team: {{ $.Values.team }}
+    spec:
+      serviceAccountName: {{ $.Chart.Name }}
+
+      # Give Habitat time to drain active provisions on SIGTERM.
+      terminationGracePeriodSeconds: 120
+
+      {{- with $.Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- with $.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      initContainers:
+        - name: hab-token-init
+          image: "{{ $.Values.global.docker.registry }}/{{ $.Values.global.consulTemplate.image.name }}:{{ $.Values.global.consulTemplate.image.tag }}"
+          args:
+            - -once
+            - -template=/etc/hab-template/token.ctmpl:{{ $habTokenMountPath }}/token
+          volumeMounts:
+            - name: hab-vault-template
+              mountPath: /etc/hab-template
+              readOnly: true
+            - name: hab-token
+              mountPath: {{ $habTokenMountPath }}
+          resources:
+            {{- toYaml $.Values.global.consulTemplate.init.resources | nindent 12 }}
+
+      containers:
+        - name: omnigent-server
+          image: "{{ $imageRegistry }}/{{ $imageRepository }}@{{ $imageDigest }}"
+          ports:
+            - name: http
+              containerPort: {{ $.Values.port }}
+              protocol: TCP
+          resources:
+            requests:
+              cpu: {{ $.Values.resources.requests.cpu }}
+              memory: {{ $.Values.resources.requests.memory }}
+            limits:
+              cpu: {{ $.Values.resources.limits.cpu }}
+              memory: {{ $.Values.resources.limits.memory }}
+          env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "{{ $.Values.port }}"
+            # DDOT exposes OTLP through the node-local Agent host port.
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: OMNIGENT_TELEMETRY_ENABLED
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://$(HOST_IP):4317"
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: "grpc"
+            - name: OTEL_METRICS_EXPORTER
+              value: "otlp"
+            # Autodiscovery already collects container logs.
+            - name: OTEL_LOGS_EXPORTER
+              value: "none"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "deployment.environment.name=staging,service.version={{ $imageDigest }}"
+            # Persist Omnigent data, artifacts, and local state on the PVC.
+            - name: OMNIGENT_DATA_DIR
+              value: "/data"
+            - name: OMNIGENT_AUTH_ENABLED
+              value: "1"
+            - name: OMNIGENT_AUTH_PROVIDER
+              value: "{{ $.Values.auth.provider }}"
+            - name: OMNIGENT_ACCOUNTS_BASE_URL
+              value: "{{ $.Values.auth.baseUrl }}"
+            - name: OMNIGENT_ACCOUNTS_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $authSecret }}
+                  key: OMNIGENT_ACCOUNTS_COOKIE_SECRET
+            # Use the operator-managed Codex agent configuration.
+            - name: OMNIGENT_BUILTIN_AGENT_DIRS
+              value: "/etc/omnigent/agents/codex-native-ui.yaml"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Chart.Name }}-postgres
+                  key: POSTGRES_PASSWORD
+            # Habitat is the chart's required sandbox provider.
+            - name: OMNIGENT_HAB_ENABLED
+              value: "1"
+            - name: OMNIGENT_SANDBOX_PROVIDER_MODULE
+              value: "omnigent_hab_launcher"
+            - name: HAB_APISERVER
+              value: {{ $habApiServer | quote }}
+            - name: OMNIGENT_HAB_IMAGE
+              value: {{ $habHostImage | quote }}
+            - name: OMNIGENT_HAB_PROFILE
+              value: {{ $habProfile | quote }}
+            - name: OMNIGENT_HAB_RUNTIME
+              value: {{ $habRuntime | quote }}
+            - name: OMNIGENT_PUBLIC_URL
+              value: {{ $habPublicUrl | quote }}
+            - name: OMNIGENT_HAB_ALLOW_ALL_EGRESS
+              value: {{ $.Values.hab.allowAllEgress | quote }}
+            - name: OMNIGENT_HAB_REGISTRY_PATH
+              value: {{ $habRegistryPath | quote }}
+            - name: OMNIGENT_HAB_CLEANUP_MODE
+              value: {{ $habCleanupMode | quote }}
+            - name: OMNIGENT_HAB_CREATE_TIMEOUT_S
+              value: "{{ $.Values.hab.timeout.create }}"
+            - name: OMNIGENT_HAB_CONNECT_TIMEOUT_S
+              value: "{{ $.Values.hab.timeout.connect }}"
+            - name: OMNIGENT_HAB_START_TIMEOUT_S
+              value: "{{ $.Values.hab.timeout.start }}"
+            - name: OMNIGENT_HAB_MAX_PER_USER
+              value: "{{ $.Values.hab.quota.perUser }}"
+            - name: OMNIGENT_HAB_MAX_SERVICE_WIDE
+              value: "{{ $.Values.hab.quota.serviceWide }}"
+            - name: OMNIGENT_HAB_MAX_GLOBAL
+              value: "{{ $.Values.hab.quota.global }}"
+            - name: HAB_TOKEN_FILE
+              value: "{{ $habTokenMountPath }}/token"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: agents
+              mountPath: /etc/omnigent/agents
+              readOnly: true
+            - name: hab-token
+              mountPath: {{ $habTokenMountPath }}
+              readOnly: true
+            # Connect directly to this chart's PostgreSQL Service.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # psycopg3 requires the explicit SQLAlchemy dialect.
+              export DATABASE_URL="postgresql+psycopg://omnigent:${POSTGRES_PASSWORD}@{{ $.Chart.Name }}-postgres:5432/omnigent"
+              # Pass the URI directly because the CLI does not read DATABASE_URL.
+              exec omnigent server --database-uri "$DATABASE_URL" --host "$HOST" --port "$PORT"
+          # Allow first-boot database initialization before liveness starts.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 18
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # /health checks the server without provisioning a Habitat.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+      volumes:
+        - name: agents
+          configMap:
+            name: {{ $.Chart.Name }}-agents
+        - name: hab-vault-template
+          configMap:
+            name: {{ $.Chart.Name }}-hab-vault-template
+        - name: hab-token
+          emptyDir:
+            medium: Memory
+
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: {{ $.Chart.Name }}
+          app.kubernetes.io/instance: {{ $.Release.Name }}
+      spec:
+        storageClassName: {{ $.Values.persistence.storageClassName }}
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: {{ $.Values.persistence.dataSize }}

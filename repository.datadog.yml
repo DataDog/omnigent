@@ -1,6 +1,14 @@
 ---
+# Preserve the repository's existing MergeGate. Dynamic Build is a separate
+# repository capability, so it is intentionally a second YAML document.
 schema-version: v1
 kind: mergegate
 rules:
   - require: commit-signatures
     allow_unsigned_external: true
+---
+schema-version: v1
+kind: dynamicbuild-worker
+team: workspaces
+rules_files:
+  - .dynamic-build.yml

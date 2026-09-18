@@ -1,0 +1,118 @@
+# Filled by ddr-package from the signed image built for this checkout.  Do not
+# replace these placeholders with a fixed tag: Conductor deploys the digest it
+# just signed, so the chart and image always describe the same commit.
+cnab:
+  images:
+    main:
+      registry: "PLACEHOLDER"
+      repository: "PLACEHOLDER"
+      tag: ""
+      digest: "PLACEHOLDER"
+
+# Hard ceiling, not a starting point: upstream's in-memory runner registry
+# (deploy/kubernetes/README.md:335-339) supports exactly one replica today.
+replicas: 1
+
+resources:
+  requests:
+    cpu: "500m"
+    memory: "1Gi"
+  limits:
+    cpu: "1"
+    memory: "2Gi"
+
+persistence:
+  storageClassName: "gp3"
+  dataSize: "20Gi"
+
+port: 8000
+
+auth:
+  # Native invite-only accounts; oidc can replace it per environment.
+  provider: "accounts"
+  # Matches the Dev Gateway hostname from fabric/routing-domain.yaml.
+  baseUrl: "https://omnigent.us1.ddbuild.staging.dog"
+  # This durable Secret is managed outside the release.
+  existingSecret: "omnigent-server-auth"
+
+postgres:
+  # The server connects directly to this chart's PostgreSQL Service.
+  image:
+    # GBI-compatible PostgreSQL image.
+    repo: "registry.ddbuild.io/images/postgres-official"
+    tag: "17-gbi"
+  persistence:
+    # Separate durable storage for the database.
+    storageClassName: "gp3"
+    dataSize: "10Gi"
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+
+tolerations:
+  - key: "node"
+    operator: "Equal"
+    effect: "NoSchedule"
+    value: "nodeless"
+
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: "node-role.kubernetes.io/nodeless"
+              operator: Exists
+
+runnerAccess:
+  # Allows engineering users to port-forward the service.
+  enabled: true
+  # Engineering group authorized by runner-portforward-rbac.yaml.
+  group: "dept-engineering"
+
+# Habitat is the chart's required sandbox provider. Its credential remains in
+# Vault and is rendered into a memory-backed file at pod startup.
+hab:
+  apiServer: "https://api.staging.habvm.dev:443"
+
+  profile: "hab-bench-devtools"
+
+  # Initial Habitat runtime.
+  runtime: "firecracker"
+
+  # Habitat staging uses ARM64 hablets, so pin the multi-architecture digest.
+  hostImage: "ghcr.io/omnigent-ai/omnigent-host:v0.9.0@sha256:c15277d6ae25ac6c7c41dbc94320c81c4e9a562a86f5438da716af1ae12d39e9"
+
+  # URL reachable from a Hab for registration and WebSocket traffic.
+  publicUrl: "https://omnigent.us1.ddbuild.staging.dog"
+
+  # Persistent Habitat lifecycle registry under the data PVC.
+  registryPath: "/data/hab-registry"
+
+  # Drain stops new provisions; graceful attempts cleanup on termination.
+  cleanupMode: "drain"
+
+  # consul-template renders this Vault value into tokenMountPath.
+  vaultPath: "kv/k8s/workspaces/shared/omnigent/hab"
+  vaultKey: "HAB_TOKEN"
+  tokenMountPath: "/etc/hab/token"
+
+  # Allow normal hablet development traffic.
+  allowAllEgress: true
+
+  # Provisioning timeouts in seconds.
+  timeout:
+    create: 120
+    connect: 60
+    start: 300
+
+  # Provider-enforced concurrency quotas.
+  quota:
+    perUser: 3
+    serviceWide: 20
+    global: 50
+
+team: workspaces
