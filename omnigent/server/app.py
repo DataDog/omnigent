@@ -1587,30 +1587,12 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
-    # GitHub App integration: enabled only when both the config and the
-    # connection store are wired. The client is stateless (holds config),
-    # built once and reused for the connect flow.
-    # Per-user connection providers (GitHub, ...). One registry entry per
-    # provider (connections_registry) drives uniform wiring: each gets
-    # ``app.state.<name>_{config,store,client}``, populated only when both its
-    # config and its store are present, else None. The info endpoint's
-    # enabled_connections list and the router mounting below both read these.
-    from omnigent.server.connections_registry import connection_providers
+    # Later lifecycle operations have no request ContextVar. This resolver
+    # recreates only the exact owner-bound credential session persisted with a
+    # managed resource; it never searches for another user's current login.
+    from omnigent.server.managed_sandbox_identity import ManagedSandboxIdentityResolver
 
-    _connection_inputs = {
-        "github": (github_config, github_store),
-        "databricks": (databricks_config, databricks_store),
-    }
-    for _provider in connection_providers():
-        _cfg, _store = _connection_inputs.get(_provider.name, (None, None))
-        _on = _cfg is not None and _store is not None
-        setattr(app.state, f"{_provider.name}_config", _cfg if _on else None)
-        setattr(app.state, f"{_provider.name}_store", _store if _on else None)
-        setattr(
-            app.state,
-            f"{_provider.name}_client",
-            _provider.client_factory(_cfg) if _on else None,
-        )
+    app.state.managed_sandbox_identity_resolver = ManagedSandboxIdentityResolver(auth_provider)
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the

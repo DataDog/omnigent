@@ -27,6 +27,7 @@ from omnigent.onboarding.sandboxes.base import (
     render_host_config_write_command,
 )
 from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s as blaxel_managed_token_ttl_s
+from omnigent.onboarding.sandboxes.context import ManagedSandboxContext
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.onboarding.sandboxes.registry import (
     COMMUNITY_MODULE_PREFIX,
@@ -2934,65 +2935,28 @@ async def test_launch_entrypoint_provider_cleans_up_on_launch_failure(db_uri: st
 # ── relaunch_managed_host ───────────────────────────────────
 
 
-class _ReusedIdFakeLauncher(FakeSandboxLauncher):
-    provider: ClassVar[str] = "blaxel"
-
-    def provision(self, name: str) -> str:
-        self.provisioned_names.append(name)
-        return name
-
-
-async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str) -> None:
-    host_store = HostStore(db_uri)
-
-    def _register(invocation: HostStartInvocation) -> None:
-        host_store.upsert_on_connect(
-            host_id=invocation.host_id,
-            name=invocation.host_name,
-            user_id=_OWNER,
-        )
-
-    fake = _ReusedIdFakeLauncher(on_host_start=_register)
-    config = _injected_config(fake)
-    first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
-    active = host_store.get_host(first.host_id)
-    assert active is not None
-    assert active.sandbox_id is not None
-    assert host_store.detach_stale_managed_sandbox(
-        active.host_id,
-        sandbox_id=active.sandbox_id,
-        expected_updated_at=active.updated_at,
+def test_managed_host_persists_non_secret_lifecycle_binding(db_uri: str) -> None:
+    """Restart recovery retains only opaque owner/resource lifecycle references."""
+    HostStore(db_uri).register_managed_host(
+        host_id="f2a2b3c4d5e6f708192a3b4c5d6e7f80",
+        name="managed-lifecycle",
+        user_id=_OWNER,
+        token="launch-token-not-persisted",
+        provider="hab",
+        sandbox_id="hab-exact-uuid",
+        token_expires_at=now_epoch() + 3600,
+        session_id="conv-lifecycle",
+        credential_session_id="oidc-session-ref",
     )
-    pending = host_store.get_host(active.host_id)
-    assert pending is not None
 
-    with pytest.raises(HTTPException) as exc:
-        await relaunch_managed_host(config=config, host=pending, host_store=host_store)
-
-    assert exc.value.status_code == 409
-    assert "host lifecycle" in exc.value.detail
-    assert len(fake.host_starts) == 1
-    assert fake.terminated == []
-    still_pending = host_store.get_host(active.host_id)
-    assert still_pending is not None
-    assert still_pending.sandbox_id is None
-    assert still_pending.terminating_sandbox_id == active.name
-
-    reaper = ManagedSandboxReaper(host_store=host_store, sandbox_config=config)
-    assert await reaper.sweep_once() == 1
-    assert fake.terminated == [active.name]
-    cleared = host_store.get_host(active.host_id)
-    assert cleared is not None
-    assert cleared.sandbox_id is None
-    assert cleared.terminating_sandbox_id is None
-
-    relaunched = await relaunch_managed_host(config=config, host=cleared, host_store=host_store)
-    assert relaunched.host_id == active.host_id
-    current = host_store.get_host(active.host_id)
-    assert current is not None
-    assert current.status == "online"
-    assert current.sandbox_id == active.name
-    assert current.terminating_sandbox_id is None
+    recovered = HostStore(db_uri).get_host("f2a2b3c4d5e6f708192a3b4c5d6e7f80")
+    assert recovered is not None
+    assert recovered.sandbox_provider == "hab"
+    assert recovered.sandbox_id == "hab-exact-uuid"
+    assert recovered.sandbox_session_id == "conv-lifecycle"
+    assert recovered.sandbox_credential_session_id == "oidc-session-ref"
+    assert recovered.sandbox_lifecycle_state == "active"
+    assert recovered.sandbox_cleanup_attempts == 0
 
 
 async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) -> None:
@@ -3089,32 +3053,40 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
     )
 
 
-async def test_relaunch_does_not_recreate_deleted_host(db_uri: str) -> None:
-    """A relaunch that loses to full teardown cleans up its new sandbox."""
+async def test_relaunch_does_not_create_second_generation_when_old_cleanup_is_ambiguous(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed exact-ID termination blocks relaunch and leaves a tombstone."""
     host_store = HostStore(db_uri)
-    host = host_store.register_managed_host(
-        host_id="c73ad22fd7be4fe2a62a36b7e0fbcaa8",
-        name="managed-deleted-relaunch",
-        user_id=_OWNER,
-        token="deleted-relaunch-token",
-        provider="modal",
-        sandbox_id="sb-deleted-old",
-        token_expires_at=now_epoch() + 3600,
-    )
-    host_store.delete_host(host.host_id)
-    fake = FakeSandboxLauncher()
 
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    first = await launch_managed_host(
+        config=_injected_config(fake), owner=_OWNER, host_store=host_store
+    )
+    host = host_store.get_host(first.host_id)
+    assert host is not None
+
+    monkeypatch.setattr(
+        fake,
+        "terminate",
+        lambda _sandbox_id: (_ for _ in ()).throw(click.ClickException("unavailable")),
+    )
     with pytest.raises(HTTPException) as exc:
         await relaunch_managed_host(
-            config=_injected_config(fake),
-            host=host,
-            host_store=host_store,
+            config=_injected_config(fake), host=host, host_store=host_store
         )
 
     assert exc.value.status_code == 409
-    assert "no longer exists" in exc.value.detail
-    assert fake.terminated == ["sb-deleted-old", "sb-fake-1"]
-    assert host_store.get_host(host.host_id) is None
+    assert fake.provisioned_names == ["managed-" + first.host_id[:8]]
+    tombstone = host_store.get_host(first.host_id)
+    assert tombstone is not None
+    assert tombstone.sandbox_lifecycle_state == "cleanup_pending"
+    assert tombstone.sandbox_cleanup_attempts == 1
 
 
 async def test_relaunch_rejects_unconfigured_provider(db_uri: str) -> None:
@@ -3561,107 +3533,16 @@ async def test_terminate_managed_host_terminates_and_deletes_row(db_uri: str) ->
         host_store.resolve_launch_token("62a91eb065624754c6a6dfb5869dd7e8", "tok-term-1") is None
     )
 
-
-async def test_terminate_managed_host_cleans_active_and_pending_generations(db_uri: str) -> None:
-    """Full host teardown best-effort terminates both persisted sandbox ids."""
-    fake = FakeSandboxLauncher()
-    host_store = HostStore(db_uri)
-    host_id = "b63810fdd86a4f04988b3e53a930ad08"
-    original = host_store.register_managed_host(
-        host_id=host_id,
-        name="managed-term-both",
-        user_id=_OWNER,
-        token="tok-term-old",
-        provider="modal",
-        sandbox_id="sb-term-old",
-        token_expires_at=now_epoch() + 3600,
-    )
-    assert host_store.detach_stale_managed_sandbox(
-        host_id,
-        sandbox_id="sb-term-old",
-        expected_updated_at=original.updated_at,
-    )
-    replaced = host_store.replace_managed_host_sandbox(
-        host_id=host_id,
-        user_id=_OWNER,
-        token="tok-term-new",
-        provider="modal",
-        sandbox_id="sb-term-new",
-        token_expires_at=now_epoch() + 3600,
-    )
-    assert replaced is not None
-    host = host_store.get_host(host_id)
-    assert host is not None
-
-    await terminate_managed_host(host, host_store, _injected_config(fake))
-
-    assert fake.terminated == ["sb-term-new", "sb-term-old"]
-    assert host_store.get_host(host_id) is None
+    assert await terminate_managed_host(host, host_store, _injected_config(fake)) is True
+    assert fake.terminated == ["sb-term-1"]
 
 
-async def test_terminate_managed_host_targets_latest_registered_generation(db_uri: str) -> None:
-    """A stale teardown snapshot removes and terminates the current generation."""
-    fake = FakeSandboxLauncher()
-    host_store = HostStore(db_uri)
-    stale = host_store.register_managed_host(
-        host_id="5233b41530ed474f9860ecf3acfc9131",
-        name="managed-term-current",
-        user_id=_OWNER,
-        token="tok-term-old",
-        provider="modal",
-        sandbox_id="sb-term-old",
-        token_expires_at=now_epoch() + 3600,
-    )
-    updated = host_store.replace_managed_host_sandbox(
-        host_id=stale.host_id,
-        user_id=stale.user_id,
-        token="tok-term-new",
-        provider="modal",
-        sandbox_id="sb-term-new",
-        token_expires_at=now_epoch() + 3600,
-    )
-    assert updated is not None
-
-    await terminate_managed_host(stale, host_store, _injected_config(fake))
-
-    assert fake.terminated == ["sb-term-new"]
-    assert host_store.get_host(stale.host_id) is None
-
-
-async def test_terminate_managed_host_deletes_row_before_provider_call(
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Provider teardown runs only after the host can no longer be relaunched."""
-    fake = FakeSandboxLauncher()
-    host_store = HostStore(db_uri)
-    host = host_store.register_managed_host(
-        host_id="af48b60a7afb4c0696709403116c30c6",
-        name="managed-delete-first",
-        user_id=_OWNER,
-        token="tok-delete-first",
-        provider="modal",
-        sandbox_id="sb-delete-first",
-        token_expires_at=now_epoch() + 3600,
-    )
-
-    def _terminate(sandbox_id: str) -> None:
-        assert host_store.get_host(host.host_id) is None
-        fake.terminated.append(sandbox_id)
-
-    monkeypatch.setattr(fake, "terminate", _terminate)
-
-    await terminate_managed_host(host, host_store, _injected_config(fake))
-
-    assert fake.terminated == ["sb-delete-first"]
-
-
-async def test_terminate_managed_host_retries_tombstone_after_terminate_fails(
+async def test_terminate_managed_host_retains_cleanup_tombstone_when_terminate_fails(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    A provider failure does not block logical deletion, and the persisted
-    sandbox id is retried by the existing reaper.
+    A provider termination failure revokes local authorization but keeps the
+    exact resource binding as a cleanup-pending tombstone.
     """
     fake = FakeSandboxLauncher()
     original_terminate = fake.terminate
@@ -3682,9 +3563,13 @@ async def test_terminate_managed_host_retries_tombstone_after_terminate_fails(
         token_expires_at=now_epoch() + 3600,
     )
 
-    await terminate_managed_host(host, host_store, _injected_config(fake))
+    assert await terminate_managed_host(host, host_store, _injected_config(fake)) is False
 
-    assert host_store.get_host("057e7fa3f1cdb40c0ec393a3d42affc7") is None
+    tombstone = host_store.get_host("057e7fa3f1cdb40c0ec393a3d42affc7")
+    assert tombstone is not None
+    assert tombstone.sandbox_id == "sb-term-2"
+    assert tombstone.sandbox_lifecycle_state == "cleanup_pending"
+    assert tombstone.sandbox_cleanup_attempts == 1
     assert (
         host_store.resolve_launch_token("057e7fa3f1cdb40c0ec393a3d42affc7", "tok-term-2") is None
     )
@@ -3773,12 +3658,84 @@ async def test_terminate_managed_host_retains_only_failed_generation(
     assert host_store.list_current_managed_sandbox_hosts_page(after=None, limit=10) == []
     assert host_store.list_terminating_managed_sandbox_hosts_page(after=None, limit=10) == []
 
+    monkeypatch.setattr(fake, "terminate", lambda sandbox_id: fake.terminated.append(sandbox_id))
+    assert await terminate_managed_host(tombstone, host_store, _injected_config(fake)) is True
+    assert fake.terminated == ["sb-term-2"]
+    assert host_store.get_host("057e7fa3f1cdb40c0ec393a3d42affc7") is None
+
+
+async def test_session_delete_returns_cleanup_pending_and_retains_host_tombstone(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deleting a session reports remote-cleanup debt without losing its binding."""
+    fake = FakeSandboxLauncher()
+
+    def _explode(sandbox_id: str) -> None:
+        raise click.ClickException("provider unavailable")
+
+    monkeypatch.setattr(fake, "terminate", _explode)
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="9603749b468c4560aec2f85636a6ba71",
+        name="managed-session-delete",
+        user_id=_OWNER,
+        token="tok-session-delete",
+        provider="modal",
+        sandbox_id="sb-session-delete",
+        token_expires_at=now_epoch() + 3600,
+        session_id="session-delete",
+        credential_session_id="credential-session-delete",
+    )
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="delete-test-agent", bundle_location="test:///bundle")
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    conversation = conversation_store.create_conversation(
+        agent_id=agent_id,
+        host_id=host.host_id,
+        workspace="/workspace",
+    )
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=agent_store,
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        host_store=host_store,
+        sandbox_config=_injected_config(fake),
+    )
+    app.state.managed_sandbox_identity_resolver = SimpleNamespace(
+        for_host=lambda bound_host: ManagedSandboxContext(
+            session_id=bound_host.sandbox_session_id or bound_host.host_id,
+            user_id=bound_host.user_id,
+            identity_token_provider=None,
+            credential_session_id=bound_host.sandbox_credential_session_id,
+        )
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.delete(f"/v1/sessions/{conversation.id}")
+
+    assert response.status_code == 200
+    response_body = response.json()
+    assert response_body["id"] == conversation.id
+    assert response_body["deleted"] is True
+    assert response_body["cleanup_pending"] is True
+    tombstone = host_store.get_host(host.host_id)
+    assert tombstone is not None
+    assert tombstone.sandbox_id == "sb-session-delete"
+    assert tombstone.sandbox_lifecycle_state == "cleanup_pending"
+    assert tombstone.sandbox_cleanup_attempts == 1
+    assert host_store.resolve_launch_token(host.host_id, "tok-session-delete") is None
+
 
 async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> None:
     """
-    A config change between launch and teardown must not aim the new provider's
-    terminate at a stale sandbox id. The host becomes invisible and its cleanup
-    tombstone remains available if that provider is configured again later.
+    A config change between launch and teardown (current launcher's
+    provider ≠ the provider recorded on the row) must NOT aim the new
+    provider's terminate at a stale sandbox id. The row remains a
+    cleanup-pending tombstone after local token revocation.
     """
     fake = FakeSandboxLauncher()  # provider "modal"
     host_store = HostStore(db_uri)
@@ -3796,12 +3753,15 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
     await terminate_managed_host(host, host_store, _injected_config(fake))
     # No cross-provider terminate was attempted.
     assert fake.terminated == []
-    assert host_store.get_host("487212fd2b157b6ab6a6d6d3ef06ce5b") is None
+    assert (
+        host_store.get_host("487212fd2b157b6ab6a6d6d3ef06ce5b").sandbox_lifecycle_state
+        == "cleanup_pending"
+    )
     assert (
         host_store.resolve_launch_token("487212fd2b157b6ab6a6d6d3ef06ce5b", "tok-term-3") is None
     )
 
-    # config=None behaves the same: host hidden, cleanup retained.
+    # config=None behaves the same: retain the exact tombstone, do not guess.
     host2 = host_store.register_managed_host(
         host_id="b114bf90a8fd155ce6007c3bb262aa79",
         name="managed-term4",
@@ -3812,7 +3772,10 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
         token_expires_at=now_epoch() + 3600,
     )
     await terminate_managed_host(host2, host_store, None)
-    assert host_store.get_host("b114bf90a8fd155ce6007c3bb262aa79") is None
+    assert (
+        host_store.get_host("b114bf90a8fd155ce6007c3bb262aa79").sandbox_lifecycle_state
+        == "cleanup_pending"
+    )
 
 
 def test_parse_modal_secrets_thread_to_launcher(monkeypatch: pytest.MonkeyPatch) -> None:
