@@ -286,6 +286,19 @@ def test_callback_public_client_omits_client_secret(
     assert "client_secret" not in client.app.state.token_requests[-1]
 
 
+def test_callback_confidential_client_sends_client_secret(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A confidential client's code exchange authenticates with its secret."""
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 302, resp.text
+    assert client.app.state.token_requests[-1]["client_secret"] == "secret"
+
+
 def test_callback_verified_email_mints_session(
     callback_client: tuple[TestClient, _IdpKeys],
 ) -> None:

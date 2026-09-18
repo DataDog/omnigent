@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock
 
+import httpx
 import jwt
 import pytest
 
@@ -975,6 +976,10 @@ def test_oidc_config_allows_public_client(monkeypatch: pytest.MonkeyPatch) -> No
     config = OIDCConfig.from_env()
 
     assert config.client_secret is None
+    assert config.authorization_endpoint == "https://idp.example.com/authorize"
+    assert config.token_endpoint == "https://idp.example.com/token"
+    assert config.jwks_uri == "https://idp.example.com/jwks"
+    assert config.userinfo_endpoint is None
 
 
 def test_oidc_config_github_still_requires_client_secret(
@@ -1007,6 +1012,7 @@ def test_oidc_endpoint_overrides_preserve_canonical_issuer(
     assert config.authorization_endpoint == "https://public.example.com/authorize"
     assert config.token_endpoint == "https://public.example.com/token"
     assert config.jwks_uri == "https://public.example.com/jwks"
+    assert config.userinfo_endpoint is None
     get.assert_not_called()
 
 
@@ -1018,4 +1024,39 @@ def test_oidc_endpoint_overrides_must_be_complete(monkeypatch: pytest.MonkeyPatc
     )
 
     with pytest.raises(RuntimeError, match="must be configured together"):
+        OIDCConfig.from_env()
+
+
+def test_oidc_discovery_failure_reports_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Discovery transport failures identify the provider URL."""
+    _set_generic_oidc_env(monkeypatch)
+    get = MagicMock(side_effect=httpx.ConnectError("unreachable"))
+    monkeypatch.setattr("omnigent.server.oidc.httpx.get", get)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"Failed to fetch OIDC discovery document from "
+        r"https://issuer\.example\.com/\.well-known/openid-configuration",
+    ):
+        OIDCConfig.from_env()
+
+
+@pytest.mark.parametrize("missing_field", ["authorization_endpoint", "token_endpoint", "jwks_uri"])
+def test_oidc_discovery_requires_all_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+    missing_field: str,
+) -> None:
+    """Discovery fails when any endpoint required by the login flow is absent."""
+    _set_generic_oidc_env(monkeypatch)
+    document = {
+        "authorization_endpoint": "https://idp.example.com/authorize",
+        "token_endpoint": "https://idp.example.com/token",
+        "jwks_uri": "https://idp.example.com/jwks",
+    }
+    del document[missing_field]
+    discovery = MagicMock()
+    discovery.json.return_value = document
+    monkeypatch.setattr("omnigent.server.oidc.httpx.get", MagicMock(return_value=discovery))
+
+    with pytest.raises(RuntimeError, match="missing required fields"):
         OIDCConfig.from_env()
