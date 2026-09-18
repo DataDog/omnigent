@@ -366,6 +366,14 @@ class AuthProvider(ABC):
         """
         return None
 
+    def get_identity_token_provider_for_credential_session(
+        self,
+        credential_session_id: str,  # noqa: ARG002
+        expected_user_id: str,  # noqa: ARG002
+    ) -> IdentityTokenProvider | None:
+        """Resolve one persisted owner-bound credential session, or fail closed."""
+        return None
+
 
 class _OidcIdentityTokenProvider:
     """IdentityTokenProvider bound to one encrypted OIDC credential session.
@@ -384,6 +392,11 @@ class _OidcIdentityTokenProvider:
         self._token_manager = token_manager
         self._session_id = session_id
         self._expected_user_id = expected_user_id
+
+    @property
+    def credential_session_id(self) -> str:
+        """Opaque OIDC credential-session reference; never a credential."""
+        return self._session_id
 
     def get_identity_token(self) -> IdentityToken:
         result = self._token_manager.get_current_id_token(
@@ -588,6 +601,29 @@ class UnifiedAuthProvider(AuthProvider):
         return _OidcIdentityTokenProvider(
             token_manager=token_manager,
             session_id=session_id,
+            expected_user_id=expected_user_id,
+        )
+
+    def get_identity_token_provider_for_credential_session(
+        self,
+        credential_session_id: str,
+        expected_user_id: str,
+    ) -> IdentityTokenProvider | None:
+        """Reconstruct a provider for exactly one active owner credential session."""
+        from omnigent.server.oidc_token_manager import OidcTokenManager
+
+        if self._source != "oidc" or self._oidc_config is None or self._oidc_session_store is None:
+            return None
+        # Validate owner, revocation, and absolute expiry without exposing the
+        # encrypted credential outside the session store.
+        if (
+            self._oidc_session_store.get_credentials(credential_session_id, expected_user_id)
+            is None
+        ):
+            return None
+        return _OidcIdentityTokenProvider(
+            token_manager=OidcTokenManager(self._oidc_session_store, self._oidc_config),
+            session_id=credential_session_id,
             expected_user_id=expected_user_id,
         )
 
