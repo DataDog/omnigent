@@ -19,6 +19,8 @@ from omnigent.server.oidc_session_store import OidcSessionStore
 
 _TEST_KEY = bytes.fromhex("aa" * 32)
 _TEST_KEY_2 = bytes.fromhex("bb" * 32)
+_TEST_ISSUER = "https://idp.example.com"
+_TEST_CLIENT_ID = "test-client"
 
 
 @pytest.fixture()
@@ -45,6 +47,8 @@ def test_raw_tokens_never_in_database(session_factory) -> None:
     store.create(
         user_id="alice@example.com",
         provider_subject="idp-sub-123",
+        provider_issuer=_TEST_ISSUER,
+        provider_client_id=_TEST_CLIENT_ID,
         id_token=id_token,
         refresh_token=refresh_token,
         id_token_expiry=int(time.time()) + 3600,
@@ -75,6 +79,8 @@ def test_handle_resolves_to_one_user_and_session(session_factory) -> None:
     handle = store.create(
         user_id="alice@example.com",
         provider_subject="sub-1",
+        provider_issuer=_TEST_ISSUER,
+        provider_client_id=_TEST_CLIENT_ID,
         id_token="id-token-1",
         refresh_token="rt-1",
         id_token_expiry=int(time.time()) + 3600,
@@ -103,6 +109,8 @@ def test_revoked_handle_fails_closed(session_factory) -> None:
     handle = store.create(
         user_id="bob@example.com",
         provider_subject="sub-2",
+        provider_issuer=_TEST_ISSUER,
+        provider_client_id=_TEST_CLIENT_ID,
         id_token="id-token-2",
         refresh_token="rt-2",
         id_token_expiry=int(time.time()) + 3600,
@@ -124,6 +132,8 @@ def test_expired_session_fails_closed(session_factory) -> None:
     handle = store.create(
         user_id="carol@example.com",
         provider_subject="sub-3",
+        provider_issuer=_TEST_ISSUER,
+        provider_client_id=_TEST_CLIENT_ID,
         id_token="id-token-3",
         refresh_token="rt-3",
         id_token_expiry=past,
@@ -142,6 +152,8 @@ def test_get_credentials_roundtrip(session_factory) -> None:
     handle = store.create(
         user_id="alice@example.com",
         provider_subject="sub-1",
+        provider_issuer=_TEST_ISSUER,
+        provider_client_id=_TEST_CLIENT_ID,
         id_token=id_token,
         refresh_token=refresh_token,
         id_token_expiry=expiry,
@@ -165,6 +177,8 @@ def test_update_credentials_atomic(session_factory) -> None:
     handle = store.create(
         user_id="alice@example.com",
         provider_subject="sub-1",
+        provider_issuer=_TEST_ISSUER,
+        provider_client_id=_TEST_CLIENT_ID,
         id_token="old-id-token",
         refresh_token="old-rt",
         id_token_expiry=int(time.time()) + 3600,
@@ -195,6 +209,8 @@ def test_survives_reconstruction(session_factory) -> None:
     handle = store1.create(
         user_id="alice@example.com",
         provider_subject="sub-1",
+        provider_issuer=_TEST_ISSUER,
+        provider_client_id=_TEST_CLIENT_ID,
         id_token="persisted-id-token",
         refresh_token="persisted-rt",
         id_token_expiry=int(time.time()) + 3600,
@@ -218,6 +234,8 @@ def test_key_change_invalidates_credentials(session_factory) -> None:
     handle = store1.create(
         user_id="alice@example.com",
         provider_subject="sub-1",
+        provider_issuer=_TEST_ISSUER,
+        provider_client_id=_TEST_CLIENT_ID,
         id_token="secret-id-token",
         refresh_token="secret-rt",
         id_token_expiry=int(time.time()) + 3600,
@@ -246,6 +264,8 @@ def test_delete_expired_removes_old_sessions(session_factory) -> None:
     store.create(
         user_id="expired@example.com",
         provider_subject="sub-x",
+        provider_issuer=_TEST_ISSUER,
+        provider_client_id=_TEST_CLIENT_ID,
         id_token="id-x",
         refresh_token="rt-x",
         id_token_expiry=past,
@@ -255,6 +275,8 @@ def test_delete_expired_removes_old_sessions(session_factory) -> None:
     handle_active = store.create(
         user_id="active@example.com",
         provider_subject="sub-a",
+        provider_issuer=_TEST_ISSUER,
+        provider_client_id=_TEST_CLIENT_ID,
         id_token="id-a",
         refresh_token="rt-a",
         id_token_expiry=int(time.time()) + 3600,
@@ -274,6 +296,8 @@ def test_wrong_user_id_fails_closed(session_factory) -> None:
     handle = store.create(
         user_id="alice@example.com",
         provider_subject="sub-1",
+        provider_issuer=_TEST_ISSUER,
+        provider_client_id=_TEST_CLIENT_ID,
         id_token="id-token",
         refresh_token="rt",
         id_token_expiry=int(time.time()) + 3600,
@@ -293,6 +317,8 @@ def test_revoke_does_not_delete_other_sessions(session_factory) -> None:
     handle1 = store.create(
         user_id="alice@example.com",
         provider_subject="sub-1",
+        provider_issuer=_TEST_ISSUER,
+        provider_client_id=_TEST_CLIENT_ID,
         id_token="id-1",
         refresh_token="rt-1",
         id_token_expiry=int(time.time()) + 3600,
@@ -301,6 +327,8 @@ def test_revoke_does_not_delete_other_sessions(session_factory) -> None:
     handle2 = store.create(
         user_id="alice@example.com",
         provider_subject="sub-1",
+        provider_issuer=_TEST_ISSUER,
+        provider_client_id=_TEST_CLIENT_ID,
         id_token="id-2",
         refresh_token="rt-2",
         id_token_expiry=int(time.time()) + 3600,
