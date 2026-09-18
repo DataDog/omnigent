@@ -1697,6 +1697,8 @@ class SqlOidcSession(OmnigentBase):
         handle.
     :param user_id: Verified user email (lowercased).
     :param provider_subject: IdP subject claim from the ID token.
+    :param provider_issuer: OIDC issuer that minted the original ID token.
+    :param provider_client_id: OIDC audience bound to the original ID token.
     :param credential_ciphertext: AES-GCM encrypted blob containing
         the ID token and refresh token.
     :param id_token_expiry: Unix timestamp when the current ID token
@@ -1705,6 +1707,11 @@ class SqlOidcSession(OmnigentBase):
         expires absolutely.
     :param created_at: Row creation timestamp.
     :param updated_at: Row last-update timestamp.
+    :param credential_version: Generation of the encrypted credentials. Refresh
+        commits use it as a compare-and-swap guard.
+    :param refresh_lease_id: Short-lived owner ID for an in-flight refresh.
+    :param refresh_lease_expires_at: When another process may recover an
+        abandoned refresh lease.
     :param revoked_at: Timestamp when the session was revoked, or
         ``None`` while active.
     """
@@ -1722,11 +1729,16 @@ class SqlOidcSession(OmnigentBase):
     handle_digest: Mapped[str] = mapped_column(String(64), nullable=False)
     user_id: Mapped[str] = mapped_column(String(256), nullable=False)
     provider_subject: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    provider_issuer: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    provider_client_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
     credential_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     id_token_expiry: Mapped[int | None] = mapped_column(Integer, nullable=True)
     absolute_expiry: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    credential_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    refresh_lease_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    refresh_lease_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     revoked_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
