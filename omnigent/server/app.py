@@ -3382,6 +3382,7 @@ def create_app(
                     oidc_account_store,
                     allowed_domains=frozenset(allowed_domains or ()) or None,
                     device_grant_store=device_grant_store,
+                    oidc_session_store=getattr(auth_provider, "_oidc_session_store", None),
                 ),
                 prefix="/auth",
                 tags=["auth"],
