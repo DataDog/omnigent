@@ -16,14 +16,14 @@ below). There is no separate auth-proxy container.
 
 ```bash
 cd deploy/docker
-./bootstrap.sh                          # mints POSTGRES_PASSWORD + cookie secret into .env
+./bootstrap.sh                          # mints database and auth secrets into .env
 docker compose up -d
 docker compose logs -f omnigent       # ctrl-c when boot is clean
 ```
 
 `bootstrap.sh` is idempotent — re-running it leaves already-set secrets
 alone. If you prefer to manage `.env` yourself, just `cp .env.example
-.env` and edit `POSTGRES_PASSWORD` (and `OMNIGENT_OIDC_COOKIE_SECRET`
+.env` and edit `POSTGRES_PASSWORD` (plus both independent OIDC secrets
 if you're enabling OIDC) by hand.
 
 Server is on http://localhost:8000. The web UI prints the CLI command
@@ -101,10 +101,11 @@ shim, no oauth2-proxy.
    callback to `https://<your-host>/auth/callback` (HTTPS is
    strongly recommended; GitHub permits HTTP for testing but warns).
 
-2. **Mint a cookie secret.** `./bootstrap.sh` already did this on the
-   quickstart path — `OMNIGENT_OIDC_COOKIE_SECRET` is set in your
-   `.env`. If you skipped it, run `openssl rand -hex 32` and paste the
-   value yourself.
+2. **Mint the OIDC secrets.** `./bootstrap.sh` already did this on the
+   quickstart path: `OMNIGENT_OIDC_COOKIE_SECRET` signs browser sessions,
+   while the independent `OMNIGENT_OIDC_CREDENTIAL_KEY` encrypts persisted
+   provider credentials. If you skipped bootstrap, generate each value with
+   a separate `openssl rand -hex 32` invocation.
 
 3. **Edit `.env`:**
    ```bash
@@ -113,7 +114,7 @@ shim, no oauth2-proxy.
    OMNIGENT_OIDC_CLIENT_ID=Iv1.abc123…
    OMNIGENT_OIDC_CLIENT_SECRET=…
    OMNIGENT_OIDC_REDIRECT_URI=https://omnigent.example.com/auth/callback
-   # OMNIGENT_OIDC_COOKIE_SECRET is already set by bootstrap.sh — leave it alone.
+   # Both OIDC secrets are already set by bootstrap.sh — leave them alone.
    ```
 
 4. **Bring it up.**
@@ -137,6 +138,7 @@ OMNIGENT_OIDC_CLIENT_ID=…apps.googleusercontent.com
 OMNIGENT_OIDC_CLIENT_SECRET=…
 OMNIGENT_OIDC_REDIRECT_URI=https://omnigent.example.com/auth/callback
 OMNIGENT_OIDC_COOKIE_SECRET=<64-hex-chars>
+OMNIGENT_OIDC_CREDENTIAL_KEY=<different-64-hex-chars>
 OMNIGENT_OIDC_ALLOWED_DOMAINS=example.com,subsidiary.example.com
 ```
 
@@ -156,6 +158,7 @@ OMNIGENT_OIDC_CLIENT_ID=…
 OMNIGENT_OIDC_CLIENT_SECRET=…
 OMNIGENT_OIDC_REDIRECT_URI=https://omnigent.example.com/auth/callback
 OMNIGENT_OIDC_COOKIE_SECRET=<64-hex-chars>
+OMNIGENT_OIDC_CREDENTIAL_KEY=<different-64-hex-chars>
 ```
 
 ### HTTPS for the callback URL

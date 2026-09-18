@@ -79,8 +79,16 @@ class Host:
     status: str
     created_at: int
     updated_at: int
+    # Kept on the entity because background lifecycle work runs outside a
+    # request's workspace ContextVar and must restore the owning tenant before
+    # mutating the row.
+    workspace_id: int = 0
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
+    sandbox_session_id: str | None = None
+    sandbox_credential_session_id: str | None = None
+    sandbox_lifecycle_state: str | None = None
+    sandbox_cleanup_attempts: int = 0
     configured_harnesses: dict[str, HarnessAvailability] | None = None
 
 
@@ -147,8 +155,13 @@ def _row_to_host(row: SqlHost) -> Host:
         status=decode_host_status(row.status),
         created_at=row.created_at,
         updated_at=row.updated_at,
+        workspace_id=row.workspace_id,
         sandbox_provider=row.sandbox_provider,
         sandbox_id=row.sandbox_id,
+        sandbox_session_id=row.sandbox_session_id,
+        sandbox_credential_session_id=row.sandbox_credential_session_id,
+        sandbox_lifecycle_state=row.sandbox_lifecycle_state,
+        sandbox_cleanup_attempts=row.sandbox_cleanup_attempts,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
     )
 
@@ -344,6 +357,10 @@ class HostStore:
         token_expires_at = row.token_expires_at
         sandbox_provider = row.sandbox_provider
         sandbox_id = row.sandbox_id
+        sandbox_session_id = row.sandbox_session_id
+        sandbox_credential_session_id = row.sandbox_credential_session_id
+        sandbox_lifecycle_state = row.sandbox_lifecycle_state
+        sandbox_cleanup_attempts = row.sandbox_cleanup_attempts
 
         bound_ids = list(
             session.execute(
@@ -385,6 +402,10 @@ class HostStore:
             token_expires_at=token_expires_at,
             sandbox_provider=sandbox_provider,
             sandbox_id=sandbox_id,
+            sandbox_session_id=sandbox_session_id,
+            sandbox_credential_session_id=sandbox_credential_session_id,
+            sandbox_lifecycle_state=sandbox_lifecycle_state,
+            sandbox_cleanup_attempts=sandbox_cleanup_attempts,
             configured_harnesses=harnesses_json,
         )
         session.add(new_row)
@@ -650,6 +671,8 @@ class HostStore:
         provider: str,
         sandbox_id: str,
         token_expires_at: int,
+        session_id: str | None = None,
+        credential_session_id: str | None = None,
     ) -> Host:
         """
         Pre-register a server-managed sandbox host with its credential.
@@ -711,6 +734,11 @@ class HostStore:
                 existing.token_expires_at = token_expires_at
                 existing.sandbox_provider = provider
                 existing.sandbox_id = sandbox_id
+                if session_id is not None:
+                    existing.sandbox_session_id = session_id
+                if credential_session_id is not None:
+                    existing.sandbox_credential_session_id = credential_session_id
+                existing.sandbox_lifecycle_state = "active"
                 existing.updated_at = now
                 return _row_to_host(existing)
             row = SqlHost(
@@ -724,6 +752,10 @@ class HostStore:
                 token_expires_at=token_expires_at,
                 sandbox_provider=provider,
                 sandbox_id=sandbox_id,
+                sandbox_session_id=session_id,
+                sandbox_credential_session_id=credential_session_id,
+                sandbox_lifecycle_state="active",
+                sandbox_cleanup_attempts=0,
             )
             session.add(row)
             return _row_to_host(row)
@@ -821,3 +853,49 @@ class HostStore:
             row.token_hash = None
             row.token_expires_at = None
             row.updated_at = now_epoch()
+
+    def mark_managed_cleanup_pending(self, host_id: str) -> None:
+        """Persist a failed exact-resource cleanup without dropping its tombstone."""
+        with self._session() as session:
+            row = session.execute(
+                select(SqlHost).where(
+                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return
+            row.token_hash = None
+            row.token_expires_at = None
+            row.sandbox_lifecycle_state = "cleanup_pending"
+            row.sandbox_cleanup_attempts += 1
+            row.updated_at = now_epoch()
+
+    def list_managed_cleanup_pending_all_workspaces(self, *, limit: int) -> list[Host]:
+        """Return a bounded page of exact-resource cleanup tombstones.
+
+        This is deliberately the only background enumeration for managed
+        resources.  It returns persisted rows, never provider-side listings,
+        so reconciliation can issue a delete solely for the recorded provider
+        and sandbox id.  Callers restore each returned row's ``workspace_id``
+        before doing any follow-up store operation.
+
+        :param limit: Maximum number of tombstones to inspect in one pass.
+        :returns: Cleanup-pending managed hosts ordered stably for bounded
+            single-process reconciliation.
+        """
+        if limit <= 0:
+            return []
+        with self._session() as session:
+            rows = (
+                session.execute(
+                    select(SqlHost)
+                    .where(SqlHost.sandbox_lifecycle_state == "cleanup_pending")
+                    .where(SqlHost.sandbox_provider.is_not(None))
+                    .where(SqlHost.sandbox_id.is_not(None))
+                    .order_by(SqlHost.workspace_id, SqlHost.updated_at, SqlHost.host_id)
+                    .limit(limit)
+                )
+                .scalars()
+                .all()
+            )
+            return [_row_to_host(row) for row in rows]

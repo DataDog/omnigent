@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import ClassVar
 
 import click
@@ -11,8 +12,9 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 
-from omnigent.db.utils import now_epoch
+from omnigent.db.utils import generate_agent_id, now_epoch
 from omnigent.onboarding.sandboxes.base import render_host_config_write_command
+from omnigent.onboarding.sandboxes.context import IdentityToken, ManagedSandboxContext
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -33,6 +35,11 @@ from omnigent.server.managed_hosts import (
     resume_managed_host,
     terminate_managed_host,
 )
+from omnigent.server.managed_sandbox_cleanup import (
+    ManagedSandboxCleanupReconciler,
+    managed_cleanup_retry_delay_s,
+)
+from omnigent.server.managed_sandbox_identity import ManagedSandboxIdentityResolver
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -53,6 +60,32 @@ from tests.server.helpers import (
 pytestmark = pytest.mark.asyncio
 
 _OWNER = "alice@example.com"
+_TEST_CREDENTIAL_SESSION_ID = "1b8852c73c0448a8a9ab7b159722f6c1"
+
+
+class _TestLifecycleIdentityTokenProvider:
+    """Minimal renewable owner credential for lifecycle task wiring tests."""
+
+    credential_session_id = _TEST_CREDENTIAL_SESSION_ID
+
+    def get_identity_token(self) -> IdentityToken:
+        return IdentityToken(value="test-owner-token", expires_at=2_000_000_000)
+
+
+class _TestLifecycleAuthProvider:
+    """Resolve only the persisted test owner binding."""
+
+    def get_identity_token_provider_for_credential_session(
+        self, credential_session_id: str, expected_user_id: str
+    ) -> _TestLifecycleIdentityTokenProvider | None:
+        if credential_session_id == _TEST_CREDENTIAL_SESSION_ID and expected_user_id == _OWNER:
+            return _TestLifecycleIdentityTokenProvider()
+        return None
+
+
+def _test_lifecycle_identity_resolver() -> ManagedSandboxIdentityResolver:
+    """Build an explicit owner-bound resolver for lifecycle task tests."""
+    return ManagedSandboxIdentityResolver(_TestLifecycleAuthProvider())
 
 
 def _injected_config(
@@ -2096,6 +2129,30 @@ async def test_launch_entrypoint_provider_cleans_up_on_launch_failure(db_uri: st
 # ── relaunch_managed_host ───────────────────────────────────
 
 
+def test_managed_host_persists_non_secret_lifecycle_binding(db_uri: str) -> None:
+    """Restart recovery retains only opaque owner/resource lifecycle references."""
+    HostStore(db_uri).register_managed_host(
+        host_id="f2a2b3c4d5e6f708192a3b4c5d6e7f80",
+        name="managed-lifecycle",
+        user_id=_OWNER,
+        token="launch-token-not-persisted",
+        provider="hab",
+        sandbox_id="hab-exact-uuid",
+        token_expires_at=now_epoch() + 3600,
+        session_id="conv-lifecycle",
+        credential_session_id="oidc-session-ref",
+    )
+
+    recovered = HostStore(db_uri).get_host("f2a2b3c4d5e6f708192a3b4c5d6e7f80")
+    assert recovered is not None
+    assert recovered.sandbox_provider == "hab"
+    assert recovered.sandbox_id == "hab-exact-uuid"
+    assert recovered.sandbox_session_id == "conv-lifecycle"
+    assert recovered.sandbox_credential_session_id == "oidc-session-ref"
+    assert recovered.sandbox_lifecycle_state == "active"
+    assert recovered.sandbox_cleanup_attempts == 0
+
+
 async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) -> None:
     """
     A relaunch terminates the dead generation, provisions a fresh
@@ -2188,6 +2245,42 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
         host_store.resolve_launch_token(fake.host_starts[0].host_id, fake.host_starts[0].token)
         is None
     )
+
+
+async def test_relaunch_does_not_create_second_generation_when_old_cleanup_is_ambiguous(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed exact-ID termination blocks relaunch and leaves a tombstone."""
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = FakeSandboxLauncher(on_host_start=_register)
+    first = await launch_managed_host(
+        config=_injected_config(fake), owner=_OWNER, host_store=host_store
+    )
+    host = host_store.get_host(first.host_id)
+    assert host is not None
+
+    monkeypatch.setattr(
+        fake,
+        "terminate",
+        lambda _sandbox_id: (_ for _ in ()).throw(click.ClickException("unavailable")),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await relaunch_managed_host(
+            config=_injected_config(fake), host=host, host_store=host_store
+        )
+
+    assert exc.value.status_code == 409
+    assert fake.provisioned_names == ["managed-" + first.host_id[:8]]
+    tombstone = host_store.get_host(first.host_id)
+    assert tombstone is not None
+    assert tombstone.sandbox_lifecycle_state == "cleanup_pending"
+    assert tombstone.sandbox_cleanup_attempts == 1
 
 
 async def test_relaunch_rejects_unconfigured_provider(db_uri: str) -> None:
@@ -2431,14 +2524,16 @@ async def test_terminate_managed_host_terminates_and_deletes_row(db_uri: str) ->
         host_store.resolve_launch_token("62a91eb065624754c6a6dfb5869dd7e8", "tok-term-1") is None
     )
 
+    assert await terminate_managed_host(host, host_store, _injected_config(fake)) is True
+    assert fake.terminated == ["sb-term-1"]
 
-async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
+
+async def test_terminate_managed_host_retains_cleanup_tombstone_when_terminate_fails(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    Best-effort contract: a provider termination failure neither
-    propagates nor blocks the row deletion (the provider's lifetime
-    cap reaps the sandbox; the credential must die now).
+    A provider termination failure revokes local authorization but keeps the
+    exact resource binding as a cleanup-pending tombstone.
     """
     fake = FakeSandboxLauncher()
 
@@ -2458,21 +2553,95 @@ async def test_terminate_managed_host_deletes_row_even_when_terminate_fails(
         token_expires_at=now_epoch() + 3600,
     )
 
-    await terminate_managed_host(host, host_store, _injected_config(fake))
+    assert await terminate_managed_host(host, host_store, _injected_config(fake)) is False
 
-    assert host_store.get_host("057e7fa3f1cdb40c0ec393a3d42affc7") is None
+    tombstone = host_store.get_host("057e7fa3f1cdb40c0ec393a3d42affc7")
+    assert tombstone is not None
+    assert tombstone.sandbox_id == "sb-term-2"
+    assert tombstone.sandbox_lifecycle_state == "cleanup_pending"
+    assert tombstone.sandbox_cleanup_attempts == 1
     assert (
         host_store.resolve_launch_token("057e7fa3f1cdb40c0ec393a3d42affc7", "tok-term-2") is None
     )
+
+    monkeypatch.setattr(fake, "terminate", lambda sandbox_id: fake.terminated.append(sandbox_id))
+    assert await terminate_managed_host(tombstone, host_store, _injected_config(fake)) is True
+    assert fake.terminated == ["sb-term-2"]
+    assert host_store.get_host("057e7fa3f1cdb40c0ec393a3d42affc7") is None
+
+
+async def test_session_delete_returns_cleanup_pending_and_retains_host_tombstone(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deleting a session reports remote-cleanup debt without losing its binding."""
+    fake = FakeSandboxLauncher()
+
+    def _explode(sandbox_id: str) -> None:
+        raise click.ClickException("provider unavailable")
+
+    monkeypatch.setattr(fake, "terminate", _explode)
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="9603749b468c4560aec2f85636a6ba71",
+        name="managed-session-delete",
+        user_id=_OWNER,
+        token="tok-session-delete",
+        provider="modal",
+        sandbox_id="sb-session-delete",
+        token_expires_at=now_epoch() + 3600,
+        session_id="session-delete",
+        credential_session_id="credential-session-delete",
+    )
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="delete-test-agent", bundle_location="test:///bundle")
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    conversation = conversation_store.create_conversation(
+        agent_id=agent_id,
+        host_id=host.host_id,
+        workspace="/workspace",
+    )
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=agent_store,
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        host_store=host_store,
+        sandbox_config=_injected_config(fake),
+    )
+    app.state.managed_sandbox_identity_resolver = SimpleNamespace(
+        for_host=lambda bound_host: ManagedSandboxContext(
+            session_id=bound_host.sandbox_session_id or bound_host.host_id,
+            user_id=bound_host.user_id,
+            identity_token_provider=None,
+            credential_session_id=bound_host.sandbox_credential_session_id,
+        )
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.delete(f"/v1/sessions/{conversation.id}")
+
+    assert response.status_code == 200
+    response_body = response.json()
+    assert response_body["id"] == conversation.id
+    assert response_body["deleted"] is True
+    assert response_body["cleanup_pending"] is True
+    tombstone = host_store.get_host(host.host_id)
+    assert tombstone is not None
+    assert tombstone.sandbox_id == "sb-session-delete"
+    assert tombstone.sandbox_lifecycle_state == "cleanup_pending"
+    assert tombstone.sandbox_cleanup_attempts == 1
+    assert host_store.resolve_launch_token(host.host_id, "tok-session-delete") is None
 
 
 async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> None:
     """
     A config change between launch and teardown (current launcher's
     provider ≠ the provider recorded on the row) must NOT aim the new
-    provider's terminate at a stale sandbox id — the sandbox is left
-    to its lifetime cap, but the row still dies (token revoked, no
-    picker ghost). Also covers config=None (section removed).
+    provider's terminate at a stale sandbox id. The row remains a
+    cleanup-pending tombstone after local token revocation.
     """
     fake = FakeSandboxLauncher()  # provider "modal"
     host_store = HostStore(db_uri)
@@ -2490,12 +2659,15 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
     await terminate_managed_host(host, host_store, _injected_config(fake))
     # No cross-provider terminate was attempted.
     assert fake.terminated == []
-    assert host_store.get_host("487212fd2b157b6ab6a6d6d3ef06ce5b") is None
+    assert (
+        host_store.get_host("487212fd2b157b6ab6a6d6d3ef06ce5b").sandbox_lifecycle_state
+        == "cleanup_pending"
+    )
     assert (
         host_store.resolve_launch_token("487212fd2b157b6ab6a6d6d3ef06ce5b", "tok-term-3") is None
     )
 
-    # config=None behaves the same: row deleted, nothing terminated.
+    # config=None behaves the same: retain the exact tombstone, do not guess.
     host2 = host_store.register_managed_host(
         host_id="b114bf90a8fd155ce6007c3bb262aa79",
         name="managed-term4",
@@ -2506,7 +2678,216 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
         token_expires_at=now_epoch() + 3600,
     )
     await terminate_managed_host(host2, host_store, None)
-    assert host_store.get_host("b114bf90a8fd155ce6007c3bb262aa79") is None
+    assert (
+        host_store.get_host("b114bf90a8fd155ce6007c3bb262aa79").sandbox_lifecycle_state
+        == "cleanup_pending"
+    )
+
+
+# ── persisted managed-cleanup reconciliation ────────────────
+
+
+def _managed_cleanup_reconciler(
+    host_store: HostStore, fake: FakeSandboxLauncher
+) -> ManagedSandboxCleanupReconciler:
+    """Build the production-shaped reconciler with the exact test owner binding."""
+    return ManagedSandboxCleanupReconciler(
+        host_store=host_store,
+        config=_injected_config(fake),
+        identity_resolver=_test_lifecycle_identity_resolver(),
+        poll_interval_s=3600,
+    )
+
+
+async def test_cleanup_reconciler_retries_persisted_tombstone_after_restart(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new app process retries the recorded UUID, never creating another sandbox."""
+    fake = FakeSandboxLauncher()
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="0e422cc7b3d94c2ba089aec4c4e63e5d",
+        name="managed-restart-cleanup",
+        user_id=_OWNER,
+        token="tok-restart-cleanup",
+        provider="modal",
+        sandbox_id="sb-exact-restart",
+        token_expires_at=now_epoch() + 3600,
+        credential_session_id=_TEST_CREDENTIAL_SESSION_ID,
+    )
+
+    monkeypatch.setattr(
+        fake,
+        "terminate",
+        lambda _sandbox_id: (_ for _ in ()).throw(click.ClickException("transient")),
+    )
+    assert not await terminate_managed_host(host, host_store, _injected_config(fake))
+    tombstone = host_store.get_host(host.host_id)
+    assert tombstone is not None
+
+    monkeypatch.setattr(fake, "terminate", lambda sandbox_id: fake.terminated.append(sandbox_id))
+    restarted = _managed_cleanup_reconciler(host_store, fake)
+    result = await restarted.reconcile_once(
+        now=(
+            tombstone.updated_at
+            + managed_cleanup_retry_delay_s(tombstone.sandbox_cleanup_attempts)
+        )
+    )
+
+    assert result.attempted == result.deleted == 1
+    assert fake.terminated == ["sb-exact-restart"]
+    assert host_store.get_host(host.host_id) is None
+    assert fake.provisioned_names == []
+
+
+async def test_cleanup_reconciler_backs_off_transient_failure_then_succeeds(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each failed exact delete increments persisted attempts before the next retry."""
+    fake = FakeSandboxLauncher()
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="f1168b3c14d9491e80d3b9c00b669cad",
+        name="managed-backoff-cleanup",
+        user_id=_OWNER,
+        token="tok-backoff-cleanup",
+        provider="modal",
+        sandbox_id="sb-exact-backoff",
+        token_expires_at=now_epoch() + 3600,
+        credential_session_id=_TEST_CREDENTIAL_SESSION_ID,
+    )
+    host_store.mark_managed_cleanup_pending(host.host_id)
+    first = host_store.get_host(host.host_id)
+    assert first is not None
+
+    monkeypatch.setattr(
+        fake,
+        "terminate",
+        lambda _sandbox_id: (_ for _ in ()).throw(click.ClickException("transient")),
+    )
+    reconciler = _managed_cleanup_reconciler(host_store, fake)
+    first_result = await reconciler.reconcile_once(
+        now=first.updated_at + managed_cleanup_retry_delay_s(first.sandbox_cleanup_attempts)
+    )
+    assert first_result.attempted == 1
+    after_failure = host_store.get_host(host.host_id)
+    assert after_failure is not None
+    assert after_failure.sandbox_cleanup_attempts == first.sandbox_cleanup_attempts + 1
+
+    monkeypatch.setattr(fake, "terminate", lambda sandbox_id: fake.terminated.append(sandbox_id))
+    second_result = await reconciler.reconcile_once(
+        now=after_failure.updated_at
+        + managed_cleanup_retry_delay_s(after_failure.sandbox_cleanup_attempts)
+    )
+    assert second_result.deleted == 1
+    assert fake.terminated == ["sb-exact-backoff"]
+    assert host_store.get_host(host.host_id) is None
+
+
+async def test_cleanup_reconciler_retains_tombstone_for_revoked_owner_credential(
+    db_uri: str,
+) -> None:
+    """Credential resolution never falls back to another identity or provider call."""
+    fake = FakeSandboxLauncher()
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="4f168a3c16264d9a8f5aa4605e7c169a",
+        name="managed-revoked-cleanup",
+        user_id=_OWNER,
+        token="tok-revoked-cleanup",
+        provider="modal",
+        sandbox_id="sb-exact-revoked",
+        token_expires_at=now_epoch() + 3600,
+        credential_session_id="2c9c9405b33a46d1a6d9e0d80b1492a7",
+    )
+    host_store.mark_managed_cleanup_pending(host.host_id)
+    tombstone = host_store.get_host(host.host_id)
+    assert tombstone is not None
+
+    result = await _managed_cleanup_reconciler(host_store, fake).reconcile_once(
+        now=(
+            tombstone.updated_at
+            + managed_cleanup_retry_delay_s(tombstone.sandbox_cleanup_attempts)
+        )
+    )
+
+    retained = host_store.get_host(host.host_id)
+    assert result.attempted == 1
+    assert retained is not None
+    assert retained.sandbox_lifecycle_state == "cleanup_pending"
+    assert retained.sandbox_cleanup_attempts == tombstone.sandbox_cleanup_attempts + 1
+    assert fake.terminated == []
+    assert fake.provisioned_names == []
+
+
+async def test_cleanup_reconciler_uses_only_the_tombstones_exact_resource_id(
+    db_uri: str,
+) -> None:
+    """A different provider resource is never guessed or deleted early."""
+    fake = FakeSandboxLauncher()
+    host_store = HostStore(db_uri)
+    stale = host_store.register_managed_host(
+        host_id="1a71f00e69104958a9c7b2f8768bd789",
+        name="managed-stale-exact-id",
+        user_id=_OWNER,
+        token="tok-stale-exact-id",
+        provider="modal",
+        sandbox_id="sb-stale-exact-id",
+        token_expires_at=now_epoch() + 3600,
+        credential_session_id=_TEST_CREDENTIAL_SESSION_ID,
+    )
+    sibling = host_store.register_managed_host(
+        host_id="8ef0acd3a0c44bf4bc23e50fd810541f",
+        name="managed-active-sibling",
+        user_id=_OWNER,
+        token="tok-active-sibling",
+        provider="modal",
+        sandbox_id="sb-active-sibling",
+        token_expires_at=now_epoch() + 3600,
+        credential_session_id=_TEST_CREDENTIAL_SESSION_ID,
+    )
+    host_store.mark_managed_cleanup_pending(stale.host_id)
+    host_store.mark_managed_cleanup_pending(sibling.host_id)
+    host_store.mark_managed_cleanup_pending(sibling.host_id)
+    tombstone = host_store.get_host(stale.host_id)
+    assert tombstone is not None
+
+    await _managed_cleanup_reconciler(host_store, fake).reconcile_once(
+        now=(
+            tombstone.updated_at
+            + managed_cleanup_retry_delay_s(tombstone.sandbox_cleanup_attempts)
+        )
+    )
+
+    assert fake.terminated == ["sb-stale-exact-id"]
+    assert host_store.get_host(stale.host_id) is None
+    assert host_store.get_host(sibling.host_id) is not None
+    assert fake.provisioned_names == []
+
+
+async def test_cleanup_reconciler_is_started_and_stopped_with_app_lifespan(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    """The app owns one retry task and cancels it before shutdown completes."""
+    fake = FakeSandboxLauncher()
+    host_store = HostStore(db_uri)
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        host_store=host_store,
+        sandbox_config=_injected_config(fake),
+        auth_provider=_TestLifecycleAuthProvider(),
+    )
+
+    async with app.router.lifespan_context(app):
+        reconciler = app.state.managed_sandbox_cleanup_reconciler
+        assert reconciler.is_started
+
+    assert not reconciler.is_started
 
 
 def test_parse_modal_secrets_thread_to_launcher(monkeypatch: pytest.MonkeyPatch) -> None:

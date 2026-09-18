@@ -39,6 +39,7 @@ from omnigent.entities import (
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.model_override import validate_model_override
+from omnigent.onboarding.sandboxes.context import managed_sandbox_context_scope
 from omnigent.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     EFFORT_VALUES,
@@ -72,6 +73,7 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.managed_sandbox_identity import context_for_managed_sandbox_create
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_approval_access as _get_approval_access,
@@ -405,22 +407,30 @@ def register_core_routes(
             # navigates to the session page immediately after this
             # 201) already carries the "provisioning" stage.
             _publish_sandbox_status(resp.id, "provisioning")
-            launch_task = asyncio.create_task(
-                _run_managed_launch(
-                    session_id=resp.id,
-                    # On auth-disabled servers user_id is None; the
-                    # sandbox host registers under the reserved local
-                    # owner, same as a directly-connected host would.
-                    owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
-                    sandbox_config=sandbox_config,
-                    repo=repo,
-                    tracker=managed_launches,
-                    conversation_store=conversation_store,
-                    host_store=host_store_for_managed,
-                    host_registry=getattr(request.app.state, "host_registry", None),
-                    tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
-                )
+            # Bind the owner's identity context into the background task
+            # via asyncio.create_task's context copy; scoping only that
+            # call keeps the request task unscoped after scheduling.
+            # On auth-disabled servers user_id is None; the sandbox host
+            # registers under the reserved local owner, same as a
+            # directly-connected host would.
+            owner = user_id if user_id is not None else RESERVED_USER_LOCAL
+            launch_context = context_for_managed_sandbox_create(
+                request, auth_provider, session_id=resp.id, owner=owner
             )
+            with managed_sandbox_context_scope(launch_context):
+                launch_task = asyncio.create_task(
+                    _run_managed_launch(
+                        session_id=resp.id,
+                        owner=owner,
+                        sandbox_config=sandbox_config,
+                        repo=repo,
+                        tracker=managed_launches,
+                        conversation_store=conversation_store,
+                        host_store=host_store_for_managed,
+                        host_registry=getattr(request.app.state, "host_registry", None),
+                        tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                    )
+                )
             _managed_launch_tasks.add(launch_task)
             launch_task.add_done_callback(_managed_launch_tasks.discard)
 

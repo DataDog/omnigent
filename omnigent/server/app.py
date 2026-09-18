@@ -42,7 +42,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import session_live_state
-from omnigent.server.auth import AuthProvider, SharingMode
+from omnigent.server.auth import AuthPreparationMiddleware, AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
@@ -1055,6 +1055,22 @@ def create_app(
                 otel_publisher=server_metrics_otel,
             )
         )
+        # Failed managed-resource deletes leave durable tombstones.  A single
+        # local reconciler retries only those exact recorded ids, under the
+        # owner-bound credential session captured at creation time.  It is
+        # intentionally absent when managed sandboxes are disabled; in that
+        # state there is no provider launcher that can safely service debt.
+        managed_sandbox_cleanup_reconciler = None
+        if host_store is not None and sandbox_config is not None:
+            from omnigent.server.managed_sandbox_cleanup import ManagedSandboxCleanupReconciler
+
+            managed_sandbox_cleanup_reconciler = ManagedSandboxCleanupReconciler(
+                host_store=host_store,
+                config=sandbox_config,
+                identity_resolver=app_inst.state.managed_sandbox_identity_resolver,
+            )
+            app_inst.state.managed_sandbox_cleanup_reconciler = managed_sandbox_cleanup_reconciler
+            await managed_sandbox_cleanup_reconciler.start()
         # Runner ``runner_last_seen`` is refreshed per-tunnel from each
         # runner tunnel's ping loop (``runner_tunnel._ping_loop``), inside
         # that handler's ``workspace_scope`` — not from a lifespan sweep,
@@ -1116,6 +1132,8 @@ def create_app(
         try:
             yield
         finally:
+            if managed_sandbox_cleanup_reconciler is not None:
+                await managed_sandbox_cleanup_reconciler.stop()
             # Run completion is event-driven (the _publish_status hook) plus a
             # lazy-on-read stale backstop — there is no run-reconciler task to
             # cancel. Only the per-job scheduler holds timers that need stopping.
@@ -1160,6 +1178,12 @@ def create_app(
     app.state.host_registry = host_registry
     app.state.host_store = host_store
     app.state.sandbox_config = sandbox_config
+    # Later lifecycle operations have no request ContextVar. This resolver
+    # recreates only the exact owner-bound credential session persisted with a
+    # managed resource; it never searches for another user's current login.
+    from omnigent.server.managed_sandbox_identity import ManagedSandboxIdentityResolver
+
+    app.state.managed_sandbox_identity_resolver = ManagedSandboxIdentityResolver(auth_provider)
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -1237,6 +1261,7 @@ def create_app(
     app.state.managed_launches = ManagedLaunchTracker()
     app.state.server_metrics = server_metrics
     app.state.server_metrics_otel = server_metrics_otel
+    app.add_middleware(AuthPreparationMiddleware, auth_provider=auth_provider)
     app.add_middleware(_WebSocketMetricsMiddleware, metrics=server_metrics)
     # CSWSH guard: reject cross-origin WebSocket handshakes before any
     # route accepts them. Added after the metrics middleware so it is the
@@ -2390,6 +2415,7 @@ def create_app(
                     admin_list,
                     oidc_account_store,
                     allowed_domains=frozenset(allowed_domains or ()) or None,
+                    oidc_session_store=getattr(auth_provider, "_oidc_session_store", None),
                 ),
                 prefix="/auth",
                 tags=["auth"],
