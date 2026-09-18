@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sqlalchemy import or_, select, update
 
-from omnigent.db.db_models import SqlOidcSession
+from omnigent.db.db_models import SqlOidcSession, current_workspace_id
 from omnigent.db.query_context import query_name_scope
 
 _logger = logging.getLogger(__name__)
@@ -194,6 +194,7 @@ class OidcSessionStore:
             self._session_factory() as session,
         ):
             row = SqlOidcSession(
+                workspace_id=current_workspace_id(),
                 id=session_id,
                 handle_digest=handle_digest,
                 user_id=user_id,
@@ -232,6 +233,7 @@ class OidcSessionStore:
         ):
             row = session.execute(
                 select(SqlOidcSession).where(
+                    SqlOidcSession.workspace_id == current_workspace_id(),
                     SqlOidcSession.handle_digest == digest,
                     SqlOidcSession.revoked_at.is_(None),
                     SqlOidcSession.absolute_expiry > now,
@@ -282,6 +284,7 @@ class OidcSessionStore:
         ):
             row = session.execute(
                 select(SqlOidcSession).where(
+                    SqlOidcSession.workspace_id == current_workspace_id(),
                     SqlOidcSession.id == session_id,
                     SqlOidcSession.user_id == user_id,
                     SqlOidcSession.revoked_at.is_(None),
@@ -332,6 +335,7 @@ class OidcSessionStore:
             result = session.execute(
                 update(SqlOidcSession)
                 .where(
+                    SqlOidcSession.workspace_id == current_workspace_id(),
                     SqlOidcSession.id == session_id,
                     SqlOidcSession.user_id == user_id,
                     SqlOidcSession.revoked_at.is_(None),
@@ -377,6 +381,7 @@ class OidcSessionStore:
             result = session.execute(
                 update(SqlOidcSession)
                 .where(
+                    SqlOidcSession.workspace_id == current_workspace_id(),
                     SqlOidcSession.id == session_id,
                     SqlOidcSession.user_id == user_id,
                     SqlOidcSession.revoked_at.is_(None),
@@ -433,6 +438,7 @@ class OidcSessionStore:
             result = session.execute(
                 update(SqlOidcSession)
                 .where(
+                    SqlOidcSession.workspace_id == current_workspace_id(),
                     SqlOidcSession.id == session_id,
                     SqlOidcSession.user_id == user_id,
                     SqlOidcSession.revoked_at.is_(None),
@@ -468,6 +474,7 @@ class OidcSessionStore:
             session.execute(
                 update(SqlOidcSession)
                 .where(
+                    SqlOidcSession.workspace_id == current_workspace_id(),
                     SqlOidcSession.id == session_id,
                     SqlOidcSession.user_id == user_id,
                     SqlOidcSession.refresh_lease_id == lease_id,
@@ -501,6 +508,7 @@ class OidcSessionStore:
             result = session.execute(
                 update(SqlOidcSession)
                 .where(
+                    SqlOidcSession.workspace_id == current_workspace_id(),
                     SqlOidcSession.id == session_id,
                     SqlOidcSession.user_id == user_id,
                     SqlOidcSession.revoked_at.is_(None),
@@ -535,6 +543,7 @@ class OidcSessionStore:
             result = session.execute(
                 update(SqlOidcSession)
                 .where(
+                    SqlOidcSession.workspace_id == current_workspace_id(),
                     SqlOidcSession.id == session_id,
                     SqlOidcSession.user_id == user_id,
                     SqlOidcSession.revoked_at.is_(None),
@@ -578,6 +587,7 @@ class OidcSessionStore:
             row = session.execute(
                 select(SqlOidcSession)
                 .where(
+                    SqlOidcSession.workspace_id == current_workspace_id(),
                     SqlOidcSession.id == session_id,
                     SqlOidcSession.user_id == user_id,
                     SqlOidcSession.revoked_at.is_(None),
@@ -607,7 +617,10 @@ class OidcSessionStore:
             self._session_factory() as session,
         ):
             row = session.execute(
-                select(SqlOidcSession).where(SqlOidcSession.id == session_id)
+                select(SqlOidcSession).where(
+                    SqlOidcSession.workspace_id == current_workspace_id(),
+                    SqlOidcSession.id == session_id,
+                )
             ).scalar_one_or_none()
             if row is None:
                 return False
@@ -622,6 +635,7 @@ class OidcSessionStore:
 
     def delete_expired(self) -> int:
         """Delete expired and revoked sessions. Returns the count deleted."""
+        # TODO: Schedule this from server lifespan as bounded OIDC maintenance.
         now = int(time.time())
         with (
             query_name_scope("omnigent.oidc_session_store.delete_expired_sessions"),
@@ -630,8 +644,9 @@ class OidcSessionStore:
             result = (
                 session.execute(
                     select(SqlOidcSession).where(
+                        SqlOidcSession.workspace_id == current_workspace_id(),
                         (SqlOidcSession.absolute_expiry <= now)
-                        | (SqlOidcSession.revoked_at.is_not(None))
+                        | (SqlOidcSession.revoked_at.is_not(None)),
                     )
                 )
                 .scalars()

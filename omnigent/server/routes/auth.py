@@ -12,6 +12,7 @@ These routes are only mounted when ``OMNIGENT_AUTH_PROVIDER=oidc``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import time
@@ -459,7 +460,8 @@ def create_auth_router(
                 raw_refresh if isinstance(raw_refresh, str) and raw_refresh else None
             )
             now = int(time.time())
-            session_credential = oidc_session_store.create(
+            session_credential = await asyncio.to_thread(
+                oidc_session_store.create,
                 user_id=email,
                 provider_subject=provider_subject,
                 id_token=id_token_val,
@@ -621,9 +623,9 @@ def create_auth_router(
         if oidc_session_store is not None:
             token = request.cookies.get(_session_cookie)
             if token and token.startswith("sess_"):
-                resolved = oidc_session_store.resolve(token)
+                resolved = await asyncio.to_thread(oidc_session_store.resolve, token)
                 if resolved is not None:
-                    oidc_session_store.revoke(resolved[1])
+                    await asyncio.to_thread(oidc_session_store.revoke, resolved[1])
         redirect_url = config.logout_redirect_uri or "/"
         response = RedirectResponse(url=redirect_url, status_code=302)
         response.delete_cookie(

@@ -16,6 +16,7 @@ These tests fail before the behavior exists: ``AuthProvider`` has no
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from jwt.algorithms import RSAAlgorithm
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from starlette.requests import Request
 
 from omnigent.db.db_models import OmnigentBase, SqlOidcSession
 from omnigent.onboarding.sandboxes.context import IdentityToken
@@ -233,6 +235,56 @@ def test_valid_oidc_request_yields_provider_bound_to_credential_session(
     assert bob_tp is not None
     assert bob_tp.get_identity_token().value == bob_token
     assert bob_tp.get_identity_token().value != alice_token
+
+
+@pytest.mark.asyncio
+async def test_oidc_request_resolution_runs_off_event_loop(
+    session_factory, keys, monkeypatch
+) -> None:
+    """ASGI preparation resolves the opaque session in a worker thread once."""
+    config = _make_config()
+    store = OidcSessionStore(session_factory, credential_key=_TEST_KEY)
+    provider = _make_provider(store)
+    handle, _ = _create_session(
+        store,
+        keys,
+        user_id=_ALICE,
+        id_token=keys.sign_id_token({}),
+    )
+    event_loop_thread = threading.get_ident()
+    resolve_threads: list[int] = []
+    real_resolve = store.resolve
+
+    def tracked_resolve(candidate: str):
+        resolve_threads.append(threading.get_ident())
+        return real_resolve(candidate)
+
+    monkeypatch.setattr(store, "resolve", tracked_resolve)
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/v1/me",
+            "raw_path": b"/v1/me",
+            "query_string": b"",
+            "headers": [
+                (
+                    b"cookie",
+                    f"{config.session_cookie_name}={handle}".encode(),
+                )
+            ],
+            "client": ("127.0.0.1", 1234),
+            "server": ("testserver", 80),
+        }
+    )
+
+    await provider.prepare_connection(request)
+
+    assert resolve_threads and resolve_threads[0] != event_loop_thread
+    assert provider.get_user_id(request) == _ALICE
+    assert provider.get_identity_token_provider(request, _ALICE) is not None
+    assert len(resolve_threads) == 1
 
 
 def test_provider_returns_current_id_token_without_refresh(

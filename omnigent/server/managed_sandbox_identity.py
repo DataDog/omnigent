@@ -8,7 +8,7 @@ from starlette.requests import Request
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.onboarding.sandboxes.context import IdentityTokenProvider, ManagedSandboxContext
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.stores.host_store import Host
 
 
@@ -58,6 +58,14 @@ class ManagedSandboxIdentityResolver:
         credential_session_id = _canonical_credential_session_id(
             getattr(host, "sandbox_credential_session_id", None)
         )
+        if credential_session_id is None and host.user_id == RESERVED_USER_LOCAL:
+            return ManagedSandboxContext(
+                session_id=getattr(host, "sandbox_session_id", None)
+                or getattr(host, "host_id", "managed"),
+                user_id=host.user_id,
+                identity_token_provider=None,
+                credential_session_id=None,
+            )
         if credential_session_id is None:
             raise ManagedSandboxIdentityUnavailable(
                 "owner reauthentication is required before this managed sandbox can be operated"

@@ -2625,10 +2625,10 @@ def register_events_routes(
                     resolver = getattr(
                         request.app.state, "managed_sandbox_identity_resolver", None
                     )
-                    context = (
-                        resolver.for_host(bound_host)
-                        if resolver is not None
-                        else ManagedSandboxIdentityResolver(None).for_host(bound_host)
+                    identity_resolver = resolver or ManagedSandboxIdentityResolver(None)
+                    context = await asyncio.to_thread(
+                        identity_resolver.for_host,
+                        bound_host,
                     )
                     with managed_sandbox_context_scope(context):
                         cleanup_pending = not await terminate_managed_host(

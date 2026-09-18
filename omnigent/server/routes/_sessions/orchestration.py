@@ -3567,10 +3567,10 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     host_row_online = host_is_live(host)
     try:
         resolver = getattr(app_state, "managed_sandbox_identity_resolver", None)
-        operation_context = (
-            resolver.for_host(host)
-            if resolver is not None
-            else ManagedSandboxIdentityResolver(None).for_host(host)
+        identity_resolver = resolver or ManagedSandboxIdentityResolver(None)
+        operation_context = await asyncio.to_thread(
+            identity_resolver.for_host,
+            host,
         )
     except ManagedSandboxIdentityUnavailable as exc:
         raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
@@ -3881,19 +3881,17 @@ def _kick_managed_relaunch(
             session_id,
             extra={"session_id": session_id},
         )
-    try:
-        resolver = getattr(app_state, "managed_sandbox_identity_resolver", None)
-        operation_context = (
-            resolver.for_host(host)
-            if resolver is not None
-            else ManagedSandboxIdentityResolver(None).for_host(host)
-        )
-    except ManagedSandboxIdentityUnavailable as exc:
-        tracker.fail(session_id, str(exc))
-        _publish_sandbox_status(session_id, "failed", str(exc))
-        return
-    relaunch_task = asyncio.create_task(
-        _run_managed_launch(
+
+    async def _relaunch_after_identity_resolution() -> None:
+        try:
+            resolver = getattr(app_state, "managed_sandbox_identity_resolver", None)
+            identity_resolver = resolver or ManagedSandboxIdentityResolver(None)
+            operation_context = await asyncio.to_thread(identity_resolver.for_host, host)
+        except ManagedSandboxIdentityUnavailable as exc:
+            tracker.fail(session_id, str(exc))
+            _publish_sandbox_status(session_id, "failed", str(exc))
+            return
+        await _run_managed_launch(
             session_id=session_id,
             owner=host.user_id,
             sandbox_config=sandbox_config,
@@ -3908,7 +3906,8 @@ def _kick_managed_relaunch(
             agent_id=conv.agent_id,
             operation_context=operation_context,
         )
-    )
+
+    relaunch_task = asyncio.create_task(_relaunch_after_identity_resolution())
     _managed_launch_tasks.add(relaunch_task)
     relaunch_task.add_done_callback(_managed_launch_tasks.discard)
 
@@ -3984,19 +3983,17 @@ def _kick_managed_wake_impl(
     # session page when the wake fires (the composer let them send into a
     # host_asleep session).
     _publish_sandbox_status(session_id, "provisioning")
-    try:
-        resolver = getattr(app_state, "managed_sandbox_identity_resolver", None)
-        operation_context = (
-            resolver.for_host(host)
-            if resolver is not None
-            else ManagedSandboxIdentityResolver(None).for_host(host)
-        )
-    except ManagedSandboxIdentityUnavailable as exc:
-        tracker.fail(session_id, str(exc))
-        _publish_sandbox_status(session_id, "failed", str(exc))
-        return
-    wake_task = asyncio.create_task(
-        _run_managed_wake(
+
+    async def _wake_after_identity_resolution() -> None:
+        try:
+            resolver = getattr(app_state, "managed_sandbox_identity_resolver", None)
+            identity_resolver = resolver or ManagedSandboxIdentityResolver(None)
+            operation_context = await asyncio.to_thread(identity_resolver.for_host, host)
+        except ManagedSandboxIdentityUnavailable as exc:
+            tracker.fail(session_id, str(exc))
+            _publish_sandbox_status(session_id, "failed", str(exc))
+            return
+        await _run_managed_wake(
             session_id=session_id,
             conv=conv,
             sandbox_config=sandbox_config,
@@ -4007,7 +4004,8 @@ def _kick_managed_wake_impl(
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
             operation_context=operation_context,
         )
-    )
+
+    wake_task = asyncio.create_task(_wake_after_identity_resolution())
     _managed_launch_tasks.add(wake_task)
     wake_task.add_done_callback(_managed_launch_tasks.discard)
 

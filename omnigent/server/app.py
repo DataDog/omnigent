@@ -69,8 +69,8 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
-from omnigent.server.auth import AuthProvider, SharingMode
+from omnigent.server import session_live_state, shutdown_state
+from omnigent.server.auth import AuthPreparationMiddleware, AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
@@ -1686,6 +1686,7 @@ def create_app(
     app.state.managed_launches = ManagedLaunchTracker()
     app.state.server_metrics = server_metrics
     app.state.server_metrics_otel = server_metrics_otel
+    app.add_middleware(AuthPreparationMiddleware, auth_provider=auth_provider)
     app.add_middleware(_WebSocketMetricsMiddleware, metrics=server_metrics)
     # CSWSH guard: reject cross-origin WebSocket handshakes before any
     # route accepts them. Added after the metrics middleware so it is the
