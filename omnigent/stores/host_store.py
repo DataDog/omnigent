@@ -856,7 +856,7 @@ class HostStore:
 
     def mark_managed_cleanup_pending(self, host_id: str) -> None:
         """Persist a failed exact-resource cleanup without dropping its tombstone."""
-        with self._session("mark_managed_cleanup_pending") as session:
+        with self._session() as session:
             row = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
@@ -885,7 +885,7 @@ class HostStore:
         """
         if limit <= 0:
             return []
-        with self._session("list_managed_cleanup_pending_all_workspaces") as session:
+        with self._session() as session:
             rows = (
                 session.execute(
                     select(SqlHost)

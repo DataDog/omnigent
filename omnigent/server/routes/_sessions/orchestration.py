@@ -2433,6 +2433,7 @@ async def _run_managed_launch(
         sandbox generation for, or ``None`` for a first launch (a
         fresh host identity is minted).
     """
+
     async def _provision_and_bind() -> None:
         managed = await _provision_managed_sandbox(
             session_id=session_id,
