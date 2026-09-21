@@ -54,18 +54,21 @@ def test_release_template_publishes_only_signed_digests_for_ddr() -> None:
     template = (ROOT / ".gitlab/ci/release.yml").read_text()
 
     assert "--platform linux/amd64,linux/arm64" in template
-    assert '$CI_COMMIT_BRANCH == "main"' in template
+    assert "$CI_COMMIT_BRANCH == $DDCI_DEFAULT_BRANCH" in template
     assert "if: '$DDR_WORKFLOW_ID'" in template
     assert 'IMAGE_REF="${REGISTRY}/${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"' in template
     assert "DDR_WORKFLOW_ID is required for Conductor publication" in template
     assert "--deploy-config-path k8s/omnigent-server --flavor staging" in template
     assert "SERVICE_NAME: {{.Rule.Variables.SERVICE_NAME}}" in template
-    assert "DOCKER_IMAGE:" not in template
-    assert "BUNDLER_IMAGE:" not in template
     assert '--build-arg SOURCE_URL="${CI_PROJECT_URL}"' in template
     assert '--build-arg VCS_REF="${CI_COMMIT_SHA}"' in template
     rendered = yaml.safe_load(
         template.replace("{{.Rule.Variables.SERVICE_NAME}}", "omnigent-server")
+    )
+    assert rendered["variables"]["DOCKER_IMAGE"] == "${REGISTRY}/docker:27.3.1"
+    assert (
+        rendered["variables"]["BUNDLER_IMAGE"]
+        == "${REGISTRY}/mini-repo-ci-image/ddr-package:v0.30"
     )
     jobs = [
         definition

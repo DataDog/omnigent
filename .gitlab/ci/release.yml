@@ -6,6 +6,8 @@ stages:
 variables:
   REGISTRY: registry.ddbuild.io
   IMAGE_REPOSITORY: images/omnigent-server
+  DOCKER_IMAGE: ${REGISTRY}/docker:27.3.1
+  BUNDLER_IMAGE: ${REGISTRY}/mini-repo-ci-image/ddr-package:v0.30
   DOCKER_BUILDKIT: "1"
 
 verify-release-input:{{.Rule.Variables.SERVICE_NAME}}:
@@ -19,7 +21,7 @@ verify-release-input:{{.Rule.Variables.SERVICE_NAME}}:
     # Conductor.  Release/DDR execution uses the signed-image path below.
     - if: '$DDR_WORKFLOW_ID'
       when: never
-    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == $DDCI_DEFAULT_BRANCH'
       when: never
     - when: on_success
   script:
@@ -32,7 +34,7 @@ build-and-sign:{{.Rule.Variables.SERVICE_NAME}}:
   variables:
     SERVICE_NAME: {{.Rule.Variables.SERVICE_NAME}}
   rules:
-    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_COMMIT_BRANCH == $DDCI_DEFAULT_BRANCH'
     - if: '$DDR_WORKFLOW_ID'
   id_tokens:
     DDSIGN_ID_TOKEN:
