@@ -1,0 +1,27 @@
+---
+schema-version: v2.2
+dd-service: omnigent-server
+team: workspaces
+dd-team: workspaces
+contacts:
+  - type: slack
+    contact: https://dd.enterprise.slack.com/archives/C02PFPZJ37X
+repos:
+  - name: Source
+    url: https://github.com/DataDog/omnigent
+tags:
+  - service:omnigent-server
+extensions:
+  datadoghq.com/sdp:
+    workday_team: Workspaces
+    conductor:
+      targets:
+        - name: staging
+          branch: main
+          # Human-triggered while the staging rollout is being established.
+          schedule: manual
+          slack: workspaces-conductor-ops
+          ci_pipeline: omnigent-server
+          deploy_config:
+            source_path: ./deploy.yaml
+            ordered_deploy_targets: [staging]

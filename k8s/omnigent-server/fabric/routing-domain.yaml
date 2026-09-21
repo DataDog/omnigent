@@ -1,0 +1,21 @@
+---
+metadata:
+  apiVersion: v1
+  name: omnigent-server
+  namespace: workspaces
+  type: routing_domain
+spec:
+  attachments:
+    - devGateway:
+        fqdnPrefixes:
+          - omnigent
+        # This prefix resolves to omnigent.us1.ddbuild.staging.dog.
+  http:
+    routes:
+      - matcher:
+          path:
+            prefix: /
+        target:
+          destination:
+            name: omnigent-server
+            namespace: workspaces

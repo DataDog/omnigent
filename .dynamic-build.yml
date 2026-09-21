@@ -1,0 +1,31 @@
+# Build and deploy the exact Omnigent checkout.  Keep this list deliberately
+# broad: package metadata, the Docker build context, and the colocated chart
+# all affect the release artifact.
+omnigent-server:
+  template: .gitlab/ci/release.yml
+  changed:
+    - Dockerfile
+    - .dockerignore
+    - package.json
+    - pyproject.toml
+    - setup.py
+    - uv.lock
+    - README.md
+    - LICENSE
+    - NOTICE
+    - pnpm-lock.yaml
+    - pnpm-workspace.yaml
+    - omnigent/**
+    - sdks/**
+    - examples/**
+    - web/**
+    - deploy/docker/entrypoint.py
+    - k8s/omnigent-server/**
+    - tests/**
+    - .gitlab/**
+    - .dynamic-build.yml
+    - repository.datadog.yml
+    - .datadog/patches.yaml
+    - docs/conductor-delivery.md
+  variables:
+    SERVICE_NAME: omnigent-server

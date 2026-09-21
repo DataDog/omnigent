@@ -1,0 +1,37 @@
+{{- if $.Values.runnerAccess.enabled }}
+# Lets the configured engineering group port-forward without exec or Secret
+# access.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $.Chart.Name }}-portforward
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    team: {{ $.Values.team }}
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/portforward"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $.Chart.Name }}-portforward
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    team: {{ $.Values.team }}
+subjects:
+  - kind: Group
+    name: {{ $.Values.runnerAccess.group }}
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: {{ $.Chart.Name }}-portforward
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}
