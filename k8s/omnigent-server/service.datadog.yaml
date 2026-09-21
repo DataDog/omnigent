@@ -2,12 +2,13 @@
 schema-version: v2.2
 dd-service: omnigent-server
 team: workspaces
-dd-team: workspaces
 contacts:
   - type: slack
     contact: https://dd.enterprise.slack.com/archives/C02PFPZJ37X
-repos:
+links:
   - name: Source
+    type: repo
+    provider: github
     url: https://github.com/DataDog/omnigent
 tags:
   - service:omnigent-server
