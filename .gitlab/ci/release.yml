@@ -1,5 +1,4 @@
 stages:
-  - test
   - build
   - package
 
@@ -10,23 +9,6 @@ variables:
   BUNDLER_IMAGE: ${REGISTRY}/mini-repo-ci-image/ddr-package:v0.30
   DOCKER_BUILDKIT: "1"
 
-verify-release-input:{{.Rule.Variables.SERVICE_NAME}}:
-  stage: test
-  image: ${DOCKER_IMAGE}
-  tags: ["arch:amd64"]
-  variables:
-    SERVICE_NAME: {{.Rule.Variables.SERVICE_NAME}}
-  rules:
-    # PRs prove that their own checkout can build, but never publish or signal
-    # Conductor.  Release/DDR execution uses the signed-image path below.
-    - if: '$DDR_WORKFLOW_ID'
-      when: never
-    - if: '$CI_COMMIT_BRANCH == $DDCI_DEFAULT_BRANCH'
-      when: never
-    - when: on_success
-  script:
-    - dd-docker buildx build --platform linux/amd64 --tag "${REGISTRY}/${IMAGE_REPOSITORY}:pr-verify" --build-arg SOURCE_URL="${CI_PROJECT_URL}" --build-arg VCS_REF="${CI_COMMIT_SHA}" --build-arg VERSION="pr-${CI_COMMIT_SHA:0:12}" .
-
 build-and-sign:{{.Rule.Variables.SERVICE_NAME}}:
   stage: build
   image: ${DOCKER_IMAGE}
@@ -34,7 +16,6 @@ build-and-sign:{{.Rule.Variables.SERVICE_NAME}}:
   variables:
     SERVICE_NAME: {{.Rule.Variables.SERVICE_NAME}}
   rules:
-    - if: '$CI_COMMIT_BRANCH == $DDCI_DEFAULT_BRANCH'
     - if: '$DDR_WORKFLOW_ID'
   id_tokens:
     DDSIGN_ID_TOKEN:

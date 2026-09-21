@@ -50,11 +50,10 @@ def test_conductor_targets_consolidated_main_manually() -> None:
 
 
 def test_release_template_publishes_only_signed_digests_for_ddr() -> None:
-    """PR verification cannot publish; DDR receives a digest-qualified image."""
+    """Only DDR runs GitLab jobs, using a digest-qualified signed image."""
     template = (ROOT / ".gitlab/ci/release.yml").read_text()
 
     assert "--platform linux/amd64,linux/arm64" in template
-    assert "$CI_COMMIT_BRANCH == $DDCI_DEFAULT_BRANCH" in template
     assert "if: '$DDR_WORKFLOW_ID'" in template
     assert 'IMAGE_REF="${REGISTRY}/${IMAGE_REPOSITORY}@${IMAGE_DIGEST}"' in template
     assert "DDR_WORKFLOW_ID is required for Conductor publication" in template
@@ -70,14 +69,13 @@ def test_release_template_publishes_only_signed_digests_for_ddr() -> None:
         rendered["variables"]["BUNDLER_IMAGE"]
         == "${REGISTRY}/mini-repo-ci-image/ddr-package:v0.30"
     )
+    assert rendered["stages"] == ["build", "package"]
+    assert not any(name.startswith("verify-release-input:") for name in rendered)
     jobs = [
-        definition
-        for name, definition in rendered.items()
-        if name.startswith(
-            ("verify-release-input:", "build-and-sign:", "publish-conductor-bundle:")
-        )
+        rendered["build-and-sign:omnigent-server"],
+        rendered["publish-conductor-bundle:omnigent-server"],
     ]
-    assert len(jobs) == 3
+    assert all(job["rules"] == [{"if": "$DDR_WORKFLOW_ID"}] for job in jobs)
     assert all(job["tags"] == ["arch:amd64"] for job in jobs)
 
 

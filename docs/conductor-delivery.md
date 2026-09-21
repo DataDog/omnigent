@@ -6,6 +6,10 @@ publishes a bundle that injects that image's immutable digest into the colocated
 Helm chart. No `ddoghq/images` update or `k8s-resources` image-tag bump is part
 of this flow.
 
+GitHub Actions remains the source of truth for pull-request tests. The Dynamic
+Build template runs only when Conductor supplies `DDR_WORKFLOW_ID`; ordinary
+pull requests and branch pushes do not execute jobs on privileged GitLab runners.
+
 `k8s/omnigent-server` is the canonical chart. It owns Habitat configuration,
 PostgreSQL, and service/Fabric behavior. The only release-image adaptation is
 `cnab.images.main`; Conductor supplies its registry, repository, tag, and
