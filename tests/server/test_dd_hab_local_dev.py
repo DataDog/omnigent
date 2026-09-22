@@ -28,18 +28,17 @@ def test_malformed_flag_fails_configuration() -> None:
 
 
 @pytest.mark.parametrize(
-    "substitute",
+    ("substitute", "value"),
     [
-        "OMNIGENT_HAB_EXCHANGE_MODE",
-        "HAB_WORKLOAD_TOKEN_FILE",
-        "OMNIGENT_HAB_TICINO_ADDRESS",
-        "OMNIGENT_HAB_REGISTRY_PATH",
-        "OMNIGENT_HAB_LOCAL_READINESS_GRACE_SECONDS",
+        ("OMNIGENT_HAB_EXCHANGE_MODE", "file"),
+        ("HAB_WORKLOAD_TOKEN_FILE", "secret-or-path"),
+        ("OMNIGENT_HAB_REGISTRY_PATH", "secret-or-path"),
+        ("OMNIGENT_HAB_LOCAL_READINESS_GRACE_SECONDS", "secret-or-path"),
     ],
 )
-def test_substitute_requires_explicit_local_gate(substitute: str) -> None:
+def test_substitute_requires_explicit_local_gate(substitute: str, value: str) -> None:
     with pytest.raises(ValueError, match=substitute):
-        resolve_hab_local_dev_overrides({substitute: "secret-or-path"})
+        resolve_hab_local_dev_overrides({substitute: value})
 
 
 def test_local_gate_reports_names_but_not_values() -> None:
@@ -55,3 +54,9 @@ def test_local_gate_without_substitute_has_no_override() -> None:
     assert (
         resolve_hab_local_dev_overrides({HAB_LOCAL_DEV_ENV: "1"}).substitute_names == frozenset()
     )
+
+
+def test_normal_provider_endpoint_is_not_a_local_substitute() -> None:
+    result = resolve_hab_local_dev_overrides({"OMNIGENT_HAB_TICINO_ADDRESS": "https://id.example"})
+    assert result.enabled is False
+    assert result.substitute_names == frozenset()

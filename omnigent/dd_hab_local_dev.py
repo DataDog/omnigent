@@ -22,9 +22,7 @@ HAB_LOCAL_DEV_ENV = "OMNIGENT_DD_HAB_LOCAL_DEV"
 # workload-token path can itself be sensitive operational information.
 _LOCAL_SUBSTITUTE_ENVS = frozenset(
     {
-        "OMNIGENT_HAB_EXCHANGE_MODE",
         "HAB_WORKLOAD_TOKEN_FILE",
-        "OMNIGENT_HAB_TICINO_ADDRESS",
         "OMNIGENT_HAB_REGISTRY_PATH",
         "OMNIGENT_HAB_LOCAL_READINESS_GRACE_SECONDS",
     }
@@ -56,7 +54,10 @@ def resolve_hab_local_dev_overrides(
             f"{HAB_LOCAL_DEV_ENV} must be one of 1, true, yes, on, 0, false, no, or off"
         )
 
-    selected = frozenset(name for name in _LOCAL_SUBSTITUTE_ENVS if source.get(name, "").strip())
+    selected = {name for name in _LOCAL_SUBSTITUTE_ENVS if source.get(name, "").strip()}
+    if source.get("OMNIGENT_HAB_EXCHANGE_MODE", "").strip().lower() in {"file", "static"}:
+        selected.add("OMNIGENT_HAB_EXCHANGE_MODE")
+    selected = frozenset(selected)
     if selected and not enabled:
         names = ", ".join(sorted(selected))
         raise ValueError(
