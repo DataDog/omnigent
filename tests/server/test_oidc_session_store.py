@@ -19,6 +19,10 @@ from sqlalchemy.orm import sessionmaker
 from omnigent.db.db_models import OmnigentBase, SqlOidcSession, workspace_scope
 from omnigent.server import oidc_session_store as oidc_session_store_module
 from omnigent.server.oidc_session_store import OidcSessionStore
+from omnigent.stores.credential_store.local_aes_cipher import (
+    LocalAesGcmSecretCipher,
+    build_oidc_credential_cipher_from_env,
+)
 
 _TEST_KEY = bytes.fromhex("aa" * 32)
 _TEST_KEY_2 = bytes.fromhex("bb" * 32)
@@ -39,6 +43,58 @@ def session_factory(tmp_path: Path):
 
 def _make_store(session_factory, key: bytes = _TEST_KEY) -> OidcSessionStore:
     return OidcSessionStore(session_factory, credential_key=key)
+
+
+def test_keyed_envelope_supports_decrypt_only_key_rotation() -> None:
+    """Old ciphertext remains readable after moving writes to a new key ID."""
+    context = {"workspace_id": "1", "oidc_session_id": "a", "user_id": "alice@example.com"}
+    old = LocalAesGcmSecretCipher("old", {"old": _TEST_KEY})
+    ciphertext = old.encrypt("provider-token", context=context)
+
+    rotated = LocalAesGcmSecretCipher("new", {"new": _TEST_KEY_2, "old": _TEST_KEY})
+    assert rotated.decrypt(ciphertext, context=context) == "provider-token"
+    assert rotated.encrypt("new-token", context=context).split(":")[2] != ciphertext.split(":")[2]
+
+
+def test_keyed_envelope_rejects_unknown_key_and_context() -> None:
+    """An envelope cannot be read by a missing key or swapped row context."""
+    context = {"workspace_id": "1", "oidc_session_id": "a", "user_id": "alice@example.com"}
+    ciphertext = LocalAesGcmSecretCipher("old", {"old": _TEST_KEY}).encrypt(
+        "provider-token", context=context
+    )
+    assert (
+        LocalAesGcmSecretCipher("new", {"new": _TEST_KEY_2}).decrypt(ciphertext, context=context)
+        is None
+    )
+    assert (
+        LocalAesGcmSecretCipher("old", {"old": _TEST_KEY}).decrypt(
+            ciphertext, context={**context, "user_id": "bob@example.com"}
+        )
+        is None
+    )
+
+
+def test_env_cipher_requires_stable_active_key(monkeypatch) -> None:
+    """Stateful OIDC startup never generates or silently accepts a bad key."""
+    monkeypatch.delenv("OMNIGENT_OIDC_CREDENTIAL_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="Missing required environment variable"):
+        build_oidc_credential_cipher_from_env()
+
+    monkeypatch.setenv("OMNIGENT_OIDC_CREDENTIAL_KEY", "not-hex")
+    with pytest.raises(RuntimeError, match="64-character hex"):
+        build_oidc_credential_cipher_from_env()
+
+
+def test_env_cipher_uses_active_and_decrypt_only_key_ids(monkeypatch) -> None:
+    monkeypatch.setenv("OMNIGENT_OIDC_CREDENTIAL_KEY", _TEST_KEY.hex())
+    monkeypatch.setenv("OMNIGENT_OIDC_CREDENTIAL_ACTIVE_KEY_ID", "current")
+    monkeypatch.setenv(
+        "OMNIGENT_OIDC_CREDENTIAL_DECRYPTION_KEYS",
+        '{"previous": "' + _TEST_KEY_2.hex() + '"}',
+    )
+    cipher = build_oidc_credential_cipher_from_env()
+    context = {"workspace_id": "1", "oidc_session_id": "a", "user_id": "alice@example.com"}
+    assert cipher.encrypt("token", context=context).split(":")[2] == "Y3VycmVudA"
 
 
 def test_raw_tokens_never_in_database(session_factory) -> None:

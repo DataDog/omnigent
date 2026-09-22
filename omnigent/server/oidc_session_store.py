@@ -1,12 +1,12 @@
 """Encrypted OIDC provider session store.
 
-Persists IdP-issued ID and refresh tokens as AES-GCM ciphertext behind
+Persists IdP-issued ID and refresh tokens as versioned AES-GCM ciphertext behind
 an opaque ``sess_…`` handle. The browser/CLI receives only the handle;
 its SHA-256 digest is stored for lookup, never the handle itself.
 
-Uses a separate 32-byte ``OMNIGENT_OIDC_CREDENTIAL_KEY`` (distinct from
-the cookie/state signing key) for encryption. Ciphertext is bound to
-the internal session ID and user ID as AES-GCM associated data.
+Uses a separate stable ``OMNIGENT_OIDC_CREDENTIAL_KEY`` (distinct from the
+cookie/state signing key) for encryption. Ciphertext is bound to the internal
+session ID, user ID, and workspace as associated data.
 """
 
 from __future__ import annotations
@@ -14,22 +14,24 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import secrets
 import time
 import uuid
 from dataclasses import dataclass
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sqlalchemy import delete, or_, select, update
 
 from omnigent.db.db_models import SqlOidcSession, current_workspace_id
 from omnigent.db.query_context import query_name_scope
+from omnigent.stores.credential_store.local_aes_cipher import (
+    LocalAesGcmSecretCipher,
+    build_oidc_credential_cipher_from_env,
+)
+from omnigent.stores.credential_store.secret_cipher import SecretCipher
 
 _logger = logging.getLogger(__name__)
 
 _HANDLE_PREFIX = "sess_"
-_NONCE_SIZE = 12  # AES-GCM standard nonce size
 _KEY_SIZE = 32  # AES-256
 
 
@@ -53,30 +55,6 @@ class OidcSessionCredentials:
     refresh_lease_expires_at: int | None
 
 
-def _resolve_credential_key() -> bytes:
-    """Read and validate the 32-byte credential encryption key from env.
-
-    :returns: The 32-byte key.
-    :raises RuntimeError: When the key is absent or not 32 bytes.
-    """
-    raw = os.environ.get("OMNIGENT_OIDC_CREDENTIAL_KEY", "").strip()
-    if not raw:
-        raise RuntimeError(
-            "Missing required environment variable OMNIGENT_OIDC_CREDENTIAL_KEY "
-            "(OIDC mode requires a 32-byte hex key for provider credential encryption)"
-        )
-    try:
-        key = bytes.fromhex(raw)
-    except ValueError as exc:
-        raise RuntimeError("OMNIGENT_OIDC_CREDENTIAL_KEY must be a valid hex string") from exc
-    if len(key) != _KEY_SIZE:
-        raise RuntimeError(
-            f"OMNIGENT_OIDC_CREDENTIAL_KEY must be exactly {_KEY_SIZE} bytes "
-            f"({_KEY_SIZE * 2} hex chars)"
-        )
-    return key
-
-
 def _generate_handle() -> tuple[str, str]:
     """Generate a random external handle and its digest.
 
@@ -90,61 +68,15 @@ def _generate_handle() -> tuple[str, str]:
     return handle, digest
 
 
-def _encrypt_credentials(
-    key: bytes,
+def _credential_context(
     session_id: str,
     user_id: str,
-    id_token: str,
-    refresh_token: str | None,
-) -> bytes:
-    """Encrypt ID and refresh tokens with AES-GCM.
-
-    The session ID and user ID are bound as associated data so ciphertext
-    cannot be swapped between sessions.
-
-    :param key: 32-byte AES-256 key.
-    :param session_id: Internal session ID (hex string).
-    :param user_id: Verified user email.
-    :param id_token: The current signed ID token.
-    :param refresh_token: The refresh token, or ``None``.
-    :returns: ``nonce || ciphertext`` blob.
-    """
-    aesgcm = AESGCM(key)
-    nonce = os.urandom(_NONCE_SIZE)
-    plaintext = json.dumps(
-        {"id_token": id_token, "refresh_token": refresh_token},
-        separators=(",", ":"),
-    ).encode("utf-8")
-    aad = f"{session_id}:{user_id}".encode()
-    ciphertext = aesgcm.encrypt(nonce, plaintext, aad)
-    return nonce + ciphertext
-
-
-def _decrypt_credentials(
-    key: bytes,
-    session_id: str,
-    user_id: str,
-    blob: bytes,
-) -> tuple[str, str | None] | None:
-    """Decrypt the credential blob.
-
-    :returns: ``(id_token, refresh_token)`` on success, or ``None``
-        when decryption fails (wrong key, corrupted blob, or
-        session/user mismatch).
-    """
-    if len(blob) < _NONCE_SIZE:
-        return None
-    aesgcm = AESGCM(key)
-    nonce = blob[:_NONCE_SIZE]
-    ciphertext = blob[_NONCE_SIZE:]
-    aad = f"{session_id}:{user_id}".encode()
-    try:
-        plaintext = aesgcm.decrypt(nonce, ciphertext, aad)
-    except Exception:  # noqa: BLE001 - decryption can fail many ways
-        _logger.warning("Failed to decrypt OIDC session credentials")
-        return None
-    data = json.loads(plaintext)
-    return data["id_token"], data.get("refresh_token")
+) -> dict[str, str]:
+    return {
+        "workspace_id": str(current_workspace_id()),
+        "oidc_session_id": session_id,
+        "user_id": user_id,
+    }
 
 
 @dataclass(frozen=True)
@@ -166,16 +98,68 @@ class OidcSessionStore:
         self,
         session_factory,
         credential_key: bytes | None = None,
+        credential_cipher: SecretCipher | None = None,
     ):
         """Construct the store.
 
         :param session_factory: A SQLAlchemy ``sessionmaker`` or
             callable returning a ``Session``.
-        :param credential_key: 32-byte AES-256 key. When ``None``,
-            reads from ``OMNIGENT_OIDC_CREDENTIAL_KEY`` at construction.
+        :param credential_key: Legacy test-injection shortcut for one AES-256
+            key. Production uses the versioned/keyed environment configuration.
+        :param credential_cipher: Explicit cipher injection for tests and
+            alternate self-hosted key-management adapters.
         """
+        if credential_key is not None and credential_cipher is not None:
+            raise ValueError("provide either credential_key or credential_cipher, not both")
         self._session_factory = session_factory
-        self._key = credential_key or _resolve_credential_key()
+        if credential_cipher is not None:
+            self._cipher = credential_cipher
+        elif credential_key is not None:
+            if len(credential_key) != _KEY_SIZE:
+                raise ValueError("OIDC credential key must be exactly 32 bytes")
+            self._cipher = LocalAesGcmSecretCipher("test", {"test": credential_key})
+        else:
+            self._cipher = build_oidc_credential_cipher_from_env()
+
+    def _encrypt_credentials(
+        self,
+        session_id: str,
+        user_id: str,
+        id_token: str,
+        refresh_token: str | None,
+    ) -> bytes:
+        plaintext = json.dumps(
+            {"id_token": id_token, "refresh_token": refresh_token},
+            separators=(",", ":"),
+        )
+        return self._cipher.encrypt(
+            plaintext, context=_credential_context(session_id, user_id)
+        ).encode("ascii")
+
+    def _decrypt_credentials(
+        self, session_id: str, user_id: str, blob: bytes
+    ) -> tuple[str, str | None] | None:
+        try:
+            ciphertext = blob.decode("ascii")
+        except UnicodeDecodeError:
+            return None
+        plaintext = self._cipher.decrypt(
+            ciphertext, context=_credential_context(session_id, user_id)
+        )
+        if plaintext is None:
+            _logger.warning(
+                "OIDC session credentials cannot be decrypted; reauthentication is required"
+            )
+            return None
+        try:
+            data = json.loads(plaintext)
+            id_token = data["id_token"]
+            refresh_token = data.get("refresh_token")
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return None
+        if not isinstance(id_token, str) or not isinstance(refresh_token, (str, type(None))):
+            return None
+        return id_token, refresh_token
 
     def create(
         self,
@@ -224,7 +208,7 @@ class OidcSessionStore:
         session_id = uuid.uuid4().hex
         handle, handle_digest = _generate_handle()
         now = int(time.time())
-        ciphertext = _encrypt_credentials(self._key, session_id, user_id, id_token, refresh_token)
+        ciphertext = self._encrypt_credentials(session_id, user_id, id_token, refresh_token)
         with (
             query_name_scope("omnigent.oidc_session_store.create_oidc_session"),
             self._session_factory() as session,
@@ -333,9 +317,7 @@ class OidcSessionStore:
             ).scalar_one_or_none()
             if row is None or row.credential_ciphertext is None:
                 return None
-            result = _decrypt_credentials(
-                self._key, session_id, user_id, row.credential_ciphertext
-            )
+            result = self._decrypt_credentials(session_id, user_id, row.credential_ciphertext)
             if result is None:
                 return None
             id_token, refresh_token = result
@@ -470,7 +452,7 @@ class OidcSessionStore:
         replacement all make this conditional update fail. In particular, an
         in-flight refresh cannot resurrect credentials after logout or expiry.
         """
-        ciphertext = _encrypt_credentials(self._key, session_id, user_id, id_token, refresh_token)
+        ciphertext = self._encrypt_credentials(session_id, user_id, id_token, refresh_token)
         with (
             query_name_scope("omnigent.oidc_session_store.commit_refreshed_credentials"),
             self._session_factory() as session,
@@ -619,7 +601,7 @@ class OidcSessionStore:
             found or already revoked.
         """
         now = int(time.time())
-        ciphertext = _encrypt_credentials(self._key, session_id, user_id, id_token, refresh_token)
+        ciphertext = self._encrypt_credentials(session_id, user_id, id_token, refresh_token)
         with (
             query_name_scope("omnigent.oidc_session_store.update_session_credentials"),
             self._session_factory() as session,
