@@ -1370,6 +1370,7 @@ def register_resources_routes(
             app_state=request.app.state,
             conversation_store=conversation_store,
             runner_router=runner_router or get_server_runner_router(),
+            request=request,
         )
         path = f"/v1/sessions/{session_id}/resources/terminals"
         status, payload = await _proxy_post_to_runner(

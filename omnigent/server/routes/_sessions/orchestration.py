@@ -75,6 +75,7 @@ from omnigent.onboarding.sandboxes.context import (
     ManagedSandboxContext,
     managed_sandbox_context_scope,
 )
+from omnigent.onboarding.sandboxes.types import ManagedIdentityRequirement
 from omnigent.policies.types import (
     ElicitationRequest,
     EvaluationContext,
@@ -145,8 +146,8 @@ from omnigent.server.managed_hosts import (
     read_managed_repo_workspaces,
 )
 from omnigent.server.managed_sandbox_identity import (
-    ManagedSandboxIdentityResolver,
     ManagedSandboxIdentityUnavailable,
+    context_for_managed_sandbox_operation,
 )
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
@@ -3399,6 +3400,7 @@ async def _maybe_relaunch_managed_sandbox(
     conv: Conversation,
     app_state: Any,
     conversation_store: ConversationStore,
+    request: Request | None = None,
 ) -> bool:
     """
     Relaunch a dead managed sandbox for a session, if it has one.
@@ -3440,6 +3442,14 @@ async def _maybe_relaunch_managed_sandbox(
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or host.sandbox_provider is None:
         return False
+    operation_context = _managed_operation_context(
+        request=request,
+        app_state=app_state,
+        host=host,
+        session_id=session_id,
+        sandbox_config=sandbox_config,
+        operation="resume" if host_resume_supported(host, sandbox_config) else "relaunch",
+    )
     if host_is_live(host):
         host_registry = getattr(app_state, "host_registry", None)
         host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
@@ -3470,6 +3480,7 @@ async def _maybe_relaunch_managed_sandbox(
                 conversation_store=conversation_store,
                 host_store=host_store,
                 app_state=app_state,
+                operation_context=operation_context,
             )
         else:
             _kick_managed_relaunch(
@@ -3481,6 +3492,7 @@ async def _maybe_relaunch_managed_sandbox(
                 conversation_store=conversation_store,
                 host_store=host_store,
                 app_state=app_state,
+                operation_context=operation_context,
             )
         launch = tracker.get(session_id)
     if launch is not None:
@@ -3521,6 +3533,7 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     conv: Conversation,
     app_state: Any,
     conversation_store: ConversationStore,
+    request: Request | None = None,
 ) -> bool:
     """
     Wake a resumable managed host whose persisted liveness has gone stale.
@@ -3545,6 +3558,14 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or not host_resume_supported(host, sandbox_config):
         return False
+    operation_context = _managed_operation_context(
+        request=request,
+        app_state=app_state,
+        host=host,
+        session_id=session_id,
+        sandbox_config=sandbox_config,
+        operation="resume",
+    )
     host_registry = cast(HostRegistry | None, getattr(app_state, "host_registry", None))
     tunnel_registry = cast(TunnelRegistry | None, getattr(app_state, "tunnel_registry", None))
     host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
@@ -3565,15 +3586,6 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
         )
 
     host_row_online = host_is_live(host)
-    try:
-        resolver = getattr(app_state, "managed_sandbox_identity_resolver", None)
-        identity_resolver = resolver or ManagedSandboxIdentityResolver(None)
-        operation_context = await asyncio.to_thread(
-            identity_resolver.for_host,
-            host,
-        )
-    except ManagedSandboxIdentityUnavailable as exc:
-        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
     with managed_sandbox_context_scope(operation_context):
         sandbox_running = await asyncio.to_thread(host_sandbox_is_running, host, sandbox_config)
     if (
@@ -3607,6 +3619,7 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
         conv=conv,
         app_state=app_state,
         conversation_store=conversation_store,
+        request=request,
     )
 
 
@@ -3618,6 +3631,7 @@ async def ensure_runner_connected(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     raise_host_refusal: bool = False,
+    request: Request | None = None,
 ) -> tuple[httpx.AsyncClient | None, Conversation]:
     """
     Bring a wakeable session's runner online for out-of-band resource access.
@@ -3689,6 +3703,7 @@ async def ensure_runner_connected(
         conv=conv,
         app_state=app_state,
         conversation_store=conversation_store,
+        request=request,
     ):
         conv = await _reread()
         runner_client = await _get_runner_client(
@@ -3783,6 +3798,7 @@ async def ensure_runner_connected(
             conv=conv,
             app_state=app_state,
             conversation_store=conversation_store,
+            request=request,
         ):
             conv = await _reread()
             runner_client = await _get_runner_client(
@@ -3815,6 +3831,7 @@ def _kick_managed_relaunch(
     conversation_store: ConversationStore,
     host_store: HostStore,
     app_state: Any,
+    operation_context: ManagedSandboxContext,
 ) -> None:
     """
     Register and spawn the background relaunch for a dead sandbox.
@@ -3883,14 +3900,6 @@ def _kick_managed_relaunch(
         )
 
     async def _relaunch_after_identity_resolution() -> None:
-        try:
-            resolver = getattr(app_state, "managed_sandbox_identity_resolver", None)
-            identity_resolver = resolver or ManagedSandboxIdentityResolver(None)
-            operation_context = await asyncio.to_thread(identity_resolver.for_host, host)
-        except ManagedSandboxIdentityUnavailable as exc:
-            tracker.fail(session_id, str(exc))
-            _publish_sandbox_status(session_id, "failed", str(exc))
-            return
         await _run_managed_launch(
             session_id=session_id,
             owner=host.user_id,
@@ -3922,6 +3931,7 @@ def _kick_managed_wake(
     conversation_store: ConversationStore,
     host_store: HostStore,
     app_state: Any,
+    operation_context: ManagedSandboxContext,
 ) -> None:
     """
     Spawn the background wake for a dormant resumable host.
@@ -3940,6 +3950,7 @@ def _kick_managed_wake(
         conversation_store=conversation_store,
         host_store=host_store,
         app_state=app_state,
+        operation_context=operation_context,
     )
 
 
@@ -3953,6 +3964,7 @@ def _kick_managed_wake_impl(
     conversation_store: ConversationStore,
     host_store: HostStore,
     app_state: Any,
+    operation_context: ManagedSandboxContext | None = None,
 ) -> None:
     """
     Register and spawn the background WAKE for a dormant resumable host.
@@ -3972,6 +3984,7 @@ def _kick_managed_wake_impl(
     :param host_store: Persistent host registrations.
     :param app_state: ``request.app.state`` — supplies the registries.
     """
+    _ = host  # identity was captured from the authenticated request by the caller.
     _logger.info(
         "Managed host %s (session %s) is dormant but resumable; waking in background",
         conv.host_id,
@@ -3985,16 +3998,6 @@ def _kick_managed_wake_impl(
     _publish_sandbox_status(session_id, "provisioning")
 
     async def _wake_after_identity_resolution() -> None:
-        operation_context: ManagedSandboxContext | None = None
-        try:
-            if host is not None:
-                resolver = getattr(app_state, "managed_sandbox_identity_resolver", None)
-                identity_resolver = resolver or ManagedSandboxIdentityResolver(None)
-                operation_context = await asyncio.to_thread(identity_resolver.for_host, host)
-        except ManagedSandboxIdentityUnavailable as exc:
-            tracker.fail(session_id, str(exc))
-            _publish_sandbox_status(session_id, "failed", str(exc))
-            return
         await _run_managed_wake(
             session_id=session_id,
             conv=conv,
@@ -10604,3 +10607,42 @@ __all__ = [
     "configure_subagent_block_notifier",
     "ensure_runner_connected",
 ]
+
+
+def _managed_operation_context(
+    *,
+    request: Request | None,
+    app_state: Any,
+    host: Host,
+    session_id: str,
+    sandbox_config: ManagedSandboxDeployment,
+    operation: str,
+) -> ManagedSandboxContext:
+    """Capture current-owner authority before scheduling managed work.
+
+    Durable host rows intentionally contain no reference to an OIDC/browser or
+    CLI session.  A request-less caller can still operate providers that need
+    no caller identity, but cannot accidentally perform an OBO operation.
+    """
+    requirement = sandbox_config.managed_identity_requirement(host.sandbox_provider, operation)
+    if request is None:
+        if requirement is ManagedIdentityRequirement.OIDC_USER:
+            raise OmnigentError(
+                "owner reauthentication is required before this managed sandbox can be operated",
+                code=ErrorCode.REAUTHENTICATION_REQUIRED,
+            )
+        return ManagedSandboxContext(
+            session_id=session_id,
+            user_id=host.user_id,
+            identity_token_provider=None,
+        )
+    try:
+        return context_for_managed_sandbox_operation(
+            request,
+            getattr(app_state, "auth_provider", None),
+            session_id=session_id,
+            owner=host.user_id,
+            requirement=requirement,
+        )
+    except ManagedSandboxIdentityUnavailable as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.REAUTHENTICATION_REQUIRED) from exc

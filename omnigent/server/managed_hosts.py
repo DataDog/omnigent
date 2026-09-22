@@ -195,7 +195,6 @@ from fastapi import HTTPException
 
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import builtin_agent_id, now_epoch
-from omnigent.onboarding.sandboxes.context import current_managed_sandbox_context
 from omnigent.onboarding.sandboxes.types import RepoWorkspace
 from omnigent.stores.host_store import Host, HostStore
 
@@ -3700,7 +3699,6 @@ async def _register_and_start_host(
             )
             raise ValueError(f"managed host {host_id!r} no longer exists")
     else:
-        context = current_managed_sandbox_context()
         record = await asyncio.to_thread(
             host_store.register_managed_host,
             host_id=host_id,
@@ -3710,8 +3708,6 @@ async def _register_and_start_host(
             provider=launcher.provider,
             sandbox_id=sandbox_id,
             token_expires_at=now_epoch() + config.token_ttl_s,
-            session_id=context.session_id if context is not None else None,
-            credential_session_id=context.credential_session_id if context is not None else None,
         )
     try:
         # Uniform across providers: provision() fixed the sandbox id and the

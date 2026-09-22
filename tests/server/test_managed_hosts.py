@@ -27,7 +27,6 @@ from omnigent.onboarding.sandboxes.base import (
     render_host_config_write_command,
 )
 from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s as blaxel_managed_token_ttl_s
-from omnigent.onboarding.sandboxes.context import IdentityToken
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.onboarding.sandboxes.registry import (
     COMMUNITY_MODULE_PREFIX,
@@ -62,7 +61,6 @@ from omnigent.server.managed_hosts import (
     resume_managed_host,
     terminate_managed_host,
 )
-from omnigent.server.managed_sandbox_identity import ManagedSandboxIdentityResolver
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -87,31 +85,6 @@ pytestmark = pytest.mark.asyncio
 
 _OWNER = "alice@example.com"
 _TEST_CREDENTIAL_SESSION_ID = "1b8852c73c0448a8a9ab7b159722f6c1"
-
-
-class _TestLifecycleIdentityTokenProvider:
-    """Minimal renewable owner credential for lifecycle task wiring tests."""
-
-    credential_session_id = _TEST_CREDENTIAL_SESSION_ID
-
-    def get_identity_token(self) -> IdentityToken:
-        return IdentityToken(value="test-owner-token", expires_at=2_000_000_000)
-
-
-class _TestLifecycleAuthProvider:
-    """Resolve only the persisted test owner binding."""
-
-    def get_identity_token_provider_for_credential_session(
-        self, credential_session_id: str, expected_user_id: str
-    ) -> _TestLifecycleIdentityTokenProvider | None:
-        if credential_session_id == _TEST_CREDENTIAL_SESSION_ID and expected_user_id == _OWNER:
-            return _TestLifecycleIdentityTokenProvider()
-        return None
-
-
-def _test_lifecycle_identity_resolver() -> ManagedSandboxIdentityResolver:
-    """Build an explicit owner-bound resolver for lifecycle task tests."""
-    return ManagedSandboxIdentityResolver(_TestLifecycleAuthProvider())
 
 
 def _injected_config(
@@ -4358,7 +4331,6 @@ async def test_kick_managed_relaunch_defers_the_classifier_to_the_launch_task(
         host_store=SimpleNamespace(),
         app_state=SimpleNamespace(
             agent_store=store,
-            managed_sandbox_identity_resolver=_test_lifecycle_identity_resolver(),
         ),
     )
     scheduled = set(orchestration._managed_launch_tasks) - before
@@ -4452,9 +4424,7 @@ async def test_kick_managed_relaunch_without_agent_store_threads_none(
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
-        app_state=SimpleNamespace(
-            managed_sandbox_identity_resolver=_test_lifecycle_identity_resolver(),
-        ),
+        app_state=SimpleNamespace(),
     )
     scheduled = set(orchestration._managed_launch_tasks) - before
     await asyncio.gather(*scheduled)
@@ -4794,7 +4764,6 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
         sandbox_config=SimpleNamespace(),
         managed_launches=tracker,
         agent_store=_StubAgentStore({builtin.id: builtin}),
-        managed_sandbox_identity_resolver=_test_lifecycle_identity_resolver(),
         host_registry=None,
         tunnel_registry=None,
     )

@@ -1603,12 +1603,9 @@ def create_app(
             f"{_provider.name}_client",
             _provider.client_factory(_cfg) if _on else None,
         )
-    # Later lifecycle operations have no request ContextVar. This resolver
-    # recreates only the exact owner-bound credential session persisted with a
-    # managed resource; it never searches for another user's current login.
-    from omnigent.server.managed_sandbox_identity import ManagedSandboxIdentityResolver
-
-    app.state.managed_sandbox_identity_resolver = ManagedSandboxIdentityResolver(auth_provider)
+    # Managed operations capture the authenticated request's OIDC authority
+    # before background work starts; host rows never retain login-session ids.
+    app.state.auth_provider = auth_provider
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the

@@ -24,8 +24,6 @@ class ManagedSandboxContext:
     session_id: str
     user_id: str
     identity_token_provider: IdentityTokenProvider | None = field(repr=False)
-    # Opaque database reference only; never a cookie, access token, or refresh token.
-    credential_session_id: str | None = None
 
 
 _current_managed_sandbox_context: ContextVar[ManagedSandboxContext | None] = ContextVar(
