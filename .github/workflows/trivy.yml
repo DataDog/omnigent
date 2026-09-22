@@ -58,6 +58,7 @@ jobs:
           exit-code: '0'
           severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
           ignore-unfixed: false
+          ignorefile: .trivyignore.yaml
           list-all-pkgs: true
           skip-dirs: .git,**/.venv,**/node_modules
           cache-dir: ${{ runner.temp }}/trivy-cache

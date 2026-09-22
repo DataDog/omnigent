@@ -55,6 +55,7 @@ overrides:
   dompurify: 3.4.14
   mermaid: 11.16.1
   tar: 7.5.21
+  sharp: 0.35.4
   'node-gyp>undici': 6.28.0
   'undici@>=7.0.0 <8.0.0': 7.29.0
   'brace-expansion@>=1.0.0 <2.0.0': 1.1.18
