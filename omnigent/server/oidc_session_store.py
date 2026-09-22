@@ -147,6 +147,14 @@ def _decrypt_credentials(
     return data["id_token"], data.get("refresh_token")
 
 
+@dataclass(frozen=True)
+class CreatedOidcSession:
+    """Non-secret result of creating a provider credential session."""
+
+    handle: str
+    session_id: str
+
+
 class OidcSessionStore:
     """Encrypted OIDC provider session store backed by ``SqlOidcSession``.
 
@@ -185,6 +193,34 @@ class OidcSessionStore:
 
         :returns: The opaque ``sess_…`` handle for the browser/CLI.
         """
+        return self.create_with_id(
+            user_id,
+            provider_subject,
+            id_token,
+            refresh_token,
+            id_token_expiry,
+            absolute_expiry,
+            provider_issuer=provider_issuer,
+            provider_client_id=provider_client_id,
+        ).handle
+
+    def create_with_id(
+        self,
+        user_id: str,
+        provider_subject: str | None,
+        id_token: str,
+        refresh_token: str | None,
+        id_token_expiry: int,
+        absolute_expiry: int,
+        *,
+        provider_issuer: str,
+        provider_client_id: str,
+    ) -> CreatedOidcSession:
+        """Create a session and return its opaque handle plus internal ID.
+
+        The ID is only for server-side durable delegation; callers must not
+        expose it as a browser credential.
+        """
         session_id = uuid.uuid4().hex
         handle, handle_digest = _generate_handle()
         now = int(time.time())
@@ -213,7 +249,7 @@ class OidcSessionStore:
             )
             session.add(row)
             session.commit()
-        return handle
+        return CreatedOidcSession(handle=handle, session_id=session_id)
 
     def resolve(self, handle: str) -> tuple[str, str, str] | None:
         """Resolve an opaque handle to (user_id, session_id, provider_subject).

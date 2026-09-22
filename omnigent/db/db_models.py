@@ -585,6 +585,9 @@ class SqlDeviceGrant(OmnigentBase):
     expires_at: Mapped[int] = mapped_column(Integer, nullable=False)
     approved_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_polled_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Explicit, non-bearer delegation from a first-party CLI login grant to
+    # the encrypted provider credential session used for managed OBO.
+    oidc_session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (
         CheckConstraint("status IN (1, 2, 3, 4, 5)", name="ck_device_grants_status"),

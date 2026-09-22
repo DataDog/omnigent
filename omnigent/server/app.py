@@ -3333,6 +3333,7 @@ def create_app(
 
             device_grant_store = DeviceGrantStore(permission_store.storage_location)
             auth_provider.set_grant_revocation_check(device_grant_store.is_revoked)
+            auth_provider.set_device_grant_store(device_grant_store)
 
         if (
             isinstance(auth_provider, UnifiedAuthProvider)

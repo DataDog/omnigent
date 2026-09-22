@@ -31,13 +31,15 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from starlette.requests import Request
 
-from omnigent.db.db_models import OmnigentBase, SqlOidcSession
+from omnigent.db.db_models import OmnigentBase, SqlDeviceGrant, SqlOidcSession
 from omnigent.onboarding.sandboxes.context import IdentityToken
 from omnigent.server.accounts_config import AccountsConfig
 from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
+from omnigent.server.device_grant_store import DeviceGrantStore, hash_secret
 from omnigent.server.oidc import OIDCConfig, mint_session_token
 from omnigent.server.oidc_session_store import OidcSessionStore
 from omnigent.server.oidc_token_manager import ReauthenticationError
+from omnigent.server.routes.device_auth import LOGIN_GRANT_CLIENT_ID, mint_delegated_token
 
 _TEST_KEY = bytes.fromhex("aa" * 32)
 _ISSUER = "https://idp.example.com"
@@ -156,6 +158,43 @@ def _create_session(
     result = store.resolve(handle)
     assert result is not None
     return handle, result[1]
+
+
+def test_login_grant_jwt_resolves_its_owner_bound_oidc_session(
+    tmp_path: Path, session_factory, keys: _IdpKeys
+) -> None:
+    """A refreshed first-party CLI JWT retains OBO without a sess_ handle."""
+    store = OidcSessionStore(session_factory, credential_key=_TEST_KEY)
+    id_token = keys.sign_id_token({"sub": "idp-alice", "email": _ALICE})
+    _, session_id = _create_session(store, keys, user_id=_ALICE, id_token=id_token)
+    grants = DeviceGrantStore(f"sqlite:///{tmp_path}/grants.db")
+    OmnigentBase.metadata.create_all(grants._engine, tables=[SqlDeviceGrant.__table__])
+    grants.create_redeemed_grant(
+        "cli-grant",
+        user_id=_ALICE,
+        client_id=LOGIN_GRANT_CLIENT_ID,
+        refresh_token_hash=hash_secret("refresh", _TEST_KEY),
+        created_at=int(time.time()),
+        oidc_session_id=session_id,
+    )
+    provider = _make_provider(store)
+    provider.set_device_grant_store(grants)
+    access = mint_delegated_token(
+        _ALICE,
+        _TEST_KEY,
+        3600,
+        "oidc",
+        grant_id="cli-grant",
+        client_id=LOGIN_GRANT_CLIENT_ID,
+        jti="jwt-id",
+        scope=None,
+    )
+    request = _mock_request(headers={"Authorization": f"Bearer {access}"})
+    assert provider.get_identity_token_provider(request, _ALICE) is not None
+    assert provider.get_identity_token_provider(request, _BOB) is None
+
+    grants.revoke("cli-grant")
+    assert provider.get_identity_token_provider(request, _ALICE) is None
 
 
 def _request_with_handle(config: OIDCConfig, handle: str) -> MagicMock:

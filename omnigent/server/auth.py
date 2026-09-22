@@ -555,6 +555,11 @@ class UnifiedAuthProvider(AuthProvider):
         # closed). Consulted only for delegated tokens (those carrying a
         # ``grant_id`` claim); left None disables the check.
         self._grant_revoked: Callable[[str], bool] | None = None
+        # Live grant lookup is needed only for the explicit OIDC delegation
+        # attached to first-party CLI grants.  Keep it separate from the
+        # revocation predicate so a JWT cannot recover a credential merely by
+        # knowing a grant id.
+        self._device_grant_store: DeviceGrantStore | None = None
 
     def set_oidc_session_store(self, store: OidcSessionStore) -> None:
         """Wire the encrypted OIDC session store after construction.
@@ -570,6 +575,10 @@ class UnifiedAuthProvider(AuthProvider):
             grant is revoked or unknown (fail closed).
         """
         self._grant_revoked = check
+
+    def set_device_grant_store(self, store: DeviceGrantStore) -> None:
+        """Wire live first-party login-grant resolution for OIDC delegation."""
+        self._device_grant_store = store
 
     @property
     def login_url(self) -> str | None:
@@ -682,16 +691,57 @@ class UnifiedAuthProvider(AuthProvider):
             return None
         resolved = self._resolved_credential_session(token, request)
         if resolved is None:
-            return None
-        user_id, session_id = resolved
-        if user_id.lower() != expected_user_id.lower():
-            return None
+            session_id = self._credential_session_from_login_grant(token, expected_user_id)
+            if session_id is None:
+                return None
+        else:
+            user_id, session_id = resolved
+            if user_id.lower() != expected_user_id.lower():
+                return None
         token_manager = OidcTokenManager(self._oidc_session_store, self._oidc_config)
         return _OidcIdentityTokenProvider(
             token_manager=token_manager,
             session_id=session_id,
             expected_user_id=expected_user_id,
         )
+
+    def _credential_session_from_login_grant(
+        self, token: str, expected_user_id: str
+    ) -> str | None:
+        """Resolve a JWT's live, owner-bound CLI OIDC delegation.
+
+        A JWT is deliberately not itself a reference to browser credentials.
+        Only a non-revoked first-party login grant can carry the internal
+        ``oidc_session_id`` binding, and both the JWT subject and row owner
+        must match the requested managed-host owner.
+        """
+        if self._device_grant_store is None or self._oidc_config is None:
+            return None
+        import jwt
+
+        try:
+            payload = jwt.decode(token, self._oidc_config.cookie_secret, algorithms=["HS256"])
+        except jwt.InvalidTokenError:
+            return None
+        user_id = payload.get("sub")
+        grant_id = payload.get("grant_id")
+        if (
+            not isinstance(user_id, str)
+            or not isinstance(grant_id, str)
+            or user_id.lower() != expected_user_id.lower()
+        ):
+            return None
+        grant = self._device_grant_store.get_by_id(grant_id)
+        if (
+            grant is None
+            or grant.status != "redeemed"
+            or grant.client_id != "omnigent-cli"
+            or grant.user_id is None
+            or grant.user_id.lower() != expected_user_id.lower()
+            or not grant.oidc_session_id
+        ):
+            return None
+        return grant.oidc_session_id
 
     @property
     def supports_oidc_identity_tokens(self) -> bool:
@@ -1008,6 +1058,7 @@ def create_auth_provider(
 # to keep startup cost off the import path that doesn't use them.
 if TYPE_CHECKING:
     from omnigent.server.accounts_config import AccountsConfig
+    from omnigent.server.device_grant_store import DeviceGrantStore
     from omnigent.server.oidc import OIDCConfig
     from omnigent.server.oidc_session_store import OidcSessionStore
     from omnigent.server.oidc_token_manager import OidcTokenManager

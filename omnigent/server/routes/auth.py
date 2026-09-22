@@ -389,6 +389,7 @@ def create_auth_router(
         # email address.
         provider_subject = ""
         provider_id_token_expiry = 0
+        oidc_session_id: str | None = None
         if oidc_session_store is not None and config.provider_type == "oidc":
             oidc_claims = _validate_oidc_id_token(token_json, config)
             provider_subject_value = oidc_claims.get("sub") if oidc_claims is not None else None
@@ -460,8 +461,8 @@ def create_auth_router(
                 raw_refresh if isinstance(raw_refresh, str) and raw_refresh else None
             )
             now = int(time.time())
-            session_credential = await asyncio.to_thread(
-                oidc_session_store.create,
+            created_session = await asyncio.to_thread(
+                oidc_session_store.create_with_id,
                 user_id=email,
                 provider_subject=provider_subject,
                 id_token=id_token_val,
@@ -471,6 +472,8 @@ def create_auth_router(
                 provider_issuer=config.issuer,
                 provider_client_id=config.client_id,
             )
+            session_credential = created_session.handle
+            oidc_session_id = created_session.session_id
         else:
             session_credential = mint_session_cookie(
                 user_id=email,
@@ -495,6 +498,7 @@ def create_auth_router(
                         device_grant_store,
                         user_id=email,
                         cookie_secret=config.cookie_secret,
+                        oidc_session_id=oidc_session_id,
                     )
                 except Exception:
                     _logger.exception("cli-login: refresh grant issuance failed")
