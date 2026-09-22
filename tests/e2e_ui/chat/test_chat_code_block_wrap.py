@@ -202,13 +202,11 @@ def test_chat_code_controls_scroll_together(
     )
     scroller = page.locator('[role="log"] > div').first
     scroll_top = scroller.evaluate("el => el.scrollTop")
-    download_button = block.get_by_role("button", name="Download file").bounding_box()
-    assert download_button is not None
+    download_button = block.get_by_role("button", name="Download file")
     with page.expect_download() as download_info:
-        page.mouse.click(
-            download_button["x"] + download_button["width"] / 2,
-            download_button["y"] + download_button["height"] / 2,
-        )
+        # The preceding assertions deliberately leave the toolbar above the
+        # transcript viewport. Dispatching preserves that scroll position.
+        download_button.dispatch_event("click")
     download = download_info.value
     assert download.suggested_filename.endswith(".ts")
     assert Path(download.path()).read_text() == _SCROLL_CODE
