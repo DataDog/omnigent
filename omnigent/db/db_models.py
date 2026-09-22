@@ -1374,8 +1374,6 @@ class SqlHost(OmnigentBase):
     # bearer, cookie, refresh token, or browser handle is stored here.
     sandbox_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     sandbox_credential_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    sandbox_lifecycle_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    sandbox_cleanup_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
     configured_harnesses: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
 

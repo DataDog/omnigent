@@ -2596,51 +2596,20 @@ def register_events_routes(
         if managed_launches_for_delete is not None:
             managed_launches_for_delete.finish(session_id)
         # Managed-host cleanup: when the session's host is backed by a
-        # server-provisioned sandbox (host_type="managed"), revoke its local
-        # authorization and request exact-ID provider cleanup. A provider
-        # failure keeps a cleanup-pending tombstone; external laptop hosts are
-        # never touched.
-        cleanup_pending = False
+        # server-provisioned sandbox (host_type="managed"), terminate the
+        # sandbox and delete its host row. External laptop hosts are never
+        # touched.
         host_store_for_managed = getattr(request.app.state, "host_store", None)
         if conv.host_id is not None and host_store_for_managed is not None:
             bound_host = await asyncio.to_thread(host_store_for_managed.get_host, conv.host_id)
             if bound_host is not None and bound_host.sandbox_provider is not None:
-                from omnigent.onboarding.sandboxes.context import managed_sandbox_context_scope
                 from omnigent.server.managed_hosts import terminate_managed_host
-                from omnigent.server.managed_sandbox_identity import (
-                    ManagedSandboxIdentityResolver,
-                    ManagedSandboxIdentityUnavailable,
-                )
 
-                # Stop local access before attempting remote cleanup. A failed
-                # provider call leaves a durable tombstone, never a live host
-                # token or tunnel.
-                host_registry = getattr(request.app.state, "host_registry", None)
-                if host_registry is not None:
-                    host_registry.deregister(conv.host_id)
-                tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
-                if tunnel_registry is not None and conv.runner_id is not None:
-                    tunnel_registry.deregister(conv.runner_id)
-                try:
-                    resolver = getattr(
-                        request.app.state, "managed_sandbox_identity_resolver", None
-                    )
-                    identity_resolver = resolver or ManagedSandboxIdentityResolver(None)
-                    context = await asyncio.to_thread(
-                        identity_resolver.for_host,
-                        bound_host,
-                    )
-                    with managed_sandbox_context_scope(context):
-                        cleanup_pending = not await terminate_managed_host(
-                            bound_host,
-                            host_store_for_managed,
-                            getattr(request.app.state, "sandbox_config", None),
-                        )
-                except ManagedSandboxIdentityUnavailable:
-                    await asyncio.to_thread(
-                        host_store_for_managed.mark_managed_cleanup_pending, conv.host_id
-                    )
-                    cleanup_pending = True
+                await terminate_managed_host(
+                    bound_host,
+                    host_store_for_managed,
+                    getattr(request.app.state, "sandbox_config", None),
+                )
         try:
             import hashlib as _hashlib
             import time as _time
@@ -2667,4 +2636,4 @@ def register_events_routes(
             )
         except Exception:
             pass
-        return ConversationDeleted(id=session_id, cleanup_pending=cleanup_pending)
+        return ConversationDeleted(id=session_id)

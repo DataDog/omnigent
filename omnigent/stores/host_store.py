@@ -101,8 +101,6 @@ class Host:
     sandbox_id: str | None = None
     sandbox_session_id: str | None = None
     sandbox_credential_session_id: str | None = None
-    sandbox_lifecycle_state: str | None = None
-    sandbox_cleanup_attempts: int = 0
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
@@ -182,8 +180,6 @@ def _row_to_host(row: SqlHost) -> Host:
         deleted_at=row.deleted_at,
         sandbox_session_id=row.sandbox_session_id,
         sandbox_credential_session_id=row.sandbox_credential_session_id,
-        sandbox_lifecycle_state=row.sandbox_lifecycle_state,
-        sandbox_cleanup_attempts=row.sandbox_cleanup_attempts,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
     )
 
@@ -443,8 +439,7 @@ class HostStore:
         sandbox_id = row.sandbox_id
         sandbox_session_id = row.sandbox_session_id
         sandbox_credential_session_id = row.sandbox_credential_session_id
-        sandbox_lifecycle_state = row.sandbox_lifecycle_state
-        sandbox_cleanup_attempts = row.sandbox_cleanup_attempts
+        terminating_sandbox_id = row.terminating_sandbox_id
 
         bound_ids = list(
             session.execute(
@@ -488,8 +483,7 @@ class HostStore:
             sandbox_id=sandbox_id,
             sandbox_session_id=sandbox_session_id,
             sandbox_credential_session_id=sandbox_credential_session_id,
-            sandbox_lifecycle_state=sandbox_lifecycle_state,
-            sandbox_cleanup_attempts=sandbox_cleanup_attempts,
+            terminating_sandbox_id=terminating_sandbox_id,
             configured_harnesses=harnesses_json,
         )
         session.add(new_row)
@@ -890,34 +884,6 @@ class HostStore:
         token_hash = hash_host_launch_token(token)
 
         def write(session: Session) -> Host:
-            existing = session.execute(
-                select(SqlHost).where(
-                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
-                )
-            ).scalar_one_or_none()
-            if existing is not None:
-                if existing.user_id != user_id:
-                    # Fail closed (W2-class boundary): re-crediting a host
-                    # row hands its launch token holder the row owner's
-                    # identity, so a cross-owner overwrite would be a host
-                    # hijack. host_id is server-generated today (uuid4 per
-                    # launch), so this can only fire on a bug or a forged
-                    # id — refuse rather than re-own.
-                    raise ValueError(
-                        f"host {host_id!r} is registered to a different user; "
-                        "refusing to re-credential it"
-                    )
-                existing.token_hash = token_hash
-                existing.token_expires_at = token_expires_at
-                existing.sandbox_provider = provider
-                existing.sandbox_id = sandbox_id
-                if session_id is not None:
-                    existing.sandbox_session_id = session_id
-                if credential_session_id is not None:
-                    existing.sandbox_credential_session_id = credential_session_id
-                existing.sandbox_lifecycle_state = "active"
-                existing.updated_at = now
-                return _row_to_host(existing)
             row = SqlHost(
                 user_id=user_id,
                 name=name,
@@ -931,8 +897,6 @@ class HostStore:
                 sandbox_id=sandbox_id,
                 sandbox_session_id=session_id,
                 sandbox_credential_session_id=credential_session_id,
-                sandbox_lifecycle_state="active",
-                sandbox_cleanup_attempts=0,
             )
             session.add(row)
             return _row_to_host(row)
@@ -1248,49 +1212,3 @@ class HostStore:
             row.updated_at = updated_at
 
         run_write_transaction(self._session_immediate, "revoke_launch_token", write)
-
-    def mark_managed_cleanup_pending(self, host_id: str) -> None:
-        """Persist a failed exact-resource cleanup without dropping its tombstone."""
-        with self._session("mark_managed_cleanup_pending") as session:
-            row = session.execute(
-                select(SqlHost).where(
-                    SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id
-                )
-            ).scalar_one_or_none()
-            if row is None:
-                return
-            row.token_hash = None
-            row.token_expires_at = None
-            row.sandbox_lifecycle_state = "cleanup_pending"
-            row.sandbox_cleanup_attempts += 1
-            row.updated_at = now_epoch()
-
-    def list_managed_cleanup_pending_all_workspaces(self, *, limit: int) -> list[Host]:
-        """Return a bounded page of exact-resource cleanup tombstones.
-
-        This is deliberately the only background enumeration for managed
-        resources.  It returns persisted rows, never provider-side listings,
-        so reconciliation can issue a delete solely for the recorded provider
-        and sandbox id.  Callers restore each returned row's ``workspace_id``
-        before doing any follow-up store operation.
-
-        :param limit: Maximum number of tombstones to inspect in one pass.
-        :returns: Cleanup-pending managed hosts ordered stably for bounded
-            single-process reconciliation.
-        """
-        if limit <= 0:
-            return []
-        with self._session("list_managed_cleanup_pending_all_workspaces") as session:
-            rows = (
-                session.execute(
-                    select(SqlHost)
-                    .where(SqlHost.sandbox_lifecycle_state == "cleanup_pending")
-                    .where(SqlHost.sandbox_provider.is_not(None))
-                    .where(SqlHost.sandbox_id.is_not(None))
-                    .order_by(SqlHost.workspace_id, SqlHost.updated_at, SqlHost.host_id)
-                    .limit(limit)
-                )
-                .scalars()
-                .all()
-            )
-            return [_row_to_host(row) for row in rows]

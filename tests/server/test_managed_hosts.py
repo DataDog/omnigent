@@ -12,7 +12,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import click
 import pytest
@@ -62,10 +62,6 @@ from omnigent.server.managed_hosts import (
     resume_managed_host,
     terminate_managed_host,
 )
-from omnigent.server.managed_sandbox_cleanup import (
-    ManagedSandboxCleanupReconciler,
-    managed_cleanup_retry_delay_s,
-)
 from omnigent.server.managed_sandbox_identity import ManagedSandboxIdentityResolver
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -73,6 +69,12 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import Host, HostStore
+
+if TYPE_CHECKING:
+    from omnigent.server.managed_sandbox_cleanup import (
+        ManagedSandboxCleanupReconciler,
+        managed_cleanup_retry_delay_s,
+    )
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
@@ -2986,8 +2988,6 @@ def test_managed_host_persists_non_secret_lifecycle_binding(db_uri: str) -> None
     assert recovered.sandbox_id == "hab-exact-uuid"
     assert recovered.sandbox_session_id == "conv-lifecycle"
     assert recovered.sandbox_credential_session_id == "oidc-session-ref"
-    assert recovered.sandbox_lifecycle_state == "active"
-    assert recovered.sandbox_cleanup_attempts == 0
 
 
 async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) -> None:
@@ -3116,8 +3116,7 @@ async def test_relaunch_does_not_create_second_generation_when_old_cleanup_is_am
     assert fake.provisioned_names == ["managed-" + first.host_id[:8]]
     tombstone = host_store.get_host(first.host_id)
     assert tombstone is not None
-    assert tombstone.sandbox_lifecycle_state == "cleanup_pending"
-    assert tombstone.sandbox_cleanup_attempts == 1
+    assert tombstone.deleted_at is None
 
 
 async def test_relaunch_rejects_unconfigured_provider(db_uri: str) -> None:
@@ -3615,8 +3614,7 @@ async def test_terminate_managed_host_retains_cleanup_tombstone_when_terminate_f
     tombstone = _managed_tombstone(host_store, "057e7fa3f1cdb40c0ec393a3d42affc7")
     assert tombstone is not None
     assert tombstone.sandbox_id == "sb-term-2"
-    assert tombstone.sandbox_lifecycle_state == "cleanup_pending"
-    assert tombstone.sandbox_cleanup_attempts == 1
+    assert tombstone.deleted_at is not None
     assert (
         host_store.resolve_launch_token("057e7fa3f1cdb40c0ec393a3d42affc7", "tok-term-2") is None
     )
