@@ -24,9 +24,84 @@ depends_on: str | Sequence[str] | None = None
 
 _UUID16 = sa.LargeBinary(16).with_variant(mysql.BINARY(16), "mysql")
 
+_OIDC_SESSION_BASELINE_COLUMNS = frozenset(
+    {
+        "workspace_id",
+        "id",
+        "handle_digest",
+        "user_id",
+        "provider_subject",
+        "credential_ciphertext",
+        "id_token_expiry",
+        "absolute_expiry",
+        "created_at",
+        "updated_at",
+        "revoked_at",
+    }
+)
+
+
+def _upgrade_cockroachdb_baseline() -> bool:
+    """Upgrade the schema CRDB bootstrapped at the supported baseline.
+
+    CockroachDB bootstraps from ORM metadata and stamps
+    ``gf1b2c3d4e5f``.  That metadata already contained the original OIDC
+    table on feature-development databases, so replaying this linearized
+    migration must evolve that known table instead of creating it again.  A
+    table with a different shape is not a supported baseline and fails closed.
+    """
+    bind = op.get_bind()
+    if bind.dialect.name != "cockroachdb":
+        return False
+
+    inspector = sa.inspect(bind)
+    if "oidc_sessions" not in inspector.get_table_names():
+        return False
+
+    existing_columns = {column["name"] for column in inspector.get_columns("oidc_sessions")}
+    missing_baseline_columns = _OIDC_SESSION_BASELINE_COLUMNS - existing_columns
+    if missing_baseline_columns:
+        raise RuntimeError(
+            "CockroachDB has an unsupported oidc_sessions table; missing baseline columns: "
+            + ", ".join(sorted(missing_baseline_columns))
+        )
+
+    # These are the only columns introduced after the original OIDC table.
+    # IF NOT EXISTS makes the upgrade work both for a historical bootstrap and
+    # for a schema bootstrapped from current metadata then stamped at baseline.
+    op.execute("ALTER TABLE oidc_sessions ADD COLUMN IF NOT EXISTS provider_issuer STRING")
+    op.execute("ALTER TABLE oidc_sessions ADD COLUMN IF NOT EXISTS provider_client_id STRING")
+    op.execute(
+        "ALTER TABLE oidc_sessions ADD COLUMN IF NOT EXISTS credential_version INT8 "
+        "NOT NULL DEFAULT 0"
+    )
+    op.execute("ALTER TABLE oidc_sessions ADD COLUMN IF NOT EXISTS refresh_lease_id STRING")
+    op.execute("ALTER TABLE oidc_sessions ADD COLUMN IF NOT EXISTS refresh_lease_expires_at INT8")
+    op.execute("ALTER TABLE device_grants ADD COLUMN IF NOT EXISTS oidc_session_id BYTES")
+
+    unique_constraints = {
+        constraint["name"] for constraint in inspector.get_unique_constraints("oidc_sessions")
+    }
+    if "uq_oidc_sessions_handle_digest" not in unique_constraints:
+        op.execute(
+            "ALTER TABLE oidc_sessions ADD CONSTRAINT uq_oidc_sessions_handle_digest "
+            "UNIQUE (workspace_id, handle_digest)"
+        )
+    op.execute(
+        "CREATE INDEX IF NOT EXISTS ix_oidc_sessions_user_id "
+        "ON oidc_sessions (workspace_id, user_id)"
+    )
+    op.execute(
+        "CREATE INDEX IF NOT EXISTS ix_oidc_sessions_expiry_id "
+        "ON oidc_sessions (workspace_id, absolute_expiry, id)"
+    )
+    return True
+
 
 def upgrade() -> None:
     """Create encrypted OIDC credential storage and CLI delegation binding."""
+    if _upgrade_cockroachdb_baseline():
+        return
     op.create_table(
         "oidc_sessions",
         sa.Column(
