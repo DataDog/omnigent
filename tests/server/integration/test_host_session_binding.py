@@ -475,7 +475,16 @@ async def test_managed_session_create_end_to_end(
     # The hosts row carries the sandbox backing and is owned by the
     # caller — no auth provider on this app → the reserved local user,
     # same as a directly-connected host would be.
-    host = env.host_store.get_host(conv.host_id)
+    host = next(
+        (
+            candidate
+            for _, candidate in env.host_store.list_current_managed_sandbox_hosts_page(
+                after=None, limit=100
+            )
+            if candidate.host_id == conv.host_id
+        ),
+        None,
+    )
     assert host is not None
     assert host.user_id == RESERVED_USER_LOCAL
     assert host.status == "online"
