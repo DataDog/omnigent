@@ -1,6 +1,5 @@
-import XCTest
-
 @testable import Omnigent
+import XCTest
 
 final class OidcLoginManagerTests: XCTestCase {
   func testTicketAcceptsRootedSameOriginLoginPath() throws {

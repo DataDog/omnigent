@@ -1,6 +1,5 @@
-import XCTest
-
 @testable import Omnigent
+import XCTest
 
 final class ServerURLTests: XCTestCase {
   func testReleasePolicyDefaultsBareHostToHTTPS() throws {
