@@ -69,7 +69,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import session_live_state, shutdown_state
+from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import AuthPreparationMiddleware, AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -1603,6 +1603,22 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    from omnigent.server.connections_registry import connection_providers
+
+    _connection_inputs = {
+        "github": (github_config, github_store),
+        "databricks": (databricks_config, databricks_store),
+    }
+    for _provider in connection_providers():
+        _cfg, _store = _connection_inputs.get(_provider.name, (None, None))
+        _on = _cfg is not None and _store is not None
+        setattr(app.state, f"{_provider.name}_config", _cfg if _on else None)
+        setattr(app.state, f"{_provider.name}_store", _store if _on else None)
+        setattr(
+            app.state,
+            f"{_provider.name}_client",
+            _provider.client_factory(_cfg) if _on else None,
+        )
     # Later lifecycle operations have no request ContextVar. This resolver
     # recreates only the exact owner-bound credential session persisted with a
     # managed resource; it never searches for another user's current login.

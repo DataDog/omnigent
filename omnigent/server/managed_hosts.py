@@ -196,6 +196,7 @@ from fastapi import HTTPException
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import builtin_agent_id, now_epoch
 from omnigent.onboarding.sandboxes.context import current_managed_sandbox_context
+from omnigent.onboarding.sandboxes.types import RepoWorkspace
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
