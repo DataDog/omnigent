@@ -1244,7 +1244,9 @@ class HostStore:
                 return
             row.token_hash = None
             row.token_expires_at = None
-            row.updated_at = now_epoch()
+            row.updated_at = updated_at
+
+        run_write_transaction(self._session_immediate, "revoke_launch_token", write)
 
     def mark_managed_cleanup_pending(self, host_id: str) -> None:
         """Persist a failed exact-resource cleanup without dropping its tombstone."""
