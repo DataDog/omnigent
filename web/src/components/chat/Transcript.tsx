@@ -828,16 +828,23 @@ export function VirtualBubbleList({
         scrollEl.scrollTop = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight - 1);
         void c.scrollToBottom("instant");
       };
+      const deadline = performance.now() + SCROLL_RESTORE_BUDGET_MS;
       pinBottom();
       // Runs after sibling layout effects (notably LatestTurnSpacer) but before
       // the browser's next paint.
       queueMicrotask(() => {
         if (!done && restoringRef.current === conversationId) pinBottom();
       });
-      frame = requestAnimationFrame(() => {
+      const tick = () => {
+        if (done || restoringRef.current !== conversationId) return;
         pinBottom();
-        frame = requestAnimationFrame(finish);
-      });
+        if (performance.now() >= deadline) {
+          finish();
+          return;
+        }
+        frame = requestAnimationFrame(tick);
+      };
+      frame = requestAnimationFrame(tick);
       return finish;
     }
 
