@@ -830,6 +830,9 @@ export function VirtualBubbleList({
       };
       const deadline = performance.now() + SCROLL_RESTORE_BUDGET_MS;
       pinBottom();
+      for (const type of RESTORE_CANCEL_EVENTS) {
+        scrollEl.addEventListener(type, finish, { passive: true });
+      }
       // Runs after sibling layout effects (notably LatestTurnSpacer) but before
       // the browser's next paint.
       queueMicrotask(() => {
