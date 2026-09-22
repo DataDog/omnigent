@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import logging
 import re
 import uuid
 from collections.abc import Callable
@@ -49,6 +50,8 @@ from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.events import PolicyDeletedEvent as _TelPolicyDeletedEvent
 from omnigent.telemetry.events import PolicyRegisteredEvent as _TelPolicyRegisteredEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
+
+_logger = logging.getLogger(__name__)
 
 
 def _generate_policy_id() -> str:
@@ -255,6 +258,13 @@ def create_session_policies_router(
                 code=ErrorCode.CONFLICT,
             ) from exc
         invalidate_session_policy_specs_cache(session_id)
+        _logger.info(
+            "session_policies/create: user=%s created policy_id=%s session_id=%s handler=%s",
+            user_id or "(single-user)",
+            policy.id,
+            session_id,
+            policy.handler,
+        )
         try:
             import hashlib as _hashlib
 
@@ -416,6 +426,12 @@ def create_session_policies_router(
         if policy is None:
             raise OmnigentError("Policy not found", code=ErrorCode.NOT_FOUND)
         invalidate_session_policy_specs_cache(session_id)
+        _logger.info(
+            "session_policies/update: user=%s updated policy_id=%s session_id=%s",
+            user_id or "(single-user)",
+            policy_id,
+            session_id,
+        )
         return _entity_to_response(policy)
 
     @router.delete("/sessions/{session_id}/policies/{policy_id}")
@@ -447,6 +463,12 @@ def create_session_policies_router(
             )
         store.delete(policy_id, session_id)
         invalidate_session_policy_specs_cache(session_id)
+        _logger.info(
+            "session_policies/delete: user=%s deleted policy_id=%s session_id=%s",
+            user_id or "(single-user)",
+            policy_id,
+            session_id,
+        )
         try:
             import hashlib as _hashlib
 

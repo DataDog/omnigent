@@ -64,6 +64,7 @@ import anyio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, WebSocketException
 from starlette import status
 
+from omnigent.debug_logging import debug_event
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.dictation import (
     DictationEngine,
@@ -115,79 +116,86 @@ def create_dictation_router(
                 code=status.WS_1008_POLICY_VIOLATION,
                 reason="authentication required",
             )
-        async with get_feature_usage_recorder().operation(
+        usage = get_feature_usage_recorder().operation(
             feature_name="dictation",
             operation="take",
             actor_user_id=user_id or RESERVED_USER_LOCAL,
-        ) as usage:
-            await websocket.accept()
+        )
+        await websocket.accept()
+        _logger.info(
+            "dictation stream connected",
+            extra=debug_event("dictation_stream", phase="connected"),
+        )
 
-            if slots.locked():
-                usage.reject("capacity")
-                await websocket.close(
-                    code=_WS_CLOSE_TRY_AGAIN_LATER,
-                    reason="dictation is at capacity; try again shortly",
+        if slots.locked():
+            usage.reject("capacity")
+            await websocket.close(
+                code=_WS_CLOSE_TRY_AGAIN_LATER,
+                reason="dictation is at capacity; try again shortly",
+            )
+            return
+
+        async with slots:
+            # Engine construction loads model weights — seconds on first
+            # use. Run it off-loop; later takes reuse the shared engine.
+            try:
+                engine = await asyncio.to_thread(resolve_engine)
+                handle: DictationStreamHandle = await asyncio.to_thread(engine.create_stream)
+                usage.set_attribute("omnigent.dictation.engine", _dictation_engine_name(engine))
+            except Exception:
+                usage.fail("backend")
+                _logger.exception(
+                    "dictation engine failed to initialize",
+                    extra=debug_event("dictation_stream", phase="error", stage="engine_init"),
                 )
-                return
-
-            async with slots:
-                # Engine construction loads model weights — seconds on first
-                # use. Run it off-loop; later takes reuse the shared engine.
-                try:
-                    engine = await asyncio.to_thread(resolve_engine)
-                    handle: DictationStreamHandle = await asyncio.to_thread(engine.create_stream)
-                    usage.set_attribute(
-                        "omnigent.dictation.engine", _dictation_engine_name(engine)
+                with contextlib.suppress(RuntimeError):
+                    await websocket.send_text(
+                        json.dumps({"type": "error", "message": "dictation engine unavailable"})
                     )
-                except Exception:
+                    await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)
+                return
+            # Release the take on every exit — normal stop, abrupt browser
+            # disconnect, or a crash mid-send. For the in-process engines
+            # close() just frees the recognizer stream, so a best-effort
+            # close on the way out is enough.
+            try:
+                await websocket.send_text(json.dumps({"type": "ready"}))
+                stopped = await _pump_dictation(websocket, handle)
+                if stopped is True:
+                    usage.succeed()
+                elif stopped is False:
+                    usage.abandon()
+                else:
                     usage.fail("backend")
-                    _logger.exception("dictation engine failed to initialize")
-                    with contextlib.suppress(RuntimeError):
-                        await websocket.send_text(
-                            json.dumps(
-                                {"type": "error", "message": "dictation engine unavailable"}
-                            )
-                        )
-                        await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)
-                    return
-                # Release the take on every exit — normal stop, abrupt browser
-                # disconnect, or a crash mid-send. For the in-process engines
-                # close() just frees the recognizer stream, so a best-effort
-                # close on the way out is enough.
-                try:
-                    await websocket.send_text(json.dumps({"type": "ready"}))
-                    stopped = await _pump_dictation(websocket, handle)
-                    if stopped is True:
-                        usage.succeed()
-                    elif stopped is False:
-                        usage.abandon()
-                    else:
-                        usage.fail("backend")
-                except Exception:
-                    usage.fail("backend")
-                    raise
-                finally:
-                    # An abrupt disconnect tears the ASGI task down via
-                    # cancellation, which would cancel this close mid-await and
-                    # leak the take (the remote engine holds a worker slot until
-                    # close). Shield it so cleanup always completes.
-                    with anyio.CancelScope(shield=True):
-                        try:
-                            await asyncio.to_thread(handle.close)
-                        except Exception:  # noqa: BLE001 - fall back to a direct close
-                            # During teardown the loop's thread-pool executor may
-                            # already be shutting down, so offloading raises rather
-                            # than running close() — which would leak the take.
-                            # close() is a quick, non-blocking free for every
-                            # engine, so fall back to a direct call on the loop.
-                            with contextlib.suppress(Exception):
-                                handle.close()
+            except Exception:
+                usage.fail("backend")
+                raise
+            finally:
+                _logger.info(
+                    "dictation stream disconnected",
+                    extra=debug_event("dictation_stream", phase="disconnected"),
+                )
+                # An abrupt disconnect tears the ASGI task down via
+                # cancellation, which would cancel this close mid-await and
+                # leak the take (the remote engine holds a worker slot until
+                # close). Shield it so cleanup always completes.
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await asyncio.to_thread(handle.close)
+                    except Exception:  # noqa: BLE001 - fall back to a direct close
+                        # During teardown the loop's thread-pool executor may
+                        # already be shutting down, so offloading raises rather
+                        # than running close() — which would leak the take.
+                        # close() is a quick, non-blocking free for every
+                        # engine, so fall back to a direct call on the loop.
+                        with contextlib.suppress(Exception):
+                            handle.close()
 
     return router
 
 
 def _dictation_engine_name(engine: DictationEngine) -> str:
-    """Return one bounded engine family label without exposing configuration."""
+    """Return a bounded engine family label for feature telemetry."""
     name = type(engine).__name__.lower()
     if "remote" in name:
         return "remote"
@@ -249,7 +257,10 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
     except WebSocketDisconnect:
         return False
     except Exception:
-        _logger.exception("dictation stream failed")
+        _logger.exception(
+            "dictation stream failed",
+            extra=debug_event("dictation_stream", phase="error", stage="pump"),
+        )
         with contextlib.suppress(RuntimeError):
             await websocket.send_text(json.dumps({"type": "error", "message": "dictation failed"}))
             await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)
