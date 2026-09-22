@@ -1213,6 +1213,13 @@ def load_sandbox_config(cfg: dict[str, object]) -> ManagedSandboxDeployment | No
     import importlib
     import os
 
+    # Validate the central local-development policy before an external Habitat
+    # provider can consume a file/static exchange adapter.  The provider owns
+    # adapter construction; Omnigent only owns the opt-in boundary.
+    from omnigent.dd_hab_local_dev import hab_local_dev_overrides
+
+    hab_local_dev_overrides()
+
     module_name = os.environ.get(SANDBOX_PROVIDER_MODULE_ENV, "").strip()
     if not module_name:
         return parse_sandbox_config(cfg.get("sandbox"))
