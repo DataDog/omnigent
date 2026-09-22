@@ -27,6 +27,7 @@ from omnigent.onboarding.sandboxes.base import (
     render_host_config_write_command,
 )
 from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s as blaxel_managed_token_ttl_s
+from omnigent.onboarding.sandboxes.context import ManagedSandboxContext
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.onboarding.sandboxes.registry import (
     COMMUNITY_MODULE_PREFIX,
@@ -34,6 +35,7 @@ from omnigent.onboarding.sandboxes.registry import (
     SandboxProviderMetadata,
     reset_plugin_state_for_tests,
 )
+from omnigent.onboarding.sandboxes.types import ManagedIdentityRequirement
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
@@ -3047,10 +3049,10 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
     )
 
 
-async def test_relaunch_does_not_create_second_generation_when_old_cleanup_is_ambiguous(
+async def test_relaunch_proceeds_when_old_generation_termination_fails(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A failed exact-ID termination blocks relaunch and leaves a tombstone."""
+    """A failed best-effort old-generation termination does not block relaunch."""
     host_store = HostStore(db_uri)
 
     def _register(invocation: HostStartInvocation) -> None:
@@ -3070,16 +3072,15 @@ async def test_relaunch_does_not_create_second_generation_when_old_cleanup_is_am
         "terminate",
         lambda _sandbox_id: (_ for _ in ()).throw(click.ClickException("unavailable")),
     )
-    with pytest.raises(HTTPException) as exc:
-        await relaunch_managed_host(
-            config=_injected_config(fake), host=host, host_store=host_store
-        )
+    relaunched = await relaunch_managed_host(
+        config=_injected_config(fake), host=host, host_store=host_store
+    )
 
-    assert exc.value.status_code == 409
-    assert fake.provisioned_names == ["managed-" + first.host_id[:8]]
-    tombstone = host_store.get_host(first.host_id)
-    assert tombstone is not None
-    assert tombstone.deleted_at is None
+    assert relaunched.host_id == first.host_id
+    assert fake.provisioned_names == ["managed-" + first.host_id[:8]] * 2
+    current = host_store.get_host(first.host_id)
+    assert current is not None
+    assert current.sandbox_id == "sb-fake-2"
 
 
 async def test_relaunch_rejects_unconfigured_provider(db_uri: str) -> None:
@@ -4326,6 +4327,7 @@ async def test_kick_managed_relaunch_defers_the_classifier_to_the_launch_task(
         app_state=SimpleNamespace(
             agent_store=store,
         ),
+        operation_context=ManagedSandboxContext("conv_1", _OWNER, None),
     )
     scheduled = set(orchestration._managed_launch_tasks) - before
     assert scheduled, "the claim was taken but no task was scheduled to settle it"
@@ -4380,6 +4382,7 @@ async def test_relaunch_claim_and_launch_task_are_one_synchronous_step(
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
         app_state=SimpleNamespace(agent_store=_StubAgentStore()),
+        operation_context=ManagedSandboxContext("conv_1", _OWNER, None),
     )
     scheduled = set(orchestration._managed_launch_tasks) - before
     assert scheduled, "the claim was taken but no task was scheduled to settle it"
@@ -4415,6 +4418,7 @@ async def test_kick_managed_relaunch_without_agent_store_threads_none(
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
         app_state=SimpleNamespace(),
+        operation_context=ManagedSandboxContext("conv_1", _OWNER, None),
     )
     scheduled = set(orchestration._managed_launch_tasks) - before
     await asyncio.gather(*scheduled)
@@ -4449,7 +4453,9 @@ async def test_run_managed_launch_leaves_the_runner_unclassified(
     await orchestration._run_managed_launch(
         session_id="conv_1",
         owner=_OWNER,
-        sandbox_config=SimpleNamespace(),
+        sandbox_config=SimpleNamespace(
+            managed_identity_requirement=lambda *_args: ManagedIdentityRequirement.NONE
+        ),
         repos=[],
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(),
@@ -4749,7 +4755,9 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
     )
     app_state = SimpleNamespace(
         host_store=SimpleNamespace(get_host=lambda _hid: dead_host, is_online=lambda _hid: False),
-        sandbox_config=SimpleNamespace(),
+        sandbox_config=SimpleNamespace(
+            managed_identity_requirement=lambda *_args: ManagedIdentityRequirement.NONE
+        ),
         managed_launches=tracker,
         agent_store=_StubAgentStore({builtin.id: builtin}),
         host_registry=None,
