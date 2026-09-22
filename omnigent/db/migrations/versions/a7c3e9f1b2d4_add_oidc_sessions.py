@@ -11,11 +11,14 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects import mysql
 
 revision: str = "a7c3e9f1b2d4"
 down_revision: str | None = "ga1b2c3d4e5f"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
+
+_UUID16 = sa.LargeBinary(16).with_variant(mysql.BINARY(16), "mysql")
 
 
 def upgrade() -> None:
@@ -35,7 +38,7 @@ def upgrade() -> None:
             nullable=False,
             server_default="0",
         ),
-        sa.Column("id", sa.LargeBinary(16), primary_key=True, nullable=False),
+        sa.Column("id", _UUID16, primary_key=True, nullable=False),
         sa.Column("handle_digest", sa.String(64), nullable=False),
         sa.Column("user_id", sa.String(256), nullable=False),
         sa.Column("provider_subject", sa.String(256), nullable=True),
