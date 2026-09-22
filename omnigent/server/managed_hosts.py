@@ -3490,7 +3490,12 @@ async def relaunch_managed_host(
     # The old generation is normally already dead (that is why we are
     # here), but terminate defensively so a transient tunnel outage
     # can never leave two live sandboxes claiming one host identity.
-    terminated = await _terminate_sandbox_best_effort(launcher, host)
+    terminated = host.sandbox_id is None or await _terminate_sandbox_best_effort(
+        launcher,
+        host.sandbox_id,
+        host_id=host.host_id,
+        provider=host.sandbox_provider,
+    )
     if not terminated:
         await asyncio.to_thread(host_store.revoke_launch_token, host.host_id)
         await asyncio.to_thread(host_store.mark_managed_cleanup_pending, host.host_id)
@@ -3703,7 +3708,12 @@ async def _register_and_start_host(
         # cap. Cleanup-then-reraise at a system boundary, not a
         # swallow: every path below re-raises as an HTTPException.
         if keep_host_on_failure:
-            terminated = await _terminate_sandbox_best_effort(launcher, record)
+            terminated = await _terminate_sandbox_best_effort(
+                launcher,
+                sandbox_id,
+                host_id=record.host_id,
+                provider=record.sandbox_provider,
+            )
             await asyncio.to_thread(host_store.revoke_launch_token, host_id)
             if not terminated:
                 await asyncio.to_thread(host_store.mark_managed_cleanup_pending, host_id)
@@ -4001,11 +4011,7 @@ async def terminate_managed_host(
     config: ManagedSandboxDeployment | None,
 ) -> bool:
     """
-    Terminate a managed host's sandbox and delete its row only after provider confirmation.
-
-    Revoke the local token before contacting the provider. A failure retains
-    the exact-resource row as a cleanup-pending tombstone so relaunch cannot
-    create a second generation while the old one is ambiguous.
+    Terminate a managed host's sandboxes and retain failed cleanup as a tombstone.
 
     :param host: The managed host to tear down. Active and pending sandbox ids
         are both terminated when present.
@@ -4014,63 +4020,56 @@ async def terminate_managed_host(
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
     """
-    # Re-read so a repeated delete after confirmed cleanup is idempotent and
-    # never sends another provider operation for a resource we no longer own.
-    persisted = await asyncio.to_thread(host_store.get_host, host.host_id)
-    if persisted is None:
+    tombstone = await asyncio.to_thread(host_store.delete_host, host.host_id)
+    if tombstone is None:
         return True
-    host = persisted
-    await asyncio.to_thread(host_store.revoke_launch_token, host.host_id)
-    launcher = _launcher_for_teardown(host, config)
-    if await _terminate_sandbox_best_effort(launcher, host):
-        await asyncio.to_thread(host_store.delete_host, host.host_id)
-        return True
-    await asyncio.to_thread(host_store.mark_managed_cleanup_pending, host.host_id)
-    return False
+    launcher = _launcher_for_teardown(tombstone, config)
+    all_terminated = True
+    for sandbox_id in dict.fromkeys((tombstone.sandbox_id, tombstone.terminating_sandbox_id)):
+        if sandbox_id is None:
+            continue
+        terminated = await _terminate_sandbox_best_effort(
+            launcher,
+            sandbox_id,
+            host_id=tombstone.host_id,
+            provider=tombstone.sandbox_provider,
+        )
+        if terminated:
+            await asyncio.to_thread(
+                host_store.mark_sandbox_terminated,
+                tombstone.host_id,
+                sandbox_id=sandbox_id,
+            )
+        else:
+            all_terminated = False
+    return all_terminated
 
 
 async def _terminate_sandbox_best_effort(
     launcher: SandboxHostLauncher | None,
-    host: Host,
+    sandbox_id: str,
+    *,
+    host_id: str,
+    provider: str | None,
 ) -> bool:
-    """
-    Terminate a managed host's sandbox without touching its row.
-
-    Best-effort by design: termination failures (or a
-    missing/mismatched launcher after a config change) are logged, not
-    raised — the provider's lifetime cap reaps stragglers, and callers
-    (session delete, launch-failure cleanup, relaunch) must not be
-    blocked by provider hiccups.
-
-    :param launcher: Provider-matched launcher from
-        :func:`_launcher_for_teardown`, or ``None`` when no matching
-        launcher is available (logged, nothing terminated).
-    :param host: The host whose ``sandbox_id`` names the sandbox.
-    """
-    if launcher is not None and host.sandbox_id is not None:
-        try:
-            await asyncio.to_thread(launcher.terminate, host.sandbox_id)
-            return True
-        except Exception:  # noqa: BLE001
-            # provider-API boundary on a cleanup path. The provider SDK can
-            # fail here in many shapes (auth/config ClickException, network
-            # errors, SDK-internal exceptions), the sandbox may already be
-            # gone past its lifetime cap, and NONE of those may block the
-            # caller's remaining cleanup (deleting the host row / revoking
-            # the launch token), which only we can do.
-            _logger.warning(
-                "Failed to terminate managed sandbox %s (provider=%s) for host %s",
-                host.sandbox_id,
-                host.sandbox_provider,
-                host.host_id,
-                exc_info=True,
-            )
-            return False
-    else:
+    """Terminate one provider sandbox id without touching its host row."""
+    if launcher is None:
         _logger.warning(
             "No launcher available for managed sandbox provider %s; "
             "sandbox %s must be deleted with the provider's own tooling",
-            host.sandbox_provider,
-            host.sandbox_id,
+            provider,
+            sandbox_id,
         )
-    return False
+        return False
+    try:
+        await asyncio.to_thread(launcher.terminate, sandbox_id)
+        return True
+    except Exception:  # noqa: BLE001 — provider cleanup must remain best-effort.
+        _logger.warning(
+            "Failed to terminate managed sandbox %s (provider=%s) for host %s",
+            sandbox_id,
+            provider,
+            host_id,
+            exc_info=True,
+        )
+        return False

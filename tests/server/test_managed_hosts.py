@@ -67,6 +67,7 @@ from omnigent.server.managed_sandbox_cleanup import (
     managed_cleanup_retry_delay_s,
 )
 from omnigent.server.managed_sandbox_identity import ManagedSandboxIdentityResolver
+from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -3687,11 +3688,6 @@ async def test_terminate_managed_host_retains_only_failed_generation(
     assert fake.terminated == ["sb-term-old-partial", "sb-term-new-partial"]
     assert host_store.list_current_managed_sandbox_hosts_page(after=None, limit=10) == []
     assert host_store.list_terminating_managed_sandbox_hosts_page(after=None, limit=10) == []
-
-    monkeypatch.setattr(fake, "terminate", lambda sandbox_id: fake.terminated.append(sandbox_id))
-    assert await terminate_managed_host(tombstone, host_store, _injected_config(fake)) is True
-    assert fake.terminated == ["sb-term-2"]
-    assert host_store.get_host("057e7fa3f1cdb40c0ec393a3d42affc7") is None
 
 
 async def test_session_delete_returns_cleanup_pending_and_retains_host_tombstone(

@@ -1553,6 +1553,8 @@ def create_app(
         try:
             yield
         finally:
+            if managed_sandbox_reaper is not None:
+                await managed_sandbox_reaper.shutdown()
             if managed_sandbox_cleanup_reconciler is not None:
                 await managed_sandbox_cleanup_reconciler.stop()
             # Run completion is event-driven (the _publish_status hook) plus a
