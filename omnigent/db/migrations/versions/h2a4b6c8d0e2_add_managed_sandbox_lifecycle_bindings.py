@@ -1,7 +1,7 @@
 """add durable managed-sandbox lifecycle bindings
 
 Revision ID: h2a4b6c8d0e2
-Revises: a7c3e9f1b2d4
+Revises: gg1b2c3d4e5f
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "h2a4b6c8d0e2"
-down_revision: str | None = "a7c3e9f1b2d4"
+down_revision: str | None = "gg1b2c3d4e5f"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

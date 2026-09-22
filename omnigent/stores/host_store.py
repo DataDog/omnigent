@@ -178,6 +178,8 @@ def _row_to_host(row: SqlHost) -> Host:
         workspace_id=row.workspace_id,
         sandbox_provider=row.sandbox_provider,
         sandbox_id=row.sandbox_id,
+        terminating_sandbox_id=row.terminating_sandbox_id,
+        deleted_at=row.deleted_at,
         sandbox_session_id=row.sandbox_session_id,
         sandbox_credential_session_id=row.sandbox_credential_session_id,
         sandbox_lifecycle_state=row.sandbox_lifecycle_state,
