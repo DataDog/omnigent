@@ -348,6 +348,25 @@ def test_delete_expired_removes_old_sessions(session_factory) -> None:
     assert store.resolve(handle_active) is not None
 
 
+def test_delete_expired_batch_is_bounded(session_factory) -> None:
+    """Expiry maintenance deletes bounded indexed batches."""
+    store = _make_store(session_factory)
+    past = int(time.time()) - 1
+    for number in range(3):
+        store.create(
+            user_id=f"expired-{number}@example.com",
+            provider_subject=f"sub-{number}",
+            provider_issuer=_TEST_ISSUER,
+            provider_client_id=_TEST_CLIENT_ID,
+            id_token="id",
+            refresh_token="refresh",
+            id_token_expiry=past,
+            absolute_expiry=past,
+        )
+    assert store.delete_expired_batch(limit=2) == 2
+    assert store.delete_expired_batch(limit=2) == 1
+
+
 def test_wrong_user_id_fails_closed(session_factory) -> None:
     """get_credentials with wrong user_id fails closed."""
     store = _make_store(session_factory)

@@ -21,7 +21,7 @@ import uuid
 from dataclasses import dataclass
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from sqlalchemy import or_, select, update
+from sqlalchemy import delete, or_, select, update
 
 from omnigent.db.db_models import SqlOidcSession, current_workspace_id
 from omnigent.db.query_context import query_name_scope
@@ -271,11 +271,15 @@ class OidcSessionStore:
                 select(SqlOidcSession).where(
                     SqlOidcSession.workspace_id == current_workspace_id(),
                     SqlOidcSession.handle_digest == digest,
-                    SqlOidcSession.revoked_at.is_(None),
-                    SqlOidcSession.absolute_expiry > now,
                 )
             ).scalar_one_or_none()
-            if row is None:
+            if row is None or row.revoked_at is not None:
+                return None
+            if row.absolute_expiry <= now:
+                # Credentials are disposable secrets. Expiry observation is a
+                # deletion opportunity rather than leaving a dead row behind.
+                session.delete(row)
+                session.commit()
                 return None
             return row.user_id, row.id, row.provider_subject or ""
 
@@ -669,27 +673,39 @@ class OidcSessionStore:
             session.commit()
         return True
 
-    def delete_expired(self) -> int:
-        """Delete expired and revoked sessions. Returns the count deleted."""
-        # TODO: Schedule this from server lifespan as bounded OIDC maintenance.
-        now = int(time.time())
+    def delete_expired_batch(self, now: int | None = None, limit: int = 100) -> int:
+        """Delete at most ``limit`` expired or revoked disposable sessions."""
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        now = int(time.time()) if now is None else now
         with (
             query_name_scope("omnigent.oidc_session_store.delete_expired_sessions"),
             self._session_factory() as session,
         ):
-            result = (
+            ids = (
                 session.execute(
-                    select(SqlOidcSession).where(
+                    select(SqlOidcSession.id)
+                    .where(
                         SqlOidcSession.workspace_id == current_workspace_id(),
                         (SqlOidcSession.absolute_expiry <= now)
                         | (SqlOidcSession.revoked_at.is_not(None)),
                     )
+                    .order_by(SqlOidcSession.absolute_expiry, SqlOidcSession.id)
+                    .limit(limit)
                 )
                 .scalars()
                 .all()
             )
-            count = len(result)
-            for row in result:
-                session.delete(row)
+            if ids:
+                session.execute(
+                    delete(SqlOidcSession).where(
+                        SqlOidcSession.workspace_id == current_workspace_id(),
+                        SqlOidcSession.id.in_(ids),
+                    )
+                )
             session.commit()
-        return count
+        return len(ids)
+
+    def delete_expired(self) -> int:
+        """Compatibility wrapper for one bounded expiry-maintenance batch."""
+        return self.delete_expired_batch()

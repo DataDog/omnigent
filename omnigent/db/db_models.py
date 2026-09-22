@@ -1745,6 +1745,7 @@ class SqlOidcSession(OmnigentBase):
     revoked_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     __table_args__ = (
-        Index("ix_oidc_sessions_handle_digest", "workspace_id", "handle_digest"),
+        UniqueConstraint("workspace_id", "handle_digest", name="uq_oidc_sessions_handle_digest"),
         Index("ix_oidc_sessions_user_id", "workspace_id", "user_id"),
+        Index("ix_oidc_sessions_expiry_id", "workspace_id", "absolute_expiry", "id"),
     )
