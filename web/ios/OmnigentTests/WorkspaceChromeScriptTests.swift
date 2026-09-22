@@ -1,6 +1,5 @@
-import XCTest
-
 @testable import Omnigent
+import XCTest
 
 final class WorkspaceChromeScriptTests: XCTestCase {
   /// The rule must key on Omnigent's own embed root, not on the monolith-owned

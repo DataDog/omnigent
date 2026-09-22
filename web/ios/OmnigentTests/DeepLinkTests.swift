@@ -1,6 +1,5 @@
-import XCTest
-
 @testable import Omnigent
+import XCTest
 
 final class DeepLinkTests: XCTestCase {
   /// A real conversation id — a bare 32-char hex uuid, the form the API emits

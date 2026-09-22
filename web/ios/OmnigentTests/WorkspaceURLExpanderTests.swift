@@ -1,7 +1,6 @@
 import Foundation
-import XCTest
-
 @testable import Omnigent
+import XCTest
 
 final class WorkspaceURLExpanderTests: XCTestCase {
   override func setUp() {

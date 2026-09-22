@@ -1,7 +1,6 @@
 import ManagedApp
-import XCTest
-
 @testable import Omnigent
+import XCTest
 
 /// Decodes the configuration straight from property lists, the exact shape the
 /// ManagedApp framework hands `init(from:)`. No MDM, device management, or
