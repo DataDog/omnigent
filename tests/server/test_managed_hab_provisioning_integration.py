@@ -29,7 +29,6 @@ import threading
 import uuid
 from collections.abc import Iterator
 from concurrent import futures
-from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,26 +38,18 @@ from urllib.parse import parse_qs, urlparse
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
-from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from jwt.algorithms import RSAAlgorithm
-from sqlalchemy import create_engine, update
+from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from omnigent.db.db_models import OmnigentBase, SqlOidcSession
-from omnigent.onboarding.sandboxes.context import managed_sandbox_context_scope
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     host_sandbox_is_running,
-    relaunch_managed_host,
-    terminate_managed_host,
-)
-from omnigent.server.managed_sandbox_identity import (
-    ManagedSandboxIdentityResolver,
-    ManagedSandboxIdentityUnavailable,
 )
 from omnigent.server.oidc import OIDCConfig
 from omnigent.server.oidc_session_store import OidcSessionStore
@@ -585,27 +576,6 @@ def _assert_no_token_material(caplog: pytest.LogCaptureFixture, *secrets: str) -
             assert secret not in message, f"token material leaked into logs: {message!r}"
 
 
-def _reconstructed_identity_resolver(harness: _Harness) -> ManagedSandboxIdentityResolver:
-    """Model a server restart by rebuilding the encrypted-session access layer."""
-    reconstructed_store = OidcSessionStore(harness.session_factory, credential_key=_TEST_KEY)
-    reconstructed_auth = UnifiedAuthProvider(
-        source="oidc",
-        oidc_config=harness.oidc_config,
-        oidc_session_store=reconstructed_store,
-    )
-    return ManagedSandboxIdentityResolver(reconstructed_auth)
-
-
-def _replace_workload_bearer(path: Path, name: str) -> str:
-    """Atomically rotate the local-only workload file between operations."""
-    value = _workload_bearer(name)
-    replacement = path.with_name(f"{path.name}.replacement")
-    replacement.write_text(f"{value}\n")
-    replacement.chmod(0o600)
-    replacement.replace(path)
-    return value
-
-
 # ---------------------------------------------------------------------------
 # The chain, end to end
 # ---------------------------------------------------------------------------
@@ -719,12 +689,12 @@ async def test_two_users_never_share_credentials(
     _assert_no_token_material(caplog, alice_token, bob_token, workload_bearer, "obo-INTEGRATION-")
 
 
-async def test_lifecycle_operations_rebuild_the_exact_owner_context_and_reread_workload_file(
+async def test_status_and_cleanup_do_not_reconstruct_browser_authority(
     harness: _Harness,
     keys: _IdpKeys,
 ) -> None:
-    """Later status/relaunch/delete use the persisted owner, not request context."""
-    handle, alice_token = harness.login(keys, _ALICE)
+    """Status and provider-owned cleanup do not read a durable login session."""
+    handle, _ = harness.login(keys, _ALICE)
     async with harness.client_for(handle) as client:
         agent = await create_test_agent(client, name="hab-int-lifecycle")
         before = set(_managed_launch_tasks)
@@ -733,136 +703,17 @@ async def test_lifecycle_operations_rebuild_the_exact_owner_context_and_reread_w
 
         host = harness.app.state.host_store.list_hosts(_ALICE)[0]
         initial_hab_id = host.sandbox_id
-        initial_workload = harness.workload_file.read_text().strip()
-        resolver = _reconstructed_identity_resolver(harness)
-        status_context = resolver.for_host(host)
-        assert status_context.credential_session_id == host.sandbox_credential_session_id
-        with managed_sandbox_context_scope(status_context):
-            assert (
-                await asyncio.to_thread(
-                    host_sandbox_is_running,
-                    host,
-                    harness.app.state.sandbox_config,
-                )
-                is True
+        assert (
+            await asyncio.to_thread(
+                host_sandbox_is_running,
+                host,
+                harness.app.state.sandbox_config,
             )
-
-        rotated_workload = _replace_workload_bearer(harness.workload_file, "after-status")
-        relaunch_context = _reconstructed_identity_resolver(harness).for_host(host)
-        with managed_sandbox_context_scope(relaunch_context):
-            relaunched = await relaunch_managed_host(
-                config=harness.app.state.sandbox_config,
-                host=host,
-                host_store=harness.app.state.host_store,
-            )
-
-        refreshed_host = harness.app.state.host_store.get_host(relaunched.host_id)
-        assert refreshed_host is not None
-        assert refreshed_host.host_id == host.host_id
-        assert refreshed_host.sandbox_id != initial_hab_id
-        assert refreshed_host.sandbox_credential_session_id == host.sandbox_credential_session_id
+            is True
+        )
 
         response = await client.delete(f"/v1/sessions/{session_id}")
         assert response.status_code == 200, response.text
         assert response.json()["cleanup_pending"] is False
 
-    # The boundary was used for independent create, status, relaunch, and
-    # delete calls. Workload rotation applies only to later operations.
-    authorizations = {call["authorization"] for call in harness.exchange.calls}
-    assert f"Bearer {initial_workload}" in authorizations
-    assert f"Bearer {rotated_workload}" in authorizations
-    assert all(call["subject_token"] == alice_token for call in harness.exchange.calls)
-    assert [call["hab_id"] for call in harness.hab_service.deletehab_calls] == [
-        initial_hab_id,
-        refreshed_host.sandbox_id,
-    ]
-
-
-async def test_failed_cleanup_keeps_exact_tombstone_and_blocks_duplicate_generation(
-    harness: _Harness,
-    keys: _IdpKeys,
-) -> None:
-    """An ambiguous delete retries only the recorded UUID and never provisions again."""
-    handle, _ = harness.login(keys, _ALICE)
-    async with harness.client_for(handle) as client:
-        agent = await create_test_agent(client, name="hab-int-cleanup")
-        before = set(_managed_launch_tasks)
-        session_id = await _create_managed_session(client, agent["id"])
-        await _await_settled(before)
-
-        host = harness.app.state.host_store.list_hosts(_ALICE)[0]
-        exact_hab_id = host.sandbox_id
-        create_calls_before_delete = len(harness.hab_service.createhab_calls)
-        harness.hab_service.fail_next_delete = True
-        response = await client.delete(f"/v1/sessions/{session_id}")
-        assert response.status_code == 200, response.text
-        assert response.json()["cleanup_pending"] is True
-
-    tombstone = harness.app.state.host_store.get_host(host.host_id)
-    assert tombstone is not None
-    assert tombstone.sandbox_id == exact_hab_id
-    assert tombstone.sandbox_lifecycle_state == "cleanup_pending"
-    assert tombstone.sandbox_cleanup_attempts == 1
-
-    with pytest.raises(HTTPException, match="cleanup is pending"):
-        await relaunch_managed_host(
-            config=harness.app.state.sandbox_config,
-            host=tombstone,
-            host_store=harness.app.state.host_store,
-        )
-    assert len(harness.hab_service.createhab_calls) == create_calls_before_delete
-
-    retry_context = _reconstructed_identity_resolver(harness).for_host(tombstone)
-    with managed_sandbox_context_scope(retry_context):
-        assert await terminate_managed_host(
-            tombstone,
-            harness.app.state.host_store,
-            harness.app.state.sandbox_config,
-        )
-    assert harness.app.state.host_store.get_host(host.host_id) is None
-    assert [call["hab_id"] for call in harness.hab_service.deletehab_calls] == [
-        exact_hab_id,
-        exact_hab_id,
-    ]
-
-
-async def test_missing_revoked_or_expired_owner_session_fails_before_lifecycle_exchange(
-    harness: _Harness,
-    keys: _IdpKeys,
-) -> None:
-    """A reconstructed lifecycle cannot fall back to a different credential."""
-    handle, _ = harness.login(keys, _ALICE)
-    async with harness.client_for(handle) as client:
-        agent = await create_test_agent(client, name="hab-int-revoked-owner")
-        before = set(_managed_launch_tasks)
-        await _create_managed_session(client, agent["id"])
-        await _await_settled(before)
-
-    host = harness.app.state.host_store.list_hosts(_ALICE)[0]
-    assert host.sandbox_credential_session_id is not None
-    exchange_count = len(harness.exchange.calls)
-    harness.store.revoke(host.sandbox_credential_session_id)
-
-    with pytest.raises(ManagedSandboxIdentityUnavailable, match="reauthentication"):
-        _reconstructed_identity_resolver(harness).for_host(host)
-    with pytest.raises(ManagedSandboxIdentityUnavailable, match="reauthentication"):
-        _reconstructed_identity_resolver(harness).for_host(
-            replace(host, sandbox_credential_session_id=uuid.uuid4().hex)
-        )
-
-    fresh_handle, _ = harness.login(keys, _ALICE)
-    resolved = harness.store.resolve(fresh_handle)
-    assert resolved is not None
-    expired_session_id = resolved[1]
-    with harness.session_factory() as session:
-        session.execute(
-            update(SqlOidcSession)
-            .where(SqlOidcSession.id == expired_session_id)
-            .values(absolute_expiry=0)
-        )
-        session.commit()
-    with pytest.raises(ManagedSandboxIdentityUnavailable, match="reauthentication"):
-        _reconstructed_identity_resolver(harness).for_host(
-            replace(host, sandbox_credential_session_id=expired_session_id)
-        )
-    assert len(harness.exchange.calls) == exchange_count
+    assert [call["hab_id"] for call in harness.hab_service.deletehab_calls] == [initial_hab_id]

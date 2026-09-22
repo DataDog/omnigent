@@ -99,8 +99,6 @@ class Host:
     workspace_id: int = 0
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
-    sandbox_session_id: str | None = None
-    sandbox_credential_session_id: str | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
@@ -178,8 +176,6 @@ def _row_to_host(row: SqlHost) -> Host:
         sandbox_id=row.sandbox_id,
         terminating_sandbox_id=row.terminating_sandbox_id,
         deleted_at=row.deleted_at,
-        sandbox_session_id=row.sandbox_session_id,
-        sandbox_credential_session_id=row.sandbox_credential_session_id,
         configured_harnesses=_parse_configured_harnesses(row.configured_harnesses),
     )
 
@@ -437,8 +433,6 @@ class HostStore:
         token_expires_at = row.token_expires_at
         sandbox_provider = row.sandbox_provider
         sandbox_id = row.sandbox_id
-        sandbox_session_id = row.sandbox_session_id
-        sandbox_credential_session_id = row.sandbox_credential_session_id
         terminating_sandbox_id = row.terminating_sandbox_id
 
         bound_ids = list(
@@ -481,8 +475,6 @@ class HostStore:
             token_expires_at=token_expires_at,
             sandbox_provider=sandbox_provider,
             sandbox_id=sandbox_id,
-            sandbox_session_id=sandbox_session_id,
-            sandbox_credential_session_id=sandbox_credential_session_id,
             terminating_sandbox_id=terminating_sandbox_id,
             configured_harnesses=harnesses_json,
         )
@@ -851,8 +843,6 @@ class HostStore:
         provider: str,
         sandbox_id: str,
         token_expires_at: int,
-        session_id: str | None = None,
-        credential_session_id: str | None = None,
     ) -> Host:
         """
         Create a server-managed sandbox host with its credential.
@@ -895,8 +885,6 @@ class HostStore:
                 token_expires_at=token_expires_at,
                 sandbox_provider=provider,
                 sandbox_id=sandbox_id,
-                sandbox_session_id=session_id,
-                sandbox_credential_session_id=credential_session_id,
             )
             session.add(row)
             return _row_to_host(row)

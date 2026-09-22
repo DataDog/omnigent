@@ -2935,8 +2935,8 @@ async def test_launch_entrypoint_provider_cleans_up_on_launch_failure(db_uri: st
 # ── relaunch_managed_host ───────────────────────────────────
 
 
-def test_managed_host_persists_non_secret_lifecycle_binding(db_uri: str) -> None:
-    """Restart recovery retains only opaque owner/resource lifecycle references."""
+def test_managed_host_persists_provider_resource_binding(db_uri: str) -> None:
+    """Restart recovery retains the provider resource, not request authority."""
     HostStore(db_uri).register_managed_host(
         host_id="f2a2b3c4d5e6f708192a3b4c5d6e7f80",
         name="managed-lifecycle",
@@ -2945,16 +2945,12 @@ def test_managed_host_persists_non_secret_lifecycle_binding(db_uri: str) -> None
         provider="hab",
         sandbox_id="hab-exact-uuid",
         token_expires_at=now_epoch() + 3600,
-        session_id="conv-lifecycle",
-        credential_session_id="oidc-session-ref",
     )
 
     recovered = HostStore(db_uri).get_host("f2a2b3c4d5e6f708192a3b4c5d6e7f80")
     assert recovered is not None
     assert recovered.sandbox_provider == "hab"
     assert recovered.sandbox_id == "hab-exact-uuid"
-    assert recovered.sandbox_session_id == "conv-lifecycle"
-    assert recovered.sandbox_credential_session_id == "oidc-session-ref"
 
 
 async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) -> None:
@@ -4322,8 +4318,6 @@ async def test_kick_managed_relaunch_defers_the_classifier_to_the_launch_task(
         conv=conv,
         host=SimpleNamespace(
             user_id=_OWNER,
-            sandbox_credential_session_id=_TEST_CREDENTIAL_SESSION_ID,
-            sandbox_session_id="conv_1",
         ),
         sandbox_config=SimpleNamespace(),
         tracker=tracker,
@@ -4380,8 +4374,6 @@ async def test_relaunch_claim_and_launch_task_are_one_synchronous_step(
         conv=conv,
         host=SimpleNamespace(
             user_id=_OWNER,
-            sandbox_credential_session_id=_TEST_CREDENTIAL_SESSION_ID,
-            sandbox_session_id="conv_1",
         ),
         sandbox_config=SimpleNamespace(),
         tracker=tracker,
@@ -4417,8 +4409,6 @@ async def test_kick_managed_relaunch_without_agent_store_threads_none(
         conv=conv,
         host=SimpleNamespace(
             user_id=_OWNER,
-            sandbox_credential_session_id=_TEST_CREDENTIAL_SESSION_ID,
-            sandbox_session_id="conv_1",
         ),
         sandbox_config=SimpleNamespace(),
         tracker=ManagedLaunchTracker(),
@@ -4756,8 +4746,6 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
         user_id=_OWNER,
         status="offline",
         updated_at=0,
-        sandbox_credential_session_id=_TEST_CREDENTIAL_SESSION_ID,
-        sandbox_session_id="conv_1",
     )
     app_state = SimpleNamespace(
         host_store=SimpleNamespace(get_host=lambda _hid: dead_host, is_online=lambda _hid: False),
