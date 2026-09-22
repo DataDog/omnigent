@@ -1184,12 +1184,6 @@
       "ConversationDeleted": {
         "description": "Confirmation payload returned after deleting a conversation.",
         "properties": {
-          "cleanup_pending": {
-            "default": false,
-            "description": "`True` when the remote managed resource could not be confirmed deleted and its local tombstone was retained.",
-            "title": "Cleanup Pending",
-            "type": "boolean"
-          },
           "deleted": {
             "default": true,
             "description": "Always `True`.",
