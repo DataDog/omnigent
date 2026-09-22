@@ -888,6 +888,7 @@ class HostStore:
         """
         now = now_epoch()
         token_hash = hash_host_launch_token(token)
+
         def write(session: Session) -> Host:
             existing = session.execute(
                 select(SqlHost).where(
