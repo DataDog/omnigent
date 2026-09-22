@@ -293,6 +293,10 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # The session's agent was deleted or rebound; the caller must recreate the
     # agent or start a new session. Not a runner/server fault.
     ErrorCode.SESSION_AGENT_MISSING: ErrorCategory.USER,
+    # The selected provider either cannot accept the caller's identity type or
+    # needs the caller to sign in again before it can perform the operation.
+    ErrorCode.PROVIDER_IDENTITY_NOT_SUPPORTED: ErrorCategory.USER,
+    ErrorCode.REAUTHENTICATION_REQUIRED: ErrorCategory.USER,
     # A dependency tore down the in-flight call; the fix (if any) is upstream.
     ErrorCode.UPSTREAM_CANCELLED: ErrorCategory.UPSTREAM,
 }
@@ -324,6 +328,8 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorImpact.BLOCKING,
     ErrorCode.WORKSPACE_MISSING: ErrorImpact.BLOCKING,
     ErrorCode.SESSION_AGENT_MISSING: ErrorImpact.BLOCKING,
+    ErrorCode.PROVIDER_IDENTITY_NOT_SUPPORTED: ErrorImpact.BLOCKING,
+    ErrorCode.REAUTHENTICATION_REQUIRED: ErrorImpact.BLOCKING,
     # Self-healing: a session state that resumes on reconnect, a routing
     # artifact the client re-addresses, and an upstream cancellation a retry
     # outlives. No progress is lost.
@@ -368,6 +374,8 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorPhase.HARNESS_SETUP,
     ErrorCode.WORKSPACE_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.SESSION_AGENT_MISSING: ErrorPhase.HARNESS_SETUP,
+    ErrorCode.PROVIDER_IDENTITY_NOT_SUPPORTED: ErrorPhase.REQUEST,
+    ErrorCode.REAUTHENTICATION_REQUIRED: ErrorPhase.REQUEST,
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: ErrorPhase.TURN,
     ErrorCode.INTERNAL_ERROR: ErrorPhase.UNKNOWN,
     # Context-driven: a backing call can be cancelled while serving any stage.
