@@ -273,6 +273,9 @@ jobs:
           # uses this instead of running cargo build. Absolute path: the
           # fixture runs with cwd at the repo root but be explicit.
           CODEX_PARITY_SIDECAR_BIN: ${{ github.workspace }}/.tmp-codex-parity-target/debug/codex-parity-sidecar
+          # The OIDC login fixture starts a server with encrypted provider
+          # credentials; use a deterministic test-only 32-byte key.
+          OMNIGENT_OIDC_CREDENTIAL_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
         run: |
           # Always exclude @visual: the UI diff snapshot runs in its own
           # pinned-runner gate (ui-snapshot.yml) so its baseline matches the
