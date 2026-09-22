@@ -185,15 +185,18 @@ sequencing it first. The migration chains off the current `upstream/main` head
 to a single Alembic head; a test guards that
 (`tests/db/test_migration_connections.py`).
 
-## Broker endpoint (future generalization)
+## Broker endpoint (provider-generic)
 
-The credential broker currently vends only GitHub:
-`GET /v1/hosts/{host_id}/github-credential`. When a second provider needs
-on-demand delivery to a sandbox, this becomes
-`GET /v1/hosts/{host_id}/credentials/{provider}` returning the provider's secret
-+ attribution metadata, with the git credential helper and the GitHub MCP proxy
-passing `provider=github`. Kept GitHub-specific for now to limit blast radius;
-the store change is the prerequisite that makes it a small follow-up.
+The credential broker is generic over providers:
+`GET /v1/hosts/{host_id}/credentials/{provider}` resolves the launch token to
+the session owner and returns that provider's secret + attribution metadata
+(the git credential helper and the GitHub MCP proxy pass `provider=github`).
+One route (`routes/host_credentials.py`) serves every provider that registers a
+`credential_resolver` on the `ConnectionProvider` registry; a provider with no
+resolver — connect-only, or on-demand delivery not built yet — returns `404`. A
+new provider is one registry entry, not another hand-copied route + client. The
+resolver is best-effort: a fault degrades to `{"connected": false}` rather than
+a 500, and the token is never persisted in the sandbox.
 
 ## Revocation & audit note
 
@@ -206,12 +209,22 @@ launch tokens. So "stops vending when the session ends" must remain a
 server-side check on the broker path, independent of KMS; KMS is defence in
 depth on the storage, not the session boundary.
 
-## Dependency
+## Dependencies
 
-The KMS cipher needs boto3, declared as the `credentials` extra
-(`omnigent[credentials]`). It is imported lazily and only when a KMS key is
-configured, so a deployment that doesn't enable the integration credential store
-neither needs boto3 nor talks to AWS.
+The credential store is backend-agnostic; each `SecretCipher` backend declares its
+own extra, both imported lazily:
+
+- **AWS KMS** (`KmsSecretCipher`) needs boto3 — `omnigent[kms]`.
+- **HashiCorp Vault** (`VaultSecretCipher`, Transit) needs hvac — `omnigent[vault]`.
+
+boto3 / hvac load only when the matching backend is selected
+(`OMNIGENT_CREDENTIAL_KMS_KEY_ID` / `OMNIGENT_CREDENTIAL_VAULT_KEY`), so a deployment
+that doesn't enable the credential store — or uses the other backend — needs neither.
+
+`OMNIGENT_CREDENTIAL_CIPHER` (`kms` | `vault`) selects the backend explicitly per
+server; the chosen backend's key env var is then required. Leave it unset to
+auto-detect the single configured backend — configuring more than one without the
+selector is an error (no silent precedence), and configuring none disables the store.
 
 ## MCP auth & roadmap
 
