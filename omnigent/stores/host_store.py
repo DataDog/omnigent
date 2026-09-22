@@ -840,7 +840,6 @@ class HostStore:
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(),
                     SqlHost.host_id == host_id,
-                    SqlHost.deleted_at.is_(None),
                 )
             ).scalar_one_or_none()
             if row is None:

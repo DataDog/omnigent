@@ -4042,6 +4042,8 @@ async def terminate_managed_host(
             )
         else:
             all_terminated = False
+    if not all_terminated:
+        await asyncio.to_thread(host_store.mark_managed_cleanup_pending, tombstone.host_id)
     return all_terminated
 
 
