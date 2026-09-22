@@ -888,7 +888,7 @@ class HostStore:
         """
         now = now_epoch()
         token_hash = hash_host_launch_token(token)
-        with self._session("register_managed_host") as session:
+        def write(session: Session) -> Host:
             existing = session.execute(
                 select(SqlHost).where(
                     SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id

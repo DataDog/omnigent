@@ -4070,7 +4070,7 @@ async def _terminate_sandbox_best_effort(
         _logger.warning(
             "No launcher available for managed sandbox provider %s; "
             "sandbox %s must be deleted with the provider's own tooling",
-            provider,
-            sandbox_id,
+            host.sandbox_provider,
+            host.sandbox_id,
         )
     return False

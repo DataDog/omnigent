@@ -22,8 +22,7 @@ def upgrade() -> None:
     if op.get_bind().dialect.name == "cockroachdb":
         op.execute("ALTER TABLE hosts ADD COLUMN IF NOT EXISTS sandbox_session_id VARCHAR(64)")
         op.execute(
-            "ALTER TABLE hosts ADD COLUMN IF NOT EXISTS "
-            "sandbox_credential_session_id VARCHAR(64)"
+            "ALTER TABLE hosts ADD COLUMN IF NOT EXISTS sandbox_credential_session_id VARCHAR(64)"
         )
         op.execute(
             "ALTER TABLE hosts ADD COLUMN IF NOT EXISTS sandbox_lifecycle_state VARCHAR(32)"

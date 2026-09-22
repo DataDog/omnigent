@@ -911,6 +911,43 @@ def _claim_is_verified_true(value: object) -> bool:
     return isinstance(value, str) and value.strip().lower() == "true"
 
 
+def _validate_id_token(
+    token_json: dict[str, object], config: OIDCConfig
+) -> dict[str, object] | None:
+    """Validate an OIDC id token and return its decoded claims."""
+    id_token = token_json.get("id_token")
+    if not isinstance(id_token, str) or not id_token or config.jwks_uri is None:
+        return None
+    try:
+        jwks_client = jwt.PyJWKClient(config.jwks_uri)
+        signing_key = jwks_client.get_signing_key_from_jwt(id_token)
+        return jwt.decode(
+            id_token,
+            signing_key.key,
+            algorithms=["RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "ES512"],
+            audience=config.client_id,
+            issuer=config.issuer,
+        )
+    except jwt.InvalidTokenError as exc:
+        _logger.warning("id_token validation failed: %s", exc)
+        return None
+
+
+def _resolve_oidc_auth_time(token_json: dict[str, object], config: OIDCConfig) -> int | None:
+    """Return a validated id token's authentication timestamp."""
+    claims = _validate_id_token(token_json, config)
+    if claims is None:
+        return None
+    auth_time = claims.get("auth_time")
+    if isinstance(auth_time, bool):
+        return None
+    if isinstance(auth_time, int):
+        return auth_time
+    if isinstance(auth_time, float):
+        return int(auth_time)
+    return None
+
+
 def _validate_oidc_id_token(
     token_json: dict[str, object],
     config: OIDCConfig,

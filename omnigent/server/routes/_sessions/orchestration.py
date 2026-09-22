@@ -3242,7 +3242,7 @@ async def _run_managed_launch(
             session_id=session_id,
             owner=owner,
             sandbox_config=sandbox_config,
-            repo=repo,
+            repos=repos,
             tracker=tracker,
             host_store=host_store,
             relaunch_host=relaunch_host,
@@ -4056,7 +4056,6 @@ async def _run_managed_wake(
         classifier, or ``None`` to leave it unstamped.
     """
     from omnigent.server.managed_hosts import (
-        resolve_managed_agent_label,
         resume_managed_host,
     )
     from omnigent.server.routes import sessions as _facade

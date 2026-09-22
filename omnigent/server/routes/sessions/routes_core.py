@@ -387,7 +387,7 @@ def register_core_routes(
                     session_id=session_id,
                     owner=owner,
                     sandbox_config=sandbox_config,
-                    repo=repo,
+                    repos=repos,
                     tracker=managed_launches,
                     conversation_store=conversation_store,
                     host_store=host_store_for_managed,
