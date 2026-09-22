@@ -20,6 +20,9 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Create the oidc_sessions table."""
+    bind = op.get_bind()
+    if bind.dialect.name == "cockroachdb" and "oidc_sessions" in sa.inspect(bind).get_table_names():
+        return
     op.create_table(
         "oidc_sessions",
         sa.Column(

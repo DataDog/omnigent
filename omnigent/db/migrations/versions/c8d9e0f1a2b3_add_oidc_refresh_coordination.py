@@ -25,6 +25,18 @@ depends_on: str | Sequence[str] | None = None
 
 def upgrade() -> None:
     """Add non-secret identity binding, version, and lease columns."""
+    bind = op.get_bind()
+    if bind.dialect.name == "cockroachdb":
+        existing = {column["name"] for column in sa.inspect(bind).get_columns("oidc_sessions")}
+        required = {
+            "provider_issuer",
+            "provider_client_id",
+            "credential_version",
+            "refresh_lease_id",
+            "refresh_lease_expires_at",
+        }
+        if required <= existing:
+            return
     with op.batch_alter_table("oidc_sessions") as batch_op:
         batch_op.add_column(sa.Column("provider_issuer", sa.String(2048), nullable=True))
         batch_op.add_column(sa.Column("provider_client_id", sa.String(512), nullable=True))
