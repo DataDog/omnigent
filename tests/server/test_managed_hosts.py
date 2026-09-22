@@ -3568,6 +3568,22 @@ async def test_terminate_managed_host_terminates_and_deletes_row(db_uri: str) ->
     assert fake.terminated == ["sb-term-1"]
 
 
+def _managed_tombstone(host_store: HostStore, host_id: str) -> Host:
+    """Find an internal managed-cleanup row, including a logical deletion."""
+    row = next(
+        (
+            host
+            for _, host in host_store.list_current_managed_sandbox_hosts_page(
+                after=None, limit=100
+            )
+            if host.host_id == host_id
+        ),
+        None,
+    )
+    assert row is not None
+    return row
+
+
 async def test_terminate_managed_host_retains_cleanup_tombstone_when_terminate_fails(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3596,7 +3612,7 @@ async def test_terminate_managed_host_retains_cleanup_tombstone_when_terminate_f
 
     assert await terminate_managed_host(host, host_store, _injected_config(fake)) is False
 
-    tombstone = host_store.get_host("057e7fa3f1cdb40c0ec393a3d42affc7")
+    tombstone = _managed_tombstone(host_store, "057e7fa3f1cdb40c0ec393a3d42affc7")
     assert tombstone is not None
     assert tombstone.sandbox_id == "sb-term-2"
     assert tombstone.sandbox_lifecycle_state == "cleanup_pending"
@@ -3748,7 +3764,7 @@ async def test_session_delete_returns_cleanup_pending_and_retains_host_tombstone
     assert response_body["id"] == conversation.id
     assert response_body["deleted"] is True
     assert response_body["cleanup_pending"] is True
-    tombstone = host_store.get_host(host.host_id)
+    tombstone = _managed_tombstone(host_store, host.host_id)
     assert tombstone is not None
     assert tombstone.sandbox_id == "sb-session-delete"
     assert tombstone.sandbox_lifecycle_state == "cleanup_pending"
@@ -3780,7 +3796,7 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
     # No cross-provider terminate was attempted.
     assert fake.terminated == []
     assert (
-        host_store.get_host("487212fd2b157b6ab6a6d6d3ef06ce5b").sandbox_lifecycle_state
+        _managed_tombstone(host_store, "487212fd2b157b6ab6a6d6d3ef06ce5b").sandbox_lifecycle_state
         == "cleanup_pending"
     )
     assert (
@@ -3799,7 +3815,7 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
     )
     await terminate_managed_host(host2, host_store, None)
     assert (
-        host_store.get_host("b114bf90a8fd155ce6007c3bb262aa79").sandbox_lifecycle_state
+        _managed_tombstone(host_store, "b114bf90a8fd155ce6007c3bb262aa79").sandbox_lifecycle_state
         == "cleanup_pending"
     )
 
@@ -3842,7 +3858,7 @@ async def test_cleanup_reconciler_retries_persisted_tombstone_after_restart(
         lambda _sandbox_id: (_ for _ in ()).throw(click.ClickException("transient")),
     )
     assert not await terminate_managed_host(host, host_store, _injected_config(fake))
-    tombstone = host_store.get_host(host.host_id)
+    tombstone = _managed_tombstone(host_store, host.host_id)
     assert tombstone is not None
 
     monkeypatch.setattr(fake, "terminate", lambda sandbox_id: fake.terminated.append(sandbox_id))
@@ -3890,7 +3906,7 @@ async def test_cleanup_reconciler_backs_off_transient_failure_then_succeeds(
         now=first.updated_at + managed_cleanup_retry_delay_s(first.sandbox_cleanup_attempts)
     )
     assert first_result.attempted == 1
-    after_failure = host_store.get_host(host.host_id)
+    after_failure = _managed_tombstone(host_store, host.host_id)
     assert after_failure is not None
     assert after_failure.sandbox_cleanup_attempts == first.sandbox_cleanup_attempts + 1
 
