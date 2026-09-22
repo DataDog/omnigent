@@ -221,7 +221,7 @@ async def test_background_launch_sees_session_and_owner(env: _Env) -> None:
 
 
 async def test_context_carries_request_bound_identity_token_provider(env: _Env) -> None:
-    """The context exposes the auth provider's bound identity-token provider."""
+    """Providers with no identity requirement receive no user credential."""
     stub = _StubIdentityTokenProvider()
     env.token_providers[_ALICE] = stub
     before = set(_managed_launch_tasks)
@@ -234,7 +234,7 @@ async def test_context_carries_request_bound_identity_token_provider(env: _Env) 
     assert records, "background launch never reached provision"
     context = records[0].context
     assert context is not None, "no managed-sandbox context reached the launch"
-    assert context.identity_token_provider is stub
+    assert context.identity_token_provider is None
 
 
 async def test_context_survives_create_request_return(env: _Env, monkeypatch) -> None:
@@ -279,7 +279,9 @@ async def test_launcher_factory_and_provision_share_context(env: _Env) -> None:
 
     ctor_records = _records_of(env, "constructor")
     assert ctor_records, "launcher factory never constructed a launcher"
-    ctor_context = ctor_records[0].context
+    # Capability preflight builds an unscoped launcher before the request
+    # context exists. The later constructor is the launcher used to provision.
+    ctor_context = ctor_records[-1].context
     assert ctor_context is not None, "no context at launcher construction"
 
     provision_records = _records_of(env, "provision-before")

@@ -633,6 +633,19 @@ class ManagedSandboxConfig:
     provider: str | None = None
     host_config: dict[str, object] | None = None
 
+    def managed_identity_requirement(self, operation: str):
+        """Return this launcher's declared caller identity need for *operation*."""
+        caps = self.launcher_factory().capabilities
+        requirements = {
+            "create": caps.managed_create_identity,
+            "resume": caps.managed_resume_identity,
+            "relaunch": caps.managed_relaunch_identity,
+        }
+        try:
+            return requirements[operation]
+        except KeyError as exc:
+            raise ValueError(f"unknown managed sandbox operation: {operation}") from exc
+
 
 @dataclass(frozen=True)
 class ManagedSandboxReaperConfig:
@@ -802,6 +815,13 @@ class ManagedSandboxDeployment:
                 launcher = config.launcher_factory()
                 caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
         return caps
+
+    def managed_identity_requirement(self, provider: str | None, operation: str):
+        """Return the selected provider's identity requirement for *operation*."""
+        config = self.for_provider(provider)
+        if config is None:
+            raise ValueError(f"unknown managed sandbox provider: {provider}")
+        return config.managed_identity_requirement(operation)
 
 
 @dataclass

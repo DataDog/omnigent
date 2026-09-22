@@ -438,6 +438,11 @@ class AuthProvider(ABC):
         """
         return None
 
+    @property
+    def supports_oidc_identity_tokens(self) -> bool:
+        """Whether this configuration can delegate renewable OIDC identity."""
+        return False
+
     def get_identity_token_provider_for_credential_session(
         self,
         credential_session_id: str,  # noqa: ARG002
@@ -686,6 +691,15 @@ class UnifiedAuthProvider(AuthProvider):
             token_manager=token_manager,
             session_id=session_id,
             expected_user_id=expected_user_id,
+        )
+
+    @property
+    def supports_oidc_identity_tokens(self) -> bool:
+        """Whether this deployment has the OIDC credential-session plumbing."""
+        return (
+            self._source == "oidc"
+            and self._oidc_config is not None
+            and self._oidc_session_store is not None
         )
 
     def get_identity_token_provider_for_credential_session(

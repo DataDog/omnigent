@@ -221,6 +221,8 @@ class ErrorCode:
     WORKSPACE_MISSING = "workspace_missing"
     SESSION_AGENT_MISSING = "session_agent_missing"
     UPSTREAM_CANCELLED = "upstream_cancelled"
+    PROVIDER_IDENTITY_NOT_SUPPORTED = "provider_identity_not_supported"
+    REAUTHENTICATION_REQUIRED = "reauthentication_required"
 
 
 # Single source of truth for error code → HTTP status.
@@ -257,6 +259,8 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # 499, not 5xx: the peer cancelling an in-flight backing call is expected
     # and retryable, so it must not read as a server fault (see the cvar).
     ErrorCode.UPSTREAM_CANCELLED: 499,
+    ErrorCode.PROVIDER_IDENTITY_NOT_SUPPORTED: 400,
+    ErrorCode.REAUTHENTICATION_REQUIRED: 401,
 }
 
 

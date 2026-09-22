@@ -8,12 +8,17 @@ from starlette.requests import Request
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.onboarding.sandboxes.context import IdentityTokenProvider, ManagedSandboxContext
+from omnigent.onboarding.sandboxes.types import ManagedIdentityRequirement
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.stores.host_store import Host
 
 
 class ManagedSandboxIdentityUnavailable(RuntimeError):
     """The owner credential required for a lifecycle operation is unavailable."""
+
+
+class ManagedSandboxIdentityNotSupported(RuntimeError):
+    """The active authentication mode cannot provide a required OIDC identity."""
 
 
 def _credential_session_id(provider: IdentityTokenProvider | None) -> str | None:
@@ -32,14 +37,31 @@ def _canonical_credential_session_id(value: object) -> str | None:
 
 
 def context_for_managed_sandbox_create(
-    request: Request, auth_provider: AuthProvider | None, *, session_id: str, owner: str
+    request: Request,
+    auth_provider: AuthProvider | None,
+    *,
+    session_id: str,
+    owner: str,
+    requirement: ManagedIdentityRequirement = ManagedIdentityRequirement.NONE,
 ) -> ManagedSandboxContext:
-    """Build the create context and retain only an opaque credential reference."""
-    provider = (
-        auth_provider.get_identity_token_provider(request, expected_user_id=owner)
-        if auth_provider is not None
-        else None
-    )
+    """Build a request-bound create context, rejecting required OIDC early."""
+    if requirement is ManagedIdentityRequirement.NONE:
+        provider = None
+    elif requirement is ManagedIdentityRequirement.OIDC_USER:
+        if auth_provider is None or not auth_provider.supports_oidc_identity_tokens:
+            raise ManagedSandboxIdentityNotSupported(
+                "this sandbox provider requires an OIDC identity token, but the active "
+                "authentication mode cannot provide one"
+            )
+        provider = auth_provider.get_identity_token_provider(request, expected_user_id=owner)
+        if provider is None:
+            raise ManagedSandboxIdentityUnavailable(
+                "reauthentication is required before this managed sandbox can be created"
+            )
+    else:
+        raise ManagedSandboxIdentityNotSupported(
+            f"unsupported managed sandbox identity requirement: {requirement!r}"
+        )
     return ManagedSandboxContext(
         session_id=session_id,
         user_id=owner,

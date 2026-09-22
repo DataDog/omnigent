@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -26,6 +27,13 @@ class SandboxConfigError(SandboxError):
 
 class SandboxAuthError(SandboxError):
     """Provider credentials or local tooling are missing/invalid."""
+
+
+class ManagedIdentityRequirement(StrEnum):
+    """Caller authority required by one managed sandbox operation."""
+
+    NONE = "none"
+    OIDC_USER = "oidc_user"
 
 
 class SandboxCommandError(SandboxError):
@@ -92,6 +100,13 @@ class SandboxCapabilities:
         single session's workspace. Off by default, so a provider that
         clones only one repo (and every out-of-tree provider) is never
         handed a multi-repo request; providers opt in explicitly.
+    :param managed_create_identity: Caller identity needed to create a managed
+        sandbox.
+    :param managed_resume_identity: Caller identity needed to resume a managed
+        sandbox.
+    :param managed_relaunch_identity: Caller identity needed to relaunch a
+        managed sandbox generation. Termination deliberately has no user
+        identity requirement: provider/platform cleanup owns it.
     """
 
     cli_bootstrap: bool = False
@@ -107,6 +122,9 @@ class SandboxCapabilities:
     # compatibility for out-of-tree providers.
     snapshot_restore: bool = False
     multi_repo: bool = False
+    managed_create_identity: ManagedIdentityRequirement = ManagedIdentityRequirement.NONE
+    managed_resume_identity: ManagedIdentityRequirement = ManagedIdentityRequirement.NONE
+    managed_relaunch_identity: ManagedIdentityRequirement = ManagedIdentityRequirement.NONE
 
 
 @dataclass(frozen=True)

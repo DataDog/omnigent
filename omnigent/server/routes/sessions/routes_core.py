@@ -80,7 +80,11 @@ from omnigent.server.feature_usage_metrics import (
     get_feature_usage_recorder,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
-from omnigent.server.managed_sandbox_identity import context_for_managed_sandbox_create
+from omnigent.server.managed_sandbox_identity import (
+    ManagedSandboxIdentityNotSupported,
+    ManagedSandboxIdentityUnavailable,
+    context_for_managed_sandbox_create,
+)
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
@@ -378,9 +382,20 @@ def register_core_routes(
         # registers under the reserved local owner, same as a
         # directly-connected host would.
         owner = user_id if user_id is not None else RESERVED_USER_LOCAL
-        launch_context = context_for_managed_sandbox_create(
-            request, auth_provider, session_id=session_id, owner=owner
-        )
+        try:
+            launch_context = context_for_managed_sandbox_create(
+                request,
+                auth_provider,
+                session_id=session_id,
+                owner=owner,
+                requirement=sandbox_config.managed_identity_requirement(
+                    sandbox_provider, "create"
+                ),
+            )
+        except ManagedSandboxIdentityNotSupported as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.PROVIDER_IDENTITY_NOT_SUPPORTED) from exc
+        except ManagedSandboxIdentityUnavailable as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.REAUTHENTICATION_REQUIRED) from exc
         with managed_sandbox_context_scope(launch_context):
             launch_task = asyncio.create_task(
                 _run_managed_launch(
