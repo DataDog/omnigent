@@ -69,6 +69,24 @@ def test_cockroachdb_upgrades_from_supported_baseline(db_uri: str) -> None:
     _initialize_or_verify_schema(engine, db_uri)
 
     assert _get_current_db_revision(engine) == head
+    inspector = inspect(engine)
+    oidc_columns = {column["name"] for column in inspector.get_columns("oidc_sessions")}
+    assert {
+        "provider_issuer",
+        "provider_client_id",
+        "credential_version",
+        "refresh_lease_id",
+        "refresh_lease_expires_at",
+    } <= oidc_columns
+    assert "oidc_session_id" in {
+        column["name"] for column in inspector.get_columns("device_grants")
+    }
+    with engine.connect() as connection:
+        oidc_indexes = {
+            str(row["index_name"])
+            for row in connection.execute(text("SHOW INDEXES FROM oidc_sessions")).mappings()
+        }
+    assert {"ix_oidc_sessions_user_id", "ix_oidc_sessions_expiry_id"} <= oidc_indexes
 
 
 def test_cockroachdb_resumes_empty_revision_and_repairs_indexes(db_uri: str) -> None:

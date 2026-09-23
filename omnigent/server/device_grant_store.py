@@ -74,6 +74,7 @@ def _to_device_grant(row: SqlDeviceGrant) -> DeviceGrant:
         expires_at=row.expires_at,
         approved_at=row.approved_at,
         last_polled_at=row.last_polled_at,
+        oidc_session_id=row.oidc_session_id,
     )
 
 
@@ -159,6 +160,7 @@ class DeviceGrantStore:
         client_id: str | None,
         refresh_token_hash: str,
         created_at: int,
+        oidc_session_id: str | None = None,
     ) -> DeviceGrant:
         """Persist a grant born ``redeemed`` — no device-code consent step.
 
@@ -180,8 +182,15 @@ class DeviceGrantStore:
             token. The store never sees the raw token.
         :param created_at: Unix epoch seconds; also ``approved_at``, the
             anchor for the grant's absolute lifetime.
+        :param oidc_session_id: Internal encrypted OIDC credential session
+            bound to a first-party CLI login grant, if any.
         :returns: The created :class:`DeviceGrant`.
         """
+        # ``omnigent-cli`` is reserved by the route layer for server-issued
+        # login grants.  Never let a generic device or machine grant acquire
+        # a browser user's renewable OIDC authority.
+        if oidc_session_id is not None and client_id != "omnigent-cli":
+            raise ValueError("only first-party login grants may bind an OIDC session")
         device_code_hash = secrets.token_urlsafe(32)
         user_code = secrets.token_urlsafe(16)
 
@@ -199,6 +208,7 @@ class DeviceGrantStore:
                 expires_at=created_at,
                 approved_at=created_at,
                 last_polled_at=None,
+                oidc_session_id=oidc_session_id,
             )
             session.add(row)
             session.flush()

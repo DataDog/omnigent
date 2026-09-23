@@ -187,6 +187,10 @@ HARNESS_READINESS_FULL_REFRESH_INTERVAL_S = 60.0
 # 5s cadence re-uses the cached verdict for free. Matches the full-refresh
 # cadence so quick-probe staleness never exceeds a full-refresh window.
 HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S = 60.0
+# A freshly bootstrapped CLI can briefly fail a probe racing startup work.
+# Do not turn that false negative into terminal harness_not_configured.
+HARNESS_LAUNCH_READINESS_GRACE_S = 2.0
+HARNESS_LAUNCH_READINESS_POLL_INTERVAL_S = 0.1
 _quick_probe_cache: dict[str, float] = {}
 _quick_probe_cached: dict[str, bool] = {}
 
@@ -218,6 +222,25 @@ def _unavailable_harness_became_ready(
         and _harness_now_configured(harness)
         for harness, availability in previous.items()
     )
+
+
+async def _wait_for_harness_configured(harness: str) -> bool:
+    """Wait briefly for the exact requested harness to become launchable."""
+    deadline = time.monotonic() + HARNESS_LAUNCH_READINESS_GRACE_S
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            ready = await asyncio.wait_for(
+                asyncio.to_thread(harness_is_configured, harness),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            return False
+        if ready:
+            return True
+        await asyncio.sleep(min(HARNESS_LAUNCH_READINESS_POLL_INTERVAL_S, remaining))
 
 
 def _runner_log_dir() -> Path:
@@ -1722,15 +1745,11 @@ class HostProcess:
         # first turn dies confusingly inside the executor. ``None`` (an
         # older server, or a session with no resolvable harness) skips the
         # check so version skew fails open.
-        #
-        # Off the loop: the check runs ``<cli> --version``, up to 10s on a hung
-        # CLI, which inline would stall the keepalive pong and every other frame.
-        if frame.harness is not None and not await asyncio.to_thread(
-            harness_is_configured, frame.harness
-        ):
-            return self._launch_failed(
-                frame,
-                (
+        if frame.harness is not None and not await _wait_for_harness_configured(frame.harness):
+            return HostLaunchRunnerResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=(
                     f"harness {frame.harness!r} is not configured on host "
                     f"{self._identity.name!r} — {harness_setup_hint(frame.harness)}"
                 ),

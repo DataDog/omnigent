@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# First-run helper: ensures deploy/docker/.env exists with the two
-# required secrets (POSTGRES_PASSWORD, OMNIGENT_OIDC_COOKIE_SECRET)
-# generated for you, instead of making the user run `openssl rand -hex 32`
-# twice. Safe to re-run — never overwrites existing non-default values.
+# First-run helper: ensures deploy/docker/.env exists with the required
+# database and authentication secrets generated for you. Safe to re-run —
+# never overwrites existing non-default values.
 #
 # Usage:
 #   cd deploy/docker
@@ -17,6 +16,8 @@
 #     uncomments + sets it to a fresh 64-hex-char value. (Even if
 #     you're not using OIDC today, having the secret ready means
 #     enabling it later is a one-line edit.)
+#   - OMNIGENT_OIDC_CREDENTIAL_KEY is generated the same way, using an
+#     independent value for encrypting persisted provider credentials.
 #   - Already-customized values are left alone.
 
 set -euo pipefail
@@ -75,6 +76,14 @@ if [[ -z "$cookie_current" || "$cookie_current" == "<64-hex-chars>" ]]; then
   echo "→ generated OMNIGENT_OIDC_COOKIE_SECRET"
 else
   echo "→ OMNIGENT_OIDC_COOKIE_SECRET already set, leaving alone"
+fi
+
+credential_key_current=$(current_value OMNIGENT_OIDC_CREDENTIAL_KEY)
+if [[ -z "$credential_key_current" || "$credential_key_current" == "<64-hex-chars>" ]]; then
+  set_or_replace_kv OMNIGENT_OIDC_CREDENTIAL_KEY "$(openssl rand -hex 32)"
+  echo "→ generated OMNIGENT_OIDC_CREDENTIAL_KEY"
+else
+  echo "→ OMNIGENT_OIDC_CREDENTIAL_KEY already set, leaving alone"
 fi
 
 # Same generation logic for the accounts cookie secret. The two

@@ -636,6 +636,19 @@ def test_create_redeemed_grant_survives_pending_purge(store: DeviceGrantStore) -
     assert store.get_by_id("lg2") is None
 
 
+def test_only_login_grants_can_bind_oidc_session(store: DeviceGrantStore) -> None:
+    """A generic device grant must never gain a user's OIDC delegation."""
+    with pytest.raises(ValueError, match="first-party login grants"):
+        store.create_redeemed_grant(
+            "device-with-oidc",
+            user_id="alice@example.com",
+            client_id="third-party-device",
+            refresh_token_hash=hash_secret("r1", _KEY),
+            created_at=1000,
+            oidc_session_id="0" * 32,
+        )
+
+
 def test_login_grant_refresh_round_trip(disabled_app: TestClient, tmp_path: Path) -> None:
     """A login-issued refresh grant renews via /oauth/token even with the
     device flow disabled — the core unattended-host fix.

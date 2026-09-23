@@ -40,6 +40,8 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
+from omnigent.onboarding.sandboxes.context import managed_sandbox_context_scope
+from omnigent.onboarding.sandboxes.types import ManagedIdentityRequirement
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.launch_failure import classify_native_turn_error
 from omnigent.runner.routing import RunnerRouter
@@ -77,6 +79,11 @@ from omnigent.server.feature_usage_metrics import (
     get_feature_usage_recorder,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.managed_sandbox_identity import (
+    ManagedSandboxIdentityNotSupported,
+    ManagedSandboxIdentityUnavailable,
+    context_for_managed_sandbox_operation,
+)
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -355,6 +362,7 @@ async def _recover_retry_session(
             conversation_store=conversation_store,
             runner_router=runner_router,
             raise_host_refusal=True,
+            request=request,
         )
         if runner_client is None:
             raise OmnigentError(
@@ -956,6 +964,7 @@ def register_events_routes(
                 conv=wake_conv,
                 app_state=_app_state,
                 conversation_store=conversation_store,
+                request=request,
             ):
                 _refreshed = await asyncio.to_thread(
                     conversation_store.get_conversation, session_id
@@ -1831,6 +1840,7 @@ def register_events_routes(
             conv=conv,
             app_state=request.app.state,
             conversation_store=conversation_store,
+            request=request,
         ):
             # A resumable managed wake may have re-launched the runner and
             # updated liveness while this handler was holding an old row.
@@ -2025,6 +2035,7 @@ def register_events_routes(
                         conv=conv,
                         app_state=request.app.state,
                         conversation_store=conversation_store,
+                        request=request,
                     ):
                         conv_after_relaunch = await asyncio.to_thread(
                             conversation_store.get_conversation, session_id
@@ -2596,25 +2607,50 @@ def register_events_routes(
         if managed_launches_for_delete is not None:
             managed_launches_for_delete.finish(session_id)
         # Managed-host cleanup: when the session's host is backed by a
-        # server-provisioned sandbox (host_type="managed"), terminate
-        # the sandbox and delete the host row — which also revokes its
-        # launch token. Best-effort by design — the provider's lifetime
-        # cap reaps stragglers. External (laptop) hosts have no
-        # sandbox_id and are never touched.
+        # server-provisioned sandbox (host_type="managed"), terminate the
+        # sandbox and delete its host row. External laptop hosts are never
+        # touched.
         host_store_for_managed = getattr(request.app.state, "host_store", None)
         if conv.host_id is not None and host_store_for_managed is not None:
             bound_host = await asyncio.to_thread(host_store_for_managed.get_host, conv.host_id)
             if bound_host is not None and bound_host.sandbox_provider is not None:
                 from omnigent.server.managed_hosts import terminate_managed_host
 
-                await terminate_managed_host(
-                    bound_host,
-                    host_store_for_managed,
-                    # Supplies the launcher for the provider-side
-                    # terminate; None (config removed since launch)
-                    # still deletes the row and revokes the token.
-                    getattr(request.app.state, "sandbox_config", None),
+                sandbox_config = getattr(request.app.state, "sandbox_config", None)
+                requirement = (
+                    sandbox_config.managed_identity_requirement(
+                        bound_host.sandbox_provider, "terminate"
+                    )
+                    if sandbox_config is not None
+                    else ManagedIdentityRequirement.NONE
                 )
+                try:
+                    cleanup_context = context_for_managed_sandbox_operation(
+                        request,
+                        getattr(request.app.state, "auth_provider", None),
+                        session_id=session_id,
+                        owner=bound_host.user_id,
+                        requirement=requirement,
+                    )
+                except (ManagedSandboxIdentityNotSupported, ManagedSandboxIdentityUnavailable):
+                    _logger.warning(
+                        "Managed sandbox cleanup has no owner identity for host %s; "
+                        "falling back to provider background cleanup",
+                        bound_host.host_id,
+                    )
+                    await terminate_managed_host(
+                        bound_host,
+                        host_store_for_managed,
+                        sandbox_config,
+                    )
+                else:
+                    with managed_sandbox_context_scope(cleanup_context):
+                        await terminate_managed_host(
+                            bound_host,
+                            host_store_for_managed,
+                            sandbox_config,
+                            use_reaper_identity=False,
+                        )
         try:
             import hashlib as _hashlib
             import time as _time

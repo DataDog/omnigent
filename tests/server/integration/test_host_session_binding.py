@@ -475,7 +475,16 @@ async def test_managed_session_create_end_to_end(
     # The hosts row carries the sandbox backing and is owned by the
     # caller — no auth provider on this app → the reserved local user,
     # same as a directly-connected host would be.
-    host = env.host_store.get_host(conv.host_id)
+    host = next(
+        (
+            candidate
+            for _, candidate in env.host_store.list_current_managed_sandbox_hosts_page(
+                after=None, limit=100
+            )
+            if candidate.host_id == conv.host_id
+        ),
+        None,
+    )
     assert host is not None
     assert host.user_id == RESERVED_USER_LOCAL
     assert host.status == "online"
@@ -1147,6 +1156,17 @@ async def test_message_relaunches_dead_managed_sandbox(
     assert len(fake.host_starts) == 2
     assert fake.host_starts[1].host_id == conv.host_id
     assert fake.host_starts[1].token != fake.host_starts[0].token
+    # Await the generation-2 fake host before observing its liveness or
+    # the session rebinding: its tunnel handshake completes asynchronously.
+    second_tunnel = await host_futures[1]
+    # The tunnel handshake updates the registry and persistent liveness on
+    # separate await points. Wait until both reflect the new generation.
+    deadline = loop.time() + 10.0
+    while loop.time() < deadline and (
+        host_registry.get(conv.host_id) is None or not env.host_store.is_online(conv.host_id)
+    ):
+        await asyncio.sleep(0.05)
+    assert host_registry.get(conv.host_id) is not None
     assert env.host_store.is_online(conv.host_id) is True
     # The session row was re-bound to a fresh runner binding for the
     # new generation.
@@ -1157,7 +1177,6 @@ async def test_message_relaunches_dead_managed_sandbox(
     assert rebound.runner_id != gen1_runner_id
     # Release the generation-2 tunnel (and the consumed generation-1
     # communicator) only after the assertions.
-    second_tunnel = await host_futures[1]
     del first_tunnel, second_tunnel
 
 

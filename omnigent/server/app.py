@@ -70,7 +70,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
-from omnigent.server.auth import AuthProvider, SharingMode
+from omnigent.server.auth import AuthPreparationMiddleware, AuthProvider, SharingMode
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
@@ -1587,14 +1587,6 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
-    # GitHub App integration: enabled only when both the config and the
-    # connection store are wired. The client is stateless (holds config),
-    # built once and reused for the connect flow.
-    # Per-user connection providers (GitHub, ...). One registry entry per
-    # provider (connections_registry) drives uniform wiring: each gets
-    # ``app.state.<name>_{config,store,client}``, populated only when both its
-    # config and its store are present, else None. The info endpoint's
-    # enabled_connections list and the router mounting below both read these.
     from omnigent.server.connections_registry import connection_providers
 
     _connection_inputs = {
@@ -1611,6 +1603,9 @@ def create_app(
             f"{_provider.name}_client",
             _provider.client_factory(_cfg) if _on else None,
         )
+    # Managed operations capture the authenticated request's OIDC authority
+    # before background work starts; host rows never retain login-session ids.
+    app.state.auth_provider = auth_provider
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -1688,6 +1683,7 @@ def create_app(
     app.state.managed_launches = ManagedLaunchTracker()
     app.state.server_metrics = server_metrics
     app.state.server_metrics_otel = server_metrics_otel
+    app.add_middleware(AuthPreparationMiddleware, auth_provider=auth_provider)
     app.add_middleware(_WebSocketMetricsMiddleware, metrics=server_metrics)
     # CSWSH guard: reject cross-origin WebSocket handshakes before any
     # route accepts them. Added after the metrics middleware so it is the
@@ -3334,6 +3330,7 @@ def create_app(
 
             device_grant_store = DeviceGrantStore(permission_store.storage_location)
             auth_provider.set_grant_revocation_check(device_grant_store.is_revoked)
+            auth_provider.set_device_grant_store(device_grant_store)
 
         if (
             isinstance(auth_provider, UnifiedAuthProvider)
@@ -3382,6 +3379,7 @@ def create_app(
                     oidc_account_store,
                     allowed_domains=frozenset(allowed_domains or ()) or None,
                     device_grant_store=device_grant_store,
+                    oidc_session_store=getattr(auth_provider, "_oidc_session_store", None),
                 ),
                 prefix="/auth",
                 tags=["auth"],

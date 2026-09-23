@@ -585,6 +585,9 @@ class SqlDeviceGrant(OmnigentBase):
     expires_at: Mapped[int] = mapped_column(Integer, nullable=False)
     approved_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_polled_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Explicit, non-bearer delegation from a first-party CLI login grant to
+    # the encrypted provider credential session used for managed OBO.
+    oidc_session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (
         CheckConstraint("status IN (1, 2, 3, 4, 5)", name="ck_device_grants_status"),
@@ -1676,4 +1679,68 @@ class SqlScheduledTaskRun(OmnigentBase):
             "workspace_id",
             "conversation_id",
         ),
+    )
+
+
+class SqlOidcSession(OmnigentBase):
+    """Encrypted OIDC provider session backing an opaque browser handle.
+
+    Stores the IdP-issued ID token and refresh token as AES-GCM
+    ciphertext, keyed by a separate credential-encryption key. The
+    browser/CLI receives only an opaque ``sess_…`` handle; its
+    SHA-256 digest is stored here for lookup, never the handle itself.
+
+    :param id: Internal session ID (UUID, 16 raw bytes).
+    :param handle_digest: SHA-256 hex digest of the external ``sess_…``
+        handle.
+    :param user_id: Verified user email (lowercased).
+    :param provider_subject: IdP subject claim from the ID token.
+    :param provider_issuer: OIDC issuer that minted the original ID token.
+    :param provider_client_id: OIDC audience bound to the original ID token.
+    :param credential_ciphertext: AES-GCM encrypted blob containing
+        the ID token and refresh token.
+    :param id_token_expiry: Unix timestamp when the current ID token
+        expires.
+    :param absolute_expiry: Unix timestamp when the provider session
+        expires absolutely.
+    :param created_at: Row creation timestamp.
+    :param updated_at: Row last-update timestamp.
+    :param credential_version: Generation of the encrypted credentials. Refresh
+        commits use it as a compare-and-swap guard.
+    :param refresh_lease_id: Short-lived owner ID for an in-flight refresh.
+    :param refresh_lease_expires_at: When another process may recover an
+        abandoned refresh lease.
+    :param revoked_at: Timestamp when the session was revoked, or
+        ``None`` while active.
+    """
+
+    __tablename__ = "oidc_sessions"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    handle_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    provider_subject: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    provider_issuer: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    provider_client_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    credential_ciphertext: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    id_token_expiry: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    absolute_expiry: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    credential_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    refresh_lease_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    refresh_lease_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    revoked_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "handle_digest", name="uq_oidc_sessions_handle_digest"),
+        Index("ix_oidc_sessions_user_id", "workspace_id", "user_id"),
+        Index("ix_oidc_sessions_expiry_id", "workspace_id", "absolute_expiry", "id"),
     )
