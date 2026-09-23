@@ -1156,6 +1156,14 @@ async def test_message_relaunches_dead_managed_sandbox(
     assert len(fake.host_starts) == 2
     assert fake.host_starts[1].host_id == conv.host_id
     assert fake.host_starts[1].token != fake.host_starts[0].token
+    # The tunnel handshake updates the registry and persistent liveness on
+    # separate await points. Wait until both reflect the new generation.
+    deadline = loop.time() + 10.0
+    while loop.time() < deadline and (
+        host_registry.get(conv.host_id) is None or not env.host_store.is_online(conv.host_id)
+    ):
+        await asyncio.sleep(0.05)
+    assert host_registry.get(conv.host_id) is not None
     assert env.host_store.is_online(conv.host_id) is True
     # The session row was re-bound to a fresh runner binding for the
     # new generation.
