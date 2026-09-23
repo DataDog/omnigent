@@ -41,6 +41,7 @@ from omnigent.entities import (
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.models.model_override import validate_model_override
+from omnigent.onboarding.sandboxes.context import managed_sandbox_context_scope
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
@@ -79,6 +80,11 @@ from omnigent.server.feature_usage_metrics import (
     get_feature_usage_recorder,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.managed_sandbox_identity import (
+    ManagedSandboxIdentityNotSupported,
+    ManagedSandboxIdentityUnavailable,
+    context_for_managed_sandbox_create,
+)
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
@@ -369,24 +375,44 @@ def register_core_routes(
         # session page immediately after this 201) already carries the
         # "provisioning" stage.
         _publish_sandbox_status(session_id, "provisioning")
-        launch_task = asyncio.create_task(
-            _run_managed_launch(
+        # Bind the owner's identity context into the background task
+        # via asyncio.create_task's context copy; scoping only that
+        # call keeps the request task unscoped after scheduling.
+        # On auth-disabled servers user_id is None; the sandbox host
+        # registers under the reserved local owner, same as a
+        # directly-connected host would.
+        owner = user_id if user_id is not None else RESERVED_USER_LOCAL
+        try:
+            launch_context = context_for_managed_sandbox_create(
+                request,
+                auth_provider,
                 session_id=session_id,
-                # On auth-disabled servers user_id is None; the sandbox
-                # host registers under the reserved local owner.
-                owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
-                sandbox_config=sandbox_config,
-                repos=repos,
-                tracker=managed_launches,
-                conversation_store=conversation_store,
-                host_store=host_store_for_managed,
-                host_registry=getattr(request.app.state, "host_registry", None),
-                tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
-                provider=sandbox_provider,
-                agent_store=agent_store,
-                agent_id=agent_id,
+                owner=owner,
+                requirement=sandbox_config.managed_identity_requirement(
+                    sandbox_provider, "create"
+                ),
             )
-        )
+        except ManagedSandboxIdentityNotSupported as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.PROVIDER_IDENTITY_NOT_SUPPORTED) from exc
+        except ManagedSandboxIdentityUnavailable as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.REAUTHENTICATION_REQUIRED) from exc
+        with managed_sandbox_context_scope(launch_context):
+            launch_task = asyncio.create_task(
+                _run_managed_launch(
+                    session_id=session_id,
+                    owner=owner,
+                    sandbox_config=sandbox_config,
+                    repos=repos,
+                    tracker=managed_launches,
+                    conversation_store=conversation_store,
+                    host_store=host_store_for_managed,
+                    host_registry=getattr(request.app.state, "host_registry", None),
+                    tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+                    provider=sandbox_provider,
+                    agent_store=agent_store,
+                    agent_id=agent_id,
+                )
+            )
         _managed_launch_tasks.add(launch_task)
         launch_task.add_done_callback(_managed_launch_tasks.discard)
 

@@ -178,6 +178,7 @@ stores into ``create_app``):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import logging
 import posixpath
@@ -195,10 +196,6 @@ from fastapi import HTTPException
 
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import builtin_agent_id, now_epoch
-
-# RepoWorkspace lives in the launcher's own package so a launcher can accept it
-# without importing omnigent.server; re-exported here (its parser is here) so
-# existing `from omnigent.server.managed_hosts import RepoWorkspace` keeps working.
 from omnigent.onboarding.sandboxes.types import RepoWorkspace
 from omnigent.stores.host_store import Host, HostStore
 
@@ -636,6 +633,20 @@ class ManagedSandboxConfig:
     provider: str | None = None
     host_config: dict[str, object] | None = None
 
+    def managed_identity_requirement(self, operation: str):
+        """Return this launcher's declared caller identity need for *operation*."""
+        caps = self.launcher_factory().capabilities
+        requirements = {
+            "create": caps.managed_create_identity,
+            "resume": caps.managed_resume_identity,
+            "relaunch": caps.managed_relaunch_identity,
+            "terminate": caps.managed_terminate_identity,
+        }
+        try:
+            return requirements[operation]
+        except KeyError as exc:
+            raise ValueError(f"unknown managed sandbox operation: {operation}") from exc
+
 
 @dataclass(frozen=True)
 class ManagedSandboxReaperConfig:
@@ -805,6 +816,13 @@ class ManagedSandboxDeployment:
                 launcher = config.launcher_factory()
                 caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
         return caps
+
+    def managed_identity_requirement(self, provider: str | None, operation: str):
+        """Return the selected provider's identity requirement for *operation*."""
+        config = self.for_provider(provider)
+        if config is None:
+            raise ValueError(f"unknown managed sandbox provider: {provider}")
+        return config.managed_identity_requirement(operation)
 
 
 @dataclass
@@ -1215,6 +1233,13 @@ def load_sandbox_config(cfg: dict[str, object]) -> ManagedSandboxDeployment | No
     """Load YAML sandbox configuration or an externally supplied provider."""
     import importlib
     import os
+
+    # Validate the central local-development policy before an external Habitat
+    # provider can consume a file/static exchange adapter.  The provider owns
+    # adapter construction; Omnigent only owns the opt-in boundary.
+    from omnigent.dd_hab_local_dev import hab_local_dev_overrides
+
+    hab_local_dev_overrides()
 
     module_name = os.environ.get(SANDBOX_PROVIDER_MODULE_ENV, "").strip()
     if not module_name:
@@ -3672,10 +3697,7 @@ async def _register_and_start_host(
         )
         if record is None:
             await _terminate_sandbox_best_effort(
-                launcher,
-                sandbox_id,
-                host_id=host_id,
-                provider=launcher.provider,
+                launcher, sandbox_id, host_id=host_id, provider=launcher.provider
             )
             raise ValueError(f"managed host {host_id!r} no longer exists")
     else:
@@ -3911,6 +3933,18 @@ async def resume_managed_host(
     # registry alone. Cheap gate before taking the lock.
     if not force and await asyncio.to_thread(host_store.is_online, host_id):
         return
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    if host is None:
+        return
+    # Provider-matched launcher (None if config dropped / provider changed).
+    # Resume needs a reattachable volume; others (e.g. Modal) fall through to
+    # the caller's host-offline path (the user starts a new session).
+    launcher = _launcher_for_teardown(host, config)
+    if launcher is None or not launcher.capabilities.resume_stopped or host.sandbox_id is None:
+        return
+    # Re-arm with the recorded provider's own TTL / host_config.
+    entry = config.recorded(host.sandbox_provider)
+    sandbox_id = host.sandbox_id
     # Single-flight per host (see _resume_locks).
     resume_lock = _resume_locks.setdefault(host_id, asyncio.Lock())
     async with resume_lock:
@@ -3998,15 +4032,11 @@ async def terminate_managed_host(
     host: Host,
     host_store: HostStore,
     config: ManagedSandboxDeployment | None,
+    *,
+    use_reaper_identity: bool = True,
 ) -> None:
     """
     Terminate a managed host's sandbox and delete its host row.
-
-    The latest row is locked and logically deleted before provider termination.
-    This removes the host from user-visible reads, revokes its token, and
-    serializes teardown with generation replacement. Recorded sandbox ids remain
-    on the tombstone until termination succeeds, allowing the reaper to retry
-    transient provider failures.
 
     :param host: The managed host to tear down. Active and pending sandbox ids
         are both terminated when present.
@@ -4014,26 +4044,54 @@ async def terminate_managed_host(
     :param config: The deployment's current sandbox config (supplies
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
+    :param use_reaper_identity: Enter the provider's background-cleanup
+        identity scope. A request path that has already bound the owner
+        identity sets this to ``False``.
     """
     tombstone = await asyncio.to_thread(host_store.delete_host, host.host_id)
     if tombstone is None:
         return
     launcher = _launcher_for_teardown(tombstone, config)
-    sandbox_ids = dict.fromkeys((tombstone.sandbox_id, tombstone.terminating_sandbox_id))
-    for sandbox_id in sandbox_ids:
-        if sandbox_id is not None:
-            terminated = await _terminate_sandbox_best_effort(
-                launcher,
+    sandbox_ids = tuple(
+        sandbox_id
+        for sandbox_id in dict.fromkeys((tombstone.sandbox_id, tombstone.terminating_sandbox_id))
+        if sandbox_id is not None
+    )
+    if launcher is None:
+        for sandbox_id in sandbox_ids:
+            await _terminate_sandbox_best_effort(
+                None,
                 sandbox_id,
                 host_id=tombstone.host_id,
                 provider=tombstone.sandbox_provider,
             )
-            if terminated:
-                await asyncio.to_thread(
-                    host_store.mark_sandbox_terminated,
-                    tombstone.host_id,
-                    sandbox_id=sandbox_id,
+        return
+    try:
+        cleanup_scope = (
+            launcher.reaper_identity(tombstone.workspace_id)
+            if use_reaper_identity
+            else contextlib.nullcontext()
+        )
+        with cleanup_scope:
+            for sandbox_id in sandbox_ids:
+                terminated = await _terminate_sandbox_best_effort(
+                    launcher,
+                    sandbox_id,
+                    host_id=tombstone.host_id,
+                    provider=tombstone.sandbox_provider,
                 )
+                if terminated:
+                    await asyncio.to_thread(
+                        host_store.mark_sandbox_terminated,
+                        tombstone.host_id,
+                        sandbox_id=sandbox_id,
+                    )
+    except Exception:  # noqa: BLE001 — a failed cleanup remains a tombstone for the reaper.
+        _logger.warning(
+            "Failed to establish managed sandbox cleanup identity for host %s",
+            tombstone.host_id,
+            exc_info=True,
+        )
 
 
 async def _terminate_sandbox_best_effort(

@@ -12,6 +12,7 @@ These routes are only mounted when ``OMNIGENT_AUTH_PROVIDER=oidc``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 import time
@@ -55,6 +56,7 @@ _OIDC_INVITE_TTL_SECONDS = 72 * 3600
 
 if TYPE_CHECKING:
     from omnigent.server.oidc import OIDCConfig
+    from omnigent.server.oidc_session_store import OidcSessionStore
 
 
 @dataclass
@@ -88,6 +90,7 @@ def create_auth_router(
     account_store: SqlAlchemyAccountStore | None = None,
     allowed_domains: frozenset[str] | None = None,
     device_grant_store: DeviceGrantStore | None = None,
+    oidc_session_store: OidcSessionStore | None = None,
 ) -> APIRouter:
     """Create an :class:`APIRouter` with OIDC login/callback/logout routes.
 
@@ -114,6 +117,10 @@ def create_auth_router(
         so hosts and CLIs can renew without a human re-running
         ``omnigent login``. ``None`` keeps the legacy
         session-JWT-only response.
+    :param oidc_session_store: When set, the callback persists the
+        IdP-issued tokens as encrypted provider sessions and issues
+        opaque ``sess_…`` handles instead of self-contained JWT
+        cookies. ``None`` keeps the legacy JWT cookie.
     :returns: A FastAPI router with ``/login``, ``/callback``,
         ``/logout`` (and ``/invite`` when invites are enabled).
     """
@@ -284,7 +291,9 @@ def create_auth_router(
         # redirect at the 302 below.
         return_to = _sanitize_return_to(state_payload.get("return_to"))
 
-        # Exchange authorization code for tokens.
+        # Exchange authorization code for tokens. Public clients (PKCE
+        # without a secret, e.g. Ticino) omit client_secret; confidential
+        # clients (GitHub) always send one.
         token_data = {
             "grant_type": "authorization_code",
             "code": code,
@@ -295,6 +304,7 @@ def create_auth_router(
         if config.client_secret is not None:
             token_data["client_secret"] = config.client_secret
 
+        oidc_claims: dict[str, object] | None = None
         async with httpx.AsyncClient() as client:
             # GitHub requires Accept: application/json to get JSON
             # response from the token endpoint.
@@ -307,11 +317,7 @@ def create_auth_router(
             )
 
             if token_resp.status_code != 200:
-                _logger.error(
-                    "Token exchange failed: %d %s",
-                    token_resp.status_code,
-                    token_resp.text,
-                )
+                _logger.error("Token exchange failed: %d", token_resp.status_code)
                 return JSONResponse(
                     status_code=400,
                     content={"error": "Token exchange failed"},
@@ -333,6 +339,9 @@ def create_auth_router(
                     access_token if isinstance(access_token, str) else "",
                 )
             else:
+                # Keep the established wrapper as the single email admission
+                # path. Credential-backed sessions validate once more below to
+                # persist the verified identity claims needed for refresh.
                 email = _resolve_oidc_email(token_json, config)
 
         if not email:
@@ -375,6 +384,31 @@ def create_auth_router(
         # Normalize email to lowercase.
         email = email.lower()
 
+        # OIDC Core requires a stable ``sub``. Persist it with the issuer and
+        # client so refresh cannot silently switch identities that share an
+        # email address.
+        provider_subject = ""
+        provider_id_token_expiry = 0
+        oidc_session_id: str | None = None
+        if oidc_session_store is not None and config.provider_type == "oidc":
+            oidc_claims = _validate_oidc_id_token(token_json, config)
+            provider_subject_value = oidc_claims.get("sub") if oidc_claims is not None else None
+            if not isinstance(provider_subject_value, str) or not provider_subject_value:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "OIDC ID token is missing a subject"},
+                )
+            provider_subject = provider_subject_value
+            provider_expiry_value = oidc_claims.get("exp") if oidc_claims is not None else None
+            if isinstance(provider_expiry_value, bool) or not isinstance(
+                provider_expiry_value, int
+            ):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "OIDC ID token is missing a valid expiry"},
+                )
+            provider_id_token_expiry = provider_expiry_value
+
         # Redeem an OIDC invite (if one rode along in the signed state)
         # BEFORE the admission check, so the just-bound email passes the
         # domain gate via the invite bypass. Single-use: the token is
@@ -415,19 +449,44 @@ def create_auth_router(
             permission_store.ensure_user(email)
             promote_if_listed(admin_list, permission_store, email)
 
-        # Mint session cookie.
-        session_jwt = mint_session_cookie(
-            user_id=email,
-            cookie_secret=config.cookie_secret,
-            ttl_hours=config.session_ttl_hours,
-            provider=config.provider_type,
-        )
+        # Mint session credential. When an OIDC session store is
+        # configured, persist the provider tokens as AES-GCM ciphertext
+        # and issue an opaque sess_ handle. Otherwise fall back to the
+        # self-contained JWT cookie.
+        if oidc_session_store is not None and config.provider_type == "oidc":
+            raw_id_token = token_json.get("id_token")
+            id_token_val = raw_id_token if isinstance(raw_id_token, str) and raw_id_token else ""
+            raw_refresh = token_json.get("refresh_token")
+            refresh_token_val = (
+                raw_refresh if isinstance(raw_refresh, str) and raw_refresh else None
+            )
+            now = int(time.time())
+            created_session = await asyncio.to_thread(
+                oidc_session_store.create_with_id,
+                user_id=email,
+                provider_subject=provider_subject,
+                id_token=id_token_val,
+                refresh_token=refresh_token_val,
+                id_token_expiry=provider_id_token_expiry,
+                absolute_expiry=now + config.session_ttl_hours * 3600,
+                provider_issuer=config.issuer,
+                provider_client_id=config.client_id,
+            )
+            session_credential = created_session.handle
+            oidc_session_id = created_session.session_id
+        else:
+            session_credential = mint_session_cookie(
+                user_id=email,
+                cookie_secret=config.cookie_secret,
+                ttl_hours=config.session_ttl_hours,
+                provider=config.provider_type,
+            )
 
         # Check if this callback fulfills a CLI login ticket.
         ticket_id = state_payload.get("ticket")
         if ticket_id and ticket_id in _cli_tickets:
             ticket = _cli_tickets[ticket_id]
-            ticket.token = session_jwt
+            ticket.token = session_credential
             ticket.user_id = email
             # A CLI login is a long-lived unattended credential holder
             # (hosts especially) — issue a refresh grant so it can renew
@@ -439,6 +498,7 @@ def create_auth_router(
                         device_grant_store,
                         user_id=email,
                         cookie_secret=config.cookie_secret,
+                        oidc_session_id=oidc_session_id,
                     )
                 except Exception:
                     _logger.exception("cli-login: refresh grant issuance failed")
@@ -462,7 +522,7 @@ def create_auth_router(
             # the web UI in the same browser).
             resp.set_cookie(
                 key=_session_cookie,
-                value=session_jwt,
+                value=session_credential,
                 max_age=config.session_ttl_hours * 3600,
                 httponly=True,
                 secure=_secure,
@@ -482,7 +542,7 @@ def create_auth_router(
         response = RedirectResponse(url=return_to, status_code=302)
         response.set_cookie(
             key=_session_cookie,
-            value=session_jwt,
+            value=session_credential,
             max_age=config.session_ttl_hours * 3600,
             httponly=True,
             secure=_secure,
@@ -551,8 +611,12 @@ def create_auth_router(
             )
 
     @router.get("/logout")
-    async def logout() -> Response:
+    async def logout(request: Request) -> Response:
         """Clear the session cookie and redirect.
+
+        When an OIDC session store is configured, revokes the exact
+        provider session named by the presented opaque handle and
+        erases its ciphertext before clearing the cookie.
 
         If ``OMNIGENT_OIDC_LOGOUT_REDIRECT_URI`` is configured,
         redirects to the IdP's end-session endpoint. Otherwise,
@@ -560,6 +624,12 @@ def create_auth_router(
 
         :returns: 302 redirect with the session cookie cleared.
         """
+        if oidc_session_store is not None:
+            token = request.cookies.get(_session_cookie)
+            if token and token.startswith("sess_"):
+                resolved = await asyncio.to_thread(oidc_session_store.resolve, token)
+                if resolved is not None:
+                    await asyncio.to_thread(oidc_session_store.revoke, resolved[1])
         redirect_url = config.logout_redirect_uri or "/"
         response = RedirectResponse(url=redirect_url, status_code=302)
         response.delete_cookie(
@@ -846,28 +916,12 @@ def _claim_is_verified_true(value: object) -> bool:
 
 
 def _validate_id_token(
-    token_json: dict[str, object],
-    config: OIDCConfig,
+    token_json: dict[str, object], config: OIDCConfig
 ) -> dict[str, object] | None:
-    """Validate the OIDC ``id_token`` and return its decoded claims.
-
-    Checks the JWT signature against the IdP's JWKS and verifies the
-    ``iss`` and ``aud`` claims. A valid signature proves IdP provenance
-    only — callers must still gate on individual claims (email
-    verification, ``auth_time`` freshness, …).
-
-    :param token_json: Token endpoint response JSON with ``id_token``.
-    :param config: OIDC config supplying JWKS URI, issuer, audience.
-    :returns: Decoded claims, or ``None`` if the token is
-        missing/malformed or fails validation.
-    """
+    """Validate an OIDC id token and return its decoded claims."""
     id_token = token_json.get("id_token")
-    if not isinstance(id_token, str) or not id_token:
+    if not isinstance(id_token, str) or not id_token or config.jwks_uri is None:
         return None
-    if config.jwks_uri is None:
-        _logger.warning("Rejecting id_token: OIDC configuration has no JWKS URI")
-        return None
-
     try:
         jwks_client = jwt.PyJWKClient(config.jwks_uri)
         signing_key = jwks_client.get_signing_key_from_jwt(id_token)
@@ -883,24 +937,8 @@ def _validate_id_token(
         return None
 
 
-def _resolve_oidc_auth_time(
-    token_json: dict[str, object],
-    config: OIDCConfig,
-) -> int | None:
-    """Return the id_token's ``auth_time`` (last authentication instant).
-
-    ``auth_time`` is the epoch second at which the IdP actually
-    authenticated the end user. It is REQUIRED in the id_token when the
-    request carried ``max_age`` (OIDC Core §3.1.3.7), which is exactly
-    the forced-re-auth case. Used to verify the IdP honored
-    ``prompt=login``/``max_age=0`` rather than silently reusing its
-    session.
-
-    :param token_json: Token endpoint response JSON with ``id_token``.
-    :param config: OIDC config for signature/claim validation.
-    :returns: ``auth_time`` as an int, or ``None`` when the token is
-        invalid or the claim is absent/non-numeric.
-    """
+def _resolve_oidc_auth_time(token_json: dict[str, object], config: OIDCConfig) -> int | None:
+    """Return a validated id token's authentication timestamp."""
     claims = _validate_id_token(token_json, config)
     if claims is None:
         return None
@@ -914,15 +952,34 @@ def _resolve_oidc_auth_time(
     return None
 
 
-def _resolve_oidc_email(
+def _validate_oidc_id_token(
     token_json: dict[str, object],
     config: OIDCConfig,
-) -> str | None:
-    """Extract the verified email from the OIDC ``id_token``.
+) -> dict[str, object] | None:
+    """Validate the OIDC ``id_token`` signature, issuer, and audience.
 
-    Validates the JWT signature against the IdP's JWKS, verifies
-    ``iss`` and ``aud`` claims, and returns the ``email`` claim
-    **only when the IdP marked it verified** via ``email_verified``.
+    Returns the decoded claims when the token is valid, or ``None``
+    when the token is missing, the JWKS URI is unset, or signature /
+    issuer / audience verification fails.
+
+    :param token_json: The token endpoint response JSON containing
+        ``id_token``.
+    :param config: The OIDC configuration with JWKS URI and
+        expected issuer/audience.
+    :returns: Decoded claims dict, or ``None``.
+    """
+    claims = _validate_id_token(token_json, config)
+    if claims is None:
+        return None
+
+    return claims
+
+
+def _extract_verified_email(
+    claims: dict[str, object],
+    config: OIDCConfig,
+) -> str | None:
+    """Extract the verified email from validated OIDC claims.
 
     A valid signature proves the token came from the IdP; it does
     *not* prove the user controls the email address. Without the
@@ -942,20 +999,10 @@ def _resolve_oidc_email(
     ``preferred_username``). ``email_verified`` refers to the ``email``
     claim, so a custom claim always needs the verification opt-out too.
 
-    :param token_json: The token endpoint response JSON containing
-        ``id_token``.
-    :param config: The OIDC configuration with JWKS URI and
-        expected issuer/audience.
-    :returns: The user's email from the ``id_token`` when present and
-        marked verified; ``None`` if the token is missing/invalid, the
-        email claim is absent or not a non-empty string, or
-        ``email_verified`` is not truthy (and verification is not
-        skipped via config).
+    :param claims: Decoded JWT claims from :func:`_validate_oidc_id_token`.
+    :param config: The OIDC configuration.
+    :returns: The user's email, or ``None`` if absent or not verified.
     """
-    claims = _validate_id_token(token_json, config)
-    if claims is None:
-        return None
-
     email = claims.get(config.email_claim)
     if not isinstance(email, str) or not email.strip():
         _logger.warning(
@@ -1012,6 +1059,29 @@ def _resolve_oidc_email(
         return None
 
     return email
+
+
+def _resolve_oidc_email(
+    token_json: dict[str, object],
+    config: OIDCConfig,
+) -> str | None:
+    """Extract the verified email from the OIDC ``id_token``.
+
+    Convenience wrapper around :func:`_validate_oidc_id_token` and
+    :func:`_extract_verified_email` for callers that do not need the
+    decoded claims.
+
+    :param token_json: The token endpoint response JSON containing
+        ``id_token``.
+    :param config: The OIDC configuration with JWKS URI and
+        expected issuer/audience.
+    :returns: The user's email from the ``id_token`` when present and
+        marked verified; ``None`` otherwise.
+    """
+    claims = _validate_oidc_id_token(token_json, config)
+    if claims is None:
+        return None
+    return _extract_verified_email(claims, config)
 
 
 def _json_object(value: object) -> dict[str, object] | None:

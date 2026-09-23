@@ -27,6 +27,7 @@ and closed over by route factories — no per-request import cost.
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import os
@@ -37,6 +38,9 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 from starlette.requests import HTTPConnection
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+from omnigent.onboarding.sandboxes.context import IdentityToken, IdentityTokenProvider
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +52,10 @@ RESERVED_USER_PUBLIC = "__public__"
 _RESERVED_USERS = frozenset({RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC})
 _TRUTHY_STRINGS = ("1", "true", "yes")
 
-# Path prefixes a restricted (device-grant or machine client-credential)
-# access token may reach.
+_OIDC_SESSION_SCOPE_KEY = "omnigent.oidc_session"
+_OIDC_SESSION_PREPARED_SCOPE_KEY = "omnigent.oidc_session_prepared"
+
+# Path prefixes a delegated (device-grant) access token may reach.
 # Fail-closed allowlist: a token carrying a ``scope`` claim is rejected on
 # any path not covered here, so it can never touch admin / user-management
 # endpoints (``/auth/users``, ``/auth/invite``, ``/auth/setup`` …) even if
@@ -389,6 +395,10 @@ class AuthProvider(ABC):
         """Return the authenticated user ID, or ``None``."""
         ...
 
+    async def prepare_connection(self, request: HTTPConnection) -> None:
+        """Perform any asynchronous authentication work before routing."""
+        del request
+
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:  # noqa: ARG002
         """
         Mint a short-lived bearer a managed-sandbox runner presents as *user_id*.
@@ -409,6 +419,68 @@ class AuthProvider(ABC):
             cannot mint one.
         """
         return None
+
+    def get_identity_token_provider(
+        self,
+        request: HTTPConnection,  # noqa: ARG002
+        expected_user_id: str,  # noqa: ARG002
+    ) -> IdentityTokenProvider | None:
+        """Return a renewable ID-token provider for this request, or ``None``.
+
+        The managed-sandbox path uses this to hand provider code the
+        signed-in user's identity without exposing refresh credentials.
+        Default: ``None`` — sources with no renewable IdP credential
+        session (header, accounts) never delegate identity.
+
+        :param request: The authenticated request.
+        :param expected_user_id: The verified session owner the provider
+            must be bound to; a mismatch never yields a provider.
+        """
+        return None
+
+    @property
+    def supports_oidc_identity_tokens(self) -> bool:
+        """Whether this configuration can delegate renewable OIDC identity."""
+        return False
+
+    def get_identity_token_provider_for_credential_session(
+        self,
+        credential_session_id: str,  # noqa: ARG002
+        expected_user_id: str,  # noqa: ARG002
+    ) -> IdentityTokenProvider | None:
+        """Resolve one persisted owner-bound credential session, or fail closed."""
+        return None
+
+
+class _OidcIdentityTokenProvider:
+    """IdentityTokenProvider bound to one encrypted OIDC credential session.
+
+    Every call re-validates the bound session and returns the current
+    signed ID token, refreshing near expiry. The refresh token stays
+    inside the session store; only the ID token crosses this boundary.
+    """
+
+    def __init__(
+        self,
+        token_manager: OidcTokenManager,
+        session_id: str,
+        expected_user_id: str,
+    ) -> None:
+        self._token_manager = token_manager
+        self._session_id = session_id
+        self._expected_user_id = expected_user_id
+
+    @property
+    def credential_session_id(self) -> str:
+        """Opaque OIDC credential-session reference; never a credential."""
+        return self._session_id
+
+    def get_identity_token(self) -> IdentityToken:
+        result = self._token_manager.get_current_id_token(
+            self._session_id,
+            self._expected_user_id,
+        )
+        return IdentityToken(value=result.id_token, expires_at=result.expiry)
 
 
 class UnifiedAuthProvider(AuthProvider):
@@ -448,6 +520,10 @@ class UnifiedAuthProvider(AuthProvider):
         back to ``""`` (strip nothing; see
         :func:`resolve_auth_header_strip_prefix`). Only consulted in
         header mode. Tests pass an explicit prefix.
+    :param oidc_session_store: Encrypted OIDC session store for
+        ``sess_…`` handle resolution. When set, the OIDC callback issues
+        opaque handles instead of self-contained JWTs, and
+        :meth:`_check_cookie` resolves them here.
     """
 
     def __init__(
@@ -458,6 +534,7 @@ class UnifiedAuthProvider(AuthProvider):
         local_single_user: bool | None = None,
         header_name: str | None = None,
         header_strip_prefix: str | None = None,
+        oidc_session_store: OidcSessionStore | None = None,
     ) -> None:
         self._source = source
         self._oidc_config = oidc_config
@@ -472,11 +549,24 @@ class UnifiedAuthProvider(AuthProvider):
             else resolve_auth_header_strip_prefix()
         )
         self._cookie_cache: dict[str, tuple[str, float]] = {}
+        self._oidc_session_store = oidc_session_store
         # Set by create_app when a device-grant store is wired. Returns
         # True if a grant_id has been revoked (or is unknown → fail
         # closed). Consulted only for delegated tokens (those carrying a
         # ``grant_id`` claim); left None disables the check.
         self._grant_revoked: Callable[[str], bool] | None = None
+        # Live grant lookup is needed only for the explicit OIDC delegation
+        # attached to first-party CLI grants.  Keep it separate from the
+        # revocation predicate so a JWT cannot recover a credential merely by
+        # knowing a grant id.
+        self._device_grant_store: DeviceGrantStore | None = None
+
+    def set_oidc_session_store(self, store: OidcSessionStore) -> None:
+        """Wire the encrypted OIDC session store after construction.
+
+        :param store: An :class:`OidcSessionStore` instance.
+        """
+        self._oidc_session_store = store
 
     def set_grant_revocation_check(self, check: Callable[[str], bool]) -> None:
         """Wire the device-grant revocation lookup.
@@ -485,6 +575,10 @@ class UnifiedAuthProvider(AuthProvider):
             grant is revoked or unknown (fail closed).
         """
         self._grant_revoked = check
+
+    def set_device_grant_store(self, store: DeviceGrantStore) -> None:
+        """Wire live first-party login-grant resolution for OIDC delegation."""
+        self._device_grant_store = store
 
     @property
     def login_url(self) -> str | None:
@@ -515,7 +609,8 @@ class UnifiedAuthProvider(AuthProvider):
           :func:`resolve_auth_header`).
         - ``"oidc"`` / ``"accounts"``: Read ``__Host-ap_session``
           cookie, validate HS256 signature and expiry, return
-          ``sub`` claim.
+          ``sub`` claim. When an OIDC session store is wired,
+          resolve ``sess_…`` opaque handles instead.
 
         :param request: The incoming HTTP request or WebSocket
             handshake (both are ``HTTPConnection``).
@@ -524,6 +619,18 @@ class UnifiedAuthProvider(AuthProvider):
         if self._source in ("oidc", "accounts"):
             return self._check_cookie(request)
         return self._check_header(request)
+
+    async def prepare_connection(self, request: HTTPConnection) -> None:
+        """Resolve an opaque OIDC session without blocking the event loop."""
+        if self._source != "oidc" or self._oidc_session_store is None:
+            return
+        token = self._session_token(request)
+        if not token or not token.startswith("sess_"):
+            return
+        resolved = await asyncio.to_thread(self._oidc_session_store.resolve, token)
+        state = request.scope.setdefault("state", {})
+        state[_OIDC_SESSION_SCOPE_KEY] = resolved
+        state[_OIDC_SESSION_PREPARED_SCOPE_KEY] = True
 
     def mint_runner_token(self, user_id: str, ttl_seconds: int) -> str | None:
         """
@@ -557,6 +664,161 @@ class UnifiedAuthProvider(AuthProvider):
             self._source,
         )
 
+    def get_identity_token_provider(
+        self,
+        request: HTTPConnection,
+        expected_user_id: str,
+    ) -> IdentityTokenProvider | None:
+        """Return an ID-token provider bound to the request's credential session.
+
+        Only OIDC mode with a wired session store can delegate identity: the
+        request's ``sess_…`` handle is resolved through the same validated
+        path as :meth:`get_user_id`, and the session's verified user must
+        match *expected_user_id* (fail closed on any mismatch or missing
+        session). The returned provider serves only that session's current
+        ID token; refresh credentials never leave the store.
+
+        :returns: A bound :class:`IdentityTokenProvider`, or ``None``.
+        """
+        # Lazy import: oidc_token_manager pulls in routes.auth, which
+        # imports this module at load time.
+        from omnigent.server.oidc_token_manager import OidcTokenManager
+
+        if self._source != "oidc" or self._oidc_config is None or self._oidc_session_store is None:
+            return None
+        token = self._session_token(request)
+        if not token:
+            return None
+        resolved = self._resolved_credential_session(token, request)
+        if resolved is None:
+            session_id = self._credential_session_from_login_grant(token, expected_user_id)
+            if session_id is None:
+                return None
+        else:
+            user_id, session_id = resolved
+            if user_id.lower() != expected_user_id.lower():
+                return None
+        token_manager = OidcTokenManager(self._oidc_session_store, self._oidc_config)
+        return _OidcIdentityTokenProvider(
+            token_manager=token_manager,
+            session_id=session_id,
+            expected_user_id=expected_user_id,
+        )
+
+    def _credential_session_from_login_grant(
+        self, token: str, expected_user_id: str
+    ) -> str | None:
+        """Resolve a JWT's live, owner-bound CLI OIDC delegation.
+
+        A JWT is deliberately not itself a reference to browser credentials.
+        Only a non-revoked first-party login grant can carry the internal
+        ``oidc_session_id`` binding, and both the JWT subject and row owner
+        must match the requested managed-host owner.
+        """
+        if self._device_grant_store is None or self._oidc_config is None:
+            return None
+        import jwt
+
+        try:
+            payload = jwt.decode(token, self._oidc_config.cookie_secret, algorithms=["HS256"])
+        except jwt.InvalidTokenError:
+            return None
+        user_id = payload.get("sub")
+        grant_id = payload.get("grant_id")
+        if (
+            not isinstance(user_id, str)
+            or not isinstance(grant_id, str)
+            or user_id.lower() != expected_user_id.lower()
+        ):
+            return None
+        grant = self._device_grant_store.get_by_id(grant_id)
+        if (
+            grant is None
+            or grant.status != "redeemed"
+            or grant.client_id != "omnigent-cli"
+            or grant.user_id is None
+            or grant.user_id.lower() != expected_user_id.lower()
+            or not grant.oidc_session_id
+        ):
+            return None
+        return grant.oidc_session_id
+
+    @property
+    def supports_oidc_identity_tokens(self) -> bool:
+        """Whether this deployment has the OIDC credential-session plumbing."""
+        return (
+            self._source == "oidc"
+            and self._oidc_config is not None
+            and self._oidc_session_store is not None
+        )
+
+    def get_identity_token_provider_for_credential_session(
+        self,
+        credential_session_id: str,
+        expected_user_id: str,
+    ) -> IdentityTokenProvider | None:
+        """Reconstruct a provider for exactly one active owner credential session."""
+        from omnigent.server.oidc_token_manager import OidcTokenManager
+
+        if self._source != "oidc" or self._oidc_config is None or self._oidc_session_store is None:
+            return None
+        # Validate owner, revocation, and absolute expiry without exposing the
+        # encrypted credential outside the session store.
+        if (
+            self._oidc_session_store.get_credentials(credential_session_id, expected_user_id)
+            is None
+        ):
+            return None
+        return _OidcIdentityTokenProvider(
+            token_manager=OidcTokenManager(self._oidc_session_store, self._oidc_config),
+            session_id=credential_session_id,
+            expected_user_id=expected_user_id,
+        )
+
+    def _session_token(self, request: HTTPConnection) -> str | None:
+        """The raw session cookie or Bearer token, or ``None``.
+
+        Shared by :meth:`_check_cookie` and
+        :meth:`get_identity_token_provider` so user extraction and
+        identity delegation always read the same credential.
+        """
+        cookie_config = self._oidc_config if self._source == "oidc" else self._accounts_config
+        if cookie_config is None:
+            return None
+        token = request.cookies.get(cookie_config.session_cookie_name)
+        if not token:
+            # Fall back to Bearer token for CLI clients.
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:]
+        return token
+
+    def _resolved_credential_session(
+        self,
+        token: str,
+        request: HTTPConnection | None = None,
+    ) -> tuple[str, str] | None:
+        """Resolve a ``sess_…`` handle to ``(user_id, session_id)``, or ``None``.
+
+        Unknown, revoked, or expired handles resolve to ``None`` (fail
+        closed). Non-``sess_`` tokens (self-contained JWTs) also return
+        ``None`` — they carry no durable credential session.
+        """
+        if not token.startswith("sess_") or self._oidc_session_store is None:
+            return None
+        scope = request.scope if request is not None else None
+        state = scope.get("state", {}) if isinstance(scope, dict) else {}
+        if state.get(_OIDC_SESSION_PREPARED_SCOPE_KEY):
+            result = state.get(_OIDC_SESSION_SCOPE_KEY)
+        else:
+            # Direct, non-ASGI callers (primarily unit tests) retain the
+            # synchronous API. Production requests are prepared by middleware.
+            result = self._oidc_session_store.resolve(token)
+        if result is None:
+            return None
+        user_id, session_id, _provider_subject = result
+        return user_id, session_id
+
     def _check_cookie(self, request: HTTPConnection) -> str | None:
         """Validate the session cookie or Bearer token and return the
         user ID.
@@ -585,15 +847,16 @@ class UnifiedAuthProvider(AuthProvider):
         cookie_config = self._oidc_config if self._source == "oidc" else self._accounts_config
         if cookie_config is None:
             return None
-        cookie_name = cookie_config.session_cookie_name
-        token = request.cookies.get(cookie_name)
-        if not token:
-            # Fall back to Bearer token for CLI clients.
-            auth_header = request.headers.get("Authorization", "")
-            if auth_header.startswith("Bearer "):
-                token = auth_header[7:]
+        token = self._session_token(request)
         if not token:
             return None
+
+        # sess_ opaque handles are resolved via the encrypted session
+        # store when one is configured. Managed-runner JWTs and legacy
+        # self-contained cookies fall through to JWT decode below.
+        resolved = self._resolved_credential_session(token, request)
+        if resolved is not None:
+            return resolved[0]  # user_id
 
         cache_key = hmac_digest(token, cookie_config.cookie_secret)
         cached = self._cookie_cache.get(cache_key)
@@ -697,7 +960,22 @@ class UnifiedAuthProvider(AuthProvider):
         return None
 
 
-def create_auth_provider() -> AuthProvider:
+class AuthPreparationMiddleware:
+    """Prepare async authentication state for HTTP and WebSocket requests."""
+
+    def __init__(self, app: ASGIApp, auth_provider: AuthProvider | None) -> None:
+        self._app = app
+        self._auth_provider = auth_provider
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if self._auth_provider is not None and scope["type"] in ("http", "websocket"):
+            await self._auth_provider.prepare_connection(HTTPConnection(scope))
+        await self._app(scope, receive, send)
+
+
+def create_auth_provider(
+    oidc_session_store: OidcSessionStore | None = None,
+) -> AuthProvider:
     """Factory: read ``OMNIGENT_AUTH_PROVIDER`` and return a
     :class:`UnifiedAuthProvider` configured for the selected source.
 
@@ -771,6 +1049,7 @@ def create_auth_provider() -> AuthProvider:
         source=source,
         oidc_config=oidc_config,
         accounts_config=accounts_config,
+        oidc_session_store=oidc_session_store,
     )
 
 
@@ -779,4 +1058,7 @@ def create_auth_provider() -> AuthProvider:
 # to keep startup cost off the import path that doesn't use them.
 if TYPE_CHECKING:
     from omnigent.server.accounts_config import AccountsConfig
+    from omnigent.server.device_grant_store import DeviceGrantStore
     from omnigent.server.oidc import OIDCConfig
+    from omnigent.server.oidc_session_store import OidcSessionStore
+    from omnigent.server.oidc_token_manager import OidcTokenManager

@@ -34,7 +34,7 @@ def _downgrade(uri: str, engine: sa.Engine, revision: str) -> None:
 def test_single_alembic_head() -> None:
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
     heads = script.get_heads()
-    assert heads == ["gg1b2c3d4e5f"], f"expected a single head, got {heads!r}"
+    assert heads == ["r6a8c0e2f4b6"], f"expected a single head, got {heads!r}"
 
 
 def test_upgrade_creates_table_downgrade_drops_it(tmp_path: Path) -> None:
@@ -60,8 +60,30 @@ def test_upgrade_creates_table_downgrade_drops_it(tmp_path: Path) -> None:
     pk = set(inspector.get_pk_constraint("connections")["constrained_columns"])
     assert pk == {"workspace_id", "user_id", "provider", "account_id"}
 
+    oidc_columns = {column["name"] for column in inspector.get_columns("oidc_sessions")}
+    assert {
+        "workspace_id",
+        "id",
+        "handle_digest",
+        "credential_ciphertext",
+        "credential_version",
+        "refresh_lease_id",
+        "refresh_lease_expires_at",
+        "absolute_expiry",
+    } <= oidc_columns
+    oidc_indexes = {index["name"] for index in inspector.get_indexes("oidc_sessions")}
+    assert {"ix_oidc_sessions_user_id", "ix_oidc_sessions_expiry_id"} <= oidc_indexes
+    oidc_constraints = {
+        constraint["name"] for constraint in inspector.get_unique_constraints("oidc_sessions")
+    }
+    assert "uq_oidc_sessions_handle_digest" in oidc_constraints
+    assert "oidc_session_id" in {
+        column["name"] for column in inspector.get_columns("device_grants")
+    }
+
     _downgrade(uri, engine, "za2b3c4d5e6f")
     assert "connections" not in sa.inspect(engine).get_table_names()
+    assert "oidc_sessions" not in sa.inspect(engine).get_table_names()
 
     engine.dispose()
     clear_engine_cache()

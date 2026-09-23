@@ -42,6 +42,7 @@ from omnigent.onboarding.sandboxes.registry import (
 )
 from omnigent.onboarding.sandboxes.types import (
     HostContext,
+    ManagedIdentityRequirement,
     RepoWorkspace,
     SandboxCapabilities,
     SandboxCommandError,
@@ -56,6 +57,7 @@ __all__ = [
     "DEFAULT_SANDBOX_NAME",
     "DerivedWorkspace",
     "HostContext",
+    "ManagedIdentityRequirement",
     "RemoteCommandResult",
     "RemoteProcess",
     "RepoWorkspace",

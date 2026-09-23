@@ -93,6 +93,10 @@ class Host:
     status: str
     created_at: int
     updated_at: int
+    # Kept on the entity because background lifecycle work runs outside a
+    # request's workspace ContextVar and must restore the owning tenant before
+    # mutating the row.
+    workspace_id: int = 0
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
     configured_harnesses: dict[str, HarnessAvailability] | None = None
@@ -167,6 +171,7 @@ def _row_to_host(row: SqlHost) -> Host:
         status=decode_host_status(row.status),
         created_at=row.created_at,
         updated_at=row.updated_at,
+        workspace_id=row.workspace_id,
         sandbox_provider=row.sandbox_provider,
         sandbox_id=row.sandbox_id,
         terminating_sandbox_id=row.terminating_sandbox_id,

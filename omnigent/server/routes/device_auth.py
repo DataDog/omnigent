@@ -331,6 +331,7 @@ def issue_login_grant(
     *,
     user_id: str,
     cookie_secret: bytes,
+    oidc_session_id: str | None = None,
 ) -> str:
     """Create a redeemed refresh grant for an interactive login.
 
@@ -345,6 +346,8 @@ def issue_login_grant(
     :param device_grant_store: Grant persistence.
     :param user_id: The just-authenticated identity.
     :param cookie_secret: HMAC key for hashing the refresh token.
+    :param oidc_session_id: Internal OIDC credential session to delegate to
+        this first-party CLI grant.  Never pass an opaque ``sess_`` handle.
     :returns: The raw refresh token to hand to the client (stored hashed).
     """
     refresh_token = _mint_refresh_token()
@@ -354,6 +357,7 @@ def issue_login_grant(
         client_id=LOGIN_GRANT_CLIENT_ID,
         refresh_token_hash=hash_secret(refresh_token, cookie_secret),
         created_at=int(time.time()),
+        oidc_session_id=oidc_session_id,
     )
     return refresh_token
 
