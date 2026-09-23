@@ -130,12 +130,13 @@ repos:
         exclude: ^web/android/(build|\.gradle)/
 
       # iOS Swift formatting + linting via Apple's `swift format` (config:
-      # web/ios/.swift-format). The wrapper no-ops where the Swift toolchain is
-      # absent. Keep writes serial: parallel formatting is not idempotent on CI.
+      # web/ios/.swift-format). The wrapper no-ops when the Swift toolchain
+      # is absent, so these run on macOS dev machines but skip the ubuntu-latest
+      # CI pre-commit job — there is no Swift there. Enforcement is local.
       - id: web-ios-swift-format
         name: web ios swift-format
         language: system
-        entry: web/ios/bin/swift-format.sh format --in-place
+        entry: web/ios/bin/swift-format.sh format --in-place --parallel
         files: ^web/ios/.*\.swift$
         exclude: ^web/ios/(build|vendor)/
 

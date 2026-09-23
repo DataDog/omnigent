@@ -1,5 +1,6 @@
-@testable import Omnigent
 import XCTest
+
+@testable import Omnigent
 
 /// Integration test for the redirect-policy half of [F-CR-7], run on the
 /// simulator over a REAL local HTTP network.

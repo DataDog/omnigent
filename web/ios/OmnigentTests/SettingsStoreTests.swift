@@ -1,5 +1,6 @@
-@testable import Omnigent
 import XCTest
+
+@testable import Omnigent
 
 @MainActor
 final class SettingsStoreTests: XCTestCase {
