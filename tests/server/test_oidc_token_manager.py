@@ -1,6 +1,6 @@
 """Tests for the OIDC token manager (on-demand ID token refresh).
 
-Uses a fake Ticino token endpoint and controllable clock to verify
+Uses a fake token endpoint and controllable clock to verify
 refresh behaviour, concurrency safety, identity-change rejection, and
 absolute-session capping.
 """

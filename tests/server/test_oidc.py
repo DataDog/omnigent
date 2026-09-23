@@ -1017,7 +1017,7 @@ def test_oidc_config_standard_oidc_without_client_secret(
 ) -> None:
     """Standard OIDC starts without OMNIGENT_OIDC_CLIENT_SECRET.
 
-    A public OAuth client (e.g. Ticino) uses authorization code + PKCE
+    A public OAuth client uses authorization code + PKCE
     with no client secret. The config must accept the absence and set
     client_secret to None.
     """

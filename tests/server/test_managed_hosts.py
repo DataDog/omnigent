@@ -2944,15 +2944,15 @@ def test_managed_host_persists_provider_resource_binding(db_uri: str) -> None:
         name="managed-lifecycle",
         user_id=_OWNER,
         token="launch-token-not-persisted",
-        provider="hab",
-        sandbox_id="hab-exact-uuid",
+        provider="test-provider",
+        sandbox_id="test-provider-exact-uuid",
         token_expires_at=now_epoch() + 3600,
     )
 
     recovered = HostStore(db_uri).get_host("f2a2b3c4d5e6f708192a3b4c5d6e7f80")
     assert recovered is not None
-    assert recovered.sandbox_provider == "hab"
-    assert recovered.sandbox_id == "hab-exact-uuid"
+    assert recovered.sandbox_provider == "test-provider"
+    assert recovered.sandbox_id == "test-provider-exact-uuid"
 
 
 async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) -> None:

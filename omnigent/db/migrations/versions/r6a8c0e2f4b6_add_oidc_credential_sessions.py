@@ -3,7 +3,7 @@
 Revision ID: r6a8c0e2f4b6
 Revises: gg1b2c3d4e5f
 
-The managed-Hab work has not shipped, so this revision deliberately replaces
+This work has not shipped, so this revision deliberately replaces
 the branch's former OIDC/host-lifecycle migration history with the final,
 linear schema.  Provider credentials are held only in ``oidc_sessions``;
 durable hosts do not retain a browser or CLI session reference.

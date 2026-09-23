@@ -292,7 +292,7 @@ def create_auth_router(
         return_to = _sanitize_return_to(state_payload.get("return_to"))
 
         # Exchange authorization code for tokens. Public clients (PKCE
-        # without a secret, e.g. Ticino) omit client_secret; confidential
+        # without a secret) omit client_secret; confidential
         # clients (GitHub) always send one.
         token_data = {
             "grant_type": "authorization_code",

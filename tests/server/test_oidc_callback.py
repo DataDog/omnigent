@@ -320,7 +320,7 @@ def test_oidc_accepts_es384_id_token(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_callback_accepts_ps256_id_token(
     callback_client: tuple[TestClient, _IdpKeys],
 ) -> None:
-    """Ticino's PS256-signed ID tokens are accepted."""
+    """PS256-signed ID tokens are accepted."""
     client, keys = callback_client
     token = keys.sign_id_token(
         {"email": "alice@example.com", "email_verified": True},
