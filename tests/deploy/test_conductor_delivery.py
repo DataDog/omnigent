@@ -140,7 +140,10 @@ def test_delivery_dockerfile_is_frozen_and_runtime_complete() -> None:
     assert "omnigent_hab_launcher-0.0.132434155-py3-none-any.whl" in dockerfile
     assert "375bffc76904a919bb6953333909535ba94e131b20842a8132d56dbd23d339ef" in dockerfile
     assert "sha256sum --check" in dockerfile
-    assert "uv pip install --python /opt/venv/bin/python --no-deps" in dockerfile
+    assert "uv pip install --python /opt/venv/bin/python /tmp/omnigent_hab_launcher" in dockerfile
+    assert "--no-deps" not in dockerfile
+    assert "uv pip check --python /opt/venv/bin/python" in dockerfile
+    assert "/opt/venv/bin/python -c 'import omnigent_hab_launcher'" in dockerfile
     assert "openssh-client" in dockerfile
     assert "install -d -o 501 -g 0 /data/artifacts" in dockerfile
     assert "USER 501" in dockerfile

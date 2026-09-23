@@ -37,7 +37,9 @@ RUN apt-get update \
  && uv pip install --python /opt/venv/bin/python 'psycopg[binary]>=3.1,<4' \
  && curl --fail --location --retry 3 --output /tmp/omnigent_hab_launcher-0.0.132434155-py3-none-any.whl "${HAB_LAUNCHER_WHEEL_URL}" \
  && echo "${HAB_LAUNCHER_WHEEL_SHA256}  /tmp/omnigent_hab_launcher-0.0.132434155-py3-none-any.whl" | sha256sum --check \
- && uv pip install --python /opt/venv/bin/python --no-deps /tmp/omnigent_hab_launcher-0.0.132434155-py3-none-any.whl \
+ && uv pip install --python /opt/venv/bin/python /tmp/omnigent_hab_launcher-0.0.132434155-py3-none-any.whl \
+ && uv pip check --python /opt/venv/bin/python \
+ && /opt/venv/bin/python -c 'import omnigent_hab_launcher' \
  && rm /tmp/omnigent_hab_launcher-0.0.132434155-py3-none-any.whl
 
 FROM ${PYTHON_IMAGE}
