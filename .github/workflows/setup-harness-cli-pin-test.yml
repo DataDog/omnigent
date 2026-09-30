@@ -20,7 +20,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          action_pattern='omnigent-ai/omnigent/\.github/actions/setup-harness-cli'
+          action_pattern='DataDog/omnigent/\.github/actions/setup-harness-cli'
           reference_pattern="${action_pattern}@[^[:space:]#\"']+"
           references=()
           while IFS= read -r reference; do
