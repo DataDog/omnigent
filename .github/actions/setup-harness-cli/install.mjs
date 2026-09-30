@@ -3,11 +3,14 @@ import {
   appendFile,
   chmod,
   copyFile,
+  cp,
   mkdir,
+  mkdtemp,
   readFile,
   rm,
 } from "node:fs/promises";
 import path from "node:path";
+import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -82,6 +85,37 @@ async function installNpmHarness(resolved) {
     }
     return result;
   });
+
+  if (useLock) {
+    const lockPackage = JSON.parse(await readFile(path.join(installPath, "package.json"), "utf8"));
+    const overrides = lockPackage.overrides ?? {};
+    if (Object.keys(overrides).length > 0) {
+      // Pi publishes an npm-shrinkwrap.json that wins over the outer lockfile and
+      // npm overrides. Replace its nested vulnerable packages after npm ci.
+      const overridePath = await mkdtemp(path.join(tmpdir(), "omnigent-harness-overrides-"));
+      const result = run(
+        npm,
+        ["install", "--ignore-scripts", "--no-package-lock", "--no-save", "--no-audit", "--no-fund",
+          ...Object.entries(overrides).map(([name, pinnedVersion]) => `${name}@${pinnedVersion}`)],
+        { cwd: overridePath, env: { ...process.env, NPM_CONFIG_REGISTRY: "https://registry.npmjs.org/" } },
+      );
+      if (result.status !== 0) {
+        throw new Error(`Harness override install failed with exit ${result.status ?? "unknown"}`);
+      }
+      const nestedModules = path.join(installPath, "node_modules", ...spec.package.split("/"), "node_modules");
+      for (const [name, pinnedVersion] of Object.entries(overrides)) {
+        const source = path.join(overridePath, "node_modules", name);
+        const target = path.join(nestedModules, name);
+        const installed = JSON.parse(await readFile(path.join(source, "package.json"), "utf8"));
+        if (installed.version !== pinnedVersion) {
+          throw new Error(`${name} installed ${installed.version}; expected ${pinnedVersion}`);
+        }
+        await rm(target, { recursive: true, force: true });
+        await cp(source, target, { recursive: true });
+      }
+      await rm(overridePath, { recursive: true, force: true });
+    }
+  }
 
   const packageJsonPath = path.join(installPath, "node_modules", ...spec.package.split("/"), "package.json");
   const installedPackage = JSON.parse(await readFile(packageJsonPath, "utf8"));
