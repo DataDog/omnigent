@@ -24,7 +24,9 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
     ReasoningData,
+    ResourceEventData,
 )
+from omnigent.errors import StaleCursorError
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
@@ -169,6 +171,44 @@ def test_create_and_get(conversation_store: SqlAlchemyConversationStore) -> None
     fetched = conversation_store.get_conversation(conv.id)
     assert fetched is not None
     assert fetched.id == conv.id
+
+
+def test_create_persists_initial_labels_and_overrides(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Create returns the initial session state without a follow-up update."""
+    created = conversation_store.create_conversation(
+        labels={
+            "omnigent.ui": "terminal",
+            "custom": "value",
+            "long": "x" * 257,
+        },
+        reasoning_effort="high",
+        model_override="model-a",
+        cost_control_mode_override="on",
+        subagent_routing_override="off",
+        harness_override="codex-native",
+    )
+
+    assert created.labels == {
+        "omnigent.ui": "terminal",
+        "custom": "value",
+        "long": "x" * 256,
+    }
+    assert created.reasoning_effort == "high"
+    assert created.model_override == "model-a"
+    assert created.cost_control_mode_override == "on"
+    assert created.subagent_routing_override == "off"
+    assert created.harness_override == "codex-native"
+
+    fetched = conversation_store.get_conversation(created.id)
+    assert fetched is not None
+    assert fetched.labels == created.labels
+    assert fetched.reasoning_effort == "high"
+    assert fetched.model_override == "model-a"
+    assert fetched.cost_control_mode_override == "on"
+    assert fetched.subagent_routing_override == "off"
+    assert fetched.harness_override == "codex-native"
 
 
 def test_create_with_existing_caller_supplied_id_raises(db_uri: str) -> None:
@@ -1385,12 +1425,13 @@ def test_list_items_before_cursor(
 def test_list_items_cursor_scoped_to_conversation(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """A cursor id from another conversation resolves to no position.
+    """A cursor id from another conversation never supplies a position.
 
-    The cursor subquery is scoped to conversation_id so it stays a
-    primary-key point lookup. A foreign cursor id therefore matches no
-    row, the scalar subquery is NULL, and the position comparison yields
-    an empty page rather than silently using the other conversation's
+    The cursor lookup is scoped to conversation_id so it stays a
+    primary-key point lookup. A foreign cursor id therefore resolves to
+    no row and raises: an unresolvable cursor must be distinguishable
+    from a completed enumeration (an empty page would read as "no more
+    items"), and must never silently use the other conversation's
     position as a cutoff.
     """
     conv = conversation_store.create_conversation()
@@ -1398,10 +1439,10 @@ def test_list_items_cursor_scoped_to_conversation(
     _make_5_items(conversation_store, conv.id)
     other_items = _make_5_items(conversation_store, other.id)
 
-    after_page = conversation_store.list_items(conv.id, after=other_items[1].id)
-    assert after_page.data == []
-    before_page = conversation_store.list_items(conv.id, before=other_items[1].id)
-    assert before_page.data == []
+    with pytest.raises(StaleCursorError):
+        conversation_store.list_items(conv.id, after=other_items[1].id)
+    with pytest.raises(StaleCursorError):
+        conversation_store.list_items(conv.id, before=other_items[1].id)
 
 
 def _captured_item_statement_limits(store: SqlAlchemyConversationStore, run) -> list[int]:
@@ -2117,6 +2158,84 @@ def test_list_conversations_pagination(
     page2 = conversation_store.list_conversations(limit=2, after=page1.last_id)
     assert len(page2.data) == 2
     assert page2.has_more is False
+
+
+@pytest.mark.asyncio
+async def test_list_conversations_deleted_after_cursor_raises(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """An ``after`` cursor whose row was deleted between pages raises.
+
+    The deleted row's sort position is unknowable, so an empty page here
+    would be indistinguishable from a completed enumeration — every
+    ``while has_more: after = last_id`` loop would stop early and report
+    success on a partial result.
+    """
+    for _ in range(5):
+        conversation_store.create_conversation()
+    page1 = conversation_store.list_conversations(limit=2, order="asc")
+    assert page1.has_more is True
+    assert page1.last_id is not None
+    assert await conversation_store.delete_conversation(page1.last_id)
+
+    with pytest.raises(StaleCursorError) as exc_info:
+        conversation_store.list_conversations(limit=2, order="asc", after=page1.last_id)
+    assert exc_info.value.cursor_id == page1.last_id
+
+
+@pytest.mark.asyncio
+async def test_list_conversations_deleted_before_cursor_raises(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A ``before`` cursor whose row was deleted raises the same signal."""
+    for _ in range(5):
+        conversation_store.create_conversation()
+    page = conversation_store.list_conversations(limit=2, order="desc")
+    assert page.first_id is not None
+    assert await conversation_store.delete_conversation(page.first_id)
+
+    with pytest.raises(StaleCursorError):
+        conversation_store.list_conversations(limit=2, order="desc", before=page.first_id)
+
+
+@pytest.mark.asyncio
+async def test_list_conversations_delete_of_non_cursor_row_keeps_paging(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Deleting a row that is not the cursor must not disturb enumeration.
+
+    Only the cursor row's disappearance is unrecoverable; any other
+    concurrent delete just shrinks the result set, and the next page
+    still returns every surviving row after the cursor.
+    """
+    created = [conversation_store.create_conversation().id for _ in range(6)]
+    page1 = conversation_store.list_conversations(limit=2, order="asc")
+    assert page1.has_more is True
+    assert page1.last_id is not None
+    # Delete the non-cursor row of page 1 (the cursor is last_id).
+    assert page1.first_id is not None and page1.first_id != page1.last_id
+    assert await conversation_store.delete_conversation(page1.first_id)
+
+    enumerated = [c.id for c in page1.data]
+    after = page1.last_id
+    while True:
+        page = conversation_store.list_conversations(limit=2, order="asc", after=after)
+        enumerated.extend(c.id for c in page.data)
+        if not page.has_more or page.last_id is None:
+            break
+        after = page.last_id
+    # Compare against the store's own single-page order, not creation order:
+    # the ORDER BY tiebreaker is the row id outside SQLite, so rows sharing a
+    # ``created_at`` do not come back in the order they were created.
+    whole = conversation_store.list_conversations(limit=100, order="asc")
+    listed = [c.id for c in whole.data if c.id in set(created)]
+    walked = [cid for cid in enumerated if cid != page1.first_id]
+    assert walked == listed, (
+        f"the paged walk disagrees with a single-page read: {walked} vs {listed}"
+    )
+    assert set(listed) == set(created) - {page1.first_id}, (
+        "a non-cursor delete must remove exactly that row from the listing"
+    )
 
 
 def test_list_conversations_order_asc(
@@ -3279,6 +3398,51 @@ def test_set_host_id_with_workspace_satisfies_constraint(
     assert updated.workspace == "/Users/corey/projects/myapp"
 
 
+@pytest.mark.parametrize(
+    ("move_host", "workspace", "git_branch", "expected_branch"),
+    [
+        pytest.param(True, "/repo/worktree", None, None, id="different-host-same-path"),
+        pytest.param(True, None, None, None, id="different-host-omitted-workspace"),
+        pytest.param(False, "/repo/other", None, None, id="different-workspace"),
+        pytest.param(False, "/repo/worktree", None, "feature/source", id="same-binding"),
+        pytest.param(False, None, None, "feature/source", id="same-host-omitted-workspace"),
+        pytest.param(True, "/repo/other", "feature/new", "feature/new", id="move-with-branch"),
+        pytest.param(False, "/repo/worktree", "feature/new", "feature/new", id="replace-branch"),
+    ],
+)
+def test_set_host_id_keeps_git_branch_with_its_workspace(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+    move_host: bool,
+    workspace: str | None,
+    git_branch: str | None,
+    expected_branch: str | None,
+) -> None:
+    """A moved session must not reuse its former worktree branch for side chats."""
+    original_host = "292dfcdf8a31f1319b469f4fa179ac6b"
+    other_host = "8f48061706cb92d5e7cd7c4aadc56ef0"
+    _register_host(db_uri, original_host)
+    _register_host(db_uri, other_host)
+    conv = conversation_store.create_conversation(
+        host_id=original_host,
+        workspace="/repo/worktree",
+        git_branch="feature/source",
+    )
+    target_host = other_host if move_host else original_host
+
+    updated = conversation_store.set_host_id(
+        conv.id, target_host, workspace=workspace, git_branch=git_branch
+    )
+
+    assert updated.git_branch == expected_branch
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.host_id == target_host
+    assert fetched.workspace == (workspace or "/repo/worktree")
+    assert fetched.git_branch == expected_branch
+    assert fetched.updated_at == conv.updated_at
+
+
 def test_clear_host_binding_nulls_all_binding_fields(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,
@@ -3288,8 +3452,7 @@ def test_clear_host_binding_nulls_all_binding_fields(
 
     This is the failed-bind rollback primitive: after a worktree launch
     fails and the worktree is removed, the session must not keep pointing
-    at the deleted worktree/branch or stay runner-bound. Unlike set_host_id
-    (None = leave untouched, so it can't clear git_branch), this fully
+    at the deleted worktree/branch or stay runner-bound. This fully
     reverts to unbound. A leftover git_branch here would wrongly satisfy
     worktree-cleanup paths (git_branch IS NOT NULL); a leftover runner_id
     would block the picker's retry on the atomic set_runner_id CAS.
@@ -4034,6 +4197,120 @@ def test_fork_conversation_copies_items(
         assert fork_item.response_id == src_item.response_id
         # Data content is identical.
         assert fork_item.data == src_item.data
+
+
+def test_fork_conversation_remaps_file_references(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A fork given a file-id map rewrites copied file references to it.
+
+    Attachment blocks and file resource events referencing a mapped id
+    must point at the fork's own file copy; unmapped ids, non-file
+    resource events, and the source's items stay untouched.
+    """
+    agent_store.create(
+        agent_id="971f31bb0aac3f2d93931ee788150527",
+        name="fork-test",
+        bundle_location="971f31bb0aac3f2d93931ee788150527/fakehash",
+    )
+    source = conversation_store.create_conversation(
+        agent_id="971f31bb0aac3f2d93931ee788150527",
+        title="Original",
+    )
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="resource_event",
+                response_id="resp_001",
+                data=ResourceEventData(
+                    event_type="session.resource.created",
+                    resource_id="file_mapped",
+                    resource_type="file",
+                    resource={
+                        "id": "file_mapped",
+                        "object": "session.resource",
+                        "type": "file",
+                        "session_id": source.id,
+                        "name": "photo.png",
+                    },
+                ),
+            ),
+            NewConversationItem(
+                type="resource_event",
+                response_id="resp_001",
+                data=ResourceEventData(
+                    event_type="session.resource.created",
+                    resource_id="terminal_bash_s1",
+                    resource_type="terminal",
+                ),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id="resp_001",
+                data=MessageData(
+                    role="user",
+                    content=[
+                        {"type": "input_text", "text": "What is in this image?"},
+                        {
+                            "type": "input_image",
+                            "file_id": "file_mapped",
+                            "filename": "photo.png",
+                        },
+                        {"type": "input_file", "file_id": "file_unmapped"},
+                    ],
+                ),
+            ),
+        ],
+    )
+
+    fork = conversation_store.fork_conversation(
+        source.id,
+        file_id_map={"file_mapped": "file_fork_copy"},
+    )
+
+    fork_items = {item.type: item for item in conversation_store.list_items(fork.id).data}
+    file_event = next(
+        item.data
+        for item in conversation_store.list_items(fork.id).data
+        if isinstance(item.data, ResourceEventData) and item.data.resource_type == "file"
+    )
+    terminal_event = next(
+        item.data
+        for item in conversation_store.list_items(fork.id).data
+        if isinstance(item.data, ResourceEventData) and item.data.resource_type == "terminal"
+    )
+    message = fork_items["message"].data
+    assert isinstance(message, MessageData)
+
+    # The mapped attachment block points at the fork's copy; unmapped
+    # blocks keep their (possibly dangling) source reference.
+    blocks = {block["type"]: block for block in message.content if isinstance(block, dict)}
+    assert blocks["input_image"]["file_id"] == "file_fork_copy"
+    assert blocks["input_image"]["filename"] == "photo.png"
+    assert blocks["input_file"]["file_id"] == "file_unmapped"
+
+    # The file resource event follows the copy — including the embedded
+    # resource object's identity — while the terminal event is untouched.
+    assert file_event.resource_id == "file_fork_copy"
+    assert file_event.resource is not None
+    assert file_event.resource["id"] == "file_fork_copy"
+    assert file_event.resource["session_id"] == fork.id
+    assert file_event.resource["name"] == "photo.png"
+    assert terminal_event.resource_id == "terminal_bash_s1"
+
+    # The source conversation's items are untouched.
+    source_message = next(
+        item.data
+        for item in conversation_store.list_items(source.id).data
+        if item.type == "message"
+    )
+    assert isinstance(source_message, MessageData)
+    source_blocks = {
+        block["type"]: block for block in source_message.content if isinstance(block, dict)
+    }
+    assert source_blocks["input_image"]["file_id"] == "file_mapped"
 
 
 @pytest.mark.parametrize("item_count", [0, 1, 129])
@@ -6526,6 +6803,60 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
     conversation_store.touch_runner_liveness([], now=1)
 
 
+def test_clear_runner_liveness_not_after_spares_a_newer_stamp(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A ``not_after`` guard keeps a stamp another replica wrote after ours.
+
+    The cross-replica disconnect check compares against THIS replica's own
+    last stamp, so a clear scheduled before it learns of a reconnect
+    elsewhere must never erase that replica's fresher write.
+    """
+    conv = conversation_store.create_conversation(title="newer-elsewhere")
+    assert conversation_store.set_runner_id(conv.id, "runner_newer_elsewhere")
+
+    conversation_store.touch_runner_liveness(["runner_newer_elsewhere"], now=2_000_000)
+    conversation_store.clear_runner_liveness("runner_newer_elsewhere", not_after=1_000_000)
+
+    connectivity = conversation_store.get_session_connectivity([conv.id])
+    assert connectivity[conv.id].runner_last_seen == 2_000_000
+
+
+def test_clear_runner_liveness_not_after_clears_an_equal_or_older_stamp(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A stamp at or before ``not_after`` still clears — the runner is really gone."""
+    equal = conversation_store.create_conversation(title="equal-stamp")
+    older = conversation_store.create_conversation(title="older-stamp")
+    assert conversation_store.set_runner_id(equal.id, "runner_equal_stamp")
+    assert conversation_store.set_runner_id(older.id, "runner_older_stamp")
+
+    conversation_store.touch_runner_liveness(["runner_equal_stamp"], now=1_000_000)
+    conversation_store.clear_runner_liveness("runner_equal_stamp", not_after=1_000_000)
+
+    conversation_store.touch_runner_liveness(["runner_older_stamp"], now=999_000)
+    conversation_store.clear_runner_liveness("runner_older_stamp", not_after=1_000_000)
+
+    connectivity = conversation_store.get_session_connectivity([equal.id, older.id])
+    assert connectivity[equal.id].runner_last_seen is None
+    assert connectivity[older.id].runner_last_seen is None
+
+
+def test_clear_runner_liveness_without_not_after_still_clears_unconditionally(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Omitting ``not_after`` preserves the pre-cross-replica unconditional clear."""
+    conv = conversation_store.create_conversation(title="unconditional-clear")
+    assert conversation_store.set_runner_id(conv.id, "runner_unconditional_clear")
+
+    conversation_store.touch_runner_liveness(["runner_unconditional_clear"], now=2_000_000)
+    conversation_store.clear_runner_liveness("runner_unconditional_clear")
+
+    connectivity = conversation_store.get_session_connectivity([conv.id])
+    assert connectivity[conv.id].runner_last_seen is None
+
+
 def test_live_state_writes_via_chokepoint_land_in_scoped_workspace(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -7239,7 +7570,12 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
                 # Then the emitted spelling, as a description of what produced
                 # that plan. ``after`` in a descending scan compares "<";
                 # every other combination flips one of the two.
-                listing = next((c for c in clauses if sort_by in str(c)), clauses[0])
+                # Skip the cursor point lookup, which also mentions ``sort_by``:
+                # only the paged listing carries an ORDER BY.
+                listing = next(
+                    (c for c in clauses if sort_by in str(c) and "ORDER BY" in str(c)),
+                    clauses[0],
+                )
                 descending_scan = (order == "desc") if direction == "after" else (order == "asc")
                 comparison = "<" if descending_scan else ">"
                 assert f"(conversations.{sort_by}, {tiebreaker}) {comparison}" in " ".join(
@@ -7361,6 +7697,31 @@ def test_append_with_stable_id_is_idempotent(
 
     page = conversation_store.list_items(conv.id)
     assert [i.id for i in page.data if i.id == stable] == [stable]
+
+
+def test_get_item_returns_the_persisted_item_or_none(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``get_item`` is the point lookup the native mirror path uses to spot a retry."""
+    conv = conversation_store.create_conversation()
+    stable = "cd" * 16
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_y",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id=stable,
+    )
+    assert conversation_store.get_item(conv.id, stable) is None
+
+    [persisted] = conversation_store.append(conv.id, [item])
+
+    found = conversation_store.get_item(conv.id, stable)
+    assert found is not None
+    assert found.id == persisted.id
+    assert isinstance(found.data, MessageData)
+    assert found.data.content == [{"type": "input_text", "text": "hi"}]
+    other = conversation_store.create_conversation()
+    assert conversation_store.get_item(other.id, stable) is None
 
 
 def test_append_without_stable_id_still_duplicates(

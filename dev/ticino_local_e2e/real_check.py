@@ -236,7 +236,7 @@ def _check_public_callback_origin(public_url: str) -> list[str]:
     errors: list[str] = []
     if health_status is None or not 200 <= health_status < 300:
         errors.append("OMNIGENT_PUBLIC_URL/health is not HTTPS-reachable")
-    protected_status = _https_status(f"{origin}/v1/sessions")
+    protected_status = _https_status(f"{origin}/v1/sessions?visibility=all")
     if protected_status not in (401, 403):
         errors.append("OMNIGENT_PUBLIC_URL/v1/sessions must return 401 or 403 without credentials")
     return errors

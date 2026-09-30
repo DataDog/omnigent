@@ -34,6 +34,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -76,6 +77,7 @@ _DELEGATED_ALLOWED_PREFIXES = (
     "/v1/agents",
     "/v1/hosts",
     "/v1/sessions",
+    "/v1/skills",
     "/v1/runners",
     "/oauth/token",
     "/oauth/revoke",
@@ -483,6 +485,17 @@ class _OidcIdentityTokenProvider:
         return IdentityToken(value=result.id_token, expires_at=result.expiry)
 
 
+_CONNECTION_IDENTITY_KEY = "omnigent.account_identity"
+
+
+@dataclass(frozen=True)
+class _ConnectionIdentity:
+    provider: AuthProvider
+    workspace_id: int
+    user_id: str | None
+    generation: str | None
+
+
 class UnifiedAuthProvider(AuthProvider):
     """Unified authentication provider that supports header-based,
     OIDC, and accounts cookie-based identity extraction.
@@ -555,6 +568,9 @@ class UnifiedAuthProvider(AuthProvider):
         # closed). Consulted only for delegated tokens (those carrying a
         # ``grant_id`` claim); left None disables the check.
         self._grant_revoked: Callable[[str], bool] | None = None
+        # Accounts JWTs validate generation and revocation on every request.
+        # OIDC and machine principals retain their independent lifecycle.
+        self._account_check: Callable[[str, str], bool] | None = None
         # Live grant lookup is needed only for the explicit OIDC delegation
         # attached to first-party CLI grants.  Keep it separate from the
         # revocation predicate so a JWT cannot recover a credential merely by
@@ -575,6 +591,29 @@ class UnifiedAuthProvider(AuthProvider):
             grant is revoked or unknown (fail closed).
         """
         self._grant_revoked = check
+
+    def set_account_check(self, check: Callable[[str, str], bool]) -> None:
+        """Wire uncached generation/revocation validation in accounts mode."""
+        self._account_check = check
+
+    def accepts_account_generation(self, user_id: str, generation: str | None) -> bool:
+        return self._account_check is None or (
+            isinstance(generation, str) and self._account_check(user_id, generation)
+        )
+
+    def revoke_user_sessions(self, user_id: str) -> None:
+        """Drop this process's cached identity for every token of *user_id*.
+
+        Accounts tokens already validate revocation on every request. This
+        also clears any entries cached before account validation was wired.
+
+        :param user_id: The deleted account, e.g. ``"alice"``.
+        """
+        stale = [
+            key for key, (cached_user, _) in self._cookie_cache.items() if cached_user == user_id
+        ]
+        for key in stale:
+            del self._cookie_cache[key]
 
     def set_device_grant_store(self, store: DeviceGrantStore) -> None:
         """Wire live first-party login-grant resolution for OIDC delegation."""
@@ -616,6 +655,19 @@ class UnifiedAuthProvider(AuthProvider):
             handshake (both are ``HTTPConnection``).
         :returns: Authenticated user ID, or ``None`` (→ 401).
         """
+        from omnigent.db.account_authority import bind_account_authority, clear_account_authority
+        from omnigent.db.db_models import current_workspace_id
+
+        clear_account_authority()
+        identity = request.scope.get(_CONNECTION_IDENTITY_KEY)
+        if (
+            isinstance(identity, _ConnectionIdentity)
+            and identity.provider is self
+            and identity.workspace_id == current_workspace_id()
+        ):
+            if identity.user_id is not None and identity.generation is not None:
+                bind_account_authority(identity.user_id, identity.generation)
+            return identity.user_id
         if self._source in ("oidc", "accounts"):
             return self._check_cookie(request)
         return self._check_header(request)
@@ -655,6 +707,7 @@ class UnifiedAuthProvider(AuthProvider):
         cookie_config = self._oidc_config if self._source == "oidc" else self._accounts_config
         if cookie_config is None:
             return None
+        from omnigent.db.account_authority import account_generation
         from omnigent.server.oidc import mint_session_token
 
         return mint_session_token(
@@ -662,6 +715,7 @@ class UnifiedAuthProvider(AuthProvider):
             cookie_config.cookie_secret,
             ttl_seconds,
             self._source,
+            account_generation=account_generation(user_id),
         )
 
     def get_identity_token_provider(
@@ -860,7 +914,7 @@ class UnifiedAuthProvider(AuthProvider):
 
         cache_key = hmac_digest(token, cookie_config.cookie_secret)
         cached = self._cookie_cache.get(cache_key)
-        if cached is not None and cached[1] > time.monotonic():
+        if self._account_check is None and cached is not None and cached[1] > time.monotonic():
             return cached[0]
 
         try:
@@ -883,6 +937,16 @@ class UnifiedAuthProvider(AuthProvider):
         # a hit on one path would replay past both checks on every other.
         grant_id = payload.get("grant_id")
         scope = payload.get("scope")
+        # Only client-credentials tokens (scope without a grant) are machine
+        # principals. Every user-backed credential carries the account generation.
+        if self._account_check is not None and not (scope is not None and grant_id is None):
+            generation = payload.get("account_generation")
+            if not isinstance(generation, str) or not self._account_check(user_id, generation):
+                return None
+            from omnigent.db.account_authority import bind_account_authority
+
+            bind_account_authority(user_id, generation)
+
         if grant_id is not None or scope is not None:
             # A ``grant_id`` names a revocable stored grant, so it is checked
             # live against the denylist. The client-credentials grant has no
@@ -904,13 +968,10 @@ class UnifiedAuthProvider(AuthProvider):
                 return None
             return user_id
 
-        # Cache for remaining lifetime of the token.
-        remaining = payload.get("exp", 0) - time.time()
-        if remaining > 0:
-            self._cookie_cache[cache_key] = (
-                user_id,
-                time.monotonic() + remaining,
-            )
+        if self._account_check is None:
+            remaining = payload.get("exp", 0) - time.time()
+            if remaining > 0:
+                self._cookie_cache[cache_key] = (user_id, time.monotonic() + remaining)
 
         return user_id
 
@@ -958,6 +1019,66 @@ class UnifiedAuthProvider(AuthProvider):
         if self._local_single_user:
             return RESERVED_USER_LOCAL
         return None
+
+
+class AccountAuthorityMiddleware:
+    """Select account checks from the app's provider for every ASGI scope.
+
+    Lifespan timers, child tasks, and worker threads inherit the same policy
+    as HTTP and WebSocket handlers without sharing it across applications.
+    """
+
+    def __init__(self, app: ASGIApp, auth_provider: AuthProvider | None) -> None:
+        self._app = app
+        self._checks_enabled = (
+            isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source == "accounts"
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        from omnigent.db.account_authority import account_checks_scope
+
+        with account_checks_scope(self._checks_enabled):
+            await self._app(scope, receive, send)
+
+
+class AccountAuthenticationMiddleware:
+    """Validate each accounts HTTP request or WebSocket handshake in a worker.
+
+    The immutable result belongs to one ASGI scope. Synchronous route helpers
+    reuse it and restore the captured authority in their own task context.
+    """
+
+    def __init__(self, app: ASGIApp, auth_provider: UnifiedAuthProvider) -> None:
+        self._app = app
+        self._auth_provider = auth_provider
+
+    def _authenticate(self, connection: HTTPConnection) -> _ConnectionIdentity:
+        from omnigent.db.account_authority import account_generation
+        from omnigent.db.db_models import current_workspace_id
+
+        user_id = self._auth_provider.get_user_id(connection)
+        return _ConnectionIdentity(
+            self._auth_provider,
+            current_workspace_id(),
+            user_id,
+            account_generation(user_id) if user_id is not None else None,
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            await self._app(scope, receive, send)
+            return
+        from omnigent.db.account_authority import account_authority_scope
+
+        with account_authority_scope(None, None):
+            connection = HTTPConnection(scope)
+            identity = await asyncio.to_thread(self._authenticate, connection)
+            scope[_CONNECTION_IDENTITY_KEY] = identity
+            try:
+                self._auth_provider.get_user_id(connection)
+                await self._app(scope, receive, send)
+            finally:
+                scope.pop(_CONNECTION_IDENTITY_KEY, None)
 
 
 class AuthPreparationMiddleware:
@@ -1057,6 +1178,8 @@ def create_auth_provider(
 # types — both are imported lazily inside `create_auth_provider`
 # to keep startup cost off the import path that doesn't use them.
 if TYPE_CHECKING:
+    from starlette.types import ASGIApp, Receive, Scope, Send
+
     from omnigent.server.accounts_config import AccountsConfig
     from omnigent.server.device_grant_store import DeviceGrantStore
     from omnigent.server.oidc import OIDCConfig

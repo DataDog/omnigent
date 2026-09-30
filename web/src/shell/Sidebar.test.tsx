@@ -1,3 +1,8 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
 // longer carries a filter funnel (agent-type filter + "Show archived"
 // toggle were removed). The sidebar fetches a single session list with
@@ -9,7 +14,6 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import {
@@ -237,18 +241,21 @@ function renderSidebar(
   info?: ServerInfo,
   extensions: ExtensionCatalogItem[] = [],
   onClose = vi.fn(),
+  config: SidebarConfig = sidebarConfig,
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const sidebar = <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />;
   return render(
     <QueryClientProvider client={qc}>
-      <ExtensionCatalogProvider extensions={extensions}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[initialEntry]}>
-            {info ? <CapabilitiesProvider info={info}>{sidebar}</CapabilitiesProvider> : sidebar}
-          </MemoryRouter>
-        </TooltipProvider>
-      </ExtensionCatalogProvider>
+      <SidebarDataProvider config={config}>
+        <ExtensionCatalogProvider extensions={extensions}>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[initialEntry]}>
+              {info ? <CapabilitiesProvider info={info}>{sidebar}</CapabilitiesProvider> : sidebar}
+            </MemoryRouter>
+          </TooltipProvider>
+        </ExtensionCatalogProvider>
+      </SidebarDataProvider>
     </QueryClientProvider>,
   );
 }
@@ -513,6 +520,61 @@ describe("Sidebar session list", () => {
     expect(error).not.toHaveClass("text-sm");
   });
 
+  it.each([
+    ["shared", "loading"],
+    ["shared", "error"],
+    ["all", "loading"],
+    ["all", "error"],
+    ["archived", "loading"],
+    ["archived", "error"],
+  ] as const)("keeps pins and expanded projects mounted during %s %s", (view, state) => {
+    projectsMock.push("Work");
+    mockConversations([
+      conv("pinned-session", "Claude Code"),
+      conv("filed-session", "Claude Code", { labels: { omni_project: "Work" } }),
+    ]);
+    seedPins(["pinned-session"]);
+    const original = useConvMock.getMockImplementation()!;
+    const retry = vi.fn();
+    const mineRetry = vi.fn();
+    useConvMock.mockImplementation((...args) => {
+      const query = original(...args);
+      if (args[4] !== (view === "archived" ? "archived" : "shared")) {
+        return { ...query, refetch: mineRetry };
+      }
+      return {
+        ...query,
+        data: undefined,
+        isLoading: state === "loading",
+        isError: state === "error",
+        error: state === "error" ? new Error("unavailable") : null,
+        refetch: retry,
+      } as ReturnType<typeof useConversations>;
+    });
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Work" }));
+    const pinned = screen.getByText("pinned-session");
+    const filed = screen.getByText("filed-session");
+    const filter = screen.getByTestId("session-filter");
+
+    selectSessionFilter(view);
+
+    expect(screen.getByText("pinned-session")).toBe(pinned);
+    expect(screen.getByText("filed-session")).toBe(filed);
+    expect(screen.getByTestId("session-filter")).toBe(filter);
+    const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
+    expect(within(sessions).getByRole("status")).toHaveTextContent(
+      state === "loading" ? "Loading…" : /could not be loaded|Failed to load/,
+    );
+    if (state === "error") {
+      fireEvent.click(within(sessions).getByRole("button", { name: "Retry" }));
+      expect(retry).toHaveBeenCalledOnce();
+    }
+    selectSessionFilter("mine");
+    expect(screen.getByText("pinned-session")).toBe(pinned);
+    expect(screen.getByText("filed-session")).toBe(filed);
+  });
+
   it("reveals a thin, theme-aware scrollbar only while scrolling", () => {
     vi.useFakeTimers();
     try {
@@ -687,6 +749,69 @@ describe("Sidebar session list", () => {
     expect(screen.getByTestId("session-filter-shared")).toHaveAttribute("aria-checked", "true");
   });
 
+  it("withholds the conversation list until identity is ready", () => {
+    mockConversations([conv("conv_mine", "Claude Code")]);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (identityReady: boolean) => (
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider identityReady={identityReady}>
+          <ExtensionCatalogProvider extensions={[]}>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </ExtensionCatalogProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree(false));
+
+    expect(screen.queryByTestId("sidebar-conversation-list")).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent("Loading sessions");
+
+    rerender(tree(true));
+    expect(screen.getByTestId("sidebar-conversation-list")).toBeInTheDocument();
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+  });
+
+  it("leaves Shared when runtime policy makes it unavailable", () => {
+    localStorage.setItem("omnigent:session-filter", "shared");
+    mockConversations([
+      conv("conv_mine", "Claude Code"),
+      conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
+    ]);
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (config: SidebarConfig) => (
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider config={config}>
+          <ExtensionCatalogProvider extensions={[]}>
+            <TooltipProvider>
+              <MemoryRouter>
+                <Sidebar open onClose={vi.fn()} />
+              </MemoryRouter>
+            </TooltipProvider>
+          </ExtensionCatalogProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree(sidebarConfig));
+    expect(screen.getByText("conv_shared")).toBeInTheDocument();
+
+    rerender(tree({ ...sidebarConfig, sharedAvailable: false }));
+
+    expect(screen.getByText("conv_mine")).toBeInTheDocument();
+    expect(screen.queryByText("conv_shared")).toBeNull();
+    expect(localStorage.getItem("omnigent:session-filter")).toBe("mine");
+    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
+    expect(screen.getByTestId("session-filter-mine")).toHaveAttribute("aria-checked", "true");
+    expect(screen.queryByTestId("session-filter-shared")).toBeNull();
+  });
+
   it("drops a persisted Shared filter on a single-user server", () => {
     // "Shared sessions" isn't in the menu on a loopback-only server, so honoring
     // a value stored against a multi-user one would scope the list to a slice
@@ -777,19 +902,17 @@ describe("Sidebar session list", () => {
     expect(screen.getByText("conv_live")).toBeInTheDocument();
   });
 
-  it("requests the list with archived included", () => {
+  it("requests mine and shared scopes without an all-sessions scan", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();
-
-    // The sidebar makes two useConversations calls: one all-sessions query
-    // (includeArchived: true, reconcileWhileConnected: true — for inbox counts
-    // and WS reconciliation) and one tab-scoped filtered query (includeArchived:
-    // false, for display). Assert the all-sessions call is present and correct.
     const calls = useConvMock.mock.calls;
-    expect(calls.length).toBeGreaterThanOrEqual(1);
-    const allSessionsCall = calls.find((call) => call[0] === "" && call[1] === true);
-    expect(allSessionsCall).toBeDefined();
-    expect(allSessionsCall?.[2]).toMatchObject({ reconcileWhileConnected: true });
+    expect(calls.some((call) => call[1] === true)).toBe(false);
+    expect(calls.find((call) => call[4] === "mine")?.[2]).toMatchObject({
+      refreshIntervalMs: 60_000,
+    });
+    expect(calls.find((call) => call[4] === "shared")?.[2]).toMatchObject({
+      refreshIntervalMs: 180_000,
+    });
   });
 
   it("opens the command palette when the Search button is clicked", () => {
@@ -833,11 +956,13 @@ describe("Sidebar session list", () => {
     expect(search).toHaveAttribute("data-size", "icon-xs");
     expect(search).toHaveClass("size-6", "rounded-[var(--radius-md)]");
     expect(search).not.toHaveClass("rounded-sm");
-    expect(search.querySelector("svg")).toHaveClass("ui-icon");
+    expect(search.querySelector("svg")).toHaveClass("size-4");
+    expect(search.querySelector("svg")).not.toHaveClass("ui-icon");
     expect(settings).toHaveAttribute("aria-label", "Settings");
     expect(settings).toHaveAttribute("data-size", "icon-xs");
-    expect(settings).toHaveClass("size-6", "rounded-[var(--radius-md)]");
-    expect(settings.querySelector("svg")).toHaveClass("ui-icon");
+    expect(settings).toHaveClass("size-6", "rounded-[8px]");
+    expect(settings.querySelector("svg")).toHaveClass("size-4");
+    expect(settings.querySelector("svg")).not.toHaveClass("ui-icon");
     const collapse = within(headerActions).getByRole("button", { name: "Close sidebar" });
     expect(collapse).toHaveAttribute("data-size", "icon-xs");
     expect(collapse).toHaveClass("size-6", "rounded-[var(--radius-md)]");
@@ -985,11 +1110,13 @@ describe("Sidebar session list", () => {
     const filterSessions = within(sessionsSection!).getByRole("button", {
       name: "Filter sessions",
     });
-    // The filter never fades; its wrapper re-enables hit-testing inside the
-    // pointer-events-gated outer box (see the overlay hit-test spec below).
-    expect(filterSessions.parentElement).not.toHaveClass("md:opacity-0");
-    expect(filterSessions.parentElement).toHaveClass("pointer-events-auto", "flex");
-    expect(filterSessions.parentElement!.parentElement).toHaveClass("absolute", "right-1", "flex");
+    // The filter never fades; its persistent-action wrapper re-enables hit-testing
+    // inside the pointer-events-gated outer box (see the overlay hit-test spec below).
+    const filterTooltipTrigger = filterSessions.parentElement!;
+    const filterPersistentAction = filterTooltipTrigger.parentElement!;
+    expect(filterTooltipTrigger).not.toHaveClass("md:opacity-0");
+    expect(filterPersistentAction).toHaveClass("pointer-events-auto", "flex");
+    expect(filterPersistentAction.parentElement).toHaveClass("absolute", "right-1", "flex");
 
     fireEvent.click(selectSessions);
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
@@ -1076,11 +1203,13 @@ describe("Sidebar session list", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
     fireEvent.click(screen.getByTestId("settings-button"));
@@ -1329,14 +1458,16 @@ describe("Sidebar failed session indicator", () => {
       const sidebar = <Sidebar open onClose={vi.fn()} />;
       return (
         <QueryClientProvider client={qc}>
-          <TooltipProvider>
-            <MemoryRouter initialEntries={[initialEntry]}>
-              <Routes>
-                <Route path="/c/:conversationId" element={sidebar} />
-                <Route path="*" element={sidebar} />
-              </Routes>
-            </MemoryRouter>
-          </TooltipProvider>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={[initialEntry]}>
+                <Routes>
+                  <Route path="/c/:conversationId" element={sidebar} />
+                  <Route path="*" element={sidebar} />
+                </Routes>
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
         </QueryClientProvider>
       );
     };
@@ -1913,7 +2044,7 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
     observerCallback!([{ isIntersecting: false } as IntersectionObserverEntry], {} as never);
     expect(fetchNextPage).not.toHaveBeenCalled();
     observerCallback!([{ isIntersecting: true } as IntersectionObserverEntry], {} as never);
-    expect(fetchNextPage).toHaveBeenCalledTimes(1);
+    expect(fetchNextPage).toHaveBeenCalledTimes(2);
 
     vi.unstubAllGlobals();
   });
@@ -2046,24 +2177,7 @@ describe("Sidebar project sections", () => {
     expect(within(recentSection).queryByText("conv_moved")).toBeNull();
   });
 
-  it("offers a pencil that starts a new session pre-filed under the project", () => {
-    projectsMock.push("Customer X");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
-    ]);
-    renderSidebar();
-
-    // The pencil links to the landing composer with the project pre-selected
-    // via the `?project=` query param (URL-encoded).
-    const pencil = screen.getByTestId("project-new-session");
-    expect(pencil).toHaveAttribute("aria-label", "New session in Customer X");
-    expect(pencil.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
-  });
-
-  it("closes the mobile overlay when the project pencil is tapped", () => {
-    // jsdom's matchMedia mock reports non-desktop, so isMobileViewport() is
-    // true: a plain pencil tap must close the full-screen sidebar overlay,
-    // otherwise the pre-filed new-session page is left hidden behind it.
+  it("closes the mobile overlay when New session is selected from the project menu", async () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -2072,15 +2186,18 @@ describe("Sidebar project sections", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={onClose} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open onClose={onClose} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 
-    fireEvent.click(screen.getByTestId("project-new-session").closest("a")!);
+    fireEvent.pointerDown(screen.getByTestId("project-actions"), { button: 0, ctrlKey: false });
+    fireEvent.click(await screen.findByTestId("project-new-session-menu"));
     expect(onClose).toHaveBeenCalled();
   });
 
@@ -2110,13 +2227,15 @@ describe("Sidebar project sections", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_filed"]}>
-            <Routes>
-              <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_filed"]}>
+              <Routes>
+                <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
 
@@ -2317,106 +2436,30 @@ describe("Sidebar project sections", () => {
     );
   });
 
-  it("keeps New session in the project menu when the pencil requires hover", async () => {
-    // The pencil is a redundant shortcut for the kebab's always-present "New
-    // session" item, so without a fine hover pointer it is genuinely absent
-    // (display:none via `hidden`), NOT sr-only — an sr-only pencil would stay
-    // focusable and announce a duplicate "New session" alongside the kebab's
-    // item. On hover+fine it is display-flex, revealed on hover/focus by the
-    // overlay's opacity. The kebab (not this pencil) carries the touch a11y path.
+  it("offers a desktop New session shortcut while keeping the touch menu accessible", async () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
     ]);
     renderSidebar();
 
-    const pencil = screen.getByTestId("project-new-session");
-    expect(pencil).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:flex");
-    // Genuinely absent on touch — not merely clipped — so it leaves the a11y
-    // tree and tab order, unlike the kebab.
-    // Separate assertions: toHaveClass with multiple classes only fails when
-    // ALL are present, so a partial regression (e.g. adding just `sr-only`)
-    // would slip past a combined negation while clipping the pencil invisible
-    // on hover+fine.
-    expect(pencil).not.toHaveClass("sr-only");
-    expect(pencil).not.toHaveClass("focus-visible:not-sr-only");
-
-    // The menu remains a touch/long-press fallback even when the hover shortcut
-    // is eligible, because a touchscreen tap cannot reveal that shortcut first.
+    const shortcut = screen.getByRole("link", { name: "New session in Customer X" });
+    expect(shortcut).toHaveAttribute("href", "/?project=Customer%20X");
+    expect(shortcut).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:flex");
+    const menuButton = screen.getByTestId("project-actions");
+    expect(menuButton).not.toHaveClass("hidden");
+    expect(menuButton).not.toHaveClass("sr-only");
     fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
       button: 0,
       ctrlKey: false,
     });
     const menuItem = await screen.findByTestId("project-new-session-menu");
-    for (const hiddenClass of [
-      "hidden",
-      "md:hidden",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:hidden",
-    ]) {
-      expect(menuItem).not.toHaveClass(hiddenClass);
-    }
+    expect(menuItem).not.toHaveClass("hidden");
+    expect(menuItem).toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:hidden");
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
 
-  it("keeps the project kebab off the row but reachable without a fine hover pointer", () => {
-    // jsdom can't evaluate @media, so the capability contract is asserted via
-    // classes; the recorded demo is the behavioral guardrail. The base classes
-    // stand for every pointer lacking fine hover — a 390px phone and an 810px
-    // unfolded foldable alike (coarse, hover:none) — where the kebab is
-    // sr-only: absent from the row, zero layout, yet in the a11y tree.
-    projectsMock.push("Customer X");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
-    ]);
-    renderSidebar();
-
-    const kebab = screen.getByTestId("project-actions");
-    // sr-only at rest; revealed only where a fine hover pointer exists, at ANY
-    // width — no md gate that would drop it on a narrow hover desktop.
-    expect(kebab).toHaveClass(
-      "sr-only",
-      "[@media((hover:hover)_and_(pointer:fine))]:not-sr-only",
-      "[@media((hover:hover)_and_(pointer:fine))]:flex",
-    );
-    // Never display:none — that would strip it from the a11y tree and tab order
-    // on touch, where the long-press contextmenu isn't reliably dispatched.
-    expect(kebab).not.toHaveClass("hidden");
-    // Keyboard focus un-clips it (`:focus-visible` isn't raised by a touch tap),
-    // so a sighted keyboard/switch user on a touchscreen laptop gets a visible
-    // focus ring instead of one clipped off-screen.
-    expect(kebab).toHaveClass("focus-visible:not-sr-only");
-    // No un-capability-gated display utility at md would re-expose it on a wide
-    // touch screen (the reported foldable bug) — broader than the one literal.
-    for (const cls of kebab.classList) {
-      expect(cls).not.toMatch(
-        /^md:(flex|inline-flex|block|inline-block|inline|grid|inline-grid|table|contents|flow-root)$/,
-      );
-    }
-  });
-
-  it("gives the touch kebab the sr-only (not display:none) class contract", () => {
-    // The touch/coarse case (390px and 810px). No CSS is loaded in jsdom, so a
-    // display:none button is equally findable/focusable here — the meaningful
-    // guard is the class contract: sr-only (kept in the a11y tree, unlike
-    // `hidden`) plus focus-visible:not-sr-only (a focused control becomes
-    // visible). The demo is the behavioral guardrail for the effective render.
-    projectsMock.push("Customer X");
-    mockConversations([
-      conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
-    ]);
-    renderSidebar();
-
-    const kebab = screen.getByRole("button", { name: "Project actions for Customer X" });
-    expect(kebab).toHaveClass("sr-only", "focus-visible:not-sr-only");
-    expect(kebab).not.toHaveClass("hidden");
-  });
-
-  it("reveals the folder kebab on hover at every width, narrow hover desktops included", () => {
-    // The regression case: a fine-pointer, hover-capable desktop narrower than
-    // md (~500px window) and a wide 1280px desktop share one gate. The reveal
-    // keys off the pointer capability alone (no md), so hover brings the kebab
-    // back at any width instead of stranding a mouse-only user in a narrow
-    // window. jsdom can't evaluate @media; the demo shows the effective reveal.
+  it("reveals project actions on hover only on wide fine-pointer layouts", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_running", "Claude Code", {
@@ -2428,26 +2471,15 @@ describe("Sidebar project sections", () => {
 
     const kebab = screen.getByTestId("project-actions");
     const revealWrapper = kebab.closest("div[class*=transition-opacity]")!;
-    // Opacity reveal is capability-gated with NO md: hidden at rest, shown on
-    // hover, at every width for a fine hover pointer.
     expect(revealWrapper).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:opacity-100",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
     );
-    for (const cls of revealWrapper.classList) {
-      expect(cls).not.toMatch(/:md:opacity-0$/);
-    }
-    // A collapsed folder (marker shown) protects that marker from the kebab's
-    // at-rest hit target with the same capability-only (no md) gate, so a
-    // narrow hover desktop doesn't let an invisible control swallow the tap.
     const outerBox = kebab.closest("div[class*=absolute]")!;
     expect(outerBox).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:pointer-events-none",
-      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/header:pointer-events-auto",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto",
     );
-    for (const cls of outerBox.classList) {
-      expect(cls).not.toMatch(/:md:pointer-events-none$/);
-    }
   });
 });
 
@@ -2637,30 +2669,17 @@ describe("Sidebar collapsed project marker", () => {
     // Fixed centered box so the dot centers on the same vertical line as the
     // rows' dots.
     expect(slot).toHaveClass("w-6", "justify-center");
-    // Hover-only controls never reserve a rest column, keeping the marker at
-    // the rows' right edge.
-    expect(slot).toHaveClass("-mr-1");
-    expect(slot).not.toHaveClass("mr-14");
-    expect(slot).not.toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1");
-    // The hover-driven fades track the fine-hover reveal (hover only exists on
-    // fine), so they stay pointer-gated with no md.
+    // Visible touch controls get their own column beside the marker.
     expect(slot).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/section:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-state=open]]/header:opacity-0",
+      "mr-7",
+      "[@media((hover:hover)_and_(pointer:fine))]:mr-14",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1",
     );
-    // The focus-within fade tracks the pointer-UNgated focus-visible reveal, so
-    // it is ungated too: a coarse-pointer tablet + keyboard can focus the kebab,
-    // and the spinner must clear there as well or the revealed kebab overlaps
-    // it. Asserted separately below (it must NOT carry the pointer/hover gate).
-    expect(slot).toHaveClass("group-has-[[data-header-controls]:focus-within]/header:opacity-0");
-    expect(slot).not.toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
+    expect(slot).toHaveClass(
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0",
+      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
     );
-    // No width-gated fade survives for a hover-only action — that mismatch is
-    // the narrow-hover overlap regression.
-    for (const cls of slot.classList) {
-      expect(cls).not.toMatch(/:md:group-(hover|has-).*opacity-0$/);
-    }
   });
 
   // The "awaiting" pill is wider than the dot markers; constraining it to the
@@ -2726,11 +2745,13 @@ describe("Sidebar auto-expand Pinned on pin", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const tree = () => (
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={vi.fn()} />
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/"]}>
+              <Sidebar open onClose={vi.fn()} />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>
     );
     const { rerender } = render(tree());
@@ -2864,14 +2885,16 @@ describe("Sidebar active-row auto-scroll", () => {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     return render(
       <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={[initialEntry]}>
-            <Routes>
-              <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
-              <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[initialEntry]}>
+              <Routes>
+                <Route path="/" element={<Sidebar open onClose={vi.fn()} />} />
+                <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
       </QueryClientProvider>,
     );
   }
@@ -2941,4 +2964,33 @@ describe("Sidebar collapsed marker", () => {
     // still match [data-collapsed] and strip the glass border while open.
     expect(openAside).not.toHaveAttribute("data-collapsed");
   });
+});
+
+it("caps Shared display independently of Mine while revealing cached rows", async () => {
+  isServerLocalMock.mockReturnValue(false);
+  const owned = Array.from({ length: 40 }, (_, i) => conv(`owned-${i}`, "agent"));
+  const shared = Array.from({ length: 70 }, (_, i) =>
+    conv(`shared-${i}`, "agent", {
+      owner: "other@example.com",
+      permission_level: 1,
+      updated_at: 100 - i,
+    }),
+  );
+  mockConversations([...owned, ...shared]);
+  renderSidebar(true, "/", undefined, undefined, [], vi.fn(), {
+    ...sidebarConfig,
+    sharedDisplayPageSize: 30,
+  });
+  selectSessionFilter("mine");
+  expect(screen.getByText("owned-39", { exact: true })).toBeInTheDocument();
+  showSharedTab();
+  expect(screen.getByText("shared-29", { exact: true })).toBeInTheDocument();
+  expect(screen.queryByText("shared-30", { exact: true })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+  await waitFor(() => expect(screen.getByText("shared-59", { exact: true })).toBeInTheDocument());
+  expect(screen.queryByText("shared-60", { exact: true })).toBeNull();
+  selectSessionFilter("mine");
+  expect(screen.getByText("owned-39", { exact: true })).toBeInTheDocument();
+  showSharedTab();
+  expect(screen.queryByText("shared-30", { exact: true })).toBeNull();
 });

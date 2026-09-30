@@ -1,3 +1,9 @@
 # Consolidated repository ownership
-# The Workspaces team owns reviews and maintenance of main.
 * @DataDog/workspaces
+
+# Database migrations require approval from any one of these owners.
+/omnigent/db/migrations/ @DataDog/workspaces @Edwinhe03 @aravind-segu @dbczumar @bbqiu
+/omnigent/db/alembic.ini @DataDog/workspaces @Edwinhe03 @aravind-segu @dbczumar @bbqiu
+
+# Keep changes to the approval policy subject to the same review.
+/.github/CODEOWNERS @DataDog/workspaces @Edwinhe03 @aravind-segu @dbczumar @bbqiu
