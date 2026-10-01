@@ -692,17 +692,18 @@ def run_migrations_with_retry(
             engine.dispose()
 
 
-def _get_current_db_revision(engine: Engine) -> str | None:
+def _get_current_db_revision(engine: Engine) -> str | tuple[str, ...] | None:
     """
     Return the database's current Alembic revision, or ``None``.
 
     ``None`` means the database has no ``alembic_version`` table at
     all — i.e. nothing has ever been migrated against this database.
-    A database that exists at some revision (even if not head) returns
-    that revision string.
+    A database at one revision returns that revision string. An in-progress
+    migration across branches can have multiple current revisions; those are
+    returned as a sorted tuple.
 
     :param engine: SQLAlchemy engine bound to the target database.
-    :returns: The current revision hash (e.g. ``"c9d3a1f2e4b5"``) or
+    :returns: The current revision hash, a tuple of current hashes, or
         ``None`` if the ``alembic_version`` table is absent.
     """
     from alembic.runtime.migration import MigrationContext
@@ -713,7 +714,8 @@ def _get_current_db_revision(engine: Engine) -> str | None:
             return None
         with engine.connect() as connection:
             ctx = MigrationContext.configure(connection)
-            return ctx.get_current_revision()
+            heads = tuple(sorted(ctx.get_current_heads()))
+            return heads[0] if len(heads) == 1 else heads or None
 
 
 def _get_head_db_revision(db_uri: str) -> str:
@@ -744,7 +746,7 @@ def _get_head_db_revision(db_uri: str) -> str:
 
 def _verify_db_revision_is_supported(
     db_uri: str,
-    current: str | None,
+    current: str | tuple[str, ...] | None,
     head: str,
 ) -> None:
     """Reject a database revision that is unknown to this build."""
@@ -755,14 +757,15 @@ def _verify_db_revision_is_supported(
     from alembic.util import CommandError
 
     script = ScriptDirectory.from_config(_build_alembic_config(db_uri))
-    try:
-        script.get_revision(current)
-    except CommandError as exc:
-        raise RuntimeError(
-            "Omnigent database schema is newer than this version of Omnigent "
-            f"(found revision {current!r}, latest supported revision {head!r}). "
-            "Upgrade Omnigent before using this database."
-        ) from exc
+    for revision in (current,) if isinstance(current, str) else current:
+        try:
+            script.get_revision(revision)
+        except CommandError as exc:
+            raise RuntimeError(
+                "Omnigent database schema is newer than this version of Omnigent "
+                f"(found revision {revision!r}, latest supported revision {head!r}). "
+                "Upgrade Omnigent before using this database."
+            ) from exc
 
 
 def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:

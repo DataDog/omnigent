@@ -711,13 +711,16 @@ def register_core_routes(
     def _instrument_model_switch(handler: Callable) -> Callable:
         @functools.wraps(handler)
         async def wrapped(
-            request: Request, session_id: str, body: UpdateSessionRequest
+            request: Request,
+            session_id: str,
+            body: UpdateSessionRequest,
+            include_usage: bool = True,
         ) -> SessionResponse:
             if "model_override" not in body.model_fields_set or body.silent:
-                return await handler(request, session_id, body)
+                return await handler(request, session_id, body, include_usage)
             user_id = _get_user_id(request, auth_provider)
             if user_id is None and auth_provider is not None:
-                return await handler(request, session_id, body)
+                return await handler(request, session_id, body, include_usage)
             try:
                 before = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             except Exception:
@@ -729,7 +732,7 @@ def register_core_routes(
                 session_owner_id=await _owner_id(session_id),
             ) as usage:
                 try:
-                    result = await handler(request, session_id, body)
+                    result = await handler(request, session_id, body, include_usage)
                     if before is not None and before.model_override == result.model_override:
                         usage.finish("no_change")
                     else:

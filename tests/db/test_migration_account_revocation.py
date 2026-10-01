@@ -106,7 +106,7 @@ def test_mysql_account_migration_resumes_after_committed_column(db_uri, column):
         assert str(exc.value.__cause__) == "injected interruption after committed column"
     finally:
         sa.event.remove(engine, "after_cursor_execute", interrupt)
-    assert _get_current_db_revision(engine) == "hh1b2c3d4e5f"
+    assert _get_current_db_revision(engine) == ("hh1b2c3d4e5f", "r6a8c0e2f4b6")
     assert column in {c["name"] for c in sa.inspect(engine).get_columns("users")}
     _initialize_or_verify_schema(engine, db_uri)
     account = accounts.get_user("migration-user")

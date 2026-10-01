@@ -919,6 +919,7 @@ class HostStore:
         def write(session: Session) -> Host:
             generation = require_active_account(session, user_id)
             row = SqlHost(
+                workspace_id=current_workspace_id(),
                 account_generation=generation,
                 user_id=user_id,
                 name=name,

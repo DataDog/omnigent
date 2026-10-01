@@ -117,6 +117,13 @@ def register_permissions_routes(
             body: GrantPermissionRequest,
         ) -> PermissionObject:
             actor = _require_user(request, auth_provider) or RESERVED_USER_LOCAL
+            target = (
+                await asyncio.to_thread(permission_store.get_user, body.user_id)
+                if permission_store is not None
+                else None
+            )
+            # Pin the target before the telemetry lookup can yield to account deletion.
+            request.state.sharing_target_generation = target.account_generation if target else None
             operation = "grant"
             try:
                 if (
@@ -256,8 +263,7 @@ def register_permissions_routes(
                     "Public access is limited to read-only (level 1)",
                     code=ErrorCode.INVALID_INPUT,
                 )
-        target = await asyncio.to_thread(permission_store.get_user, body.user_id)
-        with target_account_scope(body.user_id, target.account_generation if target else None):
+        with target_account_scope(body.user_id, request.state.sharing_target_generation):
             existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
             if existing is not None and existing.level == LEVEL_OWNER:
                 raise OmnigentError(

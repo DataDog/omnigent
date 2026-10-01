@@ -167,7 +167,7 @@ def test_account_generation_backfill_resumes_after_schema_commit(db_uri) -> None
             _initialize_or_verify_schema(engine, db_uri)
     finally:
         event.remove(engine, "before_cursor_execute", interrupt_backfill)
-    assert _get_current_db_revision(engine) == "hh1b2c3d4e5f"
+    assert _get_current_db_revision(engine) == ("hh1b2c3d4e5f", "r6a8c0e2f4b6")
     assert "account_generation" in {c["name"] for c in inspect(engine).get_columns("users")}
 
     _initialize_or_verify_schema(engine, db_uri)
