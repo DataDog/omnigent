@@ -42,7 +42,7 @@ overrides:
   lightningcss: 1.32.0
   postcss: 8.5.23
   browserslist: 4.28.8
-  fast-uri: 3.1.6
+  fast-uri: 3.1.8
   '@xmldom/xmldom': 0.8.15
   qs: 6.16.0
   query-string: 9.5.0
@@ -56,11 +56,12 @@ overrides:
   mermaid: 11.16.1
   tar: 7.5.21
   sharp: 0.35.4
-  'node-gyp>undici': 6.28.0
-  'undici@>=7.0.0 <8.0.0': 7.29.0
-  'brace-expansion@>=1.0.0 <2.0.0': 1.1.18
-  'brace-expansion@>=2.0.0 <3.0.0': 2.1.4
-  'brace-expansion@>=5.0.0 <6.0.0': 5.0.9
+  'node-gyp>undici': 6.28.1
+  'undici@>=7.0.0 <8.0.0': 7.29.1
+  'undici@>=8.0.0 <9.0.0': 8.10.2
+  'brace-expansion@>=1.0.0 <2.0.0': 1.1.21
+  'brace-expansion@>=2.0.0 <3.0.0': 2.1.7
+  'brace-expansion@>=5.0.0 <6.0.0': 5.0.12
   '@shikijs/core': 4.2.0
   '@shikijs/engine-javascript': 4.2.0
   '@shikijs/engine-oniguruma': 4.2.0
