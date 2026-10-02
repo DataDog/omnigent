@@ -11241,13 +11241,10 @@ async def _handle_mcp_tools_call(
             result_policy.data if isinstance(result_policy.data, str) else str(result_policy.data)
         )
 
-    return _mcp_ok_response(
-        rpc_id,
-        {
-            "content": [{"type": "text", "text": output}],
-            "isError": exec_data.get("isError", False),
-        },
-    )
+    tool_result: dict[str, Any] = {"content": [{"type": "text", "text": output}]}
+    if execute_tool is not None or registry_config is not None:
+        tool_result["isError"] = exec_data.get("isError", False)
+    return _mcp_ok_response(rpc_id, tool_result)
 
 
 async def _fetch_model_options(
