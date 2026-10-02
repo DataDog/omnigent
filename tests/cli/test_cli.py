@@ -1099,14 +1099,16 @@ def test_help_groups_harnesses_and_other_commands() -> None:
     assert commands_at < result.output.index("server")
 
 
-def test_help_hides_deprecated_update_spelling_but_keeps_it_runnable() -> None:
-    """``update`` is omitted from --help but stays registered and runnable."""
+def test_help_hides_update_alias_but_keeps_it_runnable() -> None:
+    """The ``update`` alias is omitted from --help but stays registered."""
     result = CliRunner().invoke(cli, ["--help"])
 
     assert result.exit_code == 0, result.output
     assert "upgrade" in result.output
+    # The alias line is suppressed so it doesn't duplicate ``upgrade``...
     assert "\n  update " not in result.output
-    assert cli.commands["update"].hidden is True
+    # ...but it's still a real, invokable command.
+    assert cli.commands["update"] is cli.commands["upgrade"]
 
 
 def test_help_hides_extras_gated_harness_when_sdk_missing(
@@ -1398,6 +1400,71 @@ def test_bundled_agent_command_rejects_extra_positional_target(
 
     assert result.exit_code != 0
     dispatch.assert_not_called()
+
+
+def test_copilot_command_forwards_to_run_on_the_copilot_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``omnigent copilot`` dispatches ``run --harness copilot`` with pass-through
+    flags intact and a canonical ``omnigent run --harness copilot`` resume prefix."""
+    result, dispatch = _invoke_bundled_agent_command(
+        monkeypatch, ["copilot", "-p", "review the last commit", "--model", "m1"]
+    )
+
+    assert result.exit_code == 0, result.output
+    dispatch.assert_called_once()
+    kwargs = dispatch.call_args.kwargs
+    assert kwargs["target"] is None
+    assert kwargs["harness"] == "copilot"
+    assert kwargs["prompt"] == "review the last commit"
+    assert kwargs["model"] == "m1"
+    assert kwargs["resume_parts"][:4] == ["omnigent", "run", "--harness", "copilot"]
+
+
+def test_copilot_command_rejects_explicit_harness(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--harness`` on the copilot shorthand is a usage error, not a silent override."""
+    result, dispatch = _invoke_bundled_agent_command(monkeypatch, ["copilot", "--harness=codex"])
+
+    assert result.exit_code != 0
+    assert "always uses the copilot harness" in result.output
+    dispatch.assert_not_called()
+
+
+def test_copilot_command_answers_help_and_is_rostered_as_a_harness() -> None:
+    """``omnigent copilot --help`` prints its own usage and the command is a harness row."""
+    from omnigent.cli import _HARNESS_COMMANDS, _harness_extra_checks
+
+    result = CliRunner().invoke(cli, ["copilot", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "copilot [OPTIONS] [RUN_ARGS]..." in result.output
+    assert "No such command" not in result.output
+    assert "copilot" in _CLICK_SUBCOMMANDS
+    assert "copilot" in _HARNESS_COMMANDS
+    # Extras-gated like cursor: the roster row follows the Copilot SDK extra.
+    assert "copilot" in _harness_extra_checks()
+
+
+def test_help_rosters_copilot_only_when_its_sdk_is_installed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The copilot row appears under Harnesses with its SDK, and hides without it."""
+    monkeypatch.setattr("omnigent.cli._harness_extra_checks", lambda: {"copilot": lambda: True})
+    shown = CliRunner().invoke(cli, ["--help"])
+
+    assert shown.exit_code == 0, shown.output
+    harnesses_at = shown.output.index("Harnesses:")
+    commands_at = shown.output.index("Commands:", harnesses_at)
+    assert harnesses_at < shown.output.index("\n  copilot ") < commands_at
+
+    monkeypatch.setattr("omnigent.cli._harness_extra_checks", lambda: {"copilot": lambda: False})
+    hidden = CliRunner().invoke(cli, ["--help"])
+
+    assert hidden.exit_code == 0, hidden.output
+    assert "\n  copilot " not in hidden.output
+    assert "Some harnesses need an optional extra" in hidden.output
+    # Still registered and runnable; only the listing is suppressed.
+    assert "copilot" in cli.commands
 
 
 def test_first_run_plan_and_polly_command_agree_on_bundled_path(
@@ -3377,6 +3444,91 @@ def test_preregister_agent_accepts_directory(tmp_path: Path) -> None:
     put_location, put_bytes = artifact_store.puts[0]
     assert put_location == created["bundle_location"]
     assert len(put_bytes) > 0
+
+
+def test_preregister_agent_accepts_resolvable_policy_function(tmp_path: Path) -> None:
+    """
+    A guardrail function policy whose path IS importable from
+    sys.path registers normally — the fail-loud validation must not
+    reject valid paths.
+    """
+    agent_dir = tmp_path / "guarded-agent"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "guarded-agent",
+            "executor": {"config": {"harness": "openai-agents"}},
+            "guardrails": {
+                "policies": {
+                    "guard": {
+                        "type": "function",
+                        "on": ["request"],
+                        # A real, importable builtin — resolves from sys.path.
+                        "function": "omnigent.policies.builtins.safety.ask_on_os_tools",
+                    },
+                },
+            },
+        },
+    )
+
+    agent_store = _RecordingAgentStore()
+    artifact_store = _RecordingArtifactStore()
+    agent_cache = _RecordingAgentCache()
+
+    agent_id = _preregister_agent(agent_dir, agent_store, artifact_store, agent_cache)
+
+    assert agent_id is not None
+    assert len(agent_store.created) == 1
+
+
+def test_preregister_agent_rejects_unresolvable_policy_function(
+    tmp_path: Path,
+) -> None:
+    """
+    A guardrail function policy whose path can't be resolved from
+    sys.path fails REGISTRATION loudly, naming the agent, policy, and
+    path — instead of registering an agent whose every turn would be
+    fail-closed denied with a generic policy-evaluation error.
+    """
+    agent_dir = tmp_path / "broken-agent"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "broken-agent",
+            "executor": {"config": {"harness": "openai-agents"}},
+            "guardrails": {
+                "policies": {
+                    "pack_guard": {
+                        "type": "function",
+                        "on": ["request"],
+                        # Pack-local module the server can't import.
+                        "function": "agents.mypack.policies.missing_module.check",
+                    },
+                },
+            },
+        },
+    )
+
+    agent_store = _RecordingAgentStore()
+    artifact_store = _RecordingArtifactStore()
+    agent_cache = _RecordingAgentCache()
+
+    with pytest.raises(ClickException, match=r"cannot be resolved from sys\.path") as exc:
+        _preregister_agent(agent_dir, agent_store, artifact_store, agent_cache)
+
+    # Actionable message: names the agent, the policy, and the path.
+    message = str(exc.value)
+    assert "broken-agent" in message
+    assert "pack_guard" in message
+    assert "missing_module" in message
+
+    # Nothing half-registered.
+    assert agent_store.created == []
+    assert artifact_store.puts == []
 
 
 def test_preregister_agent_accepts_omnigent_yaml_file(tmp_path: Path) -> None:

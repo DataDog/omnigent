@@ -28,7 +28,7 @@
   },
   "orderedImports": {
     "includeConditionalImports": false,
-    "shouldGroupImports": false
+    "shouldGroupImports": true
   },
   "rules": {
     "AllPublicDeclarationsHaveDocumentation": false,
