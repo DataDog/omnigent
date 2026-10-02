@@ -174,6 +174,9 @@ def _prompt_event(prompt: str) -> SessionEventInput:
 
 async def finish_pending_fires() -> None:
     """Finish accepted session launches while their host tunnels are still open."""
+    from omnigent.server.scheduled.scheduler import finish_pending_ticks
+
+    await finish_pending_ticks()
     if _PENDING_FIRES:
         await asyncio.gather(*tuple(_PENDING_FIRES), return_exceptions=True)
 

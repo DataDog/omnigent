@@ -374,6 +374,12 @@ class ScheduledTaskScheduler:
 _PENDING_FIRES: set[Any] = set()
 
 
+async def finish_pending_ticks() -> None:
+    """Settle accepted timer callbacks before draining their background launches."""
+    if _PENDING_FIRES:
+        await asyncio.gather(*tuple(_PENDING_FIRES), return_exceptions=True)
+
+
 def _default_schedule_call(delay: float, factory: Callable[[], Any]) -> Any:
     """Arm a real ``loop.call_later`` timer that spawns the fire coroutine."""
     import asyncio
