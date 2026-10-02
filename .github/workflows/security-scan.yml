@@ -15,9 +15,9 @@ name: Security Scan
 # / uv sync / test). Detectors run fail-fast -- the first finding fails the job,
 # so a clean PR must pass every one.
 #
-# Trust tiers (should-scan.sh): trusted (OWNER/MEMBER/COLLABORATOR, or an author
-# in the MAINTAINERS list -- covers maintainers with private org membership) and
-# non-PR events aren't scanned; returning contributors are; first-timers are held
+# Trust tiers (should-scan.sh): same-repository PRs and trusted authors
+# (OWNER/MEMBER/COLLABORATOR, or an author in the MAINTAINERS list) are
+# not scanned; returning fork contributors are, and first-timers are held
 # by GitHub's native fork-approval gate first.
 
 on:
@@ -68,6 +68,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           # Trusted-CI-bot allowlist in should-scan.sh (GitHub-set, not PR-controlled).
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           # For the skip-security-scan label waiver + author check (read-only).
@@ -135,7 +136,7 @@ jobs:
 
       - name: Install uv
         if: ${{ steps.gate.outputs.scan == 'true' }}
-        uses: astral-sh/setup-uv@38f3f104447c67c051c4a08e39b64a148898af3a  # v3
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
 
       - name: OSV advisory scan (uv.lock)
         # Checks every package version pinned in the PR's uv.lock against the

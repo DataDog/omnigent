@@ -14,7 +14,7 @@ overrides:
   lightningcss: 1.32.0
   postcss: 8.5.23
   browserslist: 4.28.8
-  fast-uri: 3.1.6
+  fast-uri: 3.1.8
   '@xmldom/xmldom': 0.8.15
   qs: 6.16.0
   query-string: 9.5.0
@@ -28,11 +28,12 @@ overrides:
   mermaid: 11.16.1
   tar: 7.5.21
   sharp: 0.35.4
-  node-gyp>undici: 6.28.0
-  undici@>=7.0.0 <8.0.0: 7.29.0
-  brace-expansion@>=1.0.0 <2.0.0: 1.1.18
-  brace-expansion@>=2.0.0 <3.0.0: 2.1.4
-  brace-expansion@>=5.0.0 <6.0.0: 5.0.9
+  node-gyp>undici: 6.28.1
+  undici@>=7.0.0 <8.0.0: 7.29.1
+  undici@>=8.0.0 <9.0.0: 8.10.2
+  brace-expansion@>=1.0.0 <2.0.0: 1.1.21
+  brace-expansion@>=2.0.0 <3.0.0: 2.1.7
+  brace-expansion@>=5.0.0 <6.0.0: 5.0.12
   '@shikijs/core': 4.2.0
   '@shikijs/engine-javascript': 4.2.0
   '@shikijs/engine-oniguruma': 4.2.0
@@ -82,8 +83,8 @@ importers:
   .github/ci-deps:
     dependencies:
       '@anthropic-ai/claude-code':
-        specifier: 2.1.236
-        version: 2.1.236
+        specifier: 2.1.266
+        version: 2.1.266
       '@earendil-works/pi-coding-agent':
         specifier: 0.84.2
         version: 0.84.2(@modelcontextprotocol/sdk@1.29.0(supports-color@10.2.2)(zod@4.4.3))(supports-color@10.2.2)(ws@8.21.1)(zod@4.4.3)
@@ -146,6 +147,9 @@ importers:
       '@dnd-kit/core':
         specifier: ^6.3.1
         version: 6.3.1(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
+      '@dnd-kit/sortable':
+        specifier: ^10.0.0
+        version: 10.0.0(@dnd-kit/core@6.3.1(react-dom@18.3.1(react@18.3.1))(react@18.3.1))(react@18.3.1)
       '@emoji-mart/data':
         specifier: ^1.2.1
         version: 1.2.1
@@ -303,7 +307,7 @@ importers:
         specifier: ^0.4.6
         version: 0.4.6(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
       pdfjs-dist:
-        specifier: ^4.8.69
+        specifier: 4.8.69
         version: 4.8.69
       qrcode.react:
         specifier: ^4.2.0
@@ -485,11 +489,14 @@ importers:
         version: 4.3.2
     devDependencies:
       electron:
-        specifier: ^42.3.2
-        version: 42.7.0(supports-color@10.2.2)
+        specifier: 42.10.0
+        version: 42.10.0(supports-color@10.2.2)
       electron-builder:
         specifier: ^26.0.0
         version: 26.15.3(electron-builder-squirrel-windows@26.15.3)(supports-color@10.2.2)
+      jsdom:
+        specifier: ^29.1.1
+        version: 29.1.1(@noble/hashes@2.2.0)(canvas@3.2.3)
       playwright:
         specifier: ^1.62.1
         version: 1.62.1
@@ -553,52 +560,52 @@ packages:
   '@antfu/install-pkg@1.1.0':
     resolution: {integrity: sha512-MGQsmw10ZyI+EJo45CdSER4zEb+p31LpDAFp2Z3gkSd1yqVZGi0Ebx++YTEMonJy4oChEMLsxZ64j8FH6sSqtQ==}
 
-  '@anthropic-ai/claude-code-darwin-arm64@2.1.236':
-    resolution: {integrity: sha512-CaGOnOXLFmecFc6td8SykfbYWo+P/o9Knh7fUYRpI0NTCG7edINaDaS1Eu9PeYUn8Sy91A4TwYRglko1WFpg4g==}
+  '@anthropic-ai/claude-code-darwin-arm64@2.1.266':
+    resolution: {integrity: sha512-VXuQWllJBff2h5b4tzHpv3vLksXGiSFhCGRd6Mpk09T3/xqZIY1supoK04xMtAY4HobeAIyIjINosT0Jl6Yq8w==}
     cpu: [arm64]
     os: [darwin]
 
-  '@anthropic-ai/claude-code-darwin-x64@2.1.236':
-    resolution: {integrity: sha512-q6YsfH79686Amgy5Riw9Rv2dYh40BccUSSpxneZJtBHyaJqkEmijMg6OWZIRE1d++CbIiWDe9hkFFP6acvuYVA==}
+  '@anthropic-ai/claude-code-darwin-x64@2.1.266':
+    resolution: {integrity: sha512-zcVMxGk3pp6Vo6rWolgXXV2fXoPFUYvVazfHeDejglOuSsgmCpGVVBSKSjSSM6ufa1cvb3XiqJ3HH3OjXet6pg==}
     cpu: [x64]
     os: [darwin]
 
-  '@anthropic-ai/claude-code-linux-arm64-musl@2.1.236':
-    resolution: {integrity: sha512-bXzIK4/LmVqzaQv87cdJC0w86sEqUuozJphULSkrPHukyl9gZJ1ZpwHbfxZPXGOopbM6uLiCOmp+J+hu3u0MtQ==}
+  '@anthropic-ai/claude-code-linux-arm64-musl@2.1.266':
+    resolution: {integrity: sha512-PiekRUTXD28N8Q7LYiabX7C51oevy1GpGrVNGx61KgKMi6eV4adyEm6iN3IWQhLDzi0Nkbpct81M0fAdDuiNdg==}
     cpu: [arm64]
     os: [linux]
     libc: [musl]
 
-  '@anthropic-ai/claude-code-linux-arm64@2.1.236':
-    resolution: {integrity: sha512-3e8S69B1Nsb7eX3z9Eq0ngHpGyPIl/aVc+BaoSHGMs3gP1ucyon5YIM2VRHFE3lj+FOBsGId7dU9LpeBSWNGnA==}
+  '@anthropic-ai/claude-code-linux-arm64@2.1.266':
+    resolution: {integrity: sha512-qnyuPH1dooHNt8KREs7GLNbzvYLHmh3VQYAlvWoQPg09CxdVwBDwos8S+dap03PHv07lPUhrCqliKOV6fIs69w==}
     cpu: [arm64]
     os: [linux]
     libc: [glibc]
 
-  '@anthropic-ai/claude-code-linux-x64-musl@2.1.236':
-    resolution: {integrity: sha512-D/mlGvsiAmGQEli2lGTa5NNT+IF/0TwttqhCr+EuSnN99re54BBIekvp1FKBlRRW7WS4IeaMbjWlZmE5Le/rKA==}
+  '@anthropic-ai/claude-code-linux-x64-musl@2.1.266':
+    resolution: {integrity: sha512-4nW3qLWw2iy/Qjyjt5+N+nofkySQkN2c/VQfowyadrbg/yEgX2A1JQJXB106of+zt2dTTpM5Qy/Ai7IJ9MJJ/Q==}
     cpu: [x64]
     os: [linux]
     libc: [musl]
 
-  '@anthropic-ai/claude-code-linux-x64@2.1.236':
-    resolution: {integrity: sha512-96GVEfl+2t2HWbKBlW4oIEubH6pkL27R5j9feWS+tQH6MWiGnr8jNsL5Fv2405ZiO3+SiX2eV/3sUkUWRV5h6w==}
+  '@anthropic-ai/claude-code-linux-x64@2.1.266':
+    resolution: {integrity: sha512-0YW7k2gyjCKfoNNMn+h9LVOKbZi/XVie2BBLGcoahXtRmWIXNuhazEd0BdvXDbcUc7mi9A2Nwq/TWD/riwO6oA==}
     cpu: [x64]
     os: [linux]
     libc: [glibc]
 
-  '@anthropic-ai/claude-code-win32-arm64@2.1.236':
-    resolution: {integrity: sha512-mDqDsI1panxe3qw7U2Ixjr94yScqJDHfdMX7rGBCeHh1wxxfACddEYXzCMzEL3M4JwtcZarHqi0gvbG9qzNbmQ==}
+  '@anthropic-ai/claude-code-win32-arm64@2.1.266':
+    resolution: {integrity: sha512-LFbmYdnhWU4BCnEImXShkw76kyIMPOfgzwW1N4uPac4x6gvnk+9Wd8no6JyfBGPPej69/bu8Pgp09VMDML2ikg==}
     cpu: [arm64]
     os: [win32]
 
-  '@anthropic-ai/claude-code-win32-x64@2.1.236':
-    resolution: {integrity: sha512-ijuHexQ4q0mhWXGw6M1dfeBkMuGSs5E0tVQ3Mlrh8d5XjjLVPqhiFiGW/vieITvwjmgu7m42prdDUJSCYp2deQ==}
+  '@anthropic-ai/claude-code-win32-x64@2.1.266':
+    resolution: {integrity: sha512-C+5K9u62OLUQ2fW6P6Dpr3ojema4AxEeTdlLubXgh4QTTyQNkHOVbzSNCLoQow2WHBqZNIfIJJAizA+pwM8SPQ==}
     cpu: [x64]
     os: [win32]
 
-  '@anthropic-ai/claude-code@2.1.236':
-    resolution: {integrity: sha512-sz+7GLMhFcwkN2tZHJIXGgon/g/29WMMV5UNYog9sl4OvdX5q3evM1mcXVQnasP4obP6ueItECMCpSk1MPhTDg==}
+  '@anthropic-ai/claude-code@2.1.266':
+    resolution: {integrity: sha512-zaEL5S5twZgQzmF1b/SBMSOllwMrJiqHXTd25ZWwaZRKr1jUKy4jGTPR/uMLYWsuv9Az1neiaWGLJu93lPYO8w==}
     engines: {node: '>=22.0.0'}
     hasBin: true
 
@@ -4877,14 +4884,14 @@ packages:
   bowser@2.14.1:
     resolution: {integrity: sha512-tzPjzCxygAKWFOJP011oxFHs57HzIhOEracIgAePE4pqB3LikALKnSzUyU4MGs9/iCEUuHlAJTjTc5M+u7YEGg==}
 
-  brace-expansion@1.1.18:
-    resolution: {integrity: sha512-Edep/X9fGqVNmzKBVsDYIOtD+z1tuezV70LBjdCst9Tqu76lsnvRiZ6oTic1n+/BIwX6QDGAO94PN4N2SADvtw==}
+  brace-expansion@1.1.21:
+    resolution: {integrity: sha512-9zeA+KLZNNzglF2TPKRQEDyx6Yby7daAkuy8MiPzpXPsYDWi/DRM8jmwUDxokQjYqBpv5DgPiwD4h4ZZSy1Ujw==}
 
-  brace-expansion@2.1.4:
-    resolution: {integrity: sha512-hGfVzPxthbf3+2yjg/RBs60cB0FhqBS/zvdV/4wn4/BmN0bNMMHPc4V/BbFieqf1TKAGGAHnY4eSjajCl0f2Xg==}
+  brace-expansion@2.1.7:
+    resolution: {integrity: sha512-uZbew1NqdmPDTMJ8ah1y+b+9QEJrfkXFk3RcTQw3X0jW/xRUvFKsg1CfQdSYGdTbXZWExtU3J3ccxtnfw1Fi0g==}
 
-  brace-expansion@5.0.9:
-    resolution: {integrity: sha512-ScQ4IuvIEF1TMlP7Zt+vjJ//9zlPb2SDcxWxM3bk8s6t6GGdJ7KO1dCcTidOPJKePW30LE/2cT7wCyPho9/Wxg==}
+  brace-expansion@5.0.12:
+    resolution: {integrity: sha512-YovQ3rzhaLMIrDjNDMkNS01tea93qhEhG5xy8f6+R0l+dw3Ki+5sCoIoI942iuLZTHWogWktgwVDhU09iNEimQ==}
     engines: {node: 20 || >=22}
 
   braces@3.0.3:
@@ -5589,8 +5596,8 @@ packages:
     resolution: {integrity: sha512-bO3y10YikuUwUuDUQRM4KfwNkKhnpVO7IPdbsrejwN9/AABJzzTQ4GeHwyzNSrVO+tEH3/Np255a3sVZpZDjvg==}
     engines: {node: '>=8.0.0'}
 
-  electron@42.7.0:
-    resolution: {integrity: sha512-Uu5p03M5o7aqulT8QxFYYg3eJVDfuNEUuasBU1qFl05ghVRRH7UHL7na8S3GhxVScZQ2D7j9DCMsc+qT5FuxtQ==}
+  electron@42.10.0:
+    resolution: {integrity: sha512-yBWnZO8tKId0ADvGa4+imPmm3+8Kfs8MtkUPhQQJz1AjTnUUDwCTWkQEU0CrArVVL97Jo4Q/0mVcLHciicBDGQ==}
     engines: {node: '>= 22.12.0'}
     hasBin: true
 
@@ -5834,8 +5841,8 @@ packages:
   fast-string-width@3.0.2:
     resolution: {integrity: sha512-gX8LrtNEI5hq8DVUfRQMbr5lpaS4nMIWV+7XEbXk2b8kiQIizgnlr12B4dA3ZEx3308ze0O4Q1R+cHts8kyUJg==}
 
-  fast-uri@3.1.6:
-    resolution: {integrity: sha512-7Ical1vFEMr0onbVzEDIreM22I4khW+fzyQPwvAFWBp1iwdshSZRsL4jjRvPG9JP1uiqMHRto+YU6R2/CzDz5Q==}
+  fast-uri@3.1.8:
+    resolution: {integrity: sha512-GZMtZUTNRpOVIECoXwLNZS5xUGE+mVNbTB8h/7Rwh2TFWcBQiPzTgyZi05BF9UMZKkLJv8XBRJTlU7zg8+ZfMg==}
 
   fast-wrap-ansi@0.2.2:
     resolution: {integrity: sha512-7F2Fl+TjRSenLqlU3UjSH0iyqopqoZIu7eZVpEirP2g1GtWa2G/ecEmBdgz31+Mxr+ELclgg6sokpSFIQiZ02Q==}
@@ -8865,16 +8872,16 @@ packages:
   undici-types@7.18.2:
     resolution: {integrity: sha512-AsuCzffGHJybSaRrmr5eHr81mwJU3kjw6M+uprWvCXiNeN9SOGwQ3Jn8jb8m3Z6izVgknn1R0FTCEAP2QrLY/w==}
 
-  undici@6.28.0:
-    resolution: {integrity: sha512-LIY910g9TI13YS95lrMFrs8Rm/u/irgHeTWoKCoteeJ04CUJ92eEfj0rVn+7VKMPBpUPiUoBKfhNyLI23EE/KA==}
+  undici@6.28.1:
+    resolution: {integrity: sha512-zWpdTVD54H48CIybL0rWQ3ukpb9d23wM7eH5RtfdmeP70cWHNjtfo7P4vZX+5CoDcO53J4Pu5uXp7lNfjc6DRA==}
     engines: {node: '>=18.17'}
 
-  undici@7.29.0:
-    resolution: {integrity: sha512-IDxfleLmmbSskfWSUATiN1nfn2rDuvnMOqb5CWR92iIfojA0Ud+ulOAAEQ57LPr9rWmsreUyf5lwyao+7GNNVw==}
+  undici@7.29.1:
+    resolution: {integrity: sha512-RYONW2MeafgYlkVOKYKkA/Ag7BmXqgIWCa8t1m0JcxrQg9pI9lEqRhAOruOBCbAohOa/gkCF+iPi9hrgvTzu6Q==}
     engines: {node: '>=20.18.1'}
 
-  undici@8.9.0:
-    resolution: {integrity: sha512-aWZpUj7XoGonMClx4gdDRfgBjqeA+F473aDmROQQbM9n6PRfK/u1q/a0X4wMTgcHfT8H6fpbt98PFuDUwFg2YA==}
+  undici@8.10.2:
+    resolution: {integrity: sha512-/y4/bH9YNU5hi9NIrpOuvGXFcxrj3CMrV+/AYpowAYTpHn8gX/XPFjNy766FPoYY0miQhdW977JFWKGNhBdwyQ==}
     engines: {node: '>=22.19.0'}
 
   unenv@2.0.0-rc.24:
@@ -9463,40 +9470,40 @@ snapshots:
       package-manager-detector: 1.7.0
       tinyexec: 1.3.1
 
-  '@anthropic-ai/claude-code-darwin-arm64@2.1.236':
+  '@anthropic-ai/claude-code-darwin-arm64@2.1.266':
     optional: true
 
-  '@anthropic-ai/claude-code-darwin-x64@2.1.236':
+  '@anthropic-ai/claude-code-darwin-x64@2.1.266':
     optional: true
 
-  '@anthropic-ai/claude-code-linux-arm64-musl@2.1.236':
+  '@anthropic-ai/claude-code-linux-arm64-musl@2.1.266':
     optional: true
 
-  '@anthropic-ai/claude-code-linux-arm64@2.1.236':
+  '@anthropic-ai/claude-code-linux-arm64@2.1.266':
     optional: true
 
-  '@anthropic-ai/claude-code-linux-x64-musl@2.1.236':
+  '@anthropic-ai/claude-code-linux-x64-musl@2.1.266':
     optional: true
 
-  '@anthropic-ai/claude-code-linux-x64@2.1.236':
+  '@anthropic-ai/claude-code-linux-x64@2.1.266':
     optional: true
 
-  '@anthropic-ai/claude-code-win32-arm64@2.1.236':
+  '@anthropic-ai/claude-code-win32-arm64@2.1.266':
     optional: true
 
-  '@anthropic-ai/claude-code-win32-x64@2.1.236':
+  '@anthropic-ai/claude-code-win32-x64@2.1.266':
     optional: true
 
-  '@anthropic-ai/claude-code@2.1.236':
+  '@anthropic-ai/claude-code@2.1.266':
     optionalDependencies:
-      '@anthropic-ai/claude-code-darwin-arm64': 2.1.236
-      '@anthropic-ai/claude-code-darwin-x64': 2.1.236
-      '@anthropic-ai/claude-code-linux-arm64': 2.1.236
-      '@anthropic-ai/claude-code-linux-arm64-musl': 2.1.236
-      '@anthropic-ai/claude-code-linux-x64': 2.1.236
-      '@anthropic-ai/claude-code-linux-x64-musl': 2.1.236
-      '@anthropic-ai/claude-code-win32-arm64': 2.1.236
-      '@anthropic-ai/claude-code-win32-x64': 2.1.236
+      '@anthropic-ai/claude-code-darwin-arm64': 2.1.266
+      '@anthropic-ai/claude-code-darwin-x64': 2.1.266
+      '@anthropic-ai/claude-code-linux-arm64': 2.1.266
+      '@anthropic-ai/claude-code-linux-arm64-musl': 2.1.266
+      '@anthropic-ai/claude-code-linux-x64': 2.1.266
+      '@anthropic-ai/claude-code-linux-x64-musl': 2.1.266
+      '@anthropic-ai/claude-code-win32-arm64': 2.1.266
+      '@anthropic-ai/claude-code-win32-x64': 2.1.266
 
   '@anthropic-ai/sdk@0.91.1(zod@4.4.3)':
     dependencies:
@@ -10151,7 +10158,7 @@ snapshots:
       open: 8.4.2
       picomatch: 4.0.5
       systeminformation: 5.33.0
-      undici: 7.29.0
+      undici: 7.29.1
       which: 4.0.0
       yocto-spinner: 1.2.2
 
@@ -10219,7 +10226,7 @@ snapshots:
       proper-lockfile: 4.1.2
       semver: 7.8.0
       typebox: 1.3.7
-      undici: 8.9.0
+      undici: 8.10.2
       yaml: 2.9.0
     optionalDependencies:
       '@mariozechner/clipboard': 0.3.9
@@ -10272,14 +10279,14 @@ snapshots:
 
   '@electron/get@5.0.0(supports-color@10.2.2)':
     dependencies:
-      debug: 4.4.3(supports-color@7.2.0)
+      debug: 4.4.3(supports-color@10.2.2)
       env-paths: 3.0.0
       graceful-fs: 4.2.11
       progress: 2.0.3
       semver: 7.8.5
       sumchecker: 3.0.1(supports-color@10.2.2)
     optionalDependencies:
-      undici: 7.29.0
+      undici: 7.29.1
     transitivePeerDependencies:
       - supports-color
 
@@ -14021,7 +14028,7 @@ snapshots:
   ajv@8.20.0:
     dependencies:
       fast-deep-equal: 3.1.3
-      fast-uri: 3.1.6
+      fast-uri: 3.1.8
       json-schema-traverse: 1.0.0
       require-from-string: 2.0.2
 
@@ -14287,16 +14294,16 @@ snapshots:
 
   bowser@2.14.1: {}
 
-  brace-expansion@1.1.18:
+  brace-expansion@1.1.21:
     dependencies:
       balanced-match: 1.0.2
       concat-map: 0.0.1
 
-  brace-expansion@2.1.4:
+  brace-expansion@2.1.7:
     dependencies:
       balanced-match: 1.0.2
 
-  brace-expansion@5.0.9:
+  brace-expansion@5.0.12:
     dependencies:
       balanced-match: 4.0.4
 
@@ -14441,7 +14448,7 @@ snapshots:
       parse5: 7.3.0
       parse5-htmlparser2-tree-adapter: 7.1.0
       parse5-parser-stream: 7.1.2
-      undici: 7.29.0
+      undici: 7.29.1
       whatwg-mimetype: 4.0.0
 
   chownr@1.1.4:
@@ -14836,12 +14843,6 @@ snapshots:
     optionalDependencies:
       supports-color: 10.2.2
 
-  debug@4.4.3(supports-color@7.2.0):
-    dependencies:
-      ms: 2.1.3
-    optionalDependencies:
-      supports-color: 7.2.0
-
   decimal.js-light@2.5.1: {}
 
   decimal.js@10.6.0: {}
@@ -15066,7 +15067,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  electron@42.7.0(supports-color@10.2.2):
+  electron@42.10.0(supports-color@10.2.2):
     dependencies:
       '@electron-internal/extract-zip': 1.0.4
       '@electron/get': 5.0.0(supports-color@10.2.2)
@@ -15361,7 +15362,7 @@ snapshots:
     dependencies:
       fast-string-truncated-width: 3.0.3
 
-  fast-uri@3.1.6: {}
+  fast-uri@3.1.8: {}
 
   fast-wrap-ansi@0.2.2:
     dependencies:
@@ -16104,7 +16105,7 @@ snapshots:
       saxes: 6.0.0
       symbol-tree: 3.2.4
       tough-cookie: 6.0.2
-      undici: 7.29.0
+      undici: 7.29.1
       w3c-xmlserializer: 5.0.0
       webidl-conversions: 8.0.1
       whatwg-mimetype: 5.0.0
@@ -17023,7 +17024,7 @@ snapshots:
     dependencies:
       '@cspotcode/source-map-support': 0.8.1
       sharp: 0.35.4(@types/node@24.13.3)
-      undici: 7.29.0
+      undici: 7.29.1
       workerd: 1.20260903.1
       ws: 8.21.0
       youch: 4.1.0-beta.10
@@ -17034,19 +17035,19 @@ snapshots:
 
   minimatch@10.2.5:
     dependencies:
-      brace-expansion: 5.0.9
+      brace-expansion: 5.0.12
 
   minimatch@3.1.5:
     dependencies:
-      brace-expansion: 1.1.18
+      brace-expansion: 1.1.21
 
   minimatch@5.1.9:
     dependencies:
-      brace-expansion: 2.1.4
+      brace-expansion: 2.1.7
 
   minimatch@9.0.9:
     dependencies:
-      brace-expansion: 2.1.4
+      brace-expansion: 2.1.7
 
   minimist@1.2.8: {}
 
@@ -17207,7 +17208,7 @@ snapshots:
       semver: 7.8.5
       tar: 7.5.21
       tinyglobby: 0.2.17
-      undici: 6.28.0
+      undici: 6.28.1
       which: 6.0.1
 
   node-int64@0.4.0: {}
@@ -19187,11 +19188,11 @@ snapshots:
 
   undici-types@7.18.2: {}
 
-  undici@6.28.0: {}
+  undici@6.28.1: {}
 
-  undici@7.29.0: {}
+  undici@7.29.1: {}
 
-  undici@8.9.0: {}
+  undici@8.10.2: {}
 
   unenv@2.0.0-rc.24:
     dependencies:
