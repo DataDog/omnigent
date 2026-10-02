@@ -958,6 +958,7 @@ def _set_generic_oidc_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OMNIGENT_OIDC_ISSUER", "https://issuer.example.com")
     monkeypatch.setenv("OMNIGENT_OIDC_CLIENT_ID", "public-client")
     monkeypatch.delenv("OMNIGENT_OIDC_CLIENT_SECRET", raising=False)
+    monkeypatch.setenv("OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD", "none")
     monkeypatch.setenv("OMNIGENT_OIDC_REDIRECT_URI", "http://127.0.0.1:6767/auth/callback")
     monkeypatch.setenv("OMNIGENT_OIDC_COOKIE_SECRET", "aa" * 32)
 
@@ -975,7 +976,7 @@ def test_oidc_config_allows_public_client(monkeypatch: pytest.MonkeyPatch) -> No
 
     config = OIDCConfig.from_env()
 
-    assert config.client_secret is None
+    assert config.client_secret == ""
     assert config.authorization_endpoint == "https://idp.example.com/authorize"
     assert config.token_endpoint == "https://idp.example.com/token"
     assert config.jwks_uri == "https://idp.example.com/jwks"
@@ -1019,7 +1020,7 @@ def test_oidc_config_standard_oidc_without_client_secret(
 
     A public OAuth client (e.g. Ticino) uses authorization code + PKCE
     with no client secret. The config must accept the absence and set
-    client_secret to None.
+    client_secret to the empty string.
     """
     _discovery = {
         "authorization_endpoint": "https://idp.example.com/authorize",
@@ -1044,13 +1045,14 @@ def test_oidc_config_standard_oidc_without_client_secret(
     monkeypatch.setenv("OMNIGENT_OIDC_ISSUER", "https://idp.example.com")
     monkeypatch.setenv("OMNIGENT_OIDC_CLIENT_ID", "public-client")
     monkeypatch.delenv("OMNIGENT_OIDC_CLIENT_SECRET", raising=False)
+    monkeypatch.setenv("OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD", "none")
     monkeypatch.setenv("OMNIGENT_OIDC_REDIRECT_URI", "https://app/callback")
     monkeypatch.setenv("OMNIGENT_OIDC_COOKIE_SECRET", "aa" * 32)
 
     config = OIDCConfig.from_env()
 
     assert config.provider_type == "oidc"
-    assert config.client_secret is None
+    assert config.client_secret == ""
 
 
 def test_oidc_config_github_still_requires_client_secret(
@@ -1060,7 +1062,7 @@ def test_oidc_config_github_still_requires_client_secret(
     _set_generic_oidc_env(monkeypatch)
     monkeypatch.setenv("OMNIGENT_OIDC_ISSUER", "https://github.com")
 
-    with pytest.raises(RuntimeError, match="GitHub OAuth requires a confidential client"):
+    with pytest.raises(RuntimeError, match="GitHub login requires client_secret_post"):
         OIDCConfig.from_env()
 
 
@@ -1094,7 +1096,7 @@ def test_oidc_endpoint_overrides_must_be_complete(monkeypatch: pytest.MonkeyPatc
         "OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT", "https://public.example.com/authorize"
     )
 
-    with pytest.raises(RuntimeError, match="must be configured together"):
+    with pytest.raises(RuntimeError, match="Set all three OIDC endpoint overrides"):
         OIDCConfig.from_env()
 
 

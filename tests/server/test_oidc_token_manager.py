@@ -62,7 +62,7 @@ def _make_config() -> OIDCConfig:
     return OIDCConfig(
         issuer=_ISSUER,
         client_id=_CLIENT_ID,
-        client_secret=None,
+        client_secret="",
         redirect_uri="http://localhost:8000/auth/callback",
         cookie_secret=_TEST_KEY,
         scopes="openid email profile",

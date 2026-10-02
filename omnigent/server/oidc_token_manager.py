@@ -170,7 +170,7 @@ class OidcTokenManager:
             "client_id": self._config.client_id,
             "refresh_token": credentials.refresh_token,
         }
-        if self._config.client_secret is not None:
+        if self._config.client_secret:
             token_data["client_secret"] = self._config.client_secret
 
         try:
