@@ -1153,9 +1153,11 @@ def _init_otel_logs() -> None:
 
     try:
         from opentelemetry._logs import set_logger_provider
-        from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+        from opentelemetry.sdk._logs import LoggerProvider
         from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
         from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+
+        from omnigent.runtime._otel_logging import RedactingOTelLoggingHandler
 
         service_name = os.environ.get("OTEL_SERVICE_NAME", "omnigent")
         provider = LoggerProvider(
@@ -1165,7 +1167,7 @@ def _init_otel_logs() -> None:
         provider.add_log_record_processor(BatchLogRecordProcessor(exporter))
         set_logger_provider(provider)
 
-        handler = LoggingHandler(logger_provider=provider)
+        handler = RedactingOTelLoggingHandler(logger_provider=provider)
         root_logger = logging.getLogger()
         # Mark the handler so re-init does not stack duplicates on
         # the root logger when init() runs again after a flag reset.
@@ -1178,6 +1180,25 @@ def _init_otel_logs() -> None:
     except Exception:
         _logger.exception("failed to initialize OpenTelemetry logs")
         _logs_initialized = True
+
+
+def otel_log_bridge_handler() -> logging.Handler | None:
+    """Return the active bridge for loggers that do not propagate to root."""
+    for handler in logging.getLogger().handlers:
+        if handler.get_name() == "omnigent-otel-log-bridge":
+            return handler
+    return None
+
+
+def uvicorn_otel_log_handler() -> logging.Handler:
+    """Create a handler for Uvicorn loggers that do not propagate to root."""
+    if otel_log_bridge_handler() is None:
+        return logging.NullHandler()
+    from opentelemetry._logs import get_logger_provider
+
+    from omnigent.runtime._otel_logging import RedactingOTelLoggingHandler
+
+    return RedactingOTelLoggingHandler(logger_provider=get_logger_provider())
 
 
 def init(service_name: str | None = None) -> None:

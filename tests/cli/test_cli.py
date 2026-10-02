@@ -343,6 +343,28 @@ def test_server_uvicorn_log_config_uses_terminal_handler_when_requested(
     ]
 
 
+def test_server_uvicorn_log_config_attaches_otel_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    bridge = logging.NullHandler()
+    monkeypatch.setattr("omnigent.runtime.telemetry.otel_log_bridge_handler", lambda: bridge)
+
+    log_config = _server_uvicorn_log_config(tmp_path / "server.log", log_to_stderr=False)
+
+    assert log_config["handlers"]["server_otel"]["()"] == (
+        "omnigent.runtime.telemetry.uvicorn_otel_log_handler"
+    )
+    assert log_config["loggers"]["uvicorn.error"]["handlers"] == [
+        "server_otel",
+        "server_file",
+    ]
+    assert log_config["loggers"]["uvicorn.access"]["handlers"] == [
+        "server_otel",
+        "server_access_file",
+    ]
+
+
 def test_server_uvicorn_log_config_mirrors_foreground_tty_by_default(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

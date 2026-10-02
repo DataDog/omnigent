@@ -24,6 +24,7 @@ from opentelemetry.sdk._logs.export import (
 from opentelemetry.sdk.trace import TracerProvider
 
 from omnigent.runtime import telemetry
+from omnigent.runtime._otel_logging import RedactingOTelLoggingHandler
 
 _BRIDGE_NAME = "omnigent-otel-log-bridge"
 
@@ -248,7 +249,7 @@ def test_log_emitted_in_span_carries_trace_and_span_ids(
     log_provider.add_log_record_processor(SimpleLogRecordProcessor(log_exporter))
     set_logger_provider(log_provider)
 
-    handler = LoggingHandler(logger_provider=log_provider, level=logging.DEBUG)
+    handler = RedactingOTelLoggingHandler(logger_provider=log_provider, level=logging.DEBUG)
     handler.set_name(_BRIDGE_NAME)
     root_logger = logging.getLogger()
     root_logger.addHandler(handler)
@@ -280,3 +281,40 @@ def test_log_emitted_in_span_carries_trace_and_span_ids(
         f"log span_id {log_record.span_id:016x} does not match "
         f"span span_id {expected_span_id:016x}"
     )
+
+
+def test_otel_bridge_redacts_message_exception_and_extra_fields() -> None:
+    exporter = InMemoryLogRecordExporter()
+    provider = LoggerProvider()
+    provider.add_log_record_processor(SimpleLogRecordProcessor(exporter))
+    handler = RedactingOTelLoggingHandler(logger_provider=provider)
+    logger = logging.getLogger("omnigent.test.otel_redaction")
+    previous_handlers = logger.handlers[:]
+    previous_level = logger.level
+    previous_propagate = logger.propagate
+    logger.handlers = [handler]
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        try:
+            raise ValueError("password=exception-secret")
+        except ValueError:
+            logger.warning(
+                "Authorization: Bearer message-secret",
+                exc_info=True,
+                extra={"api_key": "extra-secret"},
+            )
+    finally:
+        logger.handlers = previous_handlers
+        logger.setLevel(previous_level)
+        logger.propagate = previous_propagate
+        provider.shutdown()
+
+    records = exporter.get_finished_logs()
+    assert len(records) == 1
+    record = records[0].log_record
+    assert record.severity_text == "WARN"
+    assert "message-secret" not in str(record.body)
+    assert "exception-secret" not in str(record.body)
+    assert "extra-secret" not in str(record.attributes)
+    assert "[REDACTED]" in str(record.body)
