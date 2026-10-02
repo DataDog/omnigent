@@ -1704,7 +1704,12 @@ def create_app(
         # the run — all fire-and-forget so the timer re-arms immediately.
         scheduled_task_scheduler: ScheduledTaskScheduler | None = None
         if scheduled_task_store is not None:
-            from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+            from omnigent.server.scheduled.fire import (
+                FireDeps,
+                build_fire_claim,
+                build_on_fire,
+                build_run_now,
+            )
 
             fire_deps = FireDeps(
                 scheduled_task_store=scheduled_task_store,
@@ -1735,6 +1740,8 @@ def create_app(
             scheduled_task_scheduler = ScheduledTaskScheduler(
                 store=scheduled_task_store,
                 on_fire=on_fire,
+                claim_fire=build_fire_claim(fire_deps),
+                refresh_interval_s=2,
             )
             app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
             # Scheduled tasks are a non-critical subsystem: a failure loading the
@@ -1816,6 +1823,7 @@ def create_app(
     )
 
     app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
+    app.state.draining = False
     from omnigent.runtime import telemetry
 
     telemetry.instrument_fastapi_app(app)
@@ -2666,6 +2674,33 @@ def create_app(
                 host_version=host_version,
             )
         return result
+
+    @app.get("/ready")
+    async def ready() -> Response:
+        """Keep liveness independent from traffic removal during shutdown."""
+        return JSONResponse(
+            {"status": "draining" if app.state.draining else "ok"},
+            status_code=503 if app.state.draining else 200,
+        )
+
+    @app.post("/internal/drain")
+    async def drain(request: Request) -> Response:
+        """Remove traffic and timers before Kubernetes sends SIGTERM."""
+        import ipaddress
+
+        if request.client is None:
+            return Response(status_code=403)
+        try:
+            loopback = ipaddress.ip_address(request.client.host).is_loopback
+        except ValueError:
+            loopback = False
+        if not loopback:
+            return Response(status_code=403)
+        app.state.draining = True
+        scheduler = getattr(app.state, "scheduled_task_scheduler", None)
+        if scheduler is not None:
+            scheduler.stop()
+        return JSONResponse({"status": "draining"})
 
     @app.get("/health")
     async def health(

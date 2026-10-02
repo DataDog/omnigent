@@ -1512,6 +1512,10 @@ def _create_artifact_store(location: str) -> Any:  # type: ignore[explicit-any] 
         ``"dbfs:/Volumes/cat/schema/vol"`` for UC Volumes.
     :returns: An :class:`ArtifactStore` instance.
     """
+    if location.startswith("s3://"):
+        from omnigent.stores.artifact_store.s3 import S3ArtifactStore
+
+        return S3ArtifactStore(location)
     if location.startswith("dbfs:/Volumes/"):
         from omnigent.stores.artifact_store.databricks_volumes import (
             DatabricksVolumesArtifactStore,
@@ -4189,6 +4193,13 @@ def _assert_server_port_bindable(host: str, port: int) -> None:
     help="Path for artifact storage.  [default: <data-dir>/artifacts]",
 )
 @click.option(
+    "--artifact-store-uri",
+    envvar="OMNIGENT_ARTIFACT_URI",
+    default=None,
+    help="Durable artifact store URI (e.g. s3://bucket/prefix). "
+    "Cache stays at --artifact-location.",
+)
+@click.option(
     "--config",
     "-c",
     "config_path",
@@ -4265,6 +4276,7 @@ def server(
     database_uri: str | None,
     conversation_database_uri: str | None,
     artifact_location: str | None,
+    artifact_store_uri: str | None,
     config_path: str | None,
     execution_timeout: int | None,
     agent_dirs: tuple[str, ...],
@@ -4377,6 +4389,7 @@ def server(
         host in ("127.0.0.1", "localhost")
         and database_uri is None
         and artifact_location is None
+        and artifact_store_uri is None
         and not port_was_explicit
     )
 
@@ -4470,7 +4483,9 @@ def server(
     permission_store = SqlAlchemyPermissionStore(db_uri)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
     project_store = SqlAlchemyProjectStore(db_uri)
-    artifact_store = _create_artifact_store(art_loc)
+    artifact_store = _create_artifact_store(
+        artifact_store_uri or cfg.get("artifact_store_uri") or art_loc
+    )
 
     # Initialize the runtime with store references so workflow code
     # can access them via getter functions (get_agent_cache(), etc.).
@@ -4748,6 +4763,13 @@ def server(
             # The runner tunnels close next; their disconnect handlers must
             # read that loss as ours, not as the runners dying.
             _shutdown_state.mark_server_shutting_down()
+            app.state.draining = True
+            scheduler = getattr(app.state, "scheduled_task_scheduler", None)
+            if scheduler is not None:
+                scheduler.stop()
+            from omnigent.server.scheduled.fire import finish_pending_fires
+
+            await finish_pending_fires()
             _session_stream.shutdown_all()
             # Yield to the event loop so generators can consume _DONE,
             # flush their final "data: [DONE]\n\n" chunk, and exit before

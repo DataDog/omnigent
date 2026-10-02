@@ -38,6 +38,30 @@ def store(db_uri: str) -> SqlAlchemyScheduledTaskStore:
 # ── create / get ────────────────────────────────────────────────────────────
 
 
+def test_concurrent_replicas_claim_one_occurrence(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Independent worker threads cannot both launch the same scheduled slot."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    task = store.create(
+        scheduled_task_id=_uid("claim-slot"),
+        name="claim test",
+        prompt="test",
+        rrule="FREQ=HOURLY",
+        user_id=None,
+        agent_id=_uid("claim-agent"),
+        timezone="UTC",
+    )
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        results = list(workers.map(lambda _: store.claim_scheduled_fire(task.id, 1000), range(2)))
+    assert sorted(results) == [False, True]
+    assert not store.claim_scheduled_fire(task.id, 999)
+    assert store.claim_scheduled_fire(task.id, 2000)
+    store.update(task.id, state="paused")
+    assert not store.claim_scheduled_fire(task.id, 3000)
+
+
 def test_create_returns_scheduled_task_with_all_fields(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:

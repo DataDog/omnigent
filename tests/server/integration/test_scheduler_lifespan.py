@@ -30,6 +30,29 @@ from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
 pytestmark = pytest.mark.asyncio
 
 
+async def test_drain_is_local_stops_timers_and_preserves_liveness(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """Remote callers cannot drain; the local preStop hook removes readiness."""
+    import httpx
+
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    app = _build_app(db_uri, tmp_path, scheduled_task_store=store)
+    async with app.router.lifespan_context(app):
+        remote = httpx.ASGITransport(app=app, client=("10.0.0.1", 123))
+        async with httpx.AsyncClient(transport=remote, base_url="http://test") as client:
+            assert (await client.post("/internal/drain")).status_code == 403
+            assert (await client.get("/ready")).status_code == 200
+        local = httpx.ASGITransport(app=app, client=("127.0.0.1", 123))
+        async with httpx.AsyncClient(transport=local, base_url="http://test") as client:
+            assert (await client.post("/internal/drain")).status_code == 200
+            assert (await client.get("/ready")).status_code == 503
+            assert (await client.get("/health")).status_code == 200
+        assert not app.state.scheduled_task_scheduler.is_started
+
+
 def _uid(seed: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, seed))
 

@@ -27,6 +27,7 @@ tests can drive the scheduler with a fake clock and manual timer firing.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -83,6 +84,8 @@ class _Job:
     timer: Any = None
     armed_capped: bool = False
     running: bool = False  # Drop overlapping on_fire callbacks.
+    source_rule: str = ""
+    source_timezone: str | None = None
 
 
 def _resolve_tz(name: str | None) -> ZoneInfo:
@@ -123,9 +126,14 @@ class ScheduledTaskScheduler:
         now: Callable[[], float] = time.time,
         schedule_call: Callable[[float, Callable[[], Any]], Any] | None = None,
         cancel_call: Callable[[Any], None] | None = None,
+        claim_fire: Callable[[int, str, int], Awaitable[bool]] | None = None,
+        refresh_interval_s: float | None = None,
     ) -> None:
         self._store = store
         self._on_fire = on_fire
+        self._claim_fire = claim_fire
+        self._refresh_interval_s = refresh_interval_s
+        self._refresh_task: asyncio.Task[None] | None = None
         self._now = now
         self._schedule_call = schedule_call or _default_schedule_call
         self._cancel_call = cancel_call or _default_cancel_call
@@ -156,15 +164,40 @@ class ScheduledTaskScheduler:
                     exc,
                 )
         self._started = True
+        if self._refresh_interval_s is not None:
+            self._refresh_task = asyncio.create_task(self._refresh())
         _logger.info("ScheduledTaskScheduler started with %d job(s)", len(self._jobs))
 
     def stop(self) -> None:
         """Cancel every armed timer and drop all jobs."""
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
+            self._refresh_task = None
         for job in self._jobs.values():
             if job.timer is not None:
                 self._cancel_call(job.timer)
         self._jobs.clear()
         self._started = False
+
+    async def _refresh(self) -> None:
+        """Pick up schedule mutations accepted by another rolling replica."""
+        while self._started:
+            await asyncio.sleep(self._refresh_interval_s or 2)
+            try:
+                tasks = await asyncio.to_thread(self._store.list_active_all_workspaces)
+                active = {(t.workspace_id, t.id) for t in tasks}
+                for key, job in list(self._jobs.items()):
+                    if key not in active:
+                        self.remove(job.task_id)
+                for task in tasks:
+                    job = self._jobs.get((task.workspace_id, task.id))
+                    if job is None or (job.source_rule, job.source_timezone) != (
+                        task.rrule,
+                        task.timezone,
+                    ):
+                        self._register(task)
+            except Exception:
+                _logger.exception("scheduler: schedule refresh failed")
 
     # ── CRUD sync (keeps timers in sync with row changes) ─────────────────────
 
@@ -241,6 +274,8 @@ class ScheduledTaskScheduler:
             workspace_id=task.workspace_id,
             trigger=trigger,
             tz=_resolve_tz(task.timezone),
+            source_rule=task.rrule,
+            source_timezone=task.timezone,
         )
         self._jobs[(task.workspace_id, task.id)] = job
         self._arm(job)
@@ -268,6 +303,7 @@ class ScheduledTaskScheduler:
 
     async def _fire_and_rearm(self, job: _Job) -> None:
         """Timer callback: fire if due, then always re-arm for the next slot."""
+        retry = False
         try:
             now_epoch = self._now()
             scheduled = job.next_run_epoch
@@ -278,12 +314,20 @@ class ScheduledTaskScheduler:
                 and scheduled - now_epoch > _DUE_TOLERANCE_S
             )
             if not early_wake and scheduled is not None:
-                await self._fire_job(job, scheduled_epoch=scheduled)
+                fired = await self._fire_job(job, scheduled_epoch=scheduled)
+                retry = (
+                    not fired
+                    and self._claim_fire is not None
+                    and self._now() - scheduled < MISFIRE_GRACE_TIME_S
+                )
         finally:
             # Only re-arm if the job is still registered (it may have been
             # removed mid-fire).
             if self._jobs.get((job.workspace_id, job.task_id)) is job:
-                self._arm(job)
+                if retry:
+                    job.timer = self._schedule_call(1, lambda: self._fire_and_rearm(job))
+                else:
+                    self._arm(job)
 
     async def _fire_job(self, job: _Job, *, scheduled_epoch: float) -> bool:
         """Invoke ``on_fire`` for a job, applying overlap + misfire policy.
@@ -303,6 +347,12 @@ class ScheduledTaskScheduler:
             return False
         job.running = True
         try:
+            if self._claim_fire is not None:
+                claimed = await self._claim_fire(
+                    job.workspace_id, job.task_id, int(scheduled_epoch)
+                )
+                if not claimed:
+                    return False
             keep_registered = await self._on_fire(job.workspace_id, job.task_id)
             key = (job.workspace_id, job.task_id)
             if keep_registered is False and self._jobs.get(key) is job:

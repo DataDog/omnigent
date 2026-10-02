@@ -5,7 +5,7 @@ from __future__ import annotations
 import builtins
 from typing import Any
 
-from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_
+from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_, update
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
@@ -125,6 +125,28 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         )
 
     # ── Scheduled tasks ──────────────────────────────────────────
+
+    def claim_scheduled_fire(self, scheduled_task_id: str, scheduled_at: int) -> bool:
+        """Atomically accept one occurrence across overlapping HTTP replicas."""
+
+        def write(session: Session) -> bool:
+            result = session.execute(
+                update(SqlScheduledTask)
+                .where(
+                    SqlScheduledTask.workspace_id == current_workspace_id(),
+                    SqlScheduledTask.id == scheduled_task_id,
+                    SqlScheduledTask.state == encode_scheduled_task_state("active"),
+                    or_(
+                        SqlScheduledTask.last_run_at.is_(None),
+                        SqlScheduledTask.last_run_at < scheduled_at,
+                    ),
+                )
+                .values(last_run_at=scheduled_at)
+                .returning(SqlScheduledTask.id)
+            )
+            return result.scalar_one_or_none() is not None
+
+        return run_write_transaction(self._session_immediate, "claim_scheduled_fire", write)
 
     def create(
         self,

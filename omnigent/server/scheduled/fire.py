@@ -172,6 +172,52 @@ def _prompt_event(prompt: str) -> SessionEventInput:
     )
 
 
+async def finish_pending_fires() -> None:
+    """Finish accepted session launches while their host tunnels are still open."""
+    if _PENDING_FIRES:
+        await asyncio.gather(*tuple(_PENDING_FIRES), return_exceptions=True)
+
+
+def build_fire_claim(deps: FireDeps) -> Callable[[int, str, int], Awaitable[bool]]:
+    """Claim an occurrence on the replica that can reach its connected host."""
+
+    async def claim(workspace_id: int, task_id: str, scheduled_at: int) -> bool:
+        with workspace_scope(workspace_id):
+            task = await asyncio.to_thread(deps.scheduled_task_store.get, task_id)
+            if task is None or task.state != "active":
+                return False
+            if (
+                task.execution_target == "connected_host"
+                and deps.host_registry is not None
+                and deps.host_store is not None
+            ):
+                if task.host_id is not None:
+                    host_ids = [task.host_id]
+                else:
+                    hosts = await asyncio.to_thread(
+                        deps.host_store.list_hosts, task.user_id or RESERVED_USER_LOCAL
+                    )
+                    host_ids = [
+                        h.host_id
+                        for h in hosts
+                        if h.sandbox_provider is None
+                        and (
+                            task.user_id is None or h.account_generation == task.account_generation
+                        )
+                    ]
+                local = any(deps.host_registry.get(h) is not None for h in host_ids)
+                online = await asyncio.to_thread(
+                    lambda: any(deps.host_store.is_online(h) for h in host_ids)
+                )
+                if online and not local:
+                    return False
+            return await asyncio.to_thread(
+                deps.scheduled_task_store.claim_scheduled_fire, task_id, scheduled_at
+            )
+
+    return claim
+
+
 def build_on_fire(
     deps: FireDeps,
     *,
