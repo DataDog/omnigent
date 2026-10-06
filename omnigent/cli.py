@@ -448,6 +448,7 @@ def _server_uvicorn_log_config(
         should_log_to_stderr,
         terminal_supports_color,
     )
+    from omnigent.runtime.telemetry import otel_log_bridge_handler
 
     access_log_format = (
         DEFAULT_LOG_PREFIX_FORMAT + '%(client_addr)s - "%(request_line)s" %(status_code)s'
@@ -503,6 +504,10 @@ def _server_uvicorn_log_config(
         }
         default_handlers: list[str] = []
         access_handlers: list[str] = []
+        if otel_log_bridge_handler() is not None:
+            handlers["server_otel"] = {"()": "omnigent.runtime.telemetry.uvicorn_otel_log_handler"}
+            default_handlers.append("server_otel")
+            access_handlers.append("server_otel")
         if mirror:
             handlers["server_terminal"] = {
                 "()": "omnigent.process_logging.terminal_stream_handler",
@@ -4514,7 +4519,7 @@ def server(
     # designs/OBSERVABILITY.md for the env var reference.
     from omnigent.runtime import telemetry
 
-    telemetry.init("omni-server")
+    telemetry.init(os.environ.get("OTEL_SERVICE_NAME") or "omni-server")
 
     # Read a pre-shared tunnel token from the environment if the
     # caller (e.g. _start_local_server) spawns the runner externally
