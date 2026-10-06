@@ -414,6 +414,24 @@ async def test_patch_session_title(
     assert resp.status_code == 200
 
 
+@pytest.mark.parametrize("include_usage", [None, "true", "false"])
+async def test_patch_session_forwards_include_usage(
+    client: httpx.AsyncClient,
+    session_id: str,
+    include_usage: str | None,
+) -> None:
+    """PATCH accepts the usage option through its model-switch wrapper."""
+    params = {"include_usage": include_usage} if include_usage is not None else None
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        params=params,
+        json={"title": "Updated"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["title"] == "Updated"
+    assert resp.json()["usage_included"] is (include_usage != "false")
+
+
 async def test_patch_session_title_enforces_user_limit(
     client: httpx.AsyncClient,
     session_id: str,
