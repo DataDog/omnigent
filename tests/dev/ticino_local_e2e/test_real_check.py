@@ -147,7 +147,7 @@ def test_network_check_verifies_the_callback_origin_is_healthy_and_protected(
             {
                 environment["HAB_APISERVER"]: 200,
                 f"{public_url}/health": 200,
-                f"{public_url}/v1/sessions": 401,
+                f"{public_url}/v1/sessions?visibility=all": 401,
             },
             calls,
         ),
@@ -157,7 +157,7 @@ def test_network_check_verifies_the_callback_origin_is_healthy_and_protected(
     assert calls == [
         environment["HAB_APISERVER"],
         f"{public_url}/health",
-        f"{public_url}/v1/sessions",
+        f"{public_url}/v1/sessions?visibility=all",
     ]
 
 
@@ -190,7 +190,7 @@ def test_network_check_rejects_a_wrong_or_unprotected_callback_origin(
             {
                 environment["HAB_APISERVER"]: 200,
                 f"{public_url}/health": health_status,
-                f"{public_url}/v1/sessions": protected_status,
+                f"{public_url}/v1/sessions?visibility=all": protected_status,
             },
             [],
         ),

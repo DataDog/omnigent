@@ -34,7 +34,26 @@ def _downgrade(uri: str, engine: sa.Engine, revision: str) -> None:
 def test_single_alembic_head() -> None:
     script = ScriptDirectory.from_config(_build_alembic_config("sqlite://"))
     heads = script.get_heads()
-    assert heads == ["r6a8c0e2f4b6"], f"expected a single head, got {heads!r}"
+    assert len(heads) == 1, f"expected a single head, got {heads!r}"
+
+
+def test_upgrade_from_datadog_oidc_revision_to_merged_head(tmp_path: Path) -> None:
+    uri = f"sqlite:///{tmp_path / 'datadog-oidc.db'}"
+    engine = sa.create_engine(uri)
+
+    _upgrade(uri, engine, "r6a8c0e2f4b6")
+    _upgrade(uri, engine, "head")
+
+    with engine.connect() as conn:
+        versions = set(conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalars())
+    assert versions == {"m016dd0930a"}
+    assert "inference_snapshot" in {
+        column["name"]
+        for column in sa.inspect(engine).get_columns("omnigent_conversation_metadata")
+    }
+
+    engine.dispose()
+    clear_engine_cache()
 
 
 def test_upgrade_creates_table_downgrade_drops_it(tmp_path: Path) -> None:
