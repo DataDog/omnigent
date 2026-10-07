@@ -43,10 +43,12 @@ import {
 } from "@/components/blocks/BlockRenderer";
 import {
   CompactionMarker,
+  CONTINUE_TURN_ERROR_CODES,
   ErrorBanner,
   RoutingDecisionCard,
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
+import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
 import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
@@ -62,7 +64,8 @@ import {
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
-import { retryRateLimitedTurn, retrySession } from "@/lib/sessionsApi";
+import { QueryClientContext } from "@tanstack/react-query";
+import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -352,6 +355,7 @@ export function bubbleKey(bubble: Bubble): string {
   if (bubble.kind === "compaction_loading") return `compaction_loading:${bubble.itemId}`;
   if (bubble.kind === "compaction") return `compaction:${bubble.itemId}`;
   if (bubble.kind === "routing_decision") return `routing_decision:${bubble.itemId}`;
+  if (bubble.kind === "subagent_activity") return `subagent_activity:${bubble.itemId}`;
   return `assistant:${bubble.stableId}`;
 }
 
@@ -395,10 +399,14 @@ export function isBackgroundTasksOnly(
  * Whether the agent's own turn is in progress — server `running`/`waiting`, or
  * a local send in flight.
  */
+export function computeIsTurnActive(sessionStatus: SessionStatus, localSending: boolean): boolean {
+  return computeIsWorking(sessionStatus) || localSending;
+}
+
 function useAgentTurnActive(): boolean {
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const localSending = useChatStore((s) => s.status === "streaming");
-  return computeIsWorking(sessionStatus) || localSending;
+  return computeIsTurnActive(sessionStatus, localSending);
 }
 
 /**
@@ -419,9 +427,16 @@ export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null)
 }
 
 export function WorkingIndicator() {
-  const bgCount = useChatStore((s) => s.backgroundTaskCount);
-  const blockedOn = useChatStore((s) => s.blockedOn);
-  const agentWorking = useAgentTurnActive();
+  const scopedConversationId = useContext(ConversationScopeContext);
+  const scopedState = useConversationEntryState(scopedConversationId);
+  const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
+  const rootBlockedOn = useChatStore((s) => s.blockedOn);
+  const rootAgentWorking = useAgentTurnActive();
+  const bgCount = scopedConversationId ? scopedState.backgroundTaskCount : rootBgCount;
+  const blockedOn = scopedConversationId ? scopedState.blockedOn : rootBlockedOn;
+  const agentWorking = scopedConversationId
+    ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
+    : rootAgentWorking;
   const tick = useWorkingLabelTick();
   // Once the turn ends but background shells outlive it, BackgroundTaskPill owns
   // the state and the shimmer stays off (it would misread as the agent still
@@ -540,17 +555,23 @@ export const BubbleView = memo(
     isLastAssistant = false,
     showsWorking = false,
     actionsPersistent = false,
+    recoveryDisabled = false,
   }: {
     bubble: Bubble;
     isLastAssistant?: boolean;
     showsWorking?: boolean;
     actionsPersistent?: boolean;
+    /** Hide retry/recovery controls when the surrounding session is sealed. */
+    recoveryDisabled?: boolean;
   }) {
     if (bubble.kind === "user") return <UserBubble bubble={bubble} />;
     if (bubble.kind === "compaction_loading") {
       return <CompactionLoadingIndicator createdAtS={bubble.createdAtS} />;
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
+    if (bubble.kind === "subagent_activity") {
+      return <SubagentActivityMessage data={bubble.data} />;
+    }
     if (bubble.kind === "routing_decision") {
       return (
         <RoutingDecisionCard
@@ -568,6 +589,7 @@ export const BubbleView = memo(
         isLastAssistant={isLastAssistant}
         showsWorking={showsWorking}
         actionsPersistent={actionsPersistent}
+        recoveryDisabled={recoveryDisabled}
       />
     );
   },
@@ -575,6 +597,7 @@ export const BubbleView = memo(
     (prev.isLastAssistant ?? false) === (next.isLastAssistant ?? false) &&
     (prev.showsWorking ?? false) === (next.showsWorking ?? false) &&
     (prev.actionsPersistent ?? false) === (next.actionsPersistent ?? false) &&
+    (prev.recoveryDisabled ?? false) === (next.recoveryDisabled ?? false) &&
     bubblesEqual(prev.bubble, next.bubble),
 );
 
@@ -913,11 +936,13 @@ function AssistantBubble({
   isLastAssistant = false,
   showsWorking = false,
   actionsPersistent = false,
+  recoveryDisabled = false,
 }: {
   bubble: Extract<Bubble, { kind: "assistant" }>;
   isLastAssistant?: boolean;
   showsWorking?: boolean;
   actionsPersistent?: boolean;
+  recoveryDisabled?: boolean;
 }) {
   // The walker only emits an assistant bubble when at least one assistant-side
   // block exists. The "Working…" shimmer for the empty-items / streaming gap
@@ -947,10 +972,11 @@ function AssistantBubble({
   const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
+  const queryClient = useContext(QueryClientContext);
   const handleRetryError = useCallback(
     async (item: Extract<RenderItem, { kind: "error" }>) => {
       if (!conversationId) throw new Error("Session is not available");
-      if (item.code === "rate_limit_exceeded") {
+      if (CONTINUE_TURN_ERROR_CODES.has(item.code)) {
         // Read a FRESH snapshot of the target conversation at click time: the
         // scoped child's own entry in a side chat, else the root store. The
         // child tab is fixed, so only the main chat guards against the user
@@ -973,15 +999,23 @@ function AssistantBubble({
         ) {
           throw new Error("Wait for the current turn to finish before retrying");
         }
-        await retryRateLimitedTurn(conversationId);
+        await continueFailedTurn(conversationId);
         return;
       }
-      const result = await retrySession(conversationId);
-      if (!result.recovered) {
-        throw new Error("The session is already connected; no recovery was performed");
+      try {
+        const result = await retrySession(conversationId);
+        if (!result.recovered) {
+          throw new Error("The session is already connected; no recovery was performed");
+        }
+      } catch (error) {
+        // Resume can seal a lost side chat; refresh its read-only state immediately.
+        if (error instanceof ApiError && error.code === "conflict") {
+          void queryClient?.invalidateQueries({ queryKey: ["session", conversationId] });
+        }
+        throw error;
       }
     },
-    [conversationId, scopedConversationId, isLastAssistant],
+    [conversationId, scopedConversationId, isLastAssistant, queryClient],
   );
 
   if (bubble.items.length === 0) return null;
@@ -1047,7 +1081,7 @@ function AssistantBubble({
             lastActivityAtS={bubble.lastActivityAtS}
             showsWorking={showsWorking}
             defaultExpanded={bubble.defaultExpanded}
-            onRetryError={handleRetryError}
+            onRetryError={recoveryDisabled ? undefined : handleRetryError}
           />
         </MessageContent>
         {bubble.lifecycle === "cancelled" && (

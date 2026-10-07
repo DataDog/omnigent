@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.script import ScriptDirectory
@@ -37,16 +38,17 @@ def test_single_alembic_head() -> None:
     assert len(heads) == 1, f"expected a single head, got {heads!r}"
 
 
-def test_upgrade_from_datadog_oidc_revision_to_merged_head(tmp_path: Path) -> None:
+@pytest.mark.parametrize("revision", ["r6a8c0e2f4b6", "m016dd0930a", "mm1a2b3c4d5e"])
+def test_upgrade_from_datadog_oidc_revision_to_merged_head(tmp_path: Path, revision: str) -> None:
     uri = f"sqlite:///{tmp_path / 'datadog-oidc.db'}"
     engine = sa.create_engine(uri)
 
-    _upgrade(uri, engine, "r6a8c0e2f4b6")
+    _upgrade(uri, engine, revision)
     _upgrade(uri, engine, "head")
 
     with engine.connect() as conn:
         versions = set(conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalars())
-    assert versions == {"m016dd0930a"}
+    assert versions == {"m017dd1006a"}
     assert "inference_snapshot" in {
         column["name"]
         for column in sa.inspect(engine).get_columns("omnigent_conversation_metadata")
