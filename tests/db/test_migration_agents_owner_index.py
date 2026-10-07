@@ -102,7 +102,9 @@ def test_postgres_retry_rebuilds_only_its_own_invalid_index() -> None:
         _run_migrations(sa.create_engine(uri), uri)
         with setup.connect() as conn:
             conn.execute(sa.text(invalidate), {"i": f"public.{_INDEX}"})
-            conn.execute(sa.text("UPDATE alembic_version SET version_num = 'll1a2b3c4d5e'"))
+            # Preserve the already-applied Datadog credential branch when retrying
+            # only the upstream index migration.
+            conn.execute(sa.text("UPDATE alembic_version SET version_num = 'm016dd0930a'"))
         _run_migrations(sa.create_engine(uri), uri)
         with setup.connect() as conn:
             assert _pg_index_valid(conn, "public") is True

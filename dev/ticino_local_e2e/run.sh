@@ -201,6 +201,7 @@ start_real_server() {
       PYTHONPATH="$launcher_pythonpath${PYTHONPATH:+:$PYTHONPATH}" \
       OMNIGENT_OIDC_ISSUER="$ticino_issuer" \
       OMNIGENT_OIDC_CLIENT_ID=omnigent-local \
+      OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none \
       OMNIGENT_OIDC_REDIRECT_URI="http://127.0.0.1:$port/auth/callback" \
       OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT="$ticino_authorization_endpoint" \
       OMNIGENT_OIDC_TOKEN_ENDPOINT="$ticino_token_endpoint" \
@@ -331,6 +332,7 @@ up() {
       PYTHONPATH="$launcher_pythonpath${PYTHONPATH:+:$PYTHONPATH}" \
       OMNIGENT_OIDC_ISSUER="$ticino_issuer" \
       OMNIGENT_OIDC_CLIENT_ID=omnigent-local \
+      OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none \
       OMNIGENT_OIDC_REDIRECT_URI="http://127.0.0.1:$port/auth/callback" \
       OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT="$ticino_authorization_endpoint" \
       OMNIGENT_OIDC_TOKEN_ENDPOINT="$ticino_token_endpoint" \
