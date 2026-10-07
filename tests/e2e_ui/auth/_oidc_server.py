@@ -106,6 +106,7 @@ def spawn_oidc_server(
             else "client_secret_post",
             "OMNIGENT_OIDC_REDIRECT_URI": redirect_uri,
             "OMNIGENT_OIDC_COOKIE_SECRET": secrets.token_hex(32),
+            "OMNIGENT_OIDC_CREDENTIAL_KEY": secrets.token_hex(32),
             "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
             "OPENAI_API_KEY": "mock-key",
             "ANTHROPIC_API_KEY": "",
