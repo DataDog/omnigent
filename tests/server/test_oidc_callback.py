@@ -24,6 +24,7 @@ import json
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import jwt
@@ -44,6 +45,7 @@ from omnigent.server.routes.auth import (
     _AUTH_STATE_COOKIE_PLAIN,
     _resolve_oidc_email,
     create_auth_router,
+    derive_code_challenge,
 )
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
@@ -230,12 +232,14 @@ def _do_callback(client: TestClient, id_token: str) -> httpx.Response:
     )
 
 
+@pytest.mark.parametrize("native", [False, True])
 def test_callback_persists_provider_binding_in_encrypted_session(
     tmp_path: Path,
     db_uri: str,
+    native: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A new encrypted session stores the verified subject, issuer, and client."""
+    """Browser and native login retain the verified provider identity for Habitat."""
     engine = create_engine(db_uri)
     OmnigentBase.metadata.create_all(engine, tables=[SqlOidcSession.__table__])
     store = OidcSessionStore(
@@ -273,9 +277,40 @@ def test_callback_persists_provider_binding_in_encrypted_session(
     try:
         with TestClient(app) as client:
             token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
-            response = _do_callback(client, token)
+            if native:
+                verifier = "v" * 64
+                redirect_uri = "http://127.0.0.1:53682/callback"
+                login = client.get(
+                    "/auth/login",
+                    params={
+                        "native_redirect_uri": redirect_uri,
+                        "native_state": "desktop-state",
+                        "code_challenge": derive_code_challenge(verifier),
+                        "code_challenge_method": "S256",
+                    },
+                    follow_redirects=False,
+                )
+                state = parse_qs(urlparse(login.headers["location"]).query)["state"][0]
+                pending_id_token[0] = token
+                response = client.get(
+                    "/auth/callback",
+                    params={"code": "idp-code", "state": state},
+                    follow_redirects=False,
+                )
+            else:
+                response = _do_callback(client, token)
             assert response.status_code == 302
-            handle = response.cookies.get("ap_session")
+            if native:
+                assert "ap_session" not in response.cookies
+                code = parse_qs(urlparse(response.headers["location"]).query)["code"][0]
+                exchanged = client.post(
+                    "/auth/native-token",
+                    data={"code": code, "code_verifier": verifier, "redirect_uri": redirect_uri},
+                )
+                assert exchanged.status_code == 200
+                handle = exchanged.json()["token"]
+            else:
+                handle = response.cookies.get("ap_session")
             assert handle is not None
             resolved = store.resolve(handle)
             assert resolved is not None

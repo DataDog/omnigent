@@ -17,6 +17,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import httpx
 import jwt
@@ -145,9 +146,7 @@ class OIDCConfig:
     :param issuer: OIDC issuer URL, e.g.
         ``"https://accounts.google.com"``.
     :param client_id: OAuth client ID registered with the IdP.
-    :param client_secret: OAuth client secret. ``None`` for public
-        clients that authenticate with PKCE and
-        ``token_endpoint_auth_method=none``.
+    :param client_secret: OAuth client secret, or empty for public PKCE clients.
     :param redirect_uri: Full callback URL, e.g.
         ``"https://myapp.example.com/auth/callback"``.
     :param cookie_secret: HMAC key for session cookie signing
@@ -242,8 +241,9 @@ class OIDCConfig:
     def from_env() -> OIDCConfig:
         """Read and validate all OIDC env vars.
 
-        Fetches the OIDC discovery document for standard providers,
-        or uses hardcoded endpoints for GitHub.
+        Uses explicit endpoints or discovery for standard providers,
+        and hardcoded endpoints for GitHub. Public clients must opt in
+        to token endpoint authentication method ``none``.
 
         :returns: A validated :class:`OIDCConfig`.
         :raises RuntimeError: If any required env var is missing or
@@ -261,7 +261,25 @@ class OIDCConfig:
 
         issuer = _require("OMNIGENT_OIDC_ISSUER")
         client_id = _require("OMNIGENT_OIDC_CLIENT_ID")
-        client_secret = os.environ.get("OMNIGENT_OIDC_CLIENT_SECRET", "").strip() or None
+        auth_method = (
+            os.environ.get("OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD") or "client_secret_post"
+        ).strip()
+        if auth_method not in {"client_secret_post", "none"}:
+            raise RuntimeError(
+                "OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD must be client_secret_post or none"
+            )
+        is_github = issuer.rstrip("/") == _GITHUB_ISSUER
+        if auth_method == "none":
+            if is_github:
+                raise RuntimeError("GitHub login requires client_secret_post authentication")
+            if os.environ.get("OMNIGENT_OIDC_CLIENT_SECRET", "").strip():
+                raise RuntimeError(
+                    "Unset OMNIGENT_OIDC_CLIENT_SECRET when "
+                    "OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none"
+                )
+            client_secret = ""
+        else:
+            client_secret = _require("OMNIGENT_OIDC_CLIENT_SECRET")
         # Redirect URI: an explicit value wins; otherwise derive it from
         # OMNIGENT_DOMAIN (the same var the Caddy HTTPS overlay uses) as
         # ``https://<domain>/auth/callback``. A domain-based deploy then
@@ -341,14 +359,45 @@ class OIDCConfig:
                 )
 
         # Determine provider type and resolve endpoints.
-        is_github = issuer.rstrip("/") == _GITHUB_ISSUER
+        endpoints = {
+            name: os.environ.get(f"OMNIGENT_OIDC_{name.upper()}", "").strip()
+            for name in ("authorization_endpoint", "token_endpoint", "jwks_uri")
+        }
+        if any(endpoints.values()):
+            if is_github:
+                raise RuntimeError("OIDC endpoint overrides are not supported for GitHub login")
+            if not all(endpoints.values()):
+                raise RuntimeError(
+                    "Set all three OIDC endpoint overrides: OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT, "
+                    "OMNIGENT_OIDC_TOKEN_ENDPOINT, and OMNIGENT_OIDC_JWKS_URI"
+                )
+            for name, endpoint in endpoints.items():
+                try:
+                    parsed = urlsplit(endpoint)
+                    valid = (
+                        bool(parsed.hostname)
+                        and parsed.username is None
+                        and parsed.password is None
+                        and not parsed.fragment
+                        and (parsed.port is None or parsed.port > 0)
+                        and not any(character.isspace() for character in endpoint)
+                        and (
+                            parsed.scheme == "https"
+                            or (
+                                parsed.scheme == "http"
+                                and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+                            )
+                        )
+                    )
+                except ValueError:
+                    valid = False
+                if not valid:
+                    raise RuntimeError(
+                        f"OMNIGENT_OIDC_{name.upper()} must be an absolute HTTPS URL "
+                        "without userinfo or a fragment (HTTP is allowed only for loopback)"
+                    )
 
         if is_github:
-            if client_secret is None:
-                raise RuntimeError(
-                    "Missing required environment variable OMNIGENT_OIDC_CLIENT_SECRET "
-                    "(GitHub OAuth requires a confidential client)"
-                )
             # Empty string (forwarded by `${VAR:-}` wrappers) → default.
             scopes = (os.environ.get("OMNIGENT_OIDC_SCOPES") or _GITHUB_SCOPES).strip()
             return OIDCConfig(
@@ -370,34 +419,12 @@ class OIDCConfig:
                 skip_email_verification=skip_email_verification,
             )
 
-        # Standard OIDC: public clients use PKCE without a client secret.
+        # Standard OIDC: fetch discovery document.
         scopes = (os.environ.get("OMNIGENT_OIDC_SCOPES") or "openid email profile").strip()
-
-        # Some providers expose browser-reachable endpoints through a
-        # different hostname than the canonical issuer in their tokens.
-        # Supplying all three endpoint overrides makes that transport
-        # topology explicit while preserving strict issuer validation.
-        endpoint_env_names = (
-            "OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT",
-            "OMNIGENT_OIDC_TOKEN_ENDPOINT",
-            "OMNIGENT_OIDC_JWKS_URI",
-        )
-        endpoint_overrides = tuple(os.environ.get(name, "").strip() for name in endpoint_env_names)
-        if any(endpoint_overrides) and not all(endpoint_overrides):
-            missing = ", ".join(
-                name
-                for name, value in zip(endpoint_env_names, endpoint_overrides, strict=True)
-                if not value
-            )
-            raise RuntimeError(
-                f"OIDC endpoint overrides must be configured together; missing {missing}"
-            )
-
-        userinfo_endpoint = None
-        if all(endpoint_overrides):
-            authorization_endpoint, token_endpoint, jwks_uri = endpoint_overrides
+        discovery_url = issuer.rstrip("/") + "/.well-known/openid-configuration"
+        if all(endpoints.values()):
+            doc = endpoints
         else:
-            discovery_url = issuer.rstrip("/") + "/.well-known/openid-configuration"
             try:
                 resp = httpx.get(discovery_url, timeout=10.0)
                 resp.raise_for_status()
@@ -407,17 +434,16 @@ class OIDCConfig:
                     f"Failed to fetch OIDC discovery document from {discovery_url}: {exc}"
                 ) from exc
 
-            authorization_endpoint = doc.get("authorization_endpoint")
-            token_endpoint = doc.get("token_endpoint")
-            jwks_uri = doc.get("jwks_uri")
-            userinfo_endpoint = doc.get("userinfo_endpoint")
+        authorization_endpoint = doc.get("authorization_endpoint")
+        token_endpoint = doc.get("token_endpoint")
+        jwks_uri = doc.get("jwks_uri")
 
-            if not authorization_endpoint or not token_endpoint or not jwks_uri:
-                raise RuntimeError(
-                    f"OIDC discovery document at {discovery_url} missing "
-                    f"required fields (authorization_endpoint, "
-                    f"token_endpoint, jwks_uri)"
-                )
+        if not authorization_endpoint or not token_endpoint or not jwks_uri:
+            raise RuntimeError(
+                f"OIDC discovery document at {discovery_url} missing "
+                f"required fields (authorization_endpoint, "
+                f"token_endpoint, jwks_uri)"
+            )
 
         return OIDCConfig(
             issuer=issuer,
@@ -433,7 +459,7 @@ class OIDCConfig:
             authorization_endpoint=authorization_endpoint,
             token_endpoint=token_endpoint,
             jwks_uri=jwks_uri,
-            userinfo_endpoint=userinfo_endpoint,
+            userinfo_endpoint=doc.get("userinfo_endpoint"),
             allow_invites=allow_invites,
             skip_email_verification=skip_email_verification,
             email_claim=email_claim,
