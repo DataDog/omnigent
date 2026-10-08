@@ -136,6 +136,38 @@ def test_connection_failure_for_unreachable_sqlite(
     assert "does not exist" in result.output
 
 
+def test_fresh_database_with_no_schema_needs_migration(tmp_path: Path) -> None:
+    """A brand-new DB file with no alembic_version table -> exit 2, not 1.
+
+    Nothing has ever been migrated against this database, so it is
+    unmigrated rather than incompatible -- the normal startup path runs
+    migrations to head on first boot, same as the behind-head case.
+    """
+    db_path = tmp_path / "fresh.db"
+    sqlite3.connect(db_path).close()  # creates an empty file, no tables at all
+
+    result = _check_db_revision_compatibility(f"sqlite:///{db_path}")
+
+    assert result.exit_code == 2
+    assert result.current is None
+    assert result.head == _M017
+    assert "no schema yet" in result.message
+
+
+def test_malformed_db_url_reports_clean_error_not_traceback() -> None:
+    """An unknown dialect/driver in OMNIGENT_DB_URL -> clean exit 1, no raw traceback.
+
+    ``sqlalchemy.create_engine`` itself can raise (unknown dialect, missing
+    driver module) before any connection attempt; that must still surface as
+    the documented "could not connect" message rather than an uncaught
+    exception propagating out of the check.
+    """
+    result = _check_db_revision_compatibility("foobar://host/db")
+
+    assert result.exit_code == 1
+    assert "Could not connect" in result.message
+
+
 def test_incompatible_for_garbage_alembic_version(tmp_path: Path) -> None:
     """An alembic_version row holding an unknown revision -> exit 1."""
     db_path = tmp_path / "garbage.db"

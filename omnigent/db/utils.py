@@ -825,10 +825,14 @@ def _check_db_revision_compatibility(db_uri: str) -> DbCheckResult:
     import sqlalchemy
     from sqlalchemy.exc import SQLAlchemyError
 
-    engine = sqlalchemy.create_engine(normalize_database_url(db_uri))
+    # create_engine itself can raise (malformed URL, unknown dialect, missing
+    # driver module) -- it must stay inside the try so those surface as the
+    # same clean "could not connect" message instead of a raw traceback.
+    engine: Engine | None = None
     try:
+        engine = sqlalchemy.create_engine(normalize_database_url(db_uri))
         current = _get_current_db_revision(engine)
-    except SQLAlchemyError as exc:
+    except (SQLAlchemyError, ModuleNotFoundError) as exc:
         return DbCheckResult(
             exit_code=1,
             current=None,
@@ -836,7 +840,8 @@ def _check_db_revision_compatibility(db_uri: str) -> DbCheckResult:
             message=f"Could not connect to the database at {db_uri!r}: {exc}",
         )
     finally:
-        engine.dispose()
+        if engine is not None:
+            engine.dispose()
 
     if current is None:
         # No alembic_version table -- nothing has ever been migrated against
