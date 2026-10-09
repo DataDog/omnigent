@@ -14,7 +14,7 @@ from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeVar
 
 from sqlalchemy import Engine, create_engine, event, inspect, text
 from sqlalchemy.engine import make_url
@@ -766,6 +766,119 @@ def _verify_db_revision_is_supported(
                 f"(found revision {revision!r}, latest supported revision {head!r}). "
                 "Upgrade Omnigent before using this database."
             ) from exc
+
+
+class DbCheckResult(NamedTuple):
+    """Outcome of a read-only compatibility check between a DB and a build.
+
+    :ivar exit_code: ``0`` schema matches head; ``2`` the current revision is
+        recognized but migrations are needed; ``1`` the schema is
+        incompatible, the database is unreachable, or the candidate's own
+        migration metadata is invalid.
+    :ivar current: The database's current Alembic revision(s), or ``None``
+        when no ``alembic_version`` table exists yet.
+    :ivar head: The candidate build's head revision, or ``None`` when it
+        could not be determined (``exit_code == 1``).
+    :ivar message: A human-readable summary suitable for ``click.echo``.
+    """
+
+    exit_code: int
+    current: str | tuple[str, ...] | None
+    head: str | None
+    message: str
+
+
+def _check_db_revision_compatibility(db_uri: str) -> DbCheckResult:
+    """
+    Compare a database's current Alembic revision against this build's head.
+
+    Strictly read-only: never calls :func:`_run_migrations` or
+    :func:`_initialize_or_verify_schema` (which can trigger an automatic
+    migration), and never uses :func:`get_or_create_engine` (which also
+    triggers schema initialization and caches the engine process-wide).
+    Opens a bare, uncached engine instead, and always disposes it before
+    returning.
+
+    Powers ``omnigent debug db-check``: a release process can run this
+    against the deployed database *before* swapping in a new server image,
+    to block a roll-forward or rollback whose candidate image is
+    incompatible with the deployed schema.
+
+    :param db_uri: SQLAlchemy database URL for the deployed database, e.g.
+        ``"sqlite:////var/lib/omnigent/chat.db"`` or
+        ``"postgresql://user:pw@host/db"``.
+    :returns: A :class:`DbCheckResult` describing the outcome.
+    """
+    try:
+        head = _get_head_db_revision(db_uri)
+    except Exception as exc:  # noqa: BLE001 -- any failure means invalid candidate metadata
+        return DbCheckResult(
+            exit_code=1,
+            current=None,
+            head=None,
+            message=(
+                "Could not determine this build's own migration head "
+                f"(invalid migration metadata): {exc}"
+            ),
+        )
+
+    import sqlalchemy
+    from sqlalchemy.exc import SQLAlchemyError
+
+    # create_engine itself can raise (malformed URL, unknown dialect, missing
+    # driver module) -- it must stay inside the try so those surface as the
+    # same clean "could not connect" message instead of a raw traceback.
+    engine: Engine | None = None
+    try:
+        engine = sqlalchemy.create_engine(normalize_database_url(db_uri))
+        current = _get_current_db_revision(engine)
+    except (SQLAlchemyError, ModuleNotFoundError) as exc:
+        return DbCheckResult(
+            exit_code=1,
+            current=None,
+            head=head,
+            message=f"Could not connect to the database at {db_uri!r}: {exc}",
+        )
+    finally:
+        if engine is not None:
+            engine.dispose()
+
+    if current is None:
+        # No alembic_version table -- nothing has ever been migrated against
+        # this database. Not incompatible, just unmigrated: the normal
+        # startup path (_initialize_or_verify_schema) will run migrations to
+        # head on first boot, same as it does for exit_code == 2.
+        return DbCheckResult(
+            exit_code=2,
+            current=None,
+            head=head,
+            message=(
+                "Database has no schema yet (no alembic_version table); "
+                "migrations will run on first start."
+            ),
+        )
+
+    try:
+        _verify_db_revision_is_supported(db_uri, current, head)
+    except RuntimeError as exc:
+        return DbCheckResult(exit_code=1, current=current, head=head, message=str(exc))
+
+    if current == head:
+        return DbCheckResult(
+            exit_code=0,
+            current=current,
+            head=head,
+            message=f"Database schema is up to date (revision {current!r}).",
+        )
+    return DbCheckResult(
+        exit_code=2,
+        current=current,
+        head=head,
+        message=(
+            f"Database schema is behind head but recognized by this build "
+            f"(found revision {current!r}, expected {head!r}); migrations are needed."
+        ),
+    )
 
 
 def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
