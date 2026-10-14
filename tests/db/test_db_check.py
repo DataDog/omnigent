@@ -179,6 +179,43 @@ def test_fresh_database_with_no_schema_needs_migration(tmp_path: Path) -> None:
     assert "no schema yet" in result.message
 
 
+def test_unparseable_db_url_reports_clean_error_not_traceback() -> None:
+    """A URL ``make_url`` can't even parse -> clean exit 1, safe-uri placeholder.
+
+    Exercises :func:`_safe_db_uri_for_display`'s own parse-failure branch
+    (never echo an unparseable string verbatim, since it could still embed
+    credentials), reached from the very first line of
+    :func:`_check_db_revision_compatibility`.
+    """
+    result = _check_db_revision_compatibility("not-a-url")
+
+    assert result.exit_code == 1
+    assert "Could not connect" in result.message
+    assert "not-a-url" not in result.message
+
+
+def test_invalid_candidate_migration_metadata_reports_exit_one(tmp_path: Path) -> None:
+    """A candidate whose own migration graph has no head -> exit 1.
+
+    Exercises the ``_get_head_db_revision`` failure branch directly (an
+    empty/corrupted migrations directory on the candidate image itself,
+    e.g. a packaging bug) -- distinct from the DB-side garbage-revision
+    case covered by ``test_incompatible_for_garbage_alembic_version``.
+    """
+    db_path = tmp_path / "irrelevant.db"
+    uri = f"sqlite:///{db_path}"
+
+    empty_config = _truncated_migrations_config(tmp_path, uri, exclude=("",))
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(db_utils, "_build_alembic_config", lambda _db_uri: empty_config)
+        result = _check_db_revision_compatibility(uri)
+
+    assert result.exit_code == 1
+    assert result.current is None
+    assert result.head is None
+    assert "invalid migration metadata" in result.message
+
+
 def test_malformed_db_url_reports_clean_error_not_traceback() -> None:
     """An unknown dialect/driver in OMNIGENT_DB_URL -> clean exit 1, no raw traceback.
 
