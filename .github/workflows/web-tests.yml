@@ -73,6 +73,9 @@ jobs:
         run: pnpm --filter web run format:check
 
       - name: Run tests with coverage
+        env:
+          # jsdom owns browser storage; Node's experimental global shadows it.
+          NODE_OPTIONS: --no-experimental-webstorage
         run: pnpm --filter web run test:coverage
 
       # Distill the v8 json-summary into a single total.txt, mirroring the
