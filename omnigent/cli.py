@@ -1320,7 +1320,15 @@ def _default_artifact_location() -> str:
 
 # Substrings marking a URL query parameter as a credential, e.g. libpq's
 # ``password`` / ``sslpassword`` or a driver ``api_key``. Matched lowercase.
-_DB_URI_CREDENTIAL_QUERY_MARKERS = ("password", "passwd", "pwd", "secret", "token", "apikey", "api_key")
+_DB_URI_CREDENTIAL_QUERY_MARKERS = (
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+)
 _DB_URI_REDACTED_QUERY_VALUE = "REDACTED"
 _UNPARSEABLE_DB_URI_DISPLAY = "<unparseable database URL>"
 
@@ -1344,7 +1352,7 @@ def _db_uri_has_credential(db_uri: str) -> bool:
 
     try:
         url = make_url(db_uri)
-    except ArgumentError:
+    except (ArgumentError, ValueError):
         return False
     return bool(url.password) or any(_is_credential_query_key(key) for key in url.query)
 
@@ -1370,7 +1378,7 @@ def _display_db_uri(db_uri: str, *, strict: bool = False) -> str:
 
     try:
         url = make_url(db_uri)
-    except ArgumentError:
+    except (ArgumentError, ValueError):
         # A malformed URI is surfaced by the engine on connect; display
         # keeps whatever the operator provided rather than failing here.
         return _UNPARSEABLE_DB_URI_DISPLAY if strict else db_uri
@@ -1434,7 +1442,7 @@ def _require_existing_sqlite_db(db_uri: str) -> None:
 
     try:
         url = make_url(db_uri)
-    except ArgumentError as exc:
+    except (ArgumentError, ValueError) as exc:
         # Neither the raw URL nor SQLAlchemy's message (which quotes it) is
         # echoed: an unparseable URL may still contain a password.
         raise click.ClickException(
