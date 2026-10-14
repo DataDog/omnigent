@@ -94,6 +94,18 @@ def test_password_with_url_delimiters_is_redacted(migrated: list[str], password:
     assert migrated == [url]
 
 
+def test_azure_style_username_password_is_redacted(migrated: list[str]) -> None:
+    """An unencoded ``@`` in the username (``user@server``) must not expose the password."""
+    url = f"postgresql+psycopg://adm@srv:{_SECRET}@db.example.com:5432/omnigent"
+
+    result = _upgrade(url)
+
+    assert result.exit_code == 0, result.output
+    assert _SECRET not in _all_output(result)
+    assert "adm%40srv:***@db.example.com:5432/omnigent" in result.stdout
+    assert migrated == [url]
+
+
 @pytest.mark.parametrize("env", [None, {"OMNIGENT_DB_URL": ""}])
 def test_missing_url_is_a_usage_error(migrated: list[str], env: dict[str, str] | None) -> None:
     result = _upgrade(env=env)

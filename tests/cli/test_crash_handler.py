@@ -97,12 +97,22 @@ def test_command_line_redacts_tokens_in_argv(
     assert "***" in cmd
 
 
-@pytest.mark.parametrize("password", ["s3cret", "s3/cret", "s3?cret", "s3#cret"])
+@pytest.mark.parametrize(
+    ("user", "password"),
+    [
+        ("omnigent", "s3cret"),
+        ("omnigent", "s3/cret"),
+        ("omnigent", "s3?cret"),
+        ("omnigent", "s3#cret"),
+        ("omnigent", "s3@cret"),
+        ("adm@srv", "s3cret"),  # Azure-style user@server username
+    ],
+)
 def test_command_line_redacts_database_url_credentials(
-    data_dir: Path, monkeypatch: pytest.MonkeyPatch, password: str
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, user: str, password: str
 ) -> None:
     """A positional DB URL must not leak its password into the crash report."""
-    url = f"postgresql://omnigent:{password}@db.example.com/omnigent?sslpassword=k3y"
+    url = f"postgresql://{user}:{password}@db.example.com/omnigent?sslpassword=k3y"
     monkeypatch.setattr(sys, "argv", ["omnigent", "debug", "db-upgrade", url])
     cmd = ch._command_line()
     assert "cret" not in cmd
