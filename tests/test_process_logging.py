@@ -135,6 +135,9 @@ def test_redact_log_text_filters_labeled_and_unlabeled_token_shapes(
         (f"provider key {provider_key}", provider_key),
         (f"workspace PAT {workspace_pat}", workspace_pat),
         ("argv=['db-upgrade', 'postgresql://u:s3cret@db/omnigent']", "s3cret"),
+        ("argv=['db-upgrade', 'postgresql://u:s3/cret@db/omnigent']", "cret"),
+        ("argv=['db-upgrade', 'postgresql://u:s3?cret@db/omnigent']", "cret"),
+        ("argv=['db-upgrade', 'postgresql://u:s3#cret@db/omnigent']", "cret"),
     )
 
     for sample, secret in samples:

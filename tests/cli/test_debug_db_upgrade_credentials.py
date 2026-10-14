@@ -81,6 +81,19 @@ def test_positional_url_wins_over_env_var(migrated: list[str], tmp_path: Path) -
     assert "from OMNIGENT_DB_URL" not in result.stdout
 
 
+@pytest.mark.parametrize("password", ["s3/cretPW", "s3?cretPW", "s3#cretPW"])
+def test_password_with_url_delimiters_is_redacted(migrated: list[str], password: str) -> None:
+    """SQLAlchemy accepts unencoded ``/ ? #`` in passwords; none may leak."""
+    url = f"postgresql+psycopg://omnigent:{password}@db.example.com:5432/omnigent"
+
+    result = _upgrade(url)
+
+    assert result.exit_code == 0, result.output
+    assert "cretPW" not in _all_output(result)
+    assert "omnigent:***@db.example.com:5432/omnigent" in result.stdout
+    assert migrated == [url]
+
+
 @pytest.mark.parametrize("env", [None, {"OMNIGENT_DB_URL": ""}])
 def test_missing_url_is_a_usage_error(migrated: list[str], env: dict[str, str] | None) -> None:
     result = _upgrade(env=env)

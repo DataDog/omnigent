@@ -128,9 +128,10 @@ _WHITESPACE_SECRET_PATTERN = re.compile(
     r"|has[ \t]+expired|(?:authentication|validation|refresh)[ \t]+failed)\b)"
     rf"(?![:=])({_AUTHORIZATION_VALUE})"
 )
-# Userinfo password in a URL, e.g. ``postgresql://user:pw@host/db``. Anchored
-# on ``://`` (not the scheme) so long dotted words can't trigger backtracking.
-URL_USERINFO_PASSWORD_PATTERN = re.compile(r"(://[^\s:/?#@]*:)[^\s/?#@]+(?=@)")
+# Userinfo password in a URL, e.g. ``postgresql://user:p/w@host/db``. Like
+# SQLAlchemy, the password may hold ``/ ? #`` and ends at the first ``@``; the
+# ``://`` anchor and length bound keep matching linear.
+URL_USERINFO_PASSWORD_PATTERN = re.compile(r"(://[^\s:/@]*:)[^\s@]{1,512}(?=@)")
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     URL_USERINFO_PASSWORD_PATTERN,
     # Keep the broad standalone-bearer behavior: short or punctuation-heavy
