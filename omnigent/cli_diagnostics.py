@@ -117,8 +117,8 @@ _redirected_logging_streams: list[_LoggingStreamSnapshot] = []
 #: URL userinfo: ``scheme://user:password@host`` — e.g. a database URI baked
 #: into a migration error's copy-pasteable command. Redacts the whole
 #: userinfo (the lookahead keeps the ``@host`` part readable). The shared
-#: :func:`omnigent.process_logging.redact_log_text` filter does not cover
-#: URL userinfo, so :func:`redact_secrets` applies this pattern on top.
+#: :func:`omnigent.process_logging.redact_log_text` filter masks only the
+#: password, so :func:`redact_secrets` applies this on top to hide the username.
 #:
 #: The greedy ``\S+`` anchors on the *last* ``@`` in the whitespace-delimited
 #: token: passwords may legally contain ``/`` and ``@`` (SQLAlchemy accepts

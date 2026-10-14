@@ -7076,6 +7076,24 @@ def test_display_db_uri_returns_unparseable_input_unchanged() -> None:
     assert _display_db_uri("not a uri") == "not a uri"
 
 
+def test_display_db_uri_strict_hides_unparseable_input() -> None:
+    """Strict mode never returns the raw string, which may hold a secret."""
+    assert _display_db_uri("not a uri s3cret", strict=True) == "<unparseable database URL>"
+    bad_port = "postgresql://u:s3cret@db.example.com:notaport/omnigent"
+    assert _display_db_uri(bad_port, strict=True) == "<unparseable database URL>"
+
+
+def test_display_db_uri_masks_query_string_credentials() -> None:
+    """libpq-style ``password`` / ``sslpassword`` query params are masked too."""
+    masked = _display_db_uri(
+        "postgresql://u:pw@db.example.com/omnigent?sslmode=require&Password=a1&sslpassword=b2"
+    )
+    assert masked == (
+        "postgresql://u:***@db.example.com/omnigent"
+        "?Password=REDACTED&sslmode=require&sslpassword=REDACTED"
+    )
+
+
 def _native_dispatch_kwargs(**overrides: object) -> dict[str, object]:
     """Build ``_dispatch_native_terminal_harness`` kwargs with safe defaults.
 

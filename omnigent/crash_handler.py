@@ -302,9 +302,12 @@ _TOKEN_PATTERNS = [
 
 
 def _redact(text: str) -> str:
+    from omnigent.process_logging import redact_log_text
+
     for pat in _TOKEN_PATTERNS:
         text = pat.sub(lambda m: m.group(0)[:4] + "***", text)
-    return text
+    # The shared log redactor also covers DB URL passwords and ``password=`` values.
+    return redact_log_text(text)
 
 
 def _command_line() -> str:
