@@ -232,11 +232,15 @@ def _do_callback(client: TestClient, id_token: str) -> httpx.Response:
     )
 
 
-@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [None, "http://127.0.0.1:53682/callback", "ai.omnigent.ios:/oauth/callback"],
+    ids=["browser", "desktop", "ios"],
+)
 def test_callback_persists_provider_binding_in_encrypted_session(
     tmp_path: Path,
     db_uri: str,
-    native: bool,
+    redirect_uri: str | None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Browser and native login retain the verified provider identity for Habitat."""
@@ -277,9 +281,8 @@ def test_callback_persists_provider_binding_in_encrypted_session(
     try:
         with TestClient(app) as client:
             token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
-            if native:
+            if redirect_uri is not None:
                 verifier = "v" * 64
-                redirect_uri = "http://127.0.0.1:53682/callback"
                 login = client.get(
                     "/auth/login",
                     params={
@@ -300,7 +303,7 @@ def test_callback_persists_provider_binding_in_encrypted_session(
             else:
                 response = _do_callback(client, token)
             assert response.status_code == 302
-            if native:
+            if redirect_uri is not None:
                 assert "ap_session" not in response.cookies
                 code = parse_qs(urlparse(response.headers["location"]).query)["code"][0]
                 exchanged = client.post(

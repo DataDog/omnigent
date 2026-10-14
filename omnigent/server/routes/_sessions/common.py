@@ -319,6 +319,12 @@ _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: str = "omnigent.last_task_error_remediat
 _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: str = "omnigent.last_task_error_item_id"
 
 
+# The runner bound when this failure was recorded, so a later exit from a
+# different runner attempt surfaces its own startup failure instead of hiding
+# behind this stale cause. Empty when unknown (treated as the current runner's).
+_LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: str = "omnigent.last_task_error_runner_id"
+
+
 _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
 
 
@@ -426,6 +432,13 @@ _MANAGED_RESUMABLE_TUNNEL_STALE_S = 30.0
 
 
 _RUNNER_CONVICTION_POLL_S = 0.25
+
+
+# Lookups, and the gap between them, when resolving a connected runner's client.
+_RUNNER_CLIENT_RESOLVE_ATTEMPTS = 3
+
+
+_RUNNER_CLIENT_RESOLVE_RETRY_S = 2.0
 
 
 _HOST_LAUNCH_RESULT_TIMEOUT_S = 10.0
@@ -1175,6 +1188,8 @@ __all__ = [
     "_PI_NATIVE_WRAPPER_LABEL_VALUE",
     "_RACE_TASK_REAP_TIMEOUT_S",
     "_RETRY_SESSION_TYPE",
+    "_RUNNER_CLIENT_RESOLVE_ATTEMPTS",
+    "_RUNNER_CLIENT_RESOLVE_RETRY_S",
     "_RUNNER_CONVICTION_POLL_S",
     "_RUNNER_FORWARD_TIMEOUT",
     "_RUNNER_RELAY_READY_TIMEOUT_S",
