@@ -136,6 +136,31 @@ def test_connection_failure_for_unreachable_sqlite(
     assert "does not exist" in result.output
 
 
+def test_connection_failure_never_leaks_password(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A connection-failure message must never echo the DB URL's password.
+
+    Port 1 forces a fast, deterministic connection refusal (no real
+    Postgres server needed) regardless of whether the ``psycopg`` driver
+    happens to be installed in this environment -- a missing driver fails
+    with ``ModuleNotFoundError`` before even trying to connect, a present
+    driver fails with a libpq connection-refused error; both are exercised
+    by this one assertion, and neither must ever surface the password.
+    """
+    uri = "postgresql+psycopg://dbuser:FAKEPW-test@localhost:1/db"
+
+    result = _check_db_revision_compatibility(uri)
+
+    assert result.exit_code == 1
+    assert "FAKEPW-test" not in result.message
+    assert "could not connect" in result.message.lower()
+
+    # Same assertion through the actual CLI surface -- the message is what
+    # gets click.echo'd, i.e. what would land in a CI/job log.
+    monkeypatch.setenv("OMNIGENT_DB_URL", uri)
+    cli_result = CliRunner().invoke(cli, ["debug", "db-check"])
+    assert "FAKEPW-test" not in cli_result.output
+
+
 def test_fresh_database_with_no_schema_needs_migration(tmp_path: Path) -> None:
     """A brand-new DB file with no alembic_version table -> exit 2, not 1.
 

@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import random
+import re
 import threading
 import time
 import uuid
@@ -768,6 +769,44 @@ def _verify_db_revision_is_supported(
             ) from exc
 
 
+# Matches the credentials segment of a connection URL, e.g. the
+# "user:password@" in "postgresql+psycopg://user:password@host/db" --
+# scrubbed from any text headed for click.echo/logs. Driver-raised
+# exceptions (DSN strings, libpq error text) can embed the same shape, so
+# this is applied to arbitrary free text, not just the URL itself.
+_CREDENTIALS_IN_URL_RE = re.compile(r"://[^/\s:@]+:[^/\s@]*@")
+
+
+def _redact_credentials(text: str) -> str:
+    """Scrub any ``scheme://user:password@`` credential pair from free text.
+
+    Defense-in-depth backstop for :func:`_check_db_revision_compatibility`'s
+    error messages: beyond redacting the URL we were given, this also
+    scrubs anything a driver's own exception text might echo back (e.g. a
+    DSN embedded in a libpq connection error).
+
+    :param text: Arbitrary text, e.g. ``str(exc)`` from a caught exception.
+    :returns: The same text with any embedded credentials replaced by
+        ``"://<redacted>@"``.
+    """
+    return _CREDENTIALS_IN_URL_RE.sub("://<redacted>@", text)
+
+
+def _safe_db_uri_for_display(db_uri: str) -> str:
+    """Render a database URL with its password redacted, for safe display.
+
+    :param db_uri: A SQLAlchemy database URL, possibly carrying a password.
+    :returns: The URL with any password replaced by SQLAlchemy's standard
+        mask, or a generic placeholder when *db_uri* cannot be parsed at
+        all (never echoes an unparseable string verbatim, since it could
+        still contain credentials).
+    """
+    try:
+        return make_url(db_uri).render_as_string(hide_password=True)
+    except Exception:  # noqa: BLE001 -- any parse failure must not leak db_uri
+        return "<unparseable database URL>"
+
+
 class DbCheckResult(NamedTuple):
     """Outcome of a read-only compatibility check between a DB and a build.
 
@@ -807,8 +846,13 @@ def _check_db_revision_compatibility(db_uri: str) -> DbCheckResult:
     :param db_uri: SQLAlchemy database URL for the deployed database, e.g.
         ``"sqlite:////var/lib/omnigent/chat.db"`` or
         ``"postgresql://user:pw@host/db"``.
-    :returns: A :class:`DbCheckResult` describing the outcome.
+    :returns: A :class:`DbCheckResult` describing the outcome. Every message
+        is scrubbed of any password embedded in *db_uri* -- see
+        :func:`_safe_db_uri_for_display` and :func:`_redact_credentials` --
+        since every branch here is reachable from ``click.echo`` output that
+        can land in CI/job logs.
     """
+    safe_uri = _safe_db_uri_for_display(db_uri)
     try:
         head = _get_head_db_revision(db_uri)
     except Exception as exc:  # noqa: BLE001 -- any failure means invalid candidate metadata
@@ -818,7 +862,7 @@ def _check_db_revision_compatibility(db_uri: str) -> DbCheckResult:
             head=None,
             message=(
                 "Could not determine this build's own migration head "
-                f"(invalid migration metadata): {exc}"
+                f"(invalid migration metadata): {_redact_credentials(str(exc))}"
             ),
         )
 
@@ -837,7 +881,10 @@ def _check_db_revision_compatibility(db_uri: str) -> DbCheckResult:
             exit_code=1,
             current=None,
             head=head,
-            message=f"Could not connect to the database at {db_uri!r}: {exc}",
+            message=(
+                f"Could not connect to the database at {safe_uri!r}: "
+                f"{_redact_credentials(str(exc))}"
+            ),
         )
     finally:
         if engine is not None:
