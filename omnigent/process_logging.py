@@ -128,7 +128,11 @@ _WHITESPACE_SECRET_PATTERN = re.compile(
     r"|has[ \t]+expired|(?:authentication|validation|refresh)[ \t]+failed)\b)"
     rf"(?![:=])({_AUTHORIZATION_VALUE})"
 )
+# Userinfo password in a URL, e.g. ``postgresql://user:pw@host/db``. Anchored
+# on ``://`` (not the scheme) so long dotted words can't trigger backtracking.
+URL_USERINFO_PASSWORD_PATTERN = re.compile(r"(://[^\s:/?#@]*:)[^\s/?#@]+(?=@)")
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    URL_USERINFO_PASSWORD_PATTERN,
     # Keep the broad standalone-bearer behavior: short or punctuation-heavy
     # credentials are still secrets.
     re.compile(r"(?i)(\bbearer\s+)\S+"),

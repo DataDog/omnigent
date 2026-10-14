@@ -134,6 +134,7 @@ def test_redact_log_text_filters_labeled_and_unlabeled_token_shapes(
         (f"session credential {jwt}", jwt),
         (f"provider key {provider_key}", provider_key),
         (f"workspace PAT {workspace_pat}", workspace_pat),
+        ("argv=['db-upgrade', 'postgresql://u:s3cret@db/omnigent']", "s3cret"),
     )
 
     for sample, secret in samples:
@@ -332,6 +333,7 @@ def test_redact_log_text_preserves_credential_diagnostic_prose(
         ("synthetic.token.marker" * 4_000)[:65_536],
         "api" + " " * 65_000 + "key is missing",
         "password is missing; api key is missing\n" * 1_600,
+        "://a:" * 13_000,
     ],
     ids=[
         "punctuation",
@@ -341,6 +343,7 @@ def test_redact_log_text_preserves_credential_diagnostic_prose(
         "dotted",
         "spaced-label",
         "diagnostic-prose",
+        "url-userinfo",
     ],
 )
 @pytest.mark.parametrize("include_whitespace_credentials", [False, True])

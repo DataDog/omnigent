@@ -97,6 +97,18 @@ def test_command_line_redacts_tokens_in_argv(
     assert "***" in cmd
 
 
+def test_command_line_redacts_database_url_credentials(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A positional DB URL must not leak its password into the crash report."""
+    url = "postgresql://omnigent:s3cret@db.example.com/omnigent?sslpassword=k3y"
+    monkeypatch.setattr(sys, "argv", ["omnigent", "debug", "db-upgrade", url])
+    cmd = ch._command_line()
+    assert "s3cret" not in cmd
+    assert "k3y" not in cmd
+    assert "db.example.com" in cmd
+
+
 # --------------------------------------------------------------------------- #
 # Save + rotation
 # --------------------------------------------------------------------------- #
