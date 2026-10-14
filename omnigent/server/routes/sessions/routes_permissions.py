@@ -258,9 +258,14 @@ def register_permissions_routes(
                     "Public access has been disabled for this Omnigent server.",
                     code=ErrorCode.FORBIDDEN,
                 )
-            if body.level > LEVEL_READ:
+            from omnigent.server.sharing_settings import PublicSharingMaxLevel
+
+            ceiling = getattr(
+                request.app.state, "public_sharing_max_level", lambda: PublicSharingMaxLevel.READ
+            )()
+            if body.level > ceiling.level:
                 raise OmnigentError(
-                    "Public access is limited to read-only (level 1)",
+                    f"Public access is limited to {ceiling.value} (level {ceiling.level})",
                     code=ErrorCode.INVALID_INPUT,
                 )
         with target_account_scope(body.user_id, request.state.sharing_target_generation):
@@ -509,7 +514,7 @@ def _to_agent_object(
     if cache is not None:
         try:
             loaded = cache.load(
-                agent.id, agent.bundle_location, expand_env=agent.session_id is None
+                agent.id, agent.bundle_location, expand_env=agent.operator_authored
             )
             harness = loaded.spec.executor.harness_kind
             if description is None:
@@ -524,7 +529,7 @@ def _to_agent_object(
             )
             # Bundled suggestions stay available while the host catalog loads.
             skills = [
-                SkillSummary(name=s.name, description=s.description)
+                SkillSummary(name=s.name, description=s.description, display_name=s.display_name)
                 for s in loaded.spec.skills
                 if s.user_invocable
             ]
