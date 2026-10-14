@@ -448,6 +448,9 @@ async def test_handle_model_options_serves_the_claude_catalog(
         )
 
     monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness", lambda harness: None
+    )
     host = _make_host_process()
 
     first = await host._handle_model_options(
@@ -1053,7 +1056,7 @@ async def test_handle_launch_refuses_unconfigured_harness(
     assert "test-laptop" in (result.error or "")
     assert "omni setup" in (result.error or "")
     assert result.runner_id is None
-    assert probes and set(probes) == {"codex"}
+    assert probes and set(probes) == {harness}
     # No runner subprocess may exist after a refusal.
     assert host._runners == {}
 
@@ -6613,6 +6616,9 @@ async def test_handle_model_options_serves_claude_sdk_endpoint_listing(
         )
 
     monkeypatch.setattr("omnigent.models.model_catalog.list_models_for_worker", _fake_listing)
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness", lambda harness: None
+    )
     host = _make_host_process()
 
     result = await host._handle_model_options(
@@ -6653,6 +6659,9 @@ async def test_handle_model_options_claude_sdk_rides_the_probe_when_endpoints_li
         )
 
     monkeypatch.setattr("omnigent.models.model_catalog.list_models_for_worker", _fake_listing)
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness", lambda harness: None
+    )
     host = _make_host_process()
 
     async def _fake_probed() -> ModelOptionsResult:
