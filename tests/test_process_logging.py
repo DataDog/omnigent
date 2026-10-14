@@ -141,6 +141,10 @@ def test_redact_log_text_filters_labeled_and_unlabeled_token_shapes(
         ("argv=['db-upgrade', 'postgresql://adm@srv:s3cretY@db/omnigent']", "s3cretY"),
         ("argv=['db-upgrade', 'postgresql://u:s3@cretY@db/omnigent']", "cretY"),
         ("argv=['db-upgrade', 'postgresql://u:s3,cretY@db/omnigent']", "cretY"),
+        ("argv=['db-upgrade', \"postgresql://u:it'scretX@db/omnigent\"]", "scretX"),
+        ("argv=['db-upgrade', 'postgresql://u:s3\"cretX@db/omnigent']", "cretX"),
+        ("argv=['db-upgrade', 'postgresql://u:s3<cretX@db/omnigent']", "cretX"),
+        ("argv=['db-upgrade', 'postgresql://u:s3>cretX@db/omnigent']", "cretX"),
     )
 
     for sample, secret in samples:
@@ -157,16 +161,9 @@ def test_redact_log_text_filters_labeled_and_unlabeled_token_shapes(
         )
 
 
-@pytest.mark.parametrize(
-    "line",
-    [
-        '{"base":"http://localhost:8080/api","owner":"dev@example.com"}',
-        "base='http://localhost:8080/api' owner='dev@example.com'",
-        "<http://localhost:8080/api><dev@example.com>",
-    ],
-)
-def test_url_password_redaction_stays_inside_quoted_fields(line: str) -> None:
-    """A credential-free URL must not merge with a later quoted ``@`` field."""
+def test_url_password_redaction_stays_inside_whitespace_delimited_token() -> None:
+    """A credential-free URL must not merge with an ``@`` in a later token."""
+    line = "base='http://localhost:8080/api' owner='dev@example.com'"
     assert redact_log_text(line) == line
 
 

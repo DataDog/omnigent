@@ -129,9 +129,9 @@ _WHITESPACE_SECRET_PATTERN = re.compile(
     rf"(?![:=])({_AUTHORIZATION_VALUE})"
 )
 # URL userinfo password, e.g. ``postgresql://adm@srv:p/w@host/db``: username to the
-# first ``:``, password to the token's last ``@``. The ``://`` anchor and 512-char
-# bound keep matching linear; passwords with ``"'<>`` or over 512 chars aren't redacted.
-URL_USERINFO_PASSWORD_PATTERN = re.compile(r"(://[^\s:/]*:)[^\s\"'<>]{1,512}(?=@)")
+# first ``:``, password to the token's last ``@``. May over-redact a later ``@`` in the
+# same token (secrecy wins). The ``://`` anchor and 512-char bound keep matching linear.
+URL_USERINFO_PASSWORD_PATTERN = re.compile(r"(://[^\s:/]*:)[^\s]{1,512}(?=@)")
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     URL_USERINFO_PASSWORD_PATTERN,
     # Keep the broad standalone-bearer behavior: short or punctuation-heavy

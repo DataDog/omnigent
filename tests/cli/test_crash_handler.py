@@ -105,6 +105,10 @@ def test_command_line_redacts_tokens_in_argv(
         ("omnigent", "s3?cret"),
         ("omnigent", "s3#cret"),
         ("omnigent", "s3@cret"),
+        ("omnigent", "it's3cret"),
+        ("omnigent", 's3"cret'),
+        ("omnigent", "s3<cret"),
+        ("omnigent", "s3>cret"),
         ("adm@srv", "s3cret"),  # Azure-style user@server username
     ],
 )
