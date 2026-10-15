@@ -18,6 +18,8 @@ from playwright.sync_api import Page, WebSocketRoute, expect
 from tests.e2e_ui.conftest import open_right_rail
 
 _ATTACH_WS = re.compile(r"/resources/terminals/.*/attach")
+# xterm's automatic replies (e.g. an OSC 11 color report) can interleave with typed input.
+_TERMINAL_REPLY = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
 def _open_new_shell(page: Page) -> None:
@@ -46,7 +48,7 @@ def test_embedded_terminal_reconnects_after_transport_close(
 
         def forward_input(message: str | bytes) -> None:
             text = message.decode(errors="replace") if isinstance(message, bytes) else message
-            live["input"] = str(live["input"]) + text
+            live["input"] = _TERMINAL_REPLY.sub("", str(live["input"]) + text)
             server.send(message)
 
         ws.on_message(forward_input)
