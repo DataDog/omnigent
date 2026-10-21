@@ -36,7 +36,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
 )
-from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -73,6 +73,7 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._gzip_route import GZipFileContentRoute, skip_gzip
+from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _logger,
@@ -184,6 +185,7 @@ def register_resources_routes(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     host_registry: HostRegistry | None = None,
+    register_initial_file_upload: Callable[..., None] | None = None,
 ) -> None:
     """Register the resources routes on router."""
 
@@ -693,6 +695,12 @@ def register_resources_routes(
             conversation.workspace,
         )
 
+    def _runner_environment_segment(environment_id: str) -> str:
+        """Preserve an environment identifier as one runner URL segment."""
+        if environment_id in {".", ".."}:
+            raise OmnigentError("Invalid environment identifier", code=ErrorCode.INVALID_INPUT)
+        return urllib.parse.quote(environment_id, safe="")
+
     def _runner_path_segment(relative_path: str, *, absolute: bool) -> str:
         """Encode a browse path for the runner's ``{relative_path:path}`` segment.
 
@@ -705,6 +713,11 @@ def register_resources_routes(
         :param absolute: Whether the path is host-absolute.
         :returns: The encoded segment.
         """
+        if ".." in relative_path.split("/"):
+            raise OmnigentError(
+                "Parent path segments are not permitted",
+                code=ErrorCode.INVALID_INPUT,
+            )
         quoted = urllib.parse.quote(relative_path.lstrip("/"))
         return "%2F" + quoted if absolute else quoted
 
@@ -729,7 +742,7 @@ def register_resources_routes(
         encoded = _runner_path_segment(relative_path, absolute=relative_path.startswith("/"))
         return (
             f"/v1/sessions/{session_id}/resources/environments"
-            f"/{environment_id}/filesystem/{encoded}"
+            f"/{_runner_environment_segment(environment_id)}/filesystem/{encoded}"
         )
 
     def _browse_level(client_path: str, *, within_workspace: int) -> int:
@@ -1228,7 +1241,10 @@ def register_resources_routes(
         :returns: The environment resource object.
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
-        path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}"
+        path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{_runner_environment_segment(environment_id)}"
+        )
         try:
             return await _proxy_get_to_runner(session_id, path, conv)
         except OmnigentError as exc:
@@ -1493,6 +1509,9 @@ def register_resources_routes(
             request=request,
         )
         path = f"/v1/sessions/{session_id}/resources/terminals"
+        router = runner_router or get_server_runner_router()
+        if router is not None:
+            await asyncio.to_thread(router.require_mcp_registry_support, conv)
         status, payload = await _proxy_post_to_runner(
             session_id,
             path,
@@ -1576,7 +1595,8 @@ def register_resources_routes(
         from the previous conversation to the fresh one while the tmux
         pane keeps running. A successful transfer also carries the
         source host, workspace, and git branch to the target because the
-        live terminal remains on that same placement.
+        live terminal remains on that same placement. The caller must own
+        both sessions and the source host.
 
         :param request: The incoming FastAPI request (for auth) with
             JSON body ``{"target_session_id": "conv_new"}``.
@@ -1586,7 +1606,7 @@ def register_resources_routes(
             e.g. ``"terminal_claude_main"``.
         :returns: The terminal resource object under the target session.
         """
-        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        conv = await _validate_session(session_id, request, LEVEL_OWNER)
         body = await request.json()
         target_session_id = body.get("target_session_id") if isinstance(body, dict) else None
         if not isinstance(target_session_id, str) or not target_session_id:
@@ -1594,7 +1614,24 @@ def register_resources_routes(
                 "'target_session_id' is required",
                 code=ErrorCode.INVALID_INPUT,
             )
-        await _validate_session(target_session_id, request, LEVEL_EDIT)
+        await _validate_session(target_session_id, request, LEVEL_OWNER)
+
+        user_id = _get_user_id(request, auth_provider)
+        # Sub-agents inherit their parent's host; check the host the terminal runs on.
+        source_host_id = await asyncio.to_thread(routing_host_id, conv, conversation_store)
+        if source_host_id is not None and user_id is not None:
+            host_store = getattr(request.app.state, "host_store", None)
+            if host_store is None:
+                raise OmnigentError(
+                    "Host ownership cannot be verified",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            await asyncio.to_thread(
+                resolve_host_owner,
+                user_id=user_id,
+                host_id=source_host_id,
+                host_store=host_store,
+            )
 
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/transfer"
         status, payload = await _proxy_post_to_runner(
@@ -1772,6 +1809,11 @@ def register_resources_routes(
         :param file: The uploaded file (multipart form data).
         :returns: The session file resource object.
         """
+        return await _store_session_file(request, session_id, file)
+
+    async def _store_session_file(
+        request: Request, session_id: str, file: UploadFile, *, initial_input: bool = False
+    ) -> dict[str, Any]:
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         if file_store is None or artifact_store is None:
             raise HTTPException(
@@ -1807,7 +1849,11 @@ def register_resources_routes(
         if filesystem_required:
             # Drop the declared type so the file is never stored as text.
             content_type = _resolve_content_type("application/octet-stream", file.filename)
-            await _require_filesystem_attachment_support(request, conv, file.filename)
+            if initial_input:
+                # The host does not exist yet; dispatch validates its runtime after provisioning.
+                await _require_filesystem_attachment_harness(conv, file.filename)
+            else:
+                await _require_filesystem_attachment_support(request, conv, file.filename)
         # Hold the quota check through the store below, so parallel uploads can't
         # all spend the same remaining allowance.
         attachment_lock = (
@@ -1920,6 +1966,14 @@ def register_resources_routes(
             resource=resource,
         )
         return resource
+
+    async def _upload_initial_file(
+        request: Request, session_id: str, file: UploadFile
+    ) -> dict[str, Any]:
+        return await _store_session_file(request, session_id, file, initial_input=True)
+
+    if register_initial_file_upload is not None:
+        register_initial_file_upload(_upload_initial_file)
 
     @router.get(
         "/sessions/{session_id}/resources/files/{file_id}",
@@ -2440,7 +2494,10 @@ def register_resources_routes(
         if before is not None:
             params["before"] = before
         qs = urllib.parse.urlencode(params)
-        path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem?{qs}"
+        path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{_runner_environment_segment(environment_id)}/filesystem?{qs}"
+        )
         conv = await _authorize_browse_read(session_id, request)
         return _skip_gzip_for_binary(
             request,
@@ -2571,10 +2628,10 @@ def register_resources_routes(
         qs = urllib.parse.urlencode(params)
         suffix = ""
         if path:
-            suffix = "/" + ("%2F" + urllib.parse.quote(path.lstrip("/")) if absolute else path)
+            suffix = "/" + _runner_path_segment(path, absolute=absolute)
         runner_path = (
             f"/v1/sessions/{session_id}/resources/environments"
-            f"/{environment_id}/search{suffix}?{qs}"
+            f"/{_runner_environment_segment(environment_id)}/search{suffix}?{qs}"
         )
         resolver = functools.partial(_authorize_absolute_browse, conv, path) if absolute else None
         return await _fs_get_with_host_fallback(
@@ -2613,7 +2670,10 @@ def register_resources_routes(
         :param environment_id: Environment resource id.
         :returns: Flat list of changed filesystem entries with ``status``.
         """
-        path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/changes"
+        path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{_runner_environment_segment(environment_id)}/changes"
+        )
         conv = await _authorize_browse_read(session_id, request)
         return await _fs_get_with_host_fallback(
             session_id,
@@ -2648,9 +2708,10 @@ def register_resources_routes(
         :param relative_path: Path relative to environment root.
         :returns: JSON with ``before`` and ``after`` content strings.
         """
+        encoded = _runner_path_segment(relative_path, absolute=relative_path.startswith("/"))
         path = (
             f"/v1/sessions/{session_id}/resources/environments"
-            f"/{environment_id}/diff/{relative_path}"
+            f"/{_runner_environment_segment(environment_id)}/diff/{encoded}"
         )
         conv = await _authorize_browse_read(session_id, request, relative_path)
         return await _fs_get_with_host_fallback(
@@ -2722,6 +2783,14 @@ def register_resources_routes(
         :returns: JSON with ``before`` and ``after`` content strings.
         """
         conv = await _authorize_browse_read(session_id, request, relative_path)
+        if previous_path is not None:
+            if not all(previous_path.split("/")):
+                raise OmnigentError(
+                    "Previous path must be a non-empty relative file path",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            # Query and host parameters retain the literal name after validation.
+            _runner_path_segment(previous_path, absolute=False)
         params = {
             key: value
             for key, value in {
@@ -2733,12 +2802,13 @@ def register_resources_routes(
             }.items()
             if value is not None
         }
+        encoded = _runner_path_segment(relative_path, absolute=relative_path.startswith("/"))
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
             op="github_diff",
             host_params={"base": base, "path": relative_path, **params},
-            runner_path=f"/v1/sessions/{session_id}/resources/github/diff/{relative_path}",
+            runner_path=f"/v1/sessions/{session_id}/resources/github/diff/{encoded}",
             runner_params=params or None,
         )
 
@@ -2816,12 +2886,12 @@ def register_resources_routes(
                 session_id,
                 conv,
                 f"/v1/sessions/{session_id}/resources/environments"
-                f"/{environment_id}/filesystem/{runner_rel}?"
+                f"/{_runner_environment_segment(environment_id)}/filesystem/{runner_rel}?"
                 + urllib.parse.urlencode({"download": "true", **reach}),
             )
         path = (
             f"/v1/sessions/{session_id}/resources/environments"
-            f"/{environment_id}/filesystem/{runner_rel}?{qs}"
+            f"/{_runner_environment_segment(environment_id)}/filesystem/{runner_rel}?{qs}"
         )
         # Offline, the host reads whatever root it is handed, so the server
         # authorizes the target itself before rooting the reader there. Deferred:
@@ -2979,7 +3049,10 @@ def register_resources_routes(
         :returns: Shell result.
         """
         body = await request.json()
-        path = f"/v1/sessions/{session_id}/resources/environments/{environment_id}/shell"
+        path = (
+            f"/v1/sessions/{session_id}/resources/environments"
+            f"/{_runner_environment_segment(environment_id)}/shell"
+        )
         return await _proxy_fs_response(
             session_id,
             "POST",
