@@ -180,7 +180,7 @@ def _row_to_host(row: SqlHost) -> Host:
         status=decode_host_status(row.status),
         created_at=row.created_at,
         updated_at=row.updated_at,
-        workspace_id=row.workspace_id,
+        workspace_id=row.workspace_id if row.workspace_id is not None else current_workspace_id(),
         sandbox_provider=row.sandbox_provider,
         sandbox_id=row.sandbox_id,
         terminating_sandbox_id=row.terminating_sandbox_id,

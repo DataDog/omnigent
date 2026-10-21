@@ -32,10 +32,6 @@ from omnigent.runtime import (
     set_runner_router,
 )
 from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
-from omnigent.server.feature_usage_metrics import (
-    FeatureUsageRecorder,
-    set_feature_usage_recorder_for_testing,
-)
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_MANAGE,
@@ -43,11 +39,15 @@ from omnigent.server.auth import (
     LEVEL_READ,
     UnifiedAuthProvider,
 )
+from omnigent.server.feature_usage_metrics import (
+    FeatureUsageRecorder,
+    set_feature_usage_recorder_for_testing,
+)
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
-from tests.server.feature_usage_helpers import RecordingMeter
 from omnigent.stores.host_store import HostStore
+from tests.server.feature_usage_helpers import RecordingMeter
 from tests.server.routes.test_shell_permission_gate import _StubPermissionStore
 
 

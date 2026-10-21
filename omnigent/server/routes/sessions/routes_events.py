@@ -9,8 +9,10 @@ import secrets
 import time
 import weakref
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, cast
+
 import httpx
 from fastapi import (
     APIRouter,
@@ -21,6 +23,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
 from starlette.datastructures import Headers
 from starlette.types import Message, Receive, Scope, Send
+
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import (
@@ -51,6 +54,7 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
+from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.onboarding.sandboxes.context import managed_sandbox_context_scope
 from omnigent.onboarding.sandboxes.types import ManagedIdentityRequirement
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
@@ -102,14 +106,12 @@ from omnigent.server.feature_usage_metrics import (
     classify_feature_usage_exception,
     get_feature_usage_recorder,
 )
+from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_sandbox_identity import (
     ManagedSandboxIdentityNotSupported,
     ManagedSandboxIdentityUnavailable,
     context_for_managed_sandbox_operation,
 )
-from collections.abc import Awaitable, Callable, Mapping
-from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
-from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
