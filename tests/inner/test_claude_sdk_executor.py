@@ -510,6 +510,10 @@ class TestConstructor(unittest.TestCase):
                 return_value=[],
             ),
             patch(
+                "omnigent.inner.claude_sdk_executor._has_managed_api_key_helper",
+                return_value=False,
+            ),
+            patch(
                 "omnigent.inner.claude_sdk_executor.create_exec_launcher",
                 side_effect=_capture_launcher,
             ),
@@ -524,6 +528,44 @@ class TestConstructor(unittest.TestCase):
         # across platforms.
         expected = Path("/home/test/.claude/sessions").resolve(strict=False)
         self.assertIn(expected, captured["sandbox"].read_roots)
+
+    def test_managed_api_key_helper_keeps_credentials_outside_sandbox(self):
+        from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
+        from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+
+        spec = OSEnvSpec(
+            type="caller_process",
+            cwd="/tmp/work",
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap", allow_network=True),
+        )
+
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._has_managed_api_key_helper",
+                return_value=True,
+            ),
+            patch("omnigent.inner.claude_sdk_executor.resolve_sandbox") as resolve,
+            patch("omnigent.inner.claude_sdk_executor.create_exec_launcher") as launcher,
+        ):
+            prepared = prepare_claude_cli_path("/usr/bin/claude", spec)
+
+        self.assertEqual(prepared.cli_path, "/usr/bin/claude")
+        self.assertFalse(prepared.enable_native_tools)
+        resolve.assert_not_called()
+        launcher.assert_not_called()
+
+    def test_detects_managed_api_key_helper(self):
+        from omnigent.inner.claude_sdk_executor import _has_managed_api_key_helper
+
+        with (
+            patch.object(Path, "is_file", return_value=True),
+            patch.object(
+                Path,
+                "read_text",
+                return_value=json.dumps({"apiKeyHelper": "managed-token-helper"}),
+            ),
+        ):
+            self.assertTrue(_has_managed_api_key_helper())
 
     def test_default_process_sandbox_wraps_cli_without_enabling_native_tools(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor

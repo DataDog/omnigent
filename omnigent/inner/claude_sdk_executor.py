@@ -1323,6 +1323,34 @@ def _claude_internal_write_files() -> list[pathlib.Path]:
     return [path for path in candidates if path.exists()]
 
 
+def _has_managed_api_key_helper() -> bool:
+    """Whether machine-managed Claude settings provide host-side auth.
+
+    A managed ``apiKeyHelper`` commonly depends on private host credential
+    stores (Vault, GPG, keychains) that must not be bind-mounted into an agent
+    sandbox.  The caller uses this signal to keep the Claude supervisor in the
+    trusted host environment while disabling Claude's native OS tools; file and
+    shell operations still flow through Omnigent's sandboxed ``sys_os_*``
+    tools.
+    """
+
+    candidates = [
+        pathlib.Path("/etc/claude-code/managed-settings.json"),
+        pathlib.Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+    ]
+    for settings_path in candidates:
+        if not settings_path.is_file():
+            continue
+        try:
+            payload = json.loads(settings_path.read_text())
+        except (OSError, ValueError):
+            continue
+        helper = payload.get("apiKeyHelper") if isinstance(payload, dict) else None
+        if isinstance(helper, str) and helper.strip():
+            return True
+    return False
+
+
 def _resolve_sandbox_cwd(spec_cwd: str | None) -> pathlib.Path:
     """Resolve the sandbox root, rooting relative paths at the session
     working folder rather than the runner daemon's process cwd.
@@ -1380,6 +1408,14 @@ def prepare_claude_cli_path(
     sandbox_spec = spec.sandbox or OSEnvSandboxSpec()
     if sandbox_spec.type == "none":
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=True)
+
+    if _has_managed_api_key_helper():
+        logger.info(
+            "Managed Claude apiKeyHelper detected; running the Claude supervisor "
+            "outside the sandbox with native tools disabled so host credentials "
+            "remain outside the agent sandbox"
+        )
+        return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=False)
 
     cwd = _resolve_sandbox_cwd(spec.cwd)
     try:
@@ -1440,6 +1476,9 @@ def prepare_tight_cli_process_path(
         return None
 
     if _sandbox_disabled_by_env():
+        return real_cli_path
+
+    if _has_managed_api_key_helper():
         return real_cli_path
 
     # Skip silently on non-Linux: the implicit default sandbox here is
