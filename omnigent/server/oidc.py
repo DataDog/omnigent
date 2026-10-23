@@ -184,6 +184,9 @@ class OIDCConfig:
         ``id_token`` email claim without requiring
         ``email_verified``. Only affects the generic-OIDC path;
         GitHub always requires a verified primary email.
+    :param allow_missing_auth_time: Permit a signed OIDC ID token without
+        ``auth_time`` during forced re-authentication. The IdP may then reuse
+        an existing session despite ``prompt=login``; opt in only knowingly.
     :param email_claim: Name of the ``id_token`` claim that carries
         the user's email identity, e.g. ``"preferred_username"`` for
         IdPs that omit ``email`` (Microsoft Entra ID). Defaults to
@@ -207,6 +210,7 @@ class OIDCConfig:
     allow_invites: bool
     skip_email_verification: bool = False
     email_claim: str = "email"
+    allow_missing_auth_time: bool = False
 
     @property
     def base_url(self) -> str:
@@ -342,6 +346,13 @@ class OIDCConfig:
         # opt-out trusts any signed email claim from the IdP — only
         # enable it when the issuer is a trusted enterprise directory.
         skip_email_verification = env_var_is_truthy("OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION")
+        allow_missing_auth_time = env_var_is_truthy("OMNIGENT_OIDC_ALLOW_MISSING_AUTH_TIME")
+        if allow_missing_auth_time:
+            _logger.warning(
+                "OMNIGENT_OIDC_ALLOW_MISSING_AUTH_TIME is set: forced OIDC "
+                "re-authentication cannot be verified when %s omits auth_time",
+                issuer,
+            )
         if skip_email_verification:
             _logger.warning(
                 "OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is set: the "
@@ -475,4 +486,5 @@ class OIDCConfig:
             allow_invites=allow_invites,
             skip_email_verification=skip_email_verification,
             email_claim=email_claim,
+            allow_missing_auth_time=allow_missing_auth_time,
         )
