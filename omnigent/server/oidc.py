@@ -58,6 +58,7 @@ def mint_session_token(
     provider: str,
     *,
     account_generation: str | None = None,
+    cli_login_ticket: str | None = None,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -74,6 +75,8 @@ def mint_session_token(
     :param ttl_seconds: Token lifetime in seconds.
     :param provider: Identity provider name, e.g. ``"google"`` or
         ``"accounts"``. Stored as an informational claim.
+    :param cli_login_ticket: Ticket authenticated by the browser callback,
+        never included in runner, refresh, or CLI-issued credentials.
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
@@ -85,6 +88,8 @@ def mint_session_token(
     }
     if account_generation is not None:
         payload["account_generation"] = account_generation
+    if cli_login_ticket is not None:
+        payload["cli_login_ticket"] = cli_login_ticket
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
 
@@ -95,6 +100,7 @@ def mint_session_cookie(
     provider: str,
     *,
     account_generation: str | None = None,
+    cli_login_ticket: str | None = None,
 ) -> str:
     """Mint a signed session cookie JWT.
 
@@ -104,10 +110,16 @@ def mint_session_cookie(
     :param ttl_hours: Session lifetime in hours.
     :param provider: Identity provider name, e.g. ``"google"``
         or ``"github"``. Stored as an informational claim.
+    :param cli_login_ticket: Ticket authenticated by the browser callback.
     :returns: An HS256-signed JWT string.
     """
     return mint_session_token(
-        user_id, cookie_secret, ttl_hours * 3600, provider, account_generation=account_generation
+        user_id,
+        cookie_secret,
+        ttl_hours * 3600,
+        provider,
+        account_generation=account_generation,
+        cli_login_ticket=cli_login_ticket,
     )
 
 
@@ -172,6 +184,9 @@ class OIDCConfig:
         ``id_token`` email claim without requiring
         ``email_verified``. Only affects the generic-OIDC path;
         GitHub always requires a verified primary email.
+    :param allow_missing_auth_time: Permit a signed OIDC ID token without
+        ``auth_time`` during forced re-authentication. The IdP may then reuse
+        an existing session despite ``prompt=login``; opt in only knowingly.
     :param email_claim: Name of the ``id_token`` claim that carries
         the user's email identity, e.g. ``"preferred_username"`` for
         IdPs that omit ``email`` (Microsoft Entra ID). Defaults to
@@ -195,6 +210,7 @@ class OIDCConfig:
     allow_invites: bool
     skip_email_verification: bool = False
     email_claim: str = "email"
+    allow_missing_auth_time: bool = False
 
     @property
     def base_url(self) -> str:
@@ -330,6 +346,13 @@ class OIDCConfig:
         # opt-out trusts any signed email claim from the IdP — only
         # enable it when the issuer is a trusted enterprise directory.
         skip_email_verification = env_var_is_truthy("OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION")
+        allow_missing_auth_time = env_var_is_truthy("OMNIGENT_OIDC_ALLOW_MISSING_AUTH_TIME")
+        if allow_missing_auth_time:
+            _logger.warning(
+                "OMNIGENT_OIDC_ALLOW_MISSING_AUTH_TIME is set: forced OIDC "
+                "re-authentication cannot be verified when %s omits auth_time",
+                issuer,
+            )
         if skip_email_verification:
             _logger.warning(
                 "OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is set: the "
@@ -463,4 +486,5 @@ class OIDCConfig:
             allow_invites=allow_invites,
             skip_email_verification=skip_email_verification,
             email_claim=email_claim,
+            allow_missing_auth_time=allow_missing_auth_time,
         )

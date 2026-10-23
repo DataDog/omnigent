@@ -48,7 +48,7 @@ def test_upgrade_from_datadog_oidc_revision_to_merged_head(tmp_path: Path, revis
 
     with engine.connect() as conn:
         versions = set(conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalars())
-    assert versions == {"m017dd1006a"}
+    assert versions == {"m019dd1021a"}
     assert "inference_snapshot" in {
         column["name"]
         for column in sa.inspect(engine).get_columns("omnigent_conversation_metadata")
