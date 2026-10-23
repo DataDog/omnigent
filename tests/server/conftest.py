@@ -746,21 +746,25 @@ async def auth_client(
 
 
 @pytest.fixture(scope="session")
-def installed_credential_plugin():
-    """Install real entry-point metadata without downloads or discovery patches."""
+def installed_credential_plugin(tmp_path_factory):
+    """Build offline and install once per worker without changing the test venv."""
     import subprocess
     import sys
-    from pathlib import Path
+
+    target = tmp_path_factory.mktemp("credential-plugin") / "site-packages"
 
     subprocess.run(
         [
             "uv",
+            "--no-cache",
             "pip",
             "install",
             "--python",
             sys.executable,
-            "--no-build-isolation",
+            "--offline",
             "--no-deps",
+            "--target",
+            str(target),
             str(Path(__file__).parent / "fixtures" / "credential_backend"),
         ],
         check=True,
@@ -769,7 +773,10 @@ def installed_credential_plugin():
     )
     import importlib
 
-    importlib.invalidate_caches()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.syspath_prepend(str(target))
+        importlib.invalidate_caches()
+        yield target
 
 
 @pytest.fixture(params=["sql", "fixture"])

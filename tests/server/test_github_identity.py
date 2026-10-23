@@ -125,3 +125,46 @@ async def test_delegated_outage_and_reauth_are_distinct(delegated, monkeypatch):
     )
     with pytest.raises(CredentialBackendUnavailable):
         await resolve()
+
+
+@pytest.mark.parametrize("status", [429, 503])
+async def test_delegated_definite_refresh_failure_recovers_after_backoff(delegated, status):
+    from omnigent.server.databricks_app_client import DatabricksAppClient
+    from omnigent.server.github_app_client import GitHubAppClient
+    from tests.server.github_app_fixtures import make_config
+    from tests.server.test_databricks_app import _config
+
+    provider, _, backend, clock, client, resolve = delegated
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        assert "keep" in request.content.decode()
+        if len(calls) == 1:
+            return httpx.Response(status, json={"error": "temporarily_unavailable"})
+        return httpx.Response(200, json={"access_token": "recovered"})
+
+    transport = httpx.MockTransport(respond)
+    real_client = (
+        GitHubAppClient(make_config(), transport=transport)
+        if provider == "github"
+        else DatabricksAppClient(_config(), transport=transport)
+    )
+    client.refresh_token = real_client.refresh_token
+    clock.now = 1999
+    assert await resolve() == "old"
+    # Neither hot calls nor cache eviction can bypass the backoff.
+    backend.cache._entries.clear()
+    assert await resolve() == "old"
+    clock.now = 2000
+    with pytest.raises(cache_module.CredentialProviderUnavailable):
+        await resolve()
+    assert len(calls) == 1
+    clock.now = 2004
+    assert await resolve() == "recovered"
+    assert len(calls) == 2
+    assert backend.get("alice", provider, with_secret=True).secret == {
+        "access_token": "recovered",
+        "refresh_token": "keep",
+    }
+    assert backend.cache.key("alice", provider) not in backend.cache._failures

@@ -28,6 +28,7 @@ from omnigent.stores.credential_store.backend import (
     CredentialBackend,
     CredentialBackendUnavailable,
 )
+from omnigent.stores.credential_store.refresh_retry import refresh_retry_safe
 
 CacheKey = tuple[int, str, str, str]
 Refresh = Callable[[ProviderConnection], Awaitable[tuple[dict[str, Any], dict[str, Any]]]]
@@ -46,12 +47,18 @@ class CredentialRefreshRejected(ConnectionError):
 class CredentialProviderUnavailable(ConnectionError):
     """The provider could not refresh a grant temporarily."""
 
+    def __init__(self, message: str, *, refresh_retry_safe: bool = False) -> None:
+        super().__init__(message)
+        self.refresh_retry_safe = refresh_retry_safe
+
 
 @dataclass(repr=False)
 class _Entry:
     connection: ProviderConnection
     refresh_at: float | None
     failure: Exception | None = field(default=None, repr=False)
+    retry_at: float | None = None
+    retry_attempts: int = 0
 
 
 @dataclass
@@ -131,7 +138,11 @@ class TokenCache:
             if generation is not None and not self.current(key, generation):
                 return
             self._failures[key] = _Entry(
-                replace(entry.connection, secret=None), None, entry.failure
+                replace(entry.connection, secret=None),
+                None,
+                entry.failure,
+                entry.retry_at,
+                entry.retry_attempts,
             )
 
     @staticmethod
@@ -266,7 +277,10 @@ class TokenCache:
                 failure = None
             if failure and (
                 isinstance(failure.failure, CredentialRefreshRejected)
-                or not self._valid(failure.connection)
+                or (
+                    not self._valid(failure.connection)
+                    and (failure.retry_at is None or failure.retry_at > time.time())
+                )
             ):
                 assert failure.failure is not None
                 raise failure.failure
@@ -281,6 +295,8 @@ class TokenCache:
             entry = self._entry(conn)
             if failure:
                 entry.failure = failure.failure
+                entry.retry_at = failure.retry_at
+                entry.retry_attempts = failure.retry_attempts
             self._cache(key, entry)
             return entry
 
@@ -320,7 +336,7 @@ class TokenCache:
             conn = entry.connection
             expiry = self.expiry(conn)
             valid = expiry is None or expiry > time.time()
-            if entry.failure:
+            if entry.failure and (entry.retry_at is None or entry.retry_at > time.time()):
                 if self._valid(conn) and not isinstance(entry.failure, CredentialRefreshRejected):
                     return conn
                 raise entry.failure
@@ -338,6 +354,11 @@ class TokenCache:
                 )
                 if isinstance(exc, httpx.HTTPStatusError):
                     rejected = exc.response.status_code in (400, 401)
+                retry_safe = not rejected and (
+                    refresh_retry_safe(exc.response)
+                    if isinstance(exc, httpx.HTTPStatusError)
+                    else getattr(exc, "refresh_retry_safe", False)
+                )
                 failure = (
                     CredentialRefreshRejected(
                         "Credential refresh rejected; reauthorize the account"
@@ -348,6 +369,11 @@ class TokenCache:
                     )
                 )
                 entry.failure = failure
+                entry.retry_at = None
+                if retry_safe:
+                    entry.retry_attempts = min(entry.retry_attempts + 1, 7)
+                    entry.retry_at = time.time() + min(300, 5 * 2 ** (entry.retry_attempts - 1))
+                    record("refresh", "retry_deferred")
                 if not await asyncio.to_thread(self._revalidate, key, generation, conn):
                     return None
                 self._remember_failure(key, entry, generation)
@@ -372,6 +398,9 @@ class TokenCache:
                     if isinstance(exc, SecretTooLargeError)
                     else CredentialBackendUnavailable()
                 )
+                # Once an exchange succeeds, failed persistence is uncertain
+                # even when an earlier provider rejection was safe to retry.
+                entry.retry_at = None
                 # Keep the old grant, never the unpersisted newly minted token.
                 with self.mutation_lock(key):
                     if self.current(key, generation):
@@ -425,6 +454,7 @@ class TokenCache:
                 return None
             conn = replace(persisted, secret=secret)
             entry = self._entry(conn)
+            self._failures.pop(key, None)
             self._cache(key, entry)
             return entry
 

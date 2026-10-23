@@ -77,6 +77,22 @@ disappears. Explicit rejection
 requires reauthorization; transient provider failures remain distinct from
 backend outages. Reconnect replaces the cached failure state.
 
+Definite unsuccessful refresh responses can recover without reconnecting:
+HTTP 429 rate-limit rejections and HTTP 503 responses with an OAuth
+`temporarily_unavailable` or `server_error` object are retried on demand after
+5 seconds, doubling to a maximum delay of 300 seconds. Neither response may
+contain an `access_token` or `refresh_token` field. A bare 503 can originate from
+a gateway after an upstream rotation, so it does not establish safe retry.
+An OAuth `error` field in either response must name one of those two temporary
+errors; other error codes do not qualify for retry. Other statuses, timeouts,
+transport failures, malformed success responses and
+failed persistence remain suppressed for that row; they can leave refresh-token
+rotation uncertain. Explicit reauthorization failures are never retried.
+During backoff the old access token remains usable until its actual expiry;
+after expiry requests report temporary provider unavailability until the next
+allowed attempt. Retry state survives positive-cache eviction and retains the
+same authorization, mutation and single-flight checks.
+
 This in-process coordination assumes one server replica. It is not distributed
 refresh locking or a durable recovery queue. Plugin implementations own their
 storage consistency and cleanup. There are no pending writes or fallback secrets.
@@ -103,8 +119,11 @@ uv run --no-sync pytest \
   --reruns 0 -q
 ```
 
-The test suite installs a small local fixture plugin with real entry-point
-metadata, requiring no cloud credentials. Its secret service is in memory and
+The test suite builds a small local fixture plugin with a stdlib-only PEP 517
+backend and installs it offline with real entry-point metadata. Each xdist worker
+uses a private temporary install target rather than changing the shared test
+virtualenv; the CLI scenario explicitly passes that target to its subprocess.
+No setuptools, lint group or network build bootstrap is required. Its secret service is in memory and
 intended only for testing. This proves application discovery and route behavior;
 it does not establish compatibility with any separately distributed backend wheel.
 The optional live Vault cases require a local Vault dev server and its Python

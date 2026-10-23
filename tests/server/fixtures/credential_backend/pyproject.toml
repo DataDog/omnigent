@@ -1,6 +1,7 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = []
+build-backend = "build_backend"
+backend-path = ["."]
 
 [project]
 name = "omnigent-test-credential-backend"
@@ -8,6 +9,3 @@ version = "0.0.1"
 
 [project.entry-points."omnigent.credential_backends"]
 fixture = "fixture_credentials:build"
-
-[tool.setuptools]
-py-modules = ["fixture_credentials"]

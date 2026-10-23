@@ -278,6 +278,14 @@ class McpRegistry:
         if response.status_code in (400, 401):
             raise CredentialRefreshRejected("MCP authorization rejected; reconnect the account")
         if response.status_code != 200:
+            from omnigent.stores.credential_store.refresh_retry import refresh_retry_safe
+            from omnigent.stores.credential_store.token_cache import CredentialProviderUnavailable
+
+            if refresh_retry_safe(response):
+                raise CredentialProviderUnavailable(
+                    "MCP credential provider temporarily unavailable; try again later",
+                    refresh_retry_safe=True,
+                )
             raise ConnectionError("MCP authorization failed; reconnect the account")
         try:
             tokens = response.json()

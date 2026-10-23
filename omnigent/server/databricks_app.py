@@ -274,6 +274,9 @@ def token_set_from_payload(payload: dict) -> DatabricksTokenSet:
 class DatabricksAppError(Exception):
     """Raised when a Databricks OAuth interaction fails."""
 
-    def __init__(self, message: str, *, reauth_required: bool = False) -> None:
+    def __init__(
+        self, message: str, *, reauth_required: bool = False, refresh_retry_safe: bool = False
+    ) -> None:
         super().__init__(message)
         self.reauth_required = reauth_required
+        self.refresh_retry_safe = refresh_retry_safe

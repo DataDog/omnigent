@@ -814,6 +814,8 @@ async def test_installed_plugin_factory_oauth_bearer_refresh_execution_and_outag
 async def test_installed_plugin_real_cli_startup_without_sql_cipher(
     tmp_path, installed_credential_plugin
 ):
+    import os
+
     from tests._helpers.live_server import isolated_local_server
 
     catalog = tmp_path / "registry.yaml"
@@ -824,6 +826,9 @@ async def test_installed_plugin_real_cli_startup_without_sql_cipher(
     with isolated_local_server(
         tmp_path / "server",
         env={
+            "PYTHONPATH": os.pathsep.join(
+                [str(installed_credential_plugin), os.environ.get("PYTHONPATH", "")]
+            ),
             "OMNIGENT_MCP_CREDENTIAL_BACKEND": "fixture",
             "OMNIGENT_MCP_REGISTRY": str(catalog),
             "OMNIGENT_CREDENTIAL_KMS_KEY_ID": None,

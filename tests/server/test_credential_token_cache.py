@@ -229,10 +229,11 @@ async def test_explicit_reauth_failure_blocks_old_cached_grant(cached):
     ] == "reconnected"
 
 
-async def test_transient_provider_failure_keeps_only_valid_old_grant(cached):
+@pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ReadTimeout])
+async def test_uncertain_provider_failure_keeps_only_valid_old_grant(cached, error_type):
     backend, clock = cached
     clock.now = 1600
-    refresh = AsyncMock(side_effect=httpx.ConnectError("private-provider-message"))
+    refresh = AsyncMock(side_effect=error_type("private-provider-message"))
     assert (await backend.cache.resolve("alice", "mcp:tracker", refresh)).secret[
         "access_token"
     ] == "old"
@@ -240,6 +241,148 @@ async def test_transient_provider_failure_keeps_only_valid_old_grant(cached):
     with pytest.raises(module.CredentialProviderUnavailable, match="temporarily unavailable"):
         await backend.cache.resolve("alice", "mcp:tracker", refresh)
     refresh.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "status,payload,retry_safe",
+    [
+        (429, None, True),
+        (429, {"error": "invalid_grant"}, False),
+        (429, {"access_token": "private-token"}, False),
+        (503, {"error": "temporarily_unavailable"}, True),
+        (503, {"error": "server_error"}, True),
+        (503, None, False),
+        (502, {"error": "temporarily_unavailable"}, False),
+        (503, {"error": "server_error", "refresh_token": "private-token"}, False),
+    ],
+)
+async def test_native_refresh_response_classification_and_recovery(
+    cached, status, payload, retry_safe, monkeypatch
+):
+    import respx
+
+    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig
+    from tests.server.test_mcp_registry import service
+
+    backend, clock = cached
+    entry = service(
+        auth="oauth",
+        oauth={
+            "authorize_url": "https://provider.test/authorize",
+            "token_url": "https://provider.test/token",
+            "client_id": "test",
+        },
+    )
+    monkeypatch.setenv("OMNIGENT_MCP_OAUTH_STATE_SECRET", "synthetic-state-key-32-characters-long")
+    registry = McpRegistry(
+        McpRegistryConfig(public_url="https://app.test", services=[entry]), backend
+    )
+    clock.now = 1600
+    with respx.mock() as router:
+        exchange = router.post("https://provider.test/token").mock(
+            side_effect=[
+                httpx.Response(status, json=payload) if payload else httpx.Response(status),
+                httpx.Response(200, json={"access_token": "recovered"}),
+            ]
+        )
+        assert await registry.token(entry, "alice", SimpleNamespace()) == "old"
+        assert await registry.token(entry, "alice", SimpleNamespace()) == "old"
+        assert exchange.call_count == 1
+        clock.now = 1605
+        expected = "recovered" if retry_safe else "old"
+        assert await registry.token(entry, "alice", SimpleNamespace()) == expected
+        clock.now = 2001
+        if retry_safe:
+            assert await registry.token(entry, "alice", SimpleNamespace()) == "recovered"
+        else:
+            with pytest.raises(module.CredentialProviderUnavailable):
+                await registry.token(entry, "alice", SimpleNamespace())
+        assert exchange.call_count == (2 if retry_safe else 1)
+
+
+async def test_safe_refresh_retry_backoff_caps_and_recovers_single_flight(cached):
+    backend, clock = cached
+    request = httpx.Request("POST", "https://provider.test/token")
+    failure = httpx.HTTPStatusError(
+        "private-provider-detail",
+        request=request,
+        response=httpx.Response(429, request=request),
+    )
+    refresh = AsyncMock(side_effect=failure)
+    clock.now = 1600
+    for attempt, delay in enumerate([5, 10, 20, 40, 80, 160, 300, 300], start=1):
+        if clock.now < 2000:
+            assert (await backend.cache.resolve("alice", "mcp:tracker", refresh)).secret[
+                "access_token"
+            ] == "old"
+        else:
+            with pytest.raises(module.CredentialProviderUnavailable) as error:
+                await backend.cache.resolve("alice", "mcp:tracker", refresh)
+            assert "private-provider-detail" not in str(error.value)
+        retry_at = backend.cache._failures[backend.cache.key("alice", "mcp:tracker")].retry_at
+        assert retry_at == clock.now + delay
+        backend.cache._entries.clear()
+        clock.now = retry_at - 1
+        if clock.now < 2000:
+            await backend.cache.resolve("alice", "mcp:tracker", refresh)
+        else:
+            with pytest.raises(module.CredentialProviderUnavailable):
+                await backend.cache.resolve("alice", "mcp:tracker", refresh)
+        assert refresh.await_count == attempt
+        clock.now = retry_at
+    refresh.side_effect = None
+    refresh.return_value = ({"access_token": "recovered"}, {})
+    results = await asyncio.gather(
+        *(backend.cache.resolve("alice", "mcp:tracker", refresh) for _ in range(5))
+    )
+    assert all(result.secret["access_token"] == "recovered" for result in results)
+    assert refresh.await_count == 9
+    assert backend.cache.key("alice", "mcp:tracker") not in backend.cache._failures
+
+
+@pytest.mark.parametrize("failure", ["save", "timeout", "reauth"])
+async def test_safe_retry_followed_by_uncertain_or_rejected_grant_never_repeats(
+    cached, monkeypatch, failure
+):
+    backend, clock = cached
+    refresh = AsyncMock(
+        side_effect=[
+            module.CredentialProviderUnavailable("safe failure", refresh_retry_safe=True),
+            {
+                "save": refresh_result(),
+                "timeout": httpx.ReadTimeout("private-timeout"),
+                "reauth": CredentialRefreshRejected("private-rejection"),
+            }[failure],
+        ]
+    )
+    if failure == "save":
+        monkeypatch.setattr(
+            backend.cache.backend,
+            "update_secret",
+            Mock(side_effect=CredentialBackendUnavailable()),
+        )
+    clock.now = 1600
+    assert (await backend.cache.resolve("alice", "mcp:tracker", refresh)).secret[
+        "access_token"
+    ] == "old"
+    clock.now = 1605
+    if failure == "reauth":
+        with pytest.raises(CredentialRefreshRejected):
+            await backend.cache.resolve("alice", "mcp:tracker", refresh)
+    else:
+        assert (await backend.cache.resolve("alice", "mcp:tracker", refresh)).secret[
+            "access_token"
+        ] == "old"
+    backend.cache._entries.clear()
+    clock.now = 2001
+    error_type = {
+        "save": CredentialBackendUnavailable,
+        "timeout": module.CredentialProviderUnavailable,
+        "reauth": CredentialRefreshRejected,
+    }[failure]
+    with pytest.raises(error_type):
+        await backend.cache.resolve("alice", "mcp:tracker", refresh)
+    assert refresh.await_count == 2
 
 
 async def test_cached_token_still_checks_service_permissions(cached):

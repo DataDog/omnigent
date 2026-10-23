@@ -20,6 +20,7 @@ from omnigent.server.github_app import (
     GitHubTokenSet,
     token_set_from_payload,
 )
+from omnigent.stores.credential_store.refresh_retry import refresh_retry_safe
 
 _TOKEN_ENDPOINT = "https://github.com/login/oauth/access_token"
 _USER_ENDPOINT = "https://api.github.com/user"
@@ -208,5 +209,6 @@ class GitHubAppClient:
             raise GitHubAppError(
                 "Credential provider token request failed",
                 reauth_required=resp.status_code in (400, 401),
+                refresh_retry_safe=refresh_retry_safe(resp),
             )
         return token_set_from_payload(resp.json())

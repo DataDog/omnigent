@@ -391,3 +391,34 @@ def test_sql_cipher_outage_is_sanitized_unavailability(db_uri, monkeypatch, oper
             store.update_secret("alice", "github", secret={"access_token": "new"})
     assert "private-marker" not in str(failure.value)
     assert store.get("alice", "github").secret is None
+
+
+def test_installed_fixture_is_worker_local_with_valid_record(
+    installed_credential_plugin, tmp_path_factory
+):
+    import csv
+    import hashlib
+    import importlib.metadata
+    import inspect
+    import io
+    import sys
+    from pathlib import Path
+
+    target = installed_credential_plugin.resolve()
+    assert target.is_relative_to(tmp_path_factory.getbasetemp())
+    assert not target.is_relative_to(Path(sys.prefix))
+    distribution = importlib.metadata.distribution("omnigent-test-credential-backend")
+    assert distribution.locate_file("").resolve() == target
+    entry = next(ep for ep in distribution.entry_points if ep.name == "fixture")
+    assert entry.group == "omnigent.credential_backends"
+    assert Path(inspect.getfile(entry.load())).resolve().is_relative_to(target)
+    rows = list(csv.reader(io.StringIO(distribution.read_text("RECORD"))))
+    assert rows
+    for path, digest, size in rows:
+        if not digest:
+            assert path.endswith(("RECORD", ".pyc"))
+            continue
+        data = distribution.locate_file(path).read_bytes()
+        assert size == str(len(data))
+        expected = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+        assert digest == f"sha256={expected}"
