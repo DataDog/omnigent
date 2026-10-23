@@ -35,6 +35,7 @@ import logging
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 
+from omnigent.errors import OmnigentError
 from omnigent.server.connections_registry import connection_providers
 from omnigent.server.routes._credential_errors import CredentialBackendRoute
 from omnigent.stores.credential_store.backend import CredentialBackendUnavailable
@@ -98,6 +99,8 @@ def create_host_credentials_router(host_store: HostStore) -> APIRouter:
             payload = await resolver(managed.user_id, store=store, client=client)
         except CredentialBackendUnavailable as exc:
             raise HTTPException(503, str(exc)) from None
+        except OmnigentError as exc:
+            raise HTTPException(exc.http_status, "Account authorization revoked") from None
         except CredentialProviderUnavailable:
             raise HTTPException(502, "Credential provider temporarily unavailable") from None
         except CredentialRefreshRejected:

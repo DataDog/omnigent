@@ -162,14 +162,23 @@ class McpConnectionStore:
     """Typed facade sharing the existing encrypted connections table."""
 
     def __init__(self, store: CredentialBackend, service_id: str) -> None:
-        self._store = store
+        self._store = managed_backend(store)
         self.provider = f"mcp:{service_id}"
+        self.pending_provider = f"mcp-pending:{service_id}"
 
     def get(self, user_id: str, *, with_tokens: bool = False) -> ProviderConnection | None:
         return self._store.get(user_id, self.provider, with_secret=with_tokens)
 
     def delete(self, user_id: str) -> bool:
-        return self._store.delete(user_id, self.provider)
+        cache = self._store.cache
+        key = cache.key(user_id, self.provider)
+        with cache.mutation_lock(key):
+            try:
+                removed = self._store.delete(user_id, self.provider)
+                self._store.delete(user_id, self.pending_provider)
+                return removed
+            finally:
+                cache.finish_mutation(key)
 
 
 class McpRegistry:
@@ -225,12 +234,13 @@ class McpRegistry:
             raise ConnectionError("Connect this MCP account in Settings > MCP")
         return str(conn.secret["access_token"])
 
-    def invalidate(self, user_id: str, service: McpService) -> None:
-        if self.store is not None:
-            provider = (
-                service.auth if service.auth in {"github", "databricks"} else f"mcp:{service.id}"
-            )
-            self.store.cache.invalidate(user_id, provider)
+    def invalidate(self, user_id: str, service: McpService, app_state: Any = None) -> None:
+        if service.auth in {"github", "databricks"}:
+            facade = getattr(app_state, f"{service.auth}_store", None)
+            if facade is not None:
+                facade._store.cache.reject(user_id, service.auth)
+        elif self.store is not None:
+            self.store.cache.reject(user_id, f"mcp:{service.id}")
 
     @staticmethod
     def metadata(tokens: dict[str, Any]) -> dict[str, Any]:
@@ -335,7 +345,7 @@ class McpRegistry:
         except Exception as exc:  # noqa: BLE001 — transport errors may contain credentials
             failure = _upstream_error(exc)
             if failure.status_code == 401:
-                self.invalidate(user_id, service)
+                await asyncio.to_thread(self.invalidate, user_id, service, app_state)
             _logger.warning(
                 "Registry MCP request failed service=%s tool=%s failure=%s http_status=%s",
                 service.id,

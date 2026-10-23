@@ -1,5 +1,15 @@
 # Per-user integration credential store
 
+## Current backend selection
+
+The default SQL implementation and its cipher selection remain available.
+The application also supports generic credential backend plugins, selected once
+and injected into MCP, GitHub and Databricks facades. See
+[Credential backends](../docs/CREDENTIAL_BACKENDS.md) for the synchronous contract,
+startup configuration, cache/persistence ordering, availability behavior and
+account-deletion lifecycle limitation. The SQL design below describes the default
+backend rather than a requirement on external implementations.
+
 ## Motivation
 
 The GitHub App integration needs to persist a per-user OAuth token set and vend

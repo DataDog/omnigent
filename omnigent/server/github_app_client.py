@@ -93,7 +93,9 @@ class GitHubAppClient:
                 },
             )
         if resp.status_code != 200:
-            raise GitHubAppError(f"GitHub /user returned {resp.status_code}")
+            raise GitHubAppError(
+                "GitHub identity request failed", reauth_required=resp.status_code == 401
+            )
         data = resp.json()
         login = data.get("login")
         user_id = data.get("id")
@@ -130,7 +132,9 @@ class GitHubAppClient:
                     headers=headers,
                 )
                 if resp.status_code != 200:
-                    raise GitHubAppError(f"GitHub /user/repos returned {resp.status_code}")
+                    raise GitHubAppError(
+                        "GitHub repository request failed", reauth_required=resp.status_code == 401
+                    )
                 batch = resp.json()
                 if not isinstance(batch, list) or not batch:
                     break
@@ -180,7 +184,7 @@ class GitHubAppClient:
                 )
                 if resp.status_code != 200:
                     raise GitHubAppError(
-                        f"GitHub /repos/{full_name}/branches returned {resp.status_code}"
+                        "GitHub branches request failed", reauth_required=resp.status_code == 401
                     )
                 batch = resp.json()
                 if not isinstance(batch, list) or not batch:

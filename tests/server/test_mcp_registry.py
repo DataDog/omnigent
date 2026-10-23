@@ -535,7 +535,11 @@ async def test_backend_value_errors_do_not_expose_details(oauth_app, monkeypatch
             )
         else:
             response = await browser.post("/v1/mcp-registry/services/tracker/test")
-    assert response.status_code == (503 if phase == "refresh" else 500)
+    if phase in {"start", "callback"}:
+        assert response.status_code == 302
+        assert "temporarily_unavailable" in response.headers["location"]
+    else:
+        assert response.status_code == 503
     assert marker not in response.text + caplog.text
 
 
@@ -793,3 +797,110 @@ async def test_refresh_locks_release_after_waiters_finish_or_cancel(registry, mo
     await asyncio.sleep(0)
     gc.collect()
     assert not registry.store.cache._locks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase", ["catalog", "status", "disconnect", "bearer", "start", "callback"]
+)
+async def test_backend_unavailability_has_safe_route_envelope(oauth_app, monkeypatch, phase):
+    from omnigent.stores.credential_store.backend import CredentialBackendUnavailable
+
+    registry = oauth_app.state.mcp_registry
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=oauth_app),
+        base_url="http://test",
+        headers={"x-test-user": "alice"},
+    ) as browser:
+        state = None
+        if phase == "callback":
+            response = await browser.get("/v1/connections/mcp-tracker/connect")
+            state = parse_qs(urlsplit(response.headers["location"]).query)["state"][0]
+        if phase == "bearer":
+            registry.services["tracker"] = service()
+        method = (
+            "upsert"
+            if phase in {"bearer", "start"}
+            else "delete"
+            if phase == "disconnect"
+            else "get"
+        )
+        monkeypatch.setattr(
+            registry.store.cache.backend,
+            method,
+            Mock(side_effect=CredentialBackendUnavailable("private-marker")),
+        )
+        if phase == "catalog":
+            response = await browser.get("/v1/mcp-registry/services")
+        elif phase == "status":
+            response = await browser.get("/v1/connections/mcp-tracker/status")
+        elif phase == "disconnect":
+            response = await browser.post("/v1/connections/mcp-tracker/disconnect")
+        elif phase == "bearer":
+            response = await browser.put(
+                "/v1/mcp-registry/services/tracker/connection", json={"token": "synthetic-token"}
+            )
+        elif phase == "start":
+            response = await browser.get("/v1/connections/mcp-tracker/connect")
+        else:
+            response = await browser.get(
+                "/v1/connections/mcp-tracker/callback",
+                params={"code": "synthetic-code", "state": state},
+            )
+        if phase in {"start", "callback"}:
+            assert response.status_code == 302
+            assert "temporarily_unavailable" in response.headers["location"]
+        else:
+            assert response.status_code == 503
+            assert "temporarily unavailable" in response.text
+            assert "connected" not in response.json()
+        assert "private-marker" not in response.text + response.headers.get("location", "")
+
+
+@pytest.mark.asyncio
+async def test_oauth_callback_cannot_restore_account_disconnected_during_exchange(
+    oauth_app, monkeypatch
+):
+    from omnigent.server.mcp_registry import McpConnectionStore
+
+    registry = oauth_app.state.mcp_registry
+
+    async def exchange(*args):
+        await asyncio.to_thread(McpConnectionStore(registry.store, "tracker").delete, "alice")
+        return {"access_token": "must-not-be-saved"}
+
+    monkeypatch.setattr(registry, "exchange", exchange)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=oauth_app),
+        base_url="http://test",
+        headers={"x-test-user": "alice"},
+    ) as browser:
+        start = await browser.get("/v1/connections/mcp-tracker/connect")
+        state = parse_qs(urlsplit(start.headers["location"]).query)["state"][0]
+        callback = await browser.get(
+            "/v1/connections/mcp-tracker/callback", params={"state": state, "code": "synthetic"}
+        )
+        assert callback.status_code == 302
+        assert "mcp-tracker=error" in callback.headers["location"]
+        assert registry.store.get("alice", "mcp:tracker") is None
+
+
+@pytest.mark.asyncio
+async def test_shared_oauth_disconnect_invalidates_pending_callback(oauth_app, monkeypatch):
+    registry = oauth_app.state.mcp_registry
+    exchange = AsyncMock(return_value={"access_token": "must-not-be-saved"})
+    monkeypatch.setattr(registry, "exchange", exchange)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=oauth_app),
+        base_url="http://test",
+        headers={"x-test-user": "alice"},
+    ) as browser:
+        start = await browser.get("/v1/connections/mcp-tracker/connect")
+        state = parse_qs(urlsplit(start.headers["location"]).query)["state"][0]
+        assert (await browser.post("/v1/connections/mcp-tracker/disconnect")).status_code == 200
+        callback = await browser.get(
+            "/v1/connections/mcp-tracker/callback", params={"state": state, "code": "synthetic"}
+        )
+        assert "mcp-tracker=error" in callback.headers["location"]
+        exchange.assert_not_awaited()
+        assert registry.store.get("alice", "mcp-pending:tracker") is None

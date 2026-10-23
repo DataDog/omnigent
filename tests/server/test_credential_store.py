@@ -305,3 +305,89 @@ def test_sql_factory_compatibility(db_uri, monkeypatch):
     backend = build_credential_backend(storage_location=db_uri)
     backend.upsert("alice", "github", secret={"arbitrary": [1]}, metadata={})
     assert backend.get("alice", "github", with_secret=True).secret == {"arbitrary": [1]}
+
+
+def test_shared_concurrent_replacement_and_created_at(contract_backend):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from omnigent.db.db_models import current_workspace_id
+
+    store = contract_backend
+    workspace = current_workspace_id()
+    original = store.upsert("alice", "mcp:tracker", secret={"nested": ["original"]}, metadata={})
+
+    def replace(index):
+        with workspace_scope(workspace):
+            return store.upsert(
+                "alice",
+                "mcp:tracker",
+                secret={"nested": [index, {"ok": True}]},
+                metadata={"version": index},
+            )
+
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        rows = list(workers.map(replace, range(8)))
+    final = store.get("alice", "mcp:tracker", with_secret=True)
+    assert final.secret == {"nested": [final.metadata["version"], {"ok": True}]}
+    assert all(row.created_at == original.created_at for row in rows)
+    assert len(store.list_all()) == 1
+
+
+def test_backend_metrics_are_bounded_and_exceptions_are_secret_safe(db_uri, monkeypatch, caplog):
+    from omnigent.stores.credential_store import token_cache
+
+    counter = Mock()
+    monkeypatch.setattr(token_cache, "_counter", counter)
+    raw = _store(db_uri)
+    store = token_cache.managed_backend(raw)
+    marker = "private-user-token-marker"
+    store.upsert(marker, "mcp:arbitrary-provider", secret={"access_token": marker}, metadata={})
+    store.get(marker, "mcp:arbitrary-provider")
+    monkeypatch.setattr(raw, "get", Mock(side_effect=RuntimeError(marker)))
+    with pytest.raises(RuntimeError, match="backend operation failed") as failure:
+        store.get(marker, "mcp:arbitrary-provider", with_secret=True)
+    assert marker not in str(failure.value) + caplog.text
+    for call in counter.add.call_args_list:
+        attributes = call.args[1]
+        assert set(attributes) == {"operation", "result"}
+        assert marker not in repr(attributes)
+        assert "arbitrary-provider" not in repr(attributes)
+
+
+@pytest.mark.parametrize("kind", ["factory", "method"])
+def test_asynchronous_plugins_are_rejected(db_uri, monkeypatch, kind):
+    from omnigent.stores.credential_store import backend
+
+    monkeypatch.setenv(backend.BACKEND_ENV_VAR, "selected")
+
+    async def asynchronous(*args, **kwargs):
+        return None
+
+    store = _store(db_uri)
+    if kind == "method":
+        monkeypatch.setattr(store, "get", asynchronous)
+    entry = Mock()
+    entry.name = "selected"
+    entry.load.return_value = asynchronous if kind == "factory" else lambda **kwargs: store
+    monkeypatch.setattr(backend.importlib.metadata, "entry_points", Mock(return_value=[entry]))
+    with pytest.raises(ValueError, match="synchronous"):
+        backend.build_credential_backend(storage_location=db_uri)
+
+
+@pytest.mark.parametrize("operation", ["read", "upsert", "update"])
+def test_sql_cipher_outage_is_sanitized_unavailability(db_uri, monkeypatch, operation):
+    from omnigent.stores.credential_store.backend import CredentialBackendUnavailable
+
+    store = _store(db_uri)
+    store.upsert("alice", "github", secret={"access_token": "old"}, metadata={})
+    target = "decrypt" if operation == "read" else "encrypt"
+    monkeypatch.setattr(store._cipher, target, Mock(side_effect=RuntimeError("private-marker")))
+    with pytest.raises(CredentialBackendUnavailable) as failure:
+        if operation == "read":
+            store.get("alice", "github", with_secret=True)
+        elif operation == "upsert":
+            store.upsert("alice", "github", secret={"access_token": "new"}, metadata={})
+        else:
+            store.update_secret("alice", "github", secret={"access_token": "new"})
+    assert "private-marker" not in str(failure.value)
+    assert store.get("alice", "github").secret is None

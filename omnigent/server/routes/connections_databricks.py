@@ -103,7 +103,7 @@ class DatabricksConnectionHooks:
                 raise ConnectionError("Authorization failed; try connecting again") from None
 
             def persist():
-                with cache._guard:
+                with cache.mutation_lock(key):
                     if not cache.current(key, generation):
                         raise ConnectionError(
                             "Account connection changed; start authorization again"
@@ -116,8 +116,8 @@ class DatabricksConnectionHooks:
                         tokens=tokens,
                     )
 
-            _logger.info("Databricks workspace %s connected for %s", workspace_host, user_id)
             await asyncio.to_thread(persist)
+            _logger.info("Provider account connected")
         finally:
             cache.end(key)
 

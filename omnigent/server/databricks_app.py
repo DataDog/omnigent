@@ -29,7 +29,7 @@ import hashlib
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 _logger = logging.getLogger(__name__)
 
@@ -56,8 +56,8 @@ class DatabricksTokenSet:
     :param scopes: Space-separated granted scopes reported by the token endpoint.
     """
 
-    access_token: str
-    refresh_token: str | None
+    access_token: str = field(repr=False)
+    refresh_token: str | None = field(repr=False)
     expires_at: int | None
     refresh_token_expires_at: int | None
     scopes: str
@@ -242,7 +242,18 @@ def token_url(workspace_host: str) -> str:
 def token_set_from_payload(payload: dict) -> DatabricksTokenSet:
     """Parse a token-endpoint JSON payload into a :class:`DatabricksTokenSet`."""
     if "error" in payload:
-        raise DatabricksAppError("Authorization rejected by provider", reauth_required=True)
+        raise DatabricksAppError(
+            "Authorization rejected by provider",
+            reauth_required=payload["error"]
+            in {
+                "invalid_grant",
+                "invalid_token",
+                "bad_refresh_token",
+                "expired_token",
+                "access_denied",
+                "bad_verification_code",
+            },
+        )
     access = payload.get("access_token")
     if not access:
         raise DatabricksAppError("Databricks token response missing access_token")
@@ -252,8 +263,10 @@ def token_set_from_payload(payload: dict) -> DatabricksTokenSet:
     return DatabricksTokenSet(
         access_token=str(access),
         refresh_token=payload.get("refresh_token") or None,
-        expires_at=now + int(expires_in) if expires_in else None,
-        refresh_token_expires_at=(now + int(refresh_expires_in) if refresh_expires_in else None),
+        expires_at=now + int(expires_in) if expires_in is not None else None,
+        refresh_token_expires_at=(
+            now + int(refresh_expires_in) if refresh_expires_in is not None else None
+        ),
         scopes=str(payload.get("scope", "")),
     )
 

@@ -10,7 +10,12 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
-from omnigent.server.mcp_registry import McpOAuthHooks, McpRegistry, McpUpstreamError
+from omnigent.server.mcp_registry import (
+    McpConnectionStore,
+    McpOAuthHooks,
+    McpRegistry,
+    McpUpstreamError,
+)
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._credential_errors import CredentialBackendRoute
 from omnigent.server.routes.connections_base import ConnectionError, create_connection_router
@@ -107,8 +112,7 @@ def create_mcp_registry_router(
                 400, "Manage the shared provider connection in Sandbox Integrations"
             )
         user_id = user(request)
-        await asyncio.to_thread(registry.store.delete, user_id, f"mcp:{entry.id}")
-        await asyncio.to_thread(registry.store.delete, user_id, f"mcp-pending:{entry.id}")
+        await asyncio.to_thread(McpConnectionStore(registry.store, entry.id).delete, user_id)
         return {"disconnected": True}
 
     @router.post("/mcp-registry/services/{service_id}/test")

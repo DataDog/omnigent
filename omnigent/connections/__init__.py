@@ -1,7 +1,7 @@
 """Provider-façade base over the generic credential store.
 
 :class:`ConnectionStore` is the per-provider surface the routes talk to: it owns
-a :class:`~omnigent.stores.credential_store.CredentialStore` and maps the
+a :class:`~omnigent.stores.credential_store.backend.CredentialBackend` and maps the
 generic :class:`~omnigent.entities.ProviderConnection` rows into a typed,
 provider-specific entity. Concrete façades (``GithubConnectionStore``,
 ``DatabricksConnectionStore``) subtype this, set ``_PROVIDER``, implement
@@ -25,10 +25,11 @@ EntityT = TypeVar("EntityT")
 
 
 class ConnectionStore(ABC, Generic[EntityT]):
-    """Typed per-provider façade over the shared :class:`CredentialStore`.
+    """Typed per-provider façade over the shared credential backend.
 
     :param storage_location: SQLAlchemy database URI (shares the pool).
-    :param secret_cipher: Cipher for the secret blob at rest.
+    :param secret_cipher: Cipher for legacy SQL constructor callers.
+    :param backend: Shared selected backend; no SQL cipher is needed for injection.
     """
 
     #: Provider key this façade owns, e.g. ``"github"``. Set by each subclass.

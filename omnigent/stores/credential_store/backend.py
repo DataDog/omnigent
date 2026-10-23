@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import inspect
 import os
 from typing import Any, Protocol, runtime_checkable
 
@@ -76,19 +77,30 @@ def build_credential_backend(*, storage_location: str) -> CredentialBackend | No
         ]
     except Exception:  # noqa: BLE001 — plugin exceptions may contain secrets
         raise ValueError("Credential backend discovery failed") from None
-    if len(matches) != 1:
-        raise ValueError("Selected credential backend must have exactly one registration")
+    if not matches:
+        raise ValueError("Selected credential backend is not installed (entry point missing)")
+    if len(matches) > 1:
+        raise ValueError("Selected credential backend has duplicate registrations")
     try:
         factory = matches[0].load()
+    except Exception:  # noqa: BLE001 — plugin exceptions may contain secrets
+        raise ValueError("Selected credential backend could not be imported") from None
+    if not callable(factory) or inspect.iscoroutinefunction(factory):
+        raise ValueError("Selected credential backend requires a synchronous factory")
+    try:
         backend = factory(storage_location=storage_location)
-        if not isinstance(backend, CredentialBackend) or not all(
-            callable(getattr(backend, method, None))
-            for method in ("get", "upsert", "update_secret", "delete", "list_for_user", "list_all")
-        ):
-            raise TypeError
     except Exception:  # noqa: BLE001 — plugin exceptions may contain secrets
         raise ValueError(
             "Selected credential backend could not be constructed; "
             "check its installation and configuration"
         ) from None
+    methods = ("get", "upsert", "update_secret", "delete", "list_for_user", "list_all")
+    if not isinstance(backend, CredentialBackend) or not all(
+        callable(getattr(backend, method, None))
+        and not inspect.iscoroutinefunction(getattr(backend, method))
+        for method in methods
+    ):
+        if inspect.iscoroutine(backend):
+            backend.close()
+        raise ValueError("Selected credential backend does not implement the synchronous contract")
     return managed_backend(backend, storage_location=storage_location)

@@ -114,7 +114,7 @@ class GithubConnectionHooks:
                 raise ConnectionError("Authorization failed; try connecting again") from None
 
             def persist():
-                with cache._guard:
+                with cache.mutation_lock(key):
                     if not cache.current(key, generation):
                         raise ConnectionError(
                             "Account connection changed; start authorization again"
@@ -126,8 +126,8 @@ class GithubConnectionHooks:
                         tokens=tokens,
                     )
 
-            _logger.info("GitHub account %s connected for %s", login, user_id)
             await asyncio.to_thread(persist)
+            _logger.info("Provider account connected")
         finally:
             cache.end(key)
 
@@ -166,6 +166,10 @@ def create_connections_github_router(
             try:
                 repo_list, truncated = await api.list_repos(token)
             except (GitHubAppError, HTTPError, ValueError) as exc:
+                if getattr(exc, "reauth_required", False) or (
+                    getattr(getattr(exc, "response", None), "status_code", None) == 401
+                ):
+                    store._store.cache.reject(user_id, "github")
                 _logger.warning("GitHub repository listing failed")
                 raise HTTPException(
                     status_code=502, detail="Failed to list GitHub repositories"
@@ -189,6 +193,10 @@ def create_connections_github_router(
             try:
                 branches = await api.list_branches(token, f"{owner}/{repo}")
             except (GitHubAppError, HTTPError, ValueError) as exc:
+                if getattr(exc, "reauth_required", False) or (
+                    getattr(getattr(exc, "response", None), "status_code", None) == 401
+                ):
+                    store._store.cache.reject(user_id, "github")
                 _logger.warning("GitHub branch listing failed")
                 raise HTTPException(
                     status_code=502, detail="Failed to list GitHub branches"

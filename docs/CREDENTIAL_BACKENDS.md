@@ -71,7 +71,9 @@ Disconnect or reconnect during refresh invalidates the result; callbacks also
 check mutations before saving. Failed persistence can leave a still-valid old
 access token usable until actual expiry, but never publishes the unsaved grant.
 An uncertain or rejected refresh is suppressed for that cached connection so a
-spent rotating refresh token is not repeatedly exchanged. Explicit rejection
+spent rotating refresh token is not repeatedly exchanged. Secret-free denial
+markers survive token-cache eviction and are cleared when the row changes or
+disappears. Explicit rejection
 requires reauthorization; transient provider failures remain distinct from
 backend outages. Reconnect replaces the cached failure state.
 
@@ -88,10 +90,44 @@ emitted.
 
 ```sh
 uv sync --frozen --group test --group lint --extra all
-uv run --no-sync pytest tests/server/test_credential_store.py tests/server/test_credential_token_cache.py tests/server/test_mcp_registry.py tests/server/test_github_identity.py tests/server/test_github_store.py tests/server/test_databricks_store.py tests/server/routes/test_host_credentials.py tests/server/integration/test_mcp_registry.py --reruns 0
+uv run --no-sync pytest \
+  tests/server/integration/test_mcp_registry.py \
+  tests/server/test_credential_store.py tests/server/test_credential_token_cache.py \
+  tests/server/test_mcp_registry.py tests/server/test_github_identity.py \
+  tests/server/test_github_store.py tests/server/test_databricks_store.py \
+  tests/server/routes/test_host_credentials.py \
+  tests/server/test_secretbox.py tests/server/test_vault_cipher.py \
+  tests/server/test_github_app.py tests/server/test_github_app_config.py \
+  tests/server/test_databricks_app.py tests/server/routes/test_integrations_github.py \
+  tests/server/test_account_revocation.py tests/server/test_oauth_shared.py \
+  --reruns 0 -q
 ```
 
 The test suite installs a small local fixture plugin with real entry-point
 metadata, requiring no cloud credentials. Its secret service is in memory and
 intended only for testing. This proves application discovery and route behavior;
 it does not establish compatibility with any separately distributed backend wheel.
+The optional live Vault cases require a local Vault dev server and its Python
+extra; they skip when those prerequisites are absent. Mock KMS and SQL coverage
+still runs. Chart/image startup verification requires the deployment artifacts
+and capability validator; the CLI subprocess check does not substitute for it.
+
+# Account deletion and remote record lifecycle
+
+Account deletion in `accounts_store._revoke_durable_authority` removes credential
+rows directly inside the transaction that tombstones the user and revokes other
+durable authority. That transaction remains authoritative. Warm cache hits check
+account authority and metadata; refresh completion and fallback after a provider
+failure recheck authority before returning tokens. A deletion racing refresh
+cannot restore a row, publish a new token, or return an old cached token.
+
+For a remote backend with permanent records, this raw SQL deletion can orphan
+remote records. The six-method backend contract offers no reference-level cleanup
+operation after row removal. Calling `backend.delete` before committing account
+revocation could destroy secrets for a transaction that later rolls back; calling
+it afterward cannot recover deleted references. The application therefore keeps
+hard transactional revocation and does **not** attempt unsafe cleanup or add a
+queue. Remote orphan cleanup after account deletion is a documented lifecycle
+limitation, distinct from account access: the former remote secret is no longer
+reachable through application identity rows. Separately distributed backend
+implementations and operational verification must account for this limitation.

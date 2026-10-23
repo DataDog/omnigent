@@ -165,7 +165,7 @@ def create_connection_router(
         except CredentialBackendUnavailable:
             return redirect_with_status(provider, clamped, "temporarily_unavailable")
         except ConnectionError as exc:
-            _logger.warning("%s connect failed for %s: %s", provider, user_id, exc)
+            _logger.warning("%s connect failed: %s", provider, exc)
             return redirect_with_status(provider, clamped, "error")
         if start is None:
             return redirect_with_status(provider, clamped, "error")
@@ -207,7 +207,7 @@ def create_connection_router(
         except CredentialBackendUnavailable:
             return redirect_with_status(provider, return_to, "temporarily_unavailable")
         except ConnectionError as exc:
-            _logger.warning("%s connect failed for %s: %s", provider, user_id, exc)
+            _logger.warning("%s connect failed: %s", provider, exc)
             return redirect_with_status(provider, return_to, "error")
         return redirect_with_status(provider, return_to, "connected")
 

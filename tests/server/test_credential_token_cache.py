@@ -19,8 +19,8 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture
-def cached(contract_backend, monkeypatch):
-    backend = managed_backend(contract_backend)
+def cached(contract_backend, monkeypatch, db_uri):
+    backend = managed_backend(contract_backend, storage_location=db_uri)
     clock = SimpleNamespace(now=1000.0)
     monkeypatch.setattr(module, "time", SimpleNamespace(time=lambda: clock.now))
     monkeypatch.setattr(module.random, "uniform", lambda *_: 0)
@@ -281,3 +281,200 @@ async def test_active_account_is_checked_on_cache_hits(cached, db_uri):
     assert backend.cache.key("alice", "mcp:tracker") not in backend.cache._entries
     with pytest.raises(OmnigentError, match="revoked"):
         backend.upsert("alice", "other", secret={"access_token": "new"}, metadata={})
+
+
+@pytest.mark.parametrize("during_refresh", [False, True])
+@pytest.mark.parametrize("refresh_fails", [False, True])
+async def test_transactional_account_deletion_rejects_warm_hits_and_refresh(
+    cached, db_uri, during_refresh, refresh_fails
+):
+    from omnigent.errors import OmnigentError
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    backend, clock = cached
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("alice", "synthetic-password-hash")
+    assert await backend.cache.resolve("alice", "mcp:tracker", None)
+    raw = backend.cache.backend
+    records = len(raw.remote.records) if hasattr(raw, "remote") else None
+    clock.now = 1600
+
+    async def refresh(_conn):
+        assert await asyncio.to_thread(accounts.delete_user, "alice") is True
+        if refresh_fails:
+            raise httpx.ConnectError("private-provider-failure")
+        return refresh_result()
+
+    if during_refresh:
+        with pytest.raises(OmnigentError, match="revoked"):
+            await backend.cache.resolve("alice", "mcp:tracker", refresh)
+    else:
+        assert await asyncio.to_thread(accounts.delete_user, "alice") is True
+    with pytest.raises(OmnigentError, match="revoked"):
+        await backend.cache.resolve("alice", "mcp:tracker", None)
+    assert backend.get("alice", "mcp:tracker") is None
+    assert backend.cache.key("alice", "mcp:tracker") not in backend.cache._entries
+    # Transactional raw SQL revocation cannot invoke remote cleanup through the
+    # six-method contract after removing its reference. Orphaning is documented.
+    if records is not None:
+        assert len(raw.remote.records) == records
+
+
+async def test_401_discards_cached_token_and_blocks_refresh_until_reconnect(cached):
+    backend, clock = cached
+    refresh = AsyncMock(return_value=refresh_result())
+    assert await backend.cache.resolve("alice", "mcp:tracker", refresh)
+    backend.cache.reject("alice", "mcp:tracker")
+    clock.now = 1600
+    for _ in range(2):
+        with pytest.raises(CredentialRefreshRejected, match="reauthorize"):
+            await backend.cache.resolve("alice", "mcp:tracker", refresh)
+    refresh.assert_not_awaited()
+    assert (
+        backend.cache._entries[backend.cache.key("alice", "mcp:tracker")].connection.secret is None
+    )
+    backend.upsert("alice", "mcp:tracker", secret={"access_token": "reconnected"}, metadata={})
+    assert (await backend.cache.resolve("alice", "mcp:tracker", refresh)).secret[
+        "access_token"
+    ] == "reconnected"
+
+
+async def test_failed_rotation_is_not_retried_after_positive_cache_eviction(cached, monkeypatch):
+    from cachetools import LRUCache
+
+    backend, clock = cached
+    backend.cache._entries = LRUCache(1)
+    clock.now = 1600
+    refresh = AsyncMock(return_value=refresh_result())
+    monkeypatch.setattr(
+        backend.cache.backend, "update_secret", Mock(side_effect=CredentialBackendUnavailable())
+    )
+    assert (await backend.cache.resolve("alice", "mcp:tracker", refresh)).secret[
+        "access_token"
+    ] == "old"
+    backend.upsert("bob", "other", secret={"access_token": "other"}, metadata={})
+    await backend.cache.resolve("bob", "other", None)
+    assert backend.cache.key("alice", "mcp:tracker") not in backend.cache._entries
+    assert (await backend.cache.resolve("alice", "mcp:tracker", refresh)).secret[
+        "access_token"
+    ] == "old"
+    clock.now = 2001
+    with pytest.raises(CredentialBackendUnavailable):
+        await backend.cache.resolve("alice", "mcp:tracker", refresh)
+    refresh.assert_awaited_once()
+    assert all(entry.connection.secret is None for entry in backend.cache._failures.values())
+
+
+async def test_cancellation_during_synchronous_save_keeps_single_flight(cached, monkeypatch):
+    import threading
+
+    backend, clock = cached
+    clock.now = 1600
+    started, release = threading.Event(), threading.Event()
+    update = backend.cache.backend.update_secret
+
+    def persist(*args, **kwargs):
+        started.set()
+        assert release.wait(10), "test did not release synchronous persistence"
+        return update(*args, **kwargs)
+
+    monkeypatch.setattr(backend.cache.backend, "update_secret", persist)
+    refresh = AsyncMock(return_value=refresh_result())
+    leader = asyncio.create_task(backend.cache.resolve("alice", "mcp:tracker", refresh))
+    assert await asyncio.to_thread(started.wait, 5)
+    leader.cancel()
+    await asyncio.sleep(0)
+    leader.cancel()  # repeated cancellation must not interrupt persistence coordination
+    waiter = asyncio.create_task(backend.cache.resolve("alice", "mcp:tracker", refresh))
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await leader
+    assert (await waiter).secret["access_token"] == "new"
+    refresh.assert_awaited_once()
+
+
+async def test_backend_io_for_one_user_does_not_block_another(cached, monkeypatch):
+    import threading
+
+    backend, _ = cached
+    backend.upsert("bob", "other", secret={"access_token": "bob"}, metadata={})
+    started, release = threading.Event(), threading.Event()
+    original = backend.cache.backend.get
+
+    def get(user_id, *args, **kwargs):
+        if user_id == "alice":
+            started.set()
+            assert release.wait(10), "test did not release backend read"
+        return original(user_id, *args, **kwargs)
+
+    monkeypatch.setattr(backend.cache.backend, "get", get)
+    alice = asyncio.create_task(backend.cache.resolve("alice", "mcp:tracker", None))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        bob = await asyncio.wait_for(backend.cache.resolve("bob", "other", None), 5)
+        assert bob.secret["access_token"] == "bob"
+    finally:
+        release.set()
+        await alice
+
+
+async def test_failed_reconnect_does_not_allow_spent_refresh_retry(cached, monkeypatch):
+    backend, clock = cached
+    clock.now = 1600
+    refresh = AsyncMock(return_value=refresh_result())
+    monkeypatch.setattr(
+        backend.cache.backend, "update_secret", Mock(side_effect=CredentialBackendUnavailable())
+    )
+    assert (await backend.cache.resolve("alice", "mcp:tracker", refresh)).secret[
+        "access_token"
+    ] == "old"
+    monkeypatch.setattr(
+        backend.cache.backend, "upsert", Mock(side_effect=CredentialBackendUnavailable())
+    )
+    with pytest.raises(CredentialBackendUnavailable):
+        backend.upsert("alice", "mcp:tracker", secret={"access_token": "not-saved"}, metadata={})
+    assert (await backend.cache.resolve("alice", "mcp:tracker", refresh)).secret[
+        "access_token"
+    ] == "old"
+    refresh.assert_awaited_once()
+
+
+async def test_expired_refreshed_grant_is_not_vended_or_repeated(cached):
+    backend, clock = cached
+    clock.now = 1600
+    refresh = AsyncMock(
+        return_value=({"access_token": "expired-new"}, {"issued_at": 1600, "expires_at": 1600})
+    )
+    for _ in range(2):
+        with pytest.raises(module.CredentialProviderUnavailable, match="expired grant"):
+            await backend.cache.resolve("alice", "mcp:tracker", refresh)
+    refresh.assert_awaited_once()
+
+
+@pytest.mark.parametrize("provider", ["github", "databricks"])
+async def test_delegated_parser_distinguishes_zero_expiry_from_non_expiring(provider):
+    import importlib
+    import time
+
+    app = importlib.import_module(f"omnigent.server.{provider}_app")
+    before = int(time.time())
+    expired = app.token_set_from_payload(
+        {"access_token": "synthetic", "expires_in": 0, "refresh_token_expires_in": 0}
+    )
+    assert before <= expired.expires_at <= int(time.time())
+    assert expired.refresh_token_expires_at == expired.expires_at
+    assert app.token_set_from_payload({"access_token": "synthetic"}).expires_at is None
+
+
+@pytest.mark.parametrize("provider", ["github", "databricks"])
+@pytest.mark.parametrize("error", ["invalid_grant", "temporarily_unavailable"])
+async def test_provider_errors_preserve_reauth_vs_temporary_failure_without_secrets(
+    provider, error
+):
+    import importlib
+
+    app = importlib.import_module(f"omnigent.server.{provider}_app")
+    with pytest.raises(Exception) as failure:
+        app.token_set_from_payload({"error": error, "error_description": "private-marker"})
+    assert failure.value.reauth_required is (error == "invalid_grant")
+    assert "private-marker" not in str(failure.value)

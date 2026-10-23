@@ -64,10 +64,3 @@ async def resolve_databricks_credential(
         return None
     access_token, workspace_host = resolved
     return {"token": access_token, "workspace_host": workspace_host}
-
-
-async def _run_sync(func, /, *args, **kwargs):
-    """Run a synchronous store call off the event loop."""
-    import asyncio
-
-    return await asyncio.to_thread(lambda: func(*args, **kwargs))

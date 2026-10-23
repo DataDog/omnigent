@@ -8,6 +8,7 @@ always vends a currently-valid token. See ``designs/CREDENTIAL_STORE.md``.
 from __future__ import annotations
 
 from omnigent.connections.github import GithubConnectionStore
+from omnigent.entities import ProviderConnection
 from omnigent.server.github_app_client import GitHubAppClient
 
 # The username git uses with a token over HTTPS (``https://<user>:<token>@…``);
@@ -22,7 +23,13 @@ async def resolve_access_token(
     client: GitHubAppClient,
 ) -> str | None:
     """Resolve a cached grant, publishing refreshes only after synchronous persistence."""
+    connection = await _resolve_connection(user_id, store=store, client=client)
+    return connection.secret.get("access_token") if connection and connection.secret else None
 
+
+async def _resolve_connection(
+    user_id: str, *, store: GithubConnectionStore, client: GitHubAppClient
+) -> ProviderConnection | None:
     async def refresh(connection):
         tokens = await client.refresh_token(connection.secret["refresh_token"])
         metadata = dict(connection.metadata)
@@ -33,8 +40,7 @@ async def resolve_access_token(
             metadata["scopes"] = tokens.scopes
         return store._secret(tokens), metadata
 
-    connection = await store._store.cache.resolve(user_id, "github", refresh)
-    return connection.secret.get("access_token") if connection and connection.secret else None
+    return await store._store.cache.resolve(user_id, "github", refresh)
 
 
 async def resolve_github_credential(
@@ -51,19 +57,11 @@ async def resolve_github_credential(
     ``None`` when the owner has not linked GitHub. The ``owner``/``login`` let
     the host attribute commits to the human, decoupled from the push credential.
     """
-    token = await resolve_access_token(user_id, store=store, client=client)
-    if token is None:
+    connection = await _resolve_connection(user_id, store=store, client=client)
+    if connection is None or not connection.secret or not connection.secret.get("access_token"):
         return None
-    connection = await _run_sync(store.get, user_id)
     return {
         "username": _GIT_TOKEN_USERNAME,
-        "token": token,
-        "login": connection.github_login if connection is not None else None,
+        "token": connection.secret["access_token"],
+        "login": connection.metadata.get("github_login"),
     }
-
-
-async def _run_sync(func, /, *args, **kwargs):
-    """Run a synchronous store call off the event loop."""
-    import asyncio
-
-    return await asyncio.to_thread(lambda: func(*args, **kwargs))
