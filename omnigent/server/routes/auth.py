@@ -521,9 +521,14 @@ def create_auth_router(
         if isinstance(reauth_at, int):
             auth_time = _resolve_oidc_auth_time(token_json, config)
             if auth_time is None:
-                if not config.allow_missing_auth_time:
+                claims = _validate_oidc_id_token(token_json, config)
+                if not (
+                    config.allow_missing_auth_time
+                    and claims is not None
+                    and "auth_time" not in claims
+                ):
                     _logger.warning(
-                        "Rejecting reauth login: IdP id_token has no auth_time claim, "
+                        "Rejecting reauth login: IdP id_token has no valid auth_time claim, "
                         "so forced re-authentication (prompt=login) cannot be verified"
                     )
                     return fail(403, "IdP did not confirm re-authentication")

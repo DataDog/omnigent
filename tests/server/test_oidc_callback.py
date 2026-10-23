@@ -822,6 +822,26 @@ def test_reauth_callback_still_rejects_stale_auth_time_when_enabled(
     assert "did not re-authenticate" in resp.json()["error"]
 
 
+@pytest.mark.parametrize(
+    "callback_client",
+    [{"allow_missing_auth_time": True}],
+    indirect=True,
+)
+def test_reauth_callback_rejects_invalid_auth_time_when_enabled(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A malformed claim is not the Ticino missing-claim compatibility case."""
+    client, keys = callback_client
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": "invalid"}
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=int(time.time()))
+
+    assert resp.status_code == 403, resp.text
+    assert "did not confirm re-authentication" in resp.json()["error"]
+
+
 def test_non_reauth_callback_ignores_auth_time(
     callback_client: tuple[TestClient, _IdpKeys],
 ) -> None:
