@@ -4541,61 +4541,34 @@ def server(
     except (ValueError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
 
-    # GitHub App integration (per-user "Connect GitHub"). Enabled only
-    # when OMNIGENT_GITHUB_APP_* env supplies a client id/secret + a
-    # resolvable redirect URI; otherwise both stay None and the feature
-    # is inert (see docs/GITHUB_APP_SETUP.md).
-    from omnigent.server.github_app import GitHubAppConfig
-
-    github_config = GitHubAppConfig.from_env()
-    github_store = None
-    if github_config is not None:
-        from omnigent.stores.credential_store import build_secret_cipher
-
-        cipher = build_secret_cipher()
-        if cipher is None:
-            logging.getLogger(__name__).error(
-                "GitHub App is configured but disabled: set OMNIGENT_CREDENTIAL_ENC_KEY "
-                "(the credential store's encryption key) to enable it."
-            )
-        else:
-            from omnigent.connections.github import GithubConnectionStore
-
-            github_store = GithubConnectionStore(db_uri, cipher)
-
-    # Databricks Connect (per-user OAuth U2M). Shares the credential store's
-    # cipher; inert unless OMNIGENT_DATABRICKS_CLIENT_ID/_SECRET are set.
+    # One backend serves all account integrations, including external plugins.
+    from omnigent.connections.databricks import DatabricksConnectionStore
+    from omnigent.connections.github import GithubConnectionStore
     from omnigent.server.databricks_app import DatabricksConfig
-
-    databricks_config = DatabricksConfig.from_env()
-    databricks_store = None
-    if databricks_config is not None:
-        from omnigent.stores.credential_store import build_secret_cipher
-
-        dbx_cipher = build_secret_cipher()
-        if dbx_cipher is None:
-            logging.getLogger(__name__).error(
-                "Databricks Connect is configured but disabled: set the credential "
-                "store's KMS key (OMNIGENT_CREDENTIAL_KMS_KEY_ID) to enable it."
-            )
-        else:
-            from omnigent.connections.databricks import DatabricksConnectionStore
-
-            databricks_store = DatabricksConnectionStore(db_uri, dbx_cipher)
-
+    from omnigent.server.github_app import GitHubAppConfig
     from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig
+    from omnigent.stores.credential_store.backend import build_credential_backend
 
-    mcp_registry = None
-    registry_config = McpRegistryConfig.from_env()
-    if registry_config is not None:
-        from omnigent.stores.credential_store import build_secret_cipher
-        from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
-
-        registry_cipher = build_secret_cipher()
-        mcp_registry = McpRegistry(
-            registry_config,
-            CredentialStore(db_uri, registry_cipher) if registry_cipher else None,
+    credential_backend = build_credential_backend(storage_location=db_uri)
+    github_config = GitHubAppConfig.from_env()
+    databricks_config = DatabricksConfig.from_env()
+    github_store = (
+        GithubConnectionStore(backend=credential_backend)
+        if github_config and credential_backend is not None
+        else None
+    )
+    databricks_store = (
+        DatabricksConnectionStore(backend=credential_backend)
+        if databricks_config and credential_backend is not None
+        else None
+    )
+    if credential_backend is None and (github_config or databricks_config):
+        logging.getLogger(__name__).error(
+            "Account integrations require a credential backend; configure a SQL cipher "
+            "or select an installed backend"
         )
+    registry_config = McpRegistryConfig.from_env()
+    mcp_registry = McpRegistry(registry_config, credential_backend) if registry_config else None
 
     # Accounts mode ergonomics: when accounts mode is selected
     # (OMNIGENT_AUTH_ENABLED=1 without OIDC config, or an explicit

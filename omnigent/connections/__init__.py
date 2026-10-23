@@ -1,7 +1,7 @@
 """Provider-façade base over the generic credential store.
 
 :class:`ConnectionStore` is the per-provider surface the routes talk to: it owns
-a :class:`~omnigent.stores.credential_store.CredentialStore` and maps the
+a :class:`~omnigent.stores.credential_store.backend.CredentialBackend` and maps the
 generic :class:`~omnigent.entities.ProviderConnection` rows into a typed,
 provider-specific entity. Concrete façades (``GithubConnectionStore``,
 ``DatabricksConnectionStore``) subtype this, set ``_PROVIDER``, implement
@@ -16,24 +16,37 @@ from abc import ABC, abstractmethod
 from typing import ClassVar, Generic, TypeVar
 
 from omnigent.entities import ProviderConnection
+from omnigent.stores.credential_store.backend import CredentialBackend
 from omnigent.stores.credential_store.secret_cipher import SecretCipher
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+from omnigent.stores.credential_store.token_cache import managed_backend
 
 EntityT = TypeVar("EntityT")
 
 
 class ConnectionStore(ABC, Generic[EntityT]):
-    """Typed per-provider façade over the shared :class:`CredentialStore`.
+    """Typed per-provider façade over the shared credential backend.
 
     :param storage_location: SQLAlchemy database URI (shares the pool).
-    :param secret_cipher: Cipher for the secret blob at rest.
+    :param secret_cipher: Cipher for legacy SQL constructor callers.
+    :param backend: Shared selected backend; no SQL cipher is needed for injection.
     """
 
     #: Provider key this façade owns, e.g. ``"github"``. Set by each subclass.
     _PROVIDER: ClassVar[str]
 
-    def __init__(self, storage_location: str, secret_cipher: SecretCipher) -> None:
-        self._store = CredentialStore(storage_location, secret_cipher)
+    def __init__(
+        self,
+        storage_location: str = "",
+        secret_cipher: SecretCipher | None = None,
+        *,
+        backend: CredentialBackend | None = None,
+    ) -> None:
+        if backend is None:
+            if secret_cipher is None:
+                raise ValueError("A credential backend or SQL cipher is required")
+            backend = CredentialStore(storage_location, secret_cipher)
+        self._store = managed_backend(backend, storage_location=storage_location or None)
 
     @staticmethod
     @abstractmethod
