@@ -245,8 +245,7 @@ def token_set_from_payload(payload: dict) -> GitHubTokenSet:
         an access token.
     """
     if "error" in payload:
-        detail = payload.get("error_description", payload["error"])
-        raise GitHubAppError(f"GitHub token exchange failed: {detail}")
+        raise GitHubAppError("Authorization rejected by provider", reauth_required=True)
     access = payload.get("access_token")
     if not access:
         raise GitHubAppError("GitHub token response missing access_token")
@@ -264,3 +263,7 @@ def token_set_from_payload(payload: dict) -> GitHubTokenSet:
 
 class GitHubAppError(Exception):
     """Raised when a GitHub App API interaction fails."""
+
+    def __init__(self, message: str, *, reauth_required: bool = False) -> None:
+        super().__init__(message)
+        self.reauth_required = reauth_required

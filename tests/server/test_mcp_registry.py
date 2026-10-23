@@ -165,7 +165,7 @@ async def test_refresh_is_reused_and_does_not_restore_disconnected_account(
         return {"access_token": "too-late", "expires_in": 3600}
 
     monkeypatch.setattr(registry, "exchange", disconnect_during_refresh)
-    with pytest.raises(ConnectionError, match="disconnected"):
+    with pytest.raises(ConnectionError, match="Connect this MCP account"):
         await registry.token(entry, "alice", SimpleNamespace())
     assert registry.store.get("alice", "mcp:tracker") is None
 
@@ -224,7 +224,7 @@ async def test_existing_provider_resolver_is_reused(registry):
     from omnigent.connections.github import GithubConnectionStore
     from omnigent.server.github_app import GitHubTokenSet
 
-    store = GithubConnectionStore(registry.store.storage_location, _FakeCipher())
+    store = GithubConnectionStore(backend=registry.store)
     store.upsert(
         "alice",
         github_login="alice-gh",
@@ -399,7 +399,7 @@ async def test_kms_rejects_oversized_serialized_bearer_before_encrypt(db_uri, to
 
 @pytest.mark.asyncio
 async def test_bearer_rejects_oversized_ciphertext_after_expansion(registry, monkeypatch):
-    monkeypatch.setattr(registry.store._engine.dialect, "name", "mysql")
+    monkeypatch.setattr(registry.store.cache.backend._engine.dialect, "name", "mysql")
     token = "é" * 9000
     assert len(json.dumps({"access_token": token}).encode("utf-8")) < 65_535
     app = FastAPI()
@@ -482,7 +482,7 @@ async def test_oversized_refresh_preserves_current_grant(oauth_app, monkeypatch)
         metadata={"expires_at": 0},
     )
     before = registry.store.get("alice", "mcp:tracker", with_secret=True)
-    monkeypatch.setattr(registry.store._engine.dialect, "name", "mysql")
+    monkeypatch.setattr(registry.store.cache.backend._engine.dialect, "name", "mysql")
     monkeypatch.setattr(
         registry,
         "exchange",
@@ -520,7 +520,7 @@ async def test_backend_value_errors_do_not_expose_details(oauth_app, monkeypatch
             assert start.status_code == 302
             state = parse_qs(urlsplit(start.headers["location"]).query)["state"][0]
         monkeypatch.setattr(
-            registry.store._cipher, "encrypt", Mock(side_effect=ValueError(marker))
+            registry.store.cache.backend._cipher, "encrypt", Mock(side_effect=ValueError(marker))
         )
         if phase == "bearer":
             response = await browser.put(
@@ -535,7 +535,7 @@ async def test_backend_value_errors_do_not_expose_details(oauth_app, monkeypatch
             )
         else:
             response = await browser.post("/v1/mcp-registry/services/tracker/test")
-    assert response.status_code == (502 if phase == "refresh" else 500)
+    assert response.status_code == (503 if phase == "refresh" else 500)
     assert marker not in response.text + caplog.text
 
 
@@ -562,8 +562,10 @@ async def test_oauth_start_errors_redirect_without_pending_grant(oauth_app, monk
     if failure == "disallowed":
         registry.services["tracker"].allowed_users = ["bob"]
     else:
-        monkeypatch.setattr(registry.store._engine.dialect, "name", "mysql")
-        monkeypatch.setattr(registry.store._cipher, "encrypt", Mock(return_value="x" * 65_536))
+        monkeypatch.setattr(registry.store.cache.backend._engine.dialect, "name", "mysql")
+        monkeypatch.setattr(
+            registry.store.cache.backend._cipher, "encrypt", Mock(return_value="x" * 65_536)
+        )
     upsert = Mock(wraps=registry.store.upsert)
     monkeypatch.setattr(registry.store, "upsert", upsert)
     async with httpx.AsyncClient(
@@ -783,11 +785,11 @@ async def test_refresh_locks_release_after_waiters_finish_or_cancel(registry, mo
     cancelled.cancel()
     with pytest.raises(asyncio.CancelledError):
         await cancelled
-    assert len(registry._locks) == 1
+    assert len(registry.store.cache._locks) == 1
     release.set()
     assert await asyncio.gather(leader, waiter) == ["fresh", "fresh"]
     refresh.assert_awaited_once()
     del leader, waiter, cancelled
     await asyncio.sleep(0)
     gc.collect()
-    assert not registry._locks
+    assert not registry.store.cache._locks

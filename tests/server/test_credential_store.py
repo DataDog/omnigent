@@ -189,3 +189,119 @@ def test_other_databases_keep_their_existing_credential_capacity(dialect):
     from omnigent.stores.credential_store.sqlalchemy_store import _check_encrypted_size
 
     _check_encrypted_size("x" * 65_536, dialect)
+
+
+def test_shared_backend_contract(contract_backend):
+    store = contract_backend
+    payload = {
+        "access_token": "private-marker",
+        "refresh_token": "rotate",
+        "nested": [True, None, {"x": 3}],
+        "verifier": "pkce",
+        "nonce": "state",
+    }
+    first = store.upsert(
+        "alice", "mcp-pending:tracker", secret=payload, metadata={"login": "alice"}
+    )
+    assert store.get("alice", "mcp-pending:tracker", with_secret=True).secret == payload
+    assert "private-marker" not in repr(first)
+    assert store.get("alice", "mcp-pending:tracker").secret is None
+    assert all(row.secret is None for row in store.list_for_user("alice") + store.list_all())
+    assert store.update_secret("alice", "mcp-pending:tracker", secret={"changed": [1, 2]})
+    changed = store.get("alice", "mcp-pending:tracker", with_secret=True)
+    assert changed.created_at == first.created_at and changed.metadata == first.metadata
+    for user, provider, account in [
+        ("bob", "mcp-pending:tracker", ""),
+        ("alice", "other", ""),
+        ("alice", "mcp-pending:tracker", "account"),
+    ]:
+        assert store.get(user, provider, account_id=account) is None
+    with workspace_scope(2):
+        assert store.get("alice", "mcp-pending:tracker") is None
+        assert store.list_all() == []
+    assert store.delete("alice", "mcp-pending:tracker") is True
+    assert store.delete("alice", "mcp-pending:tracker") is False
+    assert store.update_secret("alice", "mcp-pending:tracker", secret=payload) is False
+
+
+def test_plugin_metadata_reads_and_sanitized_outages(
+    db_uri, monkeypatch, installed_credential_plugin
+):
+    from omnigent.stores.credential_store.backend import (
+        CredentialBackendUnavailable,
+        build_credential_backend,
+    )
+
+    monkeypatch.setenv("OMNIGENT_MCP_CREDENTIAL_BACKEND", "fixture")
+    store = build_credential_backend(storage_location=db_uri)
+    remote = store.cache.backend.remote
+    store.upsert("alice", "mcp:tracker", secret={"access_token": "private"}, metadata={})
+    remote.unavailable = True
+    assert store.get("alice", "mcp:tracker").secret is None
+    assert len(store.list_for_user("alice")) == len(store.list_all()) == 1
+    assert remote.reads == 0
+    with pytest.raises(CredentialBackendUnavailable) as failure:
+        store.get("alice", "mcp:tracker", with_secret=True)
+    assert "synthetic-private" not in str(failure.value)
+    assert store.get("bob", "mcp:tracker", with_secret=True) is None
+
+
+@pytest.mark.parametrize(
+    "mode", ["missing", "duplicate", "import", "factory", "invalid", "discovery"]
+)
+def test_plugin_registration_errors_fail_closed(db_uri, monkeypatch, mode):
+    from omnigent.stores.credential_store import backend
+
+    monkeypatch.setenv(backend.BACKEND_ENV_VAR, "selected")
+    entry = Mock(name="entry")
+    entry.name = "selected"
+    if mode == "import":
+        entry.load.side_effect = ImportError("private-marker")
+    elif mode == "factory":
+        entry.load.return_value = Mock(side_effect=RuntimeError("private-marker"))
+    else:
+        entry.load.return_value = lambda **kwargs: object()
+    discovery = Mock(
+        return_value=[]
+        if mode == "missing"
+        else [entry, entry]
+        if mode == "duplicate"
+        else [entry]
+    )
+    if mode == "discovery":
+        discovery.side_effect = RuntimeError("private-marker")
+    monkeypatch.setattr(backend.importlib.metadata, "entry_points", discovery)
+    with pytest.raises(ValueError, match=r"[Cc]redential backend") as failure:
+        backend.build_credential_backend(storage_location=db_uri)
+    assert "private-marker" not in str(failure.value)
+
+
+def test_selected_plugin_does_not_construct_sql_cipher(
+    db_uri, monkeypatch, installed_credential_plugin
+):
+    from omnigent.connections.databricks import DatabricksConnectionStore
+    from omnigent.connections.github import GithubConnectionStore
+    from omnigent.stores.credential_store import secret_cipher
+    from omnigent.stores.credential_store.backend import build_credential_backend
+
+    monkeypatch.setenv("OMNIGENT_MCP_CREDENTIAL_BACKEND", "fixture")
+    cipher = Mock(side_effect=AssertionError("SQL cipher must not be required"))
+    monkeypatch.setattr(secret_cipher, "build_secret_cipher", cipher)
+    store = build_credential_backend(storage_location=db_uri)
+    assert GithubConnectionStore(backend=store)._store is store
+    assert DatabricksConnectionStore(backend=store)._store is store
+    cipher.assert_not_called()
+
+
+def test_sql_factory_compatibility(db_uri, monkeypatch):
+    from omnigent.stores.credential_store import secret_cipher
+    from omnigent.stores.credential_store.backend import build_credential_backend
+
+    monkeypatch.delenv("OMNIGENT_MCP_CREDENTIAL_BACKEND", raising=False)
+    cipher = Mock(return_value=None)
+    monkeypatch.setattr(secret_cipher, "build_secret_cipher", cipher)
+    assert build_credential_backend(storage_location=db_uri) is None
+    cipher.return_value = _FakeCipher()
+    backend = build_credential_backend(storage_location=db_uri)
+    backend.upsert("alice", "github", secret={"arbitrary": [1]}, metadata={})
+    assert backend.get("alice", "github", with_secret=True).secret == {"arbitrary": [1]}

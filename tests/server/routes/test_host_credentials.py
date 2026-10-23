@@ -126,9 +126,9 @@ def test_unknown_provider_is_404_but_only_after_auth(db_uri: str) -> None:
     assert tc.get("/v1/hosts/host1/credentials/gitlab").status_code == 401
 
 
-def test_resolver_fault_degrades_to_connected_false() -> None:
+def test_resolver_fault_reports_temporary_provider_failure() -> None:
     hs = _FakeHostStore("host1", "launch-tok", "alice@example.com")
     tc = _app(hs, github_store=_BoomStore())
     resp = tc.get("/v1/hosts/host1/credentials/github", headers=_HDR)
-    assert resp.status_code == 200
-    assert resp.json() == {"connected": False}
+    assert resp.status_code == 502
+    assert resp.json() == {"detail": "Credential provider temporarily unavailable"}

@@ -9,18 +9,8 @@ See ``designs/DATABRICKS_CONNECT.md``.
 
 from __future__ import annotations
 
-import logging
-
 from omnigent.connections.databricks import DatabricksConnectionStore
-from omnigent.db.utils import now_epoch
-from omnigent.server.databricks_app import DatabricksAppError
 from omnigent.server.databricks_app_client import DatabricksAppClient
-
-_logger = logging.getLogger(__name__)
-
-# Refresh a token that expires within this margin so it does not lapse
-# mid-launch (or shortly after) inside the sandbox.
-_REFRESH_MARGIN_S = 300
 
 
 async def resolve_databricks_token(
@@ -29,29 +19,29 @@ async def resolve_databricks_token(
     store: DatabricksConnectionStore,
     client: DatabricksAppClient,
 ) -> tuple[str, str] | None:
-    """Resolve a valid ``(access_token, workspace_host)`` for *user_id*, or ``None``.
+    """Resolve the workspace grant through the shared cache and persistence boundary."""
 
-    Reads the stored connection and transparently refreshes a token at/near
-    expiry (persisting the refresh, workspace-scoped). Best-effort: any failure
-    (no connection, no refresh token, refresh rejected) returns ``None``.
-    """
-    connection = await _run_sync(store.get, user_id, with_tokens=True)
-    if connection is None or not connection.access_token or not connection.workspace_host:
+    async def refresh(connection):
+        tokens = await client.refresh_token(
+            connection.metadata["workspace_host"], connection.secret["refresh_token"]
+        )
+        metadata = dict(connection.metadata)
+        metadata["token_expires_at"] = tokens.expires_at
+        if tokens.refresh_token:
+            metadata["refresh_token_expires_at"] = tokens.refresh_token_expires_at
+        if tokens.scopes:
+            metadata["scopes"] = tokens.scopes
+        return store._secret(tokens), metadata
+
+    connection = await store._store.cache.resolve(user_id, "databricks", refresh)
+    if (
+        not connection
+        or not connection.secret
+        or not connection.secret.get("access_token")
+        or not connection.metadata.get("workspace_host")
+    ):
         return None
-    access_token = connection.access_token
-    workspace_host = connection.workspace_host
-    expires_at = connection.token_expires_at
-    if expires_at is not None and expires_at <= now_epoch() + _REFRESH_MARGIN_S:
-        if not connection.refresh_token:
-            return None
-        try:
-            refreshed = await client.refresh_token(workspace_host, connection.refresh_token)
-        except DatabricksAppError as exc:
-            _logger.warning("Databricks token refresh failed for %s: %s", user_id, exc)
-            return None
-        await _run_sync(store.update_tokens, user_id, refreshed)
-        access_token = refreshed.access_token
-    return access_token, workspace_host
+    return connection.secret["access_token"], connection.metadata["workspace_host"]
 
 
 async def resolve_databricks_credential(

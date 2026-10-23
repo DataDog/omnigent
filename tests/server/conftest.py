@@ -743,3 +743,42 @@ async def auth_client(
     """HTTP client wired to the auth-enabled app."""
     async with _app_client(auth_app, mock_llm, tmp_path) as client:
         yield client
+
+
+@pytest.fixture(scope="session")
+def installed_credential_plugin():
+    """Install real entry-point metadata without downloads or discovery patches."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    subprocess.run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            sys.executable,
+            "--no-build-isolation",
+            "--no-deps",
+            str(Path(__file__).parent / "fixtures" / "credential_backend"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    import importlib
+
+    importlib.invalidate_caches()
+
+
+@pytest.fixture(params=["sql", "fixture"])
+def contract_backend(request, db_uri, monkeypatch, installed_credential_plugin):
+    from omnigent.stores.credential_store.backend import build_credential_backend
+
+    if request.param == "sql":
+        from tests.server.test_credential_store import _store
+
+        return _store(db_uri)
+    monkeypatch.setenv("OMNIGENT_MCP_CREDENTIAL_BACKEND", "fixture")
+    return build_credential_backend(storage_location=db_uri)

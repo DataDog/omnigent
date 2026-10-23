@@ -16,8 +16,10 @@ from abc import ABC, abstractmethod
 from typing import ClassVar, Generic, TypeVar
 
 from omnigent.entities import ProviderConnection
+from omnigent.stores.credential_store.backend import CredentialBackend
 from omnigent.stores.credential_store.secret_cipher import SecretCipher
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+from omnigent.stores.credential_store.token_cache import managed_backend
 
 EntityT = TypeVar("EntityT")
 
@@ -32,8 +34,18 @@ class ConnectionStore(ABC, Generic[EntityT]):
     #: Provider key this façade owns, e.g. ``"github"``. Set by each subclass.
     _PROVIDER: ClassVar[str]
 
-    def __init__(self, storage_location: str, secret_cipher: SecretCipher) -> None:
-        self._store = CredentialStore(storage_location, secret_cipher)
+    def __init__(
+        self,
+        storage_location: str = "",
+        secret_cipher: SecretCipher | None = None,
+        *,
+        backend: CredentialBackend | None = None,
+    ) -> None:
+        if backend is None:
+            if secret_cipher is None:
+                raise ValueError("A credential backend or SQL cipher is required")
+            backend = CredentialStore(storage_location, secret_cipher)
+        self._store = managed_backend(backend, storage_location=storage_location or None)
 
     @staticmethod
     @abstractmethod

@@ -102,20 +102,34 @@ class GithubConnectionHooks:
         return ConnectStart(build_authorize_url(self.config, state=build_state({})))
 
     async def complete(self, user_id: str, code: str, claims: dict[str, Any]) -> None:
-        del claims  # GitHub carries no extra state claims.
+        cache = self.store._store.cache
+        key = cache.key(user_id, "github")
+        generation = cache.begin(key)
         try:
-            tokens = await self.api.exchange_code(code)
-            login, github_user_id = await self.api.fetch_login(tokens.access_token)
-        except (GitHubAppError, HTTPError, ValueError) as exc:
-            raise ConnectionError(str(exc)) from exc
-        await asyncio.to_thread(
-            self.store.upsert,
-            user_id,
-            github_login=login,
-            github_user_id=github_user_id,
-            tokens=tokens,
-        )
-        _logger.info("GitHub account %s connected for %s", login, user_id)
+            del claims  # GitHub carries no extra state claims.
+            try:
+                tokens = await self.api.exchange_code(code)
+                login, github_user_id = await self.api.fetch_login(tokens.access_token)
+            except (GitHubAppError, HTTPError, ValueError):
+                raise ConnectionError("Authorization failed; try connecting again") from None
+
+            def persist():
+                with cache._guard:
+                    if not cache.current(key, generation):
+                        raise ConnectionError(
+                            "Account connection changed; start authorization again"
+                        )
+                    return self.store.upsert(
+                        user_id,
+                        github_login=login,
+                        github_user_id=github_user_id,
+                        tokens=tokens,
+                    )
+
+            _logger.info("GitHub account %s connected for %s", login, user_id)
+            await asyncio.to_thread(persist)
+        finally:
+            cache.end(key)
 
 
 def create_connections_github_router(
@@ -152,7 +166,7 @@ def create_connections_github_router(
             try:
                 repo_list, truncated = await api.list_repos(token)
             except (GitHubAppError, HTTPError, ValueError) as exc:
-                _logger.warning("GitHub repo list failed for %s: %s", user_id, exc)
+                _logger.warning("GitHub repository listing failed")
                 raise HTTPException(
                     status_code=502, detail="Failed to list GitHub repositories"
                 ) from exc
@@ -175,7 +189,7 @@ def create_connections_github_router(
             try:
                 branches = await api.list_branches(token, f"{owner}/{repo}")
             except (GitHubAppError, HTTPError, ValueError) as exc:
-                _logger.warning("GitHub branch list failed for %s/%s: %s", owner, repo, exc)
+                _logger.warning("GitHub branch listing failed")
                 raise HTTPException(
                     status_code=502, detail="Failed to list GitHub branches"
                 ) from exc

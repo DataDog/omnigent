@@ -37,8 +37,8 @@ class DatabricksConnection:
     workspace_host: str
     databricks_user: str
     databricks_user_id: str
-    access_token: str | None
-    refresh_token: str | None
+    access_token: str | None = dataclasses.field(repr=False)
+    refresh_token: str | None = dataclasses.field(repr=False)
     token_expires_at: int | None
     refresh_token_expires_at: int | None
     scopes: str

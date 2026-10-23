@@ -201,5 +201,8 @@ class GitHubAppClient:
                 headers={"Accept": "application/json"},
             )
         if resp.status_code != 200:
-            raise GitHubAppError(f"GitHub token endpoint returned {resp.status_code}")
+            raise GitHubAppError(
+                "Credential provider token request failed",
+                reauth_required=resp.status_code in (400, 401),
+            )
         return token_set_from_payload(resp.json())

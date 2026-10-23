@@ -242,8 +242,7 @@ def token_url(workspace_host: str) -> str:
 def token_set_from_payload(payload: dict) -> DatabricksTokenSet:
     """Parse a token-endpoint JSON payload into a :class:`DatabricksTokenSet`."""
     if "error" in payload:
-        detail = payload.get("error_description", payload["error"])
-        raise DatabricksAppError(f"Databricks token exchange failed: {detail}")
+        raise DatabricksAppError("Authorization rejected by provider", reauth_required=True)
     access = payload.get("access_token")
     if not access:
         raise DatabricksAppError("Databricks token response missing access_token")
@@ -261,3 +260,7 @@ def token_set_from_payload(payload: dict) -> DatabricksTokenSet:
 
 class DatabricksAppError(Exception):
     """Raised when a Databricks OAuth interaction fails."""
+
+    def __init__(self, message: str, *, reauth_required: bool = False) -> None:
+        super().__init__(message)
+        self.reauth_required = reauth_required

@@ -36,6 +36,12 @@ import logging
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 
 from omnigent.server.connections_registry import connection_providers
+from omnigent.server.routes._credential_errors import CredentialBackendRoute
+from omnigent.stores.credential_store.backend import CredentialBackendUnavailable
+from omnigent.stores.credential_store.token_cache import (
+    CredentialProviderUnavailable,
+    CredentialRefreshRejected,
+)
 from omnigent.stores.host_store import HostStore
 
 _logger = logging.getLogger(__name__)
@@ -53,7 +59,7 @@ def create_host_credentials_router(host_store: HostStore) -> APIRouter:
         if provider.credential_resolver is not None
     }
 
-    router = APIRouter()
+    router = APIRouter(route_class=CredentialBackendRoute)
 
     @router.get("/hosts/{host_id}/credentials/{provider}")
     async def host_credential(
@@ -90,9 +96,17 @@ def create_host_credentials_router(host_store: HostStore) -> APIRouter:
             raise HTTPException(status_code=404, detail="unknown credential provider")
         try:
             payload = await resolver(managed.user_id, store=store, client=client)
-        except Exception:  # noqa: BLE001 - a provider resolver fault must degrade, not 500
-            _logger.warning("credential resolve failed for provider %r", provider, exc_info=True)
-            return {"connected": False}
+        except CredentialBackendUnavailable as exc:
+            raise HTTPException(503, str(exc)) from None
+        except CredentialProviderUnavailable:
+            raise HTTPException(502, "Credential provider temporarily unavailable") from None
+        except CredentialRefreshRejected:
+            raise HTTPException(
+                401, "Credential refresh rejected; reauthorize the account"
+            ) from None
+        except Exception:  # noqa: BLE001 - do not expose credential errors
+            _logger.warning("credential resolve failed")
+            raise HTTPException(502, "Credential provider temporarily unavailable") from None
         if payload is None:
             return {"connected": False}
         return {"connected": True, "owner": managed.user_id, **payload}

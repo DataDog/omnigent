@@ -14,7 +14,6 @@ from builtins import ExceptionGroup
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlencode, urlsplit
-from weakref import WeakValueDictionary
 
 import httpx
 import yaml
@@ -24,8 +23,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.entities import ProviderConnection
 from omnigent.server.routes.connections_base import ConnectionError, ConnectStart
+from omnigent.stores.credential_store.backend import CredentialBackend
 from omnigent.stores.credential_store.secret_cipher import SecretTooLargeError
-from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+from omnigent.stores.credential_store.token_cache import CredentialRefreshRejected, managed_backend
 
 _logger = logging.getLogger(__name__)
 
@@ -161,7 +161,7 @@ class McpRegistryConfig(BaseModel):
 class McpConnectionStore:
     """Typed facade sharing the existing encrypted connections table."""
 
-    def __init__(self, store: CredentialStore, service_id: str) -> None:
+    def __init__(self, store: CredentialBackend, service_id: str) -> None:
         self._store = store
         self.provider = f"mcp:{service_id}"
 
@@ -175,15 +175,12 @@ class McpConnectionStore:
 class McpRegistry:
     """Resolve credentials and execute approved catalog tools on the server."""
 
-    def __init__(self, config: McpRegistryConfig, store: CredentialStore | None) -> None:
+    def __init__(self, config: McpRegistryConfig, store: CredentialBackend | None) -> None:
         self.config = config
         self.services = {service.id: service for service in config.services}
-        self.store = store
-        self._locks: WeakValueDictionary[tuple[int, str, str], asyncio.Lock] = (
-            WeakValueDictionary()
-        )
+        self.store = managed_backend(store) if store is not None else None
         if any(s.auth in {"oauth", "bearer"} for s in config.services) and store is None:
-            raise ValueError("MCP account connections require the existing KMS or Vault cipher")
+            raise ValueError("MCP account connections require a credential backend")
         self.state_secret = os.environ.get("OMNIGENT_MCP_OAUTH_STATE_SECRET", "")
         if any(s.oauth for s in config.services) and len(self.state_secret) < 32:
             raise ValueError(
@@ -197,6 +194,7 @@ class McpRegistry:
         return service
 
     async def token(self, service: McpService, user_id: str, app_state: Any) -> str | None:
+        self.service(service.id, user_id)
         if service.auth == "none":
             return None
         if service.auth in {"github", "databricks"}:
@@ -211,41 +209,28 @@ class McpRegistry:
             if not payload or not isinstance(payload.get("token"), str):
                 raise ConnectionError(f"Reconnect {provider.name} in Sandbox Integrations")
             return payload["token"]
-        from omnigent.db.db_models import current_workspace_id
-
         assert self.store is not None
-        key = (current_workspace_id(), user_id, service.id)
-        lock = self._locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            conn = await asyncio.to_thread(
-                self.store.get, user_id, f"mcp:{service.id}", with_secret=True
+
+        async def refresh(conn):
+            tokens = await self.exchange(
+                service,
+                {"grant_type": "refresh_token", "refresh_token": conn.secret["refresh_token"]},
             )
-            if conn is None or not conn.secret or not conn.secret.get("access_token"):
-                raise ConnectionError("Connect this MCP account in Settings > MCP")
-            expiry = conn.metadata.get("expires_at")
-            if service.oauth and expiry is not None and float(expiry) <= time.time() + 30:
-                refresh = conn.secret.get("refresh_token")
-                if not refresh:
-                    raise ConnectionError("Reconnect this MCP account in Settings > MCP")
-                tokens = await self.exchange(
-                    service, {"grant_type": "refresh_token", "refresh_token": refresh}
-                )
-                if tokens.get("refresh_token") is None:
-                    tokens["refresh_token"] = refresh
-                try:
-                    updated = await asyncio.to_thread(
-                        self.store.update_secret,
-                        user_id,
-                        f"mcp:{service.id}",
-                        secret=tokens,
-                        metadata=self.metadata(tokens),
-                    )
-                except SecretTooLargeError as exc:
-                    raise ConnectionError(str(exc)) from None
-                if not updated:
-                    raise ConnectionError("MCP account disconnected")
-                return str(tokens["access_token"])
-            return str(conn.secret["access_token"])
+            return tokens, self.metadata(tokens)
+
+        conn = await self.store.cache.resolve(
+            user_id, f"mcp:{service.id}", refresh if service.oauth else None
+        )
+        if conn is None or not conn.secret or not conn.secret.get("access_token"):
+            raise ConnectionError("Connect this MCP account in Settings > MCP")
+        return str(conn.secret["access_token"])
+
+    def invalidate(self, user_id: str, service: McpService) -> None:
+        if self.store is not None:
+            provider = (
+                service.auth if service.auth in {"github", "databricks"} else f"mcp:{service.id}"
+            )
+            self.store.cache.invalidate(user_id, provider)
 
     @staticmethod
     def metadata(tokens: dict[str, Any]) -> dict[str, Any]:
@@ -258,7 +243,7 @@ class McpRegistry:
                 raise ValueError
         except (TypeError, ValueError, OverflowError):
             raise ConnectionError("MCP provider returned an invalid token expiry") from None
-        return {"expires_at": time.time() + seconds}
+        return {"expires_at": time.time() + seconds, "issued_at": time.time()}
 
     async def exchange(self, service: McpService, data: dict[str, Any]) -> dict[str, Any]:
         oauth = service.oauth
@@ -280,6 +265,8 @@ class McpRegistry:
             raise ConnectionError(
                 "MCP authorization could not reach the provider; try again"
             ) from None
+        if response.status_code in (400, 401):
+            raise CredentialRefreshRejected("MCP authorization rejected; reconnect the account")
         if response.status_code != 200:
             raise ConnectionError("MCP authorization failed; reconnect the account")
         try:
@@ -347,6 +334,8 @@ class McpRegistry:
             raise
         except Exception as exc:  # noqa: BLE001 — transport errors may contain credentials
             failure = _upstream_error(exc)
+            if failure.status_code == 401:
+                self.invalidate(user_id, service)
             _logger.warning(
                 "Registry MCP request failed service=%s tool=%s failure=%s http_status=%s",
                 service.id,
@@ -417,35 +406,41 @@ class McpOAuthHooks:
         self.registry.service(self.service.id, user_id)
         store = self.registry.store
         assert store is not None
-        pending = await asyncio.to_thread(
-            store.get, user_id, f"mcp-pending:{self.service.id}", with_secret=True
-        )
-        if (
-            not pending
-            or not pending.secret
-            or claims.get("service") != self.service.id
-            or not secrets.compare_digest(
-                str(pending.secret.get("nonce", "")), str(claims.get("nonce", ""))
-            )
-        ):
-            raise ConnectionError("MCP authorization expired; try connecting again")
-        await asyncio.to_thread(store.delete, user_id, f"mcp-pending:{self.service.id}")
-        tokens = await self.registry.exchange(
-            self.service,
-            {
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": self.redirect_uri(),
-                "code_verifier": pending.secret["verifier"],
-            },
-        )
+        cache = store.cache
+        key = cache.key(user_id, f"mcp:{self.service.id}")
+        generation = cache.begin(key)
         try:
-            await asyncio.to_thread(
-                store.upsert,
-                user_id,
-                f"mcp:{self.service.id}",
-                secret=tokens,
-                metadata=self.registry.metadata(tokens),
+            pending = await asyncio.to_thread(
+                store.get, user_id, f"mcp-pending:{self.service.id}", with_secret=True
             )
-        except SecretTooLargeError as exc:
-            raise ConnectionError(str(exc)) from None
+            if (
+                not pending
+                or not pending.secret
+                or claims.get("service") != self.service.id
+                or not secrets.compare_digest(
+                    str(pending.secret.get("nonce", "")), str(claims.get("nonce", ""))
+                )
+            ):
+                raise ConnectionError("MCP authorization expired; try connecting again")
+            await asyncio.to_thread(store.delete, user_id, f"mcp-pending:{self.service.id}")
+            tokens = await self.registry.exchange(
+                self.service,
+                {
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": self.redirect_uri(),
+                    "code_verifier": pending.secret["verifier"],
+                },
+            )
+            try:
+                await asyncio.to_thread(
+                    cache.upsert_if_current,
+                    key,
+                    generation,
+                    secret=tokens,
+                    metadata=self.registry.metadata(tokens),
+                )
+            except SecretTooLargeError as exc:
+                raise ConnectionError(str(exc)) from None
+        finally:
+            cache.end(key)
