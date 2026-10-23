@@ -100,6 +100,30 @@ def test_pi_env_denylist_reaches_runner_through_host_daemon(
 
 
 @pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_password_store_gpg_selector_reaches_runner_through_host_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """Managed auth helpers must use the same password-store GPG home."""
+    gpg_opts = "--homedir /home/alice/.config/password-store/gpg"
+    monkeypatch.setenv("PASSWORD_STORE_GPG_OPTS", gpg_opts)
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=server_url or "http://localhost:6767",
+        runner_id="runner_password_store",
+        binding_token="binding-password-store",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    assert daemon_env["PASSWORD_STORE_GPG_OPTS"] == gpg_opts
+    assert runner_env["PASSWORD_STORE_GPG_OPTS"] == gpg_opts
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
 def test_runner_can_read_keyring_from_cli_desktop_session(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
