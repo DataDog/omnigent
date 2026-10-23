@@ -539,6 +539,13 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "DBUS_SESSION_BUS_ADDRESS",
         "XDG_RUNTIME_DIR",
         "PYTHON_KEYRING_BACKEND",
+        # pass/ddtool GPG-home selector. Datadog workspaces keep the password
+        # store keyring outside ~/.gnupg and point gpg at it with this option.
+        # Dropping it at the host -> runner boundary makes a managed Claude
+        # apiKeyHelper resolve the wrong keyring and fail with "No secret key".
+        # This is configuration (normally ``--homedir <path>``), not key
+        # material; the encrypted store and private keys remain on disk.
+        "PASSWORD_STORE_GPG_OPTS",
         "TZ",
         "TERM",
         "TERMINFO",
