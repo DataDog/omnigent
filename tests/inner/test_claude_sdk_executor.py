@@ -441,6 +441,30 @@ class TestConstructor(unittest.TestCase):
         )
         self.assertTrue(executor._os_env)
         self.assertIsNotNone(executor._os_env_spec)
+        self.assertIsNone(executor._managed_api_key_helper)
+
+    def test_constructor_enables_hardened_mode_for_managed_auth_bypass(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, PreparedClaudeCli
+        from omnigent.inner.datamodel import OSEnvSpec
+
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._find_system_claude",
+                return_value="/usr/bin/claude",
+            ),
+            patch(
+                "omnigent.inner.claude_sdk_executor.prepare_claude_cli_path",
+                return_value=PreparedClaudeCli(
+                    cli_path="/usr/bin/claude",
+                    enable_native_tools=False,
+                    managed_api_key_helper="managed-token-helper",
+                ),
+            ),
+        ):
+            executor = ClaudeSDKExecutor(os_env=OSEnvSpec(type="caller_process"))
+
+        self.assertFalse(executor._os_env)
+        self.assertEqual(executor._managed_api_key_helper, "managed-token-helper")
 
     def test_os_env_spec_wraps_cli_and_enables_native_tools(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, PreparedClaudeCli
@@ -510,8 +534,8 @@ class TestConstructor(unittest.TestCase):
                 return_value=[],
             ),
             patch(
-                "omnigent.inner.claude_sdk_executor._has_managed_api_key_helper",
-                return_value=False,
+                "omnigent.inner.claude_sdk_executor._managed_api_key_helper_command",
+                return_value=None,
             ),
             patch(
                 "omnigent.inner.claude_sdk_executor.create_exec_launcher",
@@ -541,8 +565,8 @@ class TestConstructor(unittest.TestCase):
 
         with (
             patch(
-                "omnigent.inner.claude_sdk_executor._has_managed_api_key_helper",
-                return_value=True,
+                "omnigent.inner.claude_sdk_executor._managed_api_key_helper_command",
+                return_value="managed-token-helper",
             ),
             patch("omnigent.inner.claude_sdk_executor.resolve_sandbox") as resolve,
             patch("omnigent.inner.claude_sdk_executor.create_exec_launcher") as launcher,
@@ -551,11 +575,15 @@ class TestConstructor(unittest.TestCase):
 
         self.assertEqual(prepared.cli_path, "/usr/bin/claude")
         self.assertFalse(prepared.enable_native_tools)
+        self.assertEqual(prepared.managed_api_key_helper, "managed-token-helper")
         resolve.assert_not_called()
         launcher.assert_not_called()
 
     def test_detects_managed_api_key_helper(self):
-        from omnigent.inner.claude_sdk_executor import _has_managed_api_key_helper
+        from omnigent.inner.claude_sdk_executor import (
+            _has_managed_api_key_helper,
+            _managed_api_key_helper_command,
+        )
 
         with (
             patch.object(Path, "is_file", return_value=True),
@@ -565,6 +593,7 @@ class TestConstructor(unittest.TestCase):
                 return_value=json.dumps({"apiKeyHelper": "managed-token-helper"}),
             ),
         ):
+            self.assertEqual(_managed_api_key_helper_command(), "managed-token-helper")
             self.assertTrue(_has_managed_api_key_helper())
 
     def test_default_process_sandbox_wraps_cli_without_enabling_native_tools(self):
@@ -2442,6 +2471,72 @@ class TestBundlePluginGating(unittest.TestCase):
 
 
 class TestStreamEventStreaming(unittest.TestCase):
+    def test_managed_auth_host_mode_strips_non_explicit_customizations(self):
+        """A host-side credential helper must not imply host-side code execution."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        captured_options = []
+
+        class _ResultMessage:
+            def __init__(self):
+                self.session_id = "claude-managed-auth"
+                self.result = "ok"
+
+        class _FakeSDK(_sdk_types(), _SDKTools):
+            ResultMessage = _ResultMessage
+
+            class ClaudeSDKClient(_SDKClient):
+                async def connect(self):
+                    captured_options.append(self.options)
+
+                async def receive_response(self):
+                    yield _ResultMessage()
+
+        async def _t():
+            with tempfile.TemporaryDirectory() as tmp:
+                bundle = Path(tmp)
+                (bundle / "skills" / "demo").mkdir(parents=True)
+                (bundle / "skills" / "demo" / "SKILL.md").write_text("# demo\n")
+                executor = ClaudeSDKExecutor(
+                    permission_mode="bypassPermissions",
+                    bundle_dir=bundle,
+                    skills_filter="all",
+                )
+                executor._managed_api_key_helper = "managed-token-helper"
+                with patch(
+                    "omnigent.inner.claude_sdk_executor._ensure_sdk",
+                    return_value=_FakeSDK,
+                ):
+                    events = [
+                        event
+                        async for event in executor.run_turn(
+                            [{"role": "user", "content": "hello"}], [], "system"
+                        )
+                    ]
+            self.assertEqual(events[-1].response, "ok")
+
+        _run(_t())
+
+        self.assertEqual(len(captured_options), 1)
+        options = captured_options[0]
+        self.assertEqual(options.tools, ["ToolSearch"])
+        self.assertEqual(options.skills, [])
+        self.assertEqual(options.setting_sources, [])
+        self.assertEqual(options.plugins, [])
+        self.assertEqual(options.permission_mode, "auto")
+        self.assertEqual(
+            options.extra_args,
+            {
+                "no-session-persistence": None,
+                "bare": None,
+                "restricted": None,
+            },
+        )
+        self.assertEqual(
+            json.loads(options.settings),
+            {"apiKeyHelper": "managed-token-helper"},
+        )
+
     def test_live_clients_are_reused_per_omnigent_session(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
