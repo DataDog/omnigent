@@ -21,7 +21,7 @@ from tests.e2e_ui.shells.test_terminal_direct_attach import _BLOCK_LOOPBACK_DIAL
 _ATTACH_WS = re.compile(r"/resources/terminals/.*/attach")
 # xterm answers tmux's colour queries (OSC 10/11) on the input stream, so a
 # reply can land between typed characters.
-_OSC_REPLY = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_OSC_REPLY = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 # Latch status-overlay states on the terminal view's element so short-lived
 # overlays are observed even if they render and unmount between polls.
