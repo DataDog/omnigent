@@ -70,6 +70,7 @@ def _oidc_config(
     skip_email_verification: bool = False,
     email_claim: str = "email",
     client_secret: str | None = "secret",
+    allow_missing_auth_time: bool = False,
 ) -> OIDCConfig:
     """Build a generic-OIDC config over plain HTTP (so TestClient cookies stick).
 
@@ -99,6 +100,7 @@ def _oidc_config(
         allow_invites=False,
         skip_email_verification=skip_email_verification,
         email_claim=email_claim,
+        allow_missing_auth_time=allow_missing_auth_time,
     )
 
 
@@ -779,6 +781,45 @@ def test_reauth_callback_rejects_missing_auth_time(
     assert resp.status_code == 403, resp.text
     assert "did not confirm re-authentication" in resp.json()["error"]
     assert resp.cookies.get("ap_session") is None
+
+
+@pytest.mark.parametrize(
+    "callback_client",
+    [{"allow_missing_auth_time": True}],
+    indirect=True,
+)
+def test_reauth_callback_allows_missing_auth_time_when_enabled(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A trusted OIDC token without auth_time works only with the opt-in."""
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    resp = _do_callback_reauth(client, token, reauth_at=int(time.time()))
+
+    assert resp.status_code == 302, resp.text
+    assert resp.cookies.get("ap_session") is not None
+
+
+@pytest.mark.parametrize(
+    "callback_client",
+    [{"allow_missing_auth_time": True}],
+    indirect=True,
+)
+def test_reauth_callback_still_rejects_stale_auth_time_when_enabled(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """The opt-in does not accept a known stale authentication."""
+    client, keys = callback_client
+    reauth_at = int(time.time())
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": reauth_at - 3600}
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 403, resp.text
+    assert "did not re-authenticate" in resp.json()["error"]
 
 
 def test_non_reauth_callback_ignores_auth_time(
