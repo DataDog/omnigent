@@ -1303,7 +1303,46 @@ def _default_artifact_location() -> str:
     return str(_local_data_dir() / "artifacts")
 
 
-def _display_db_uri(db_uri: str) -> str:
+# Substrings marking a URL query parameter as a credential, e.g. libpq's
+# ``password`` / ``sslpassword`` or a driver ``api_key``. Matched lowercase.
+_DB_URI_CREDENTIAL_QUERY_MARKERS = (
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+)
+_DB_URI_REDACTED_QUERY_VALUE = "REDACTED"
+_UNPARSEABLE_DB_URI_DISPLAY = "<unparseable database URL>"
+
+
+def _is_credential_query_key(key: str) -> bool:
+    """Whether a DB URL query parameter name carries a secret value."""
+    lowered = key.lower()
+    return any(marker in lowered for marker in _DB_URI_CREDENTIAL_QUERY_MARKERS)
+
+
+def _db_uri_has_credential(db_uri: str) -> bool:
+    """Whether a parseable DB URL embeds a password or credential query param.
+
+    :param db_uri: SQLAlchemy database URL, e.g.
+        ``"postgresql://omnigent:pw@db:5432/omnigent"``.
+    :returns: ``True`` when the URL carries a secret; ``False`` otherwise,
+        including when it does not parse.
+    """
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.exc import ArgumentError
+
+    try:
+        url = make_url(db_uri)
+    except (ArgumentError, ValueError):
+        return False
+    return bool(url.password) or any(_is_credential_query_key(key) for key in url.query)
+
+
+def _display_db_uri(db_uri: str, *, strict: bool = False) -> str:
     """Render a DB URI for display with any embedded credential masked.
 
     The server banner and maintenance reports reach container logs, log
@@ -1313,18 +1352,27 @@ def _display_db_uri(db_uri: str) -> str:
 
     :param db_uri: The resolved store DB URI, e.g.
         ``"postgresql://omnigent:pw@db:5432/omnigent"``.
-    :returns: The URI with the password replaced by ``***``, or the
-        original string when it is not a parseable SQLAlchemy URL.
+    :param strict: When ``True``, an unparseable URI renders as a fixed
+        placeholder instead of the raw string (which may hold a secret).
+    :returns: The URI with the password replaced by ``***`` and
+        credential-like query values replaced by ``REDACTED``. An
+        unparseable URI is returned unchanged unless ``strict``.
     """
     from sqlalchemy.engine import make_url
     from sqlalchemy.exc import ArgumentError
 
     try:
-        return make_url(db_uri).render_as_string(hide_password=True)
-    except ArgumentError:
+        url = make_url(db_uri)
+    except (ArgumentError, ValueError):
         # A malformed URI is surfaced by the engine on connect; display
         # keeps whatever the operator provided rather than failing here.
-        return db_uri
+        return _UNPARSEABLE_DB_URI_DISPLAY if strict else db_uri
+    masked_query = {
+        key: _DB_URI_REDACTED_QUERY_VALUE for key in url.query if _is_credential_query_key(key)
+    }
+    if masked_query:
+        url = url.update_query_dict(masked_query)
+    return url.render_as_string(hide_password=True)
 
 
 def _ensure_sqlite_parent_dir(db_uri: str) -> None:
@@ -1379,8 +1427,13 @@ def _require_existing_sqlite_db(db_uri: str) -> None:
 
     try:
         url = make_url(db_uri)
-    except ArgumentError as exc:
-        raise click.ClickException(f"Invalid database URL {db_uri!r}: {exc}") from exc
+    except (ArgumentError, ValueError) as exc:
+        # Neither the raw URL nor SQLAlchemy's message (which quotes it) is
+        # echoed: an unparseable URL may still contain a password.
+        raise click.ClickException(
+            "Invalid database URL: SQLAlchemy could not parse it (expected e.g. "
+            "sqlite:////abs/path/chat.db or postgresql://user:pass@host/db)."
+        ) from exc
     if url.get_backend_name() != "sqlite":
         return
     # ``url.database`` is the filesystem path for file-backed SQLite; None or
@@ -12002,15 +12055,24 @@ def debug() -> None:
 
 
 @debug.command("db-upgrade")
-@click.argument("url")
-def debug_db_upgrade(url: str) -> None:
+@click.argument("url", required=False)
+def debug_db_upgrade(url: str | None) -> None:
     """
     Upgrade the schema of an Omnigent tracking database to the
     latest supported version.
 
     URL is a SQLAlchemy database URL, e.g.
     ``sqlite:////absolute/path/to/chat.db`` or
-    ``postgresql://<user>:<password>@host/dbname``.
+    ``postgresql://<user>:<password>@host/dbname``. When URL is
+    omitted it is read from the ``OMNIGENT_DB_URL`` environment
+    variable. Prefer the environment variable for URLs that carry a
+    password: command-line arguments are visible to other users via
+    ``ps``.
+
+    \b
+    Examples:
+      omnigent debug db-upgrade sqlite:////home/alice/.omnigent/chat.db
+      OMNIGENT_DB_URL="$DATABASE_URL" omnigent debug db-upgrade
 
     \b
     IMPORTANT: schema migrations can be slow and are not guaranteed
@@ -12021,8 +12083,21 @@ def debug_db_upgrade(url: str) -> None:
 
     from omnigent.db.utils import _run_migrations
 
+    source = ""
+    if not url:
+        url = os.environ.get("OMNIGENT_DB_URL") or None
+        source = " (from OMNIGENT_DB_URL)"
+    if not url:
+        raise click.UsageError("Pass the database URL as URL or set OMNIGENT_DB_URL.")
+
     _require_existing_sqlite_db(url)
-    click.echo(f"Upgrading {url} ...")
+    if not source and _db_uri_has_credential(url):
+        click.echo(
+            "Warning: the database URL contains a credential and is visible to "
+            "other users via `ps`; pass it via OMNIGENT_DB_URL instead.",
+            err=True,
+        )
+    click.echo(f"Upgrading {_display_db_uri(url, strict=True)}{source} ...")
     engine = create_engine(url)
     try:
         _run_migrations(engine, url)
