@@ -2062,6 +2062,62 @@ async def test_credential_rewrite_swaps_bearer_and_token(
     assert synthetic not in (captured[0].authorization or "")
 
 
+def test_credential_rewrite_can_require_placeholder_and_exact_https_origin(
+    ca_paths: tuple[Path, Path, Path],
+) -> None:
+    """Strict rules reject missing, plaintext, and wrong-port credentials."""
+    cert_path, key_path, _ = ca_paths
+    synthetic = f"{SYNTHETIC_CREDENTIAL_PREFIX}pi"
+    proxy = EgressProxy(
+        parse_rules(["* gateway.example.test/**"]),
+        cert_path,
+        key_path,
+        credential_rewrites=[
+            CredentialRewriteRule(
+                host="gateway.example.test",
+                port=443,
+                scheme="bearer",
+                synthetic=synthetic,
+                real_secret="real-secret-value",
+                require_placeholder=True,
+                https_only=True,
+            )
+        ],
+    )
+    headers = f"Authorization: Bearer {synthetic}\r\n\r\n".encode()
+
+    approved = proxy._rewrite_authorization(
+        method="POST",
+        host="gateway.example.test",
+        port=443,
+        is_https=True,
+        headers_raw=headers,
+    )
+    assert approved.error is None
+    assert b"Bearer real-secret-value" in approved.headers
+
+    for is_https, port in ((False, 443), (True, 8443)):
+        rejected = proxy._rewrite_authorization(
+            method="POST",
+            host="gateway.example.test",
+            port=port,
+            is_https=is_https,
+            headers_raw=headers,
+        )
+        assert rejected.error == "synthetic credential is not allowed for this host"
+        assert b"real-secret-value" not in rejected.headers
+
+    bare = proxy._rewrite_authorization(
+        method="POST",
+        host="gateway.example.test",
+        port=443,
+        is_https=True,
+        headers_raw=b"Host: gateway.example.test\r\n\r\n",
+    )
+    assert bare.error is None
+    assert b"Authorization:" not in bare.headers
+
+
 @pytest.mark.asyncio
 async def test_credential_rewrite_swaps_via_refreshing_provider(
     ca_paths: tuple[Path, Path, Path],
