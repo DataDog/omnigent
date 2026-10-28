@@ -2856,6 +2856,10 @@ def create_app(
             bound host's reported version, or ``None`` when there's no
             host binding / the version isn't resolvable on this replica.
         """
+        from omnigent.server._vit924_fault import health_should_fail
+
+        if health_should_fail():
+            raise StarletteHTTPException(status_code=503, detail="VIT-924 injected fault")
         result: dict[str, Any] = {"status": "ok"}
         batch_ids = [s.strip() for s in session_ids.split(",") if s.strip()] if session_ids else []
         # Resolve every requested id (single + batch) in ONE lookup. The
