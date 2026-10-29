@@ -2323,6 +2323,16 @@ def create_app(
                 status_code=metrics_status_code,
             )
 
+    from omnigent.stores.credential_store.backend import CredentialBackendUnavailable
+
+    @app.exception_handler(CredentialBackendUnavailable)
+    async def credential_backend_unavailable(_request: Request, exc: CredentialBackendUnavailable):
+        return JSONResponse(
+            status_code=503,
+            content={"detail": str(exc)},
+            headers={"Retry-After": "5", "Cache-Control": "no-store"},
+        )
+
     @app.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
         request: Request,

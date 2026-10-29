@@ -28,6 +28,8 @@ from starlette.responses import RedirectResponse
 from omnigent.db.account_authority import account_generation
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._credential_errors import CredentialBackendRoute
+from omnigent.stores.credential_store.backend import CredentialBackendUnavailable
 
 _logger = logging.getLogger(__name__)
 
@@ -120,7 +122,7 @@ def create_connection_router(
     """
     provider = hooks.provider
     store = hooks.store
-    router = APIRouter()
+    router = APIRouter(route_class=CredentialBackendRoute)
     key = hooks.signing_key()
 
     def _current_user(request: Request) -> str:
@@ -160,8 +162,10 @@ def create_connection_router(
 
         try:
             start = await asyncio.to_thread(hooks.begin, request, build_state)
+        except CredentialBackendUnavailable:
+            return redirect_with_status(provider, clamped, "temporarily_unavailable")
         except ConnectionError as exc:
-            _logger.warning("%s connect failed for %s: %s", provider, user_id, exc)
+            _logger.warning("%s connect failed: %s", provider, exc)
             return redirect_with_status(provider, clamped, "error")
         if start is None:
             return redirect_with_status(provider, clamped, "error")
@@ -200,8 +204,10 @@ def create_connection_router(
             return redirect_with_status(provider, return_to, "error")
         try:
             await hooks.complete(user_id, code, claims)
+        except CredentialBackendUnavailable:
+            return redirect_with_status(provider, return_to, "temporarily_unavailable")
         except ConnectionError as exc:
-            _logger.warning("%s connect failed for %s: %s", provider, user_id, exc)
+            _logger.warning("%s connect failed: %s", provider, exc)
             return redirect_with_status(provider, return_to, "error")
         return redirect_with_status(provider, return_to, "connected")
 

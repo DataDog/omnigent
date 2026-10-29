@@ -35,8 +35,8 @@ class GithubConnection:
     user_id: str
     github_login: str
     github_user_id: int
-    access_token: str | None
-    refresh_token: str | None
+    access_token: str | None = dataclasses.field(repr=False)
+    refresh_token: str | None = dataclasses.field(repr=False)
     token_expires_at: int | None
     refresh_token_expires_at: int | None
     scopes: str
