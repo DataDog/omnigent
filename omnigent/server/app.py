@@ -1324,15 +1324,10 @@ def _ensure_default_polly_agent(
 def _wire_kill_switch_sweep(app_inst: FastAPI) -> None:
     """Connect the kill switch to the in-flight turn sweep for this replica."""
     from omnigent.server.routes._sessions.common import _session_status_cache
-    from omnigent.server.routes._sessions.helpers import (
-        _get_runner_client,
-        _is_codex_native_subagent,
-    )
 
     controller: KillSwitchController = app_inst.state.kill_switch
     interrupt = getattr(app_inst.state, "turn_interrupter", None)
     store = getattr(app_inst.state, "kill_switch_conversation_store", None)
-    router = getattr(app_inst.state, "runner_router", None)
     if interrupt is None or store is None:
         return
 
@@ -1345,13 +1340,9 @@ def _wire_kill_switch_sweep(app_inst: FastAPI) -> None:
 
     async def _halt(session_id: str) -> bool:
         conv = await asyncio.to_thread(store.get_conversation, session_id)
-        # Codex side-chat children are halted by their parent's interrupt.
-        if conv is None or (conv.kind == "sub_agent" and _is_codex_native_subagent(conv)):
+        if conv is None:
             return False
-        # No local runner tunnel: another replica owns this session.
-        if await _get_runner_client(session_id, router, conversation=conv) is None:
-            return False
-        return await interrupt(session_id)
+        return await interrupt(session_id, conv)
 
     controller.sweep_targets = _targets
     controller.interrupter = _halt
@@ -1864,11 +1855,12 @@ def create_app(
                 await managed_sandbox_reaper.start()
 
         _wire_kill_switch_sweep(app_inst)
-        await resolved_kill_switch.start()
+        kill_switch_controller: KillSwitchController = app_inst.state.kill_switch
+        await kill_switch_controller.start()
         try:
             yield
         finally:
-            await resolved_kill_switch.stop()
+            await kill_switch_controller.stop()
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
             # Run completion is event-driven (the _publish_status hook) plus a

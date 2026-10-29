@@ -784,7 +784,8 @@ def register_events_routes(
     register_runner_ingest: Callable[[Callable[..., Awaitable[EventAckFrame]]], None]
     | None = None,
     register_startup_dispatch: Callable[[StartupDispatch], None] | None = None,
-    register_turn_interrupter: Callable[[Callable[[str], Awaitable[bool]]], None] | None = None,
+    register_turn_interrupter: Callable[[Callable[[str, Conversation], Awaitable[bool]]], None]
+    | None = None,
 ) -> None:
     """Register the events, stream, and delete routes on router."""
 
@@ -1070,8 +1071,42 @@ def register_events_routes(
             _interrupt_fenced_sessions.discard(session_id)
         return delivered
 
+    async def _halt_turn(session_id: str, conv: Conversation) -> bool:
+        """Kill-switch sweep: interrupt *conv*'s running turn if this replica owns it."""
+        if not (conv.kind == "sub_agent" and _is_codex_native_subagent(conv)):
+            # No local runner tunnel: another replica owns this session.
+            if await _get_runner_client(session_id, runner_router, conversation=conv) is None:
+                return False
+            return await _interrupt_active_turn(session_id)
+        parent_id = conv.parent_conversation_id
+        if parent_id and _session_status_cache.get(parent_id) in ("running", "waiting"):
+            return False  # The parent's interrupt in this sweep covers the side chat.
+        child_thread_id = (conv.labels or {}).get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY)
+        response_id = _session_active_response_cache.get(session_id)
+        if (
+            not parent_id
+            or not child_thread_id
+            or not isinstance(response_id, str)
+            or not response_id.startswith("codex_")
+            or response_id in ("codex_", "codex_native")
+        ):
+            return False  # Turn not identifiable yet; the next sweep retries.
+        runner_client = await _get_runner_client(parent_id, runner_router)
+        if runner_client is None:
+            return False
+        resp = await runner_client.post(
+            f"/v1/sessions/{parent_id}/events",
+            json={
+                "type": "interrupt",
+                "codex_side_thread_id": child_thread_id,
+                "codex_side_turn_id": response_id.removeprefix("codex_"),
+            },
+            timeout=5.0,
+        )
+        return resp.status_code < 400
+
     if register_turn_interrupter is not None:
-        register_turn_interrupter(_interrupt_active_turn)
+        register_turn_interrupter(_halt_turn)
 
     async def _post_event_impl(
         request: Request | _RunnerEventContext | StartupInputContext,

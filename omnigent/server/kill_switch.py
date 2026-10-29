@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -150,6 +151,7 @@ class KillSwitchController:
         self._force = force
         self._metrics = _Metrics(self, meter)
         self._task: asyncio.Task[None] | None = None
+        self._started_at = clock()
         self.interrupter: TurnInterrupter | None = None
         self.sweep_targets: SweepTargets | None = None
 
@@ -169,9 +171,8 @@ class KillSwitchController:
     def staleness_observations(self) -> list[Any]:
         if self._source is None or self._force is not None:
             return []
-        last = self._state.last_success_at
-        if last is None:
-            return []
+        # Never reached the source: measure the outage from controller start.
+        last = self._state.last_success_at or self._started_at
         return [otel_metrics.Observation(max(0.0, self._clock() - last))]
 
     def require_enabled(self, operation: str) -> None:
@@ -183,7 +184,11 @@ class KillSwitchController:
 
     async def refresh(self) -> KillSwitchState:
         """Evaluate the source once and apply the result (fail-safe)."""
-        if self._source is None or self._force is not None:
+        if self._force is not None:
+            if self._force:
+                await self.sweep()
+            return self._state
+        if self._source is None:
             return self._state
         previous = self._state
         try:
@@ -238,18 +243,28 @@ class KillSwitchController:
 
     async def start(self) -> None:
         """Bounded first evaluation, then background polling."""
-        if self._source is None or self._force is not None:
+        self._started_at = self._clock()
+        if self._force is not None:
             if self._force:
                 _logger.warning("kill_switch_engaged: forced by OMNIGENT_KILL_SWITCH_FORCE")
+                await self.refresh()
+                self._task = asyncio.create_task(self._poll_loop(), name="kill-switch-poll")
+            return
+        if self._source is None:
             return
         try:
-            await asyncio.wait_for(self.refresh(), timeout=self._init_timeout_s)
+            await asyncio.wait_for(self._first_reading(), timeout=self._init_timeout_s)
         except TimeoutError:
             _logger.warning(
                 "kill switch flag not evaluated within %.1fs; starting disengaged",
                 self._init_timeout_s,
             )
         self._task = asyncio.create_task(self._poll_loop(), name="kill-switch-poll")
+
+    async def _first_reading(self) -> None:
+        """Retry until the source answers (e.g. async provider initialization)."""
+        while (await self.refresh()).source_status != "ready":
+            await asyncio.sleep(min(self._poll_interval_s, 0.5))
 
     async def _poll_loop(self) -> None:
         while True:
@@ -295,8 +310,8 @@ def _positive_float(environ: Mapping[str, str], name: str, default: float) -> fl
         value = float(raw)
     except ValueError:
         value = -1.0
-    if value <= 0:
-        raise ValueError(f"{name} must be a positive number of seconds, got {raw!r}")
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a finite positive number of seconds, got {raw!r}")
     return value
 
 

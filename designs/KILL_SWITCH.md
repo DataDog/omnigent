@@ -15,7 +15,8 @@ While **engaged**:
 - Running turns are interrupted as soon as the switch engages, and again on
   every poll, so a turn started later (for example typed into a native
   terminal) is stopped too. Each replica halts the sessions whose runner
-  tunnel it holds.
+  tunnel it holds. Codex side chats are halted through their parent's runner
+  unless the parent itself is being interrupted. Forced mode sweeps the same way.
 - Scheduled task fires are recorded as `skipped` with
   `error_code=kill_switch_engaged`.
 - `POST /v1/sessions/{id}/policies/evaluate` denies tool-call and LLM-request
@@ -77,7 +78,7 @@ Meter `omnigent.server.kill_switch`:
 
 - `omnigent.kill_switch.engaged` (gauge, 0/1)
 - `omnigent.kill_switch.flag_refresh` (counter, `outcome=ok|unavailable`)
-- `omnigent.kill_switch.staleness` (gauge, seconds since last successful evaluation)
+- `omnigent.kill_switch.staleness` (gauge, seconds since last successful evaluation, or since startup if none succeeded)
 - `omnigent.kill_switch.rejected_requests` (counter, by `operation`)
 - `omnigent.kill_switch.halted_turns` (counter, `outcome=delivered|not_delivered|failed`)
 
@@ -93,7 +94,8 @@ Recommended monitors:
   becomes `unavailable`, `last_error` is set and staleness grows. A server that
   never reached Datadog stays disengaged.
 - **Restart while engaged**: startup waits up to the init timeout for the first
-  evaluation, so the service does not briefly reopen. On timeout it starts
+  evaluation, retrying while the Datadog provider is still initializing, so the
+  service does not briefly reopen. On timeout it starts
   disengaged and logs a warning.
 - **Feature Flags itself broken**: set `OMNIGENT_KILL_SWITCH_FORCE` and restart.
 

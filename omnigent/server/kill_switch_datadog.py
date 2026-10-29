@@ -41,7 +41,10 @@ class DatadogFlagSource:
                 raise RuntimeError(_INSTALL_HINT) from exc
             provider = cast(Any, DataDogProvider())
         env = os.environ if environ is None else environ
+        from openfeature.provider import ProviderStatus
+
         self._api = api
+        self._ready_status = ProviderStatus.READY
         self._flag_key = flag_key
         self._provider = provider
         self._client: Any = None
@@ -59,6 +62,10 @@ class DatadogFlagSource:
             # Blocks up to the provider's own init timeout; runs off the loop.
             self._api.set_provider(self._provider)
             self._client = self._api.get_client("omnigent-kill-switch")
+        status = self._client.get_provider_status()
+        if status != self._ready_status:
+            # Async provider init: a default answered before READY is not a reading.
+            return FlagReading(engaged=None, error=f"provider status {status}")
         details = self._client.get_boolean_details(self._flag_key, last_known, self._context)
         if details.error_code is not None:
             message = details.error_message or str(details.error_code)

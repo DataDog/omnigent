@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import Counter
 from typing import Any
 
@@ -11,7 +12,6 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.app import _wire_kill_switch_sweep
 from omnigent.server.kill_switch import (
     DEFAULT_MESSAGE,
     FlagReading,
@@ -142,8 +142,11 @@ def test_resolve_env_force_and_validation() -> None:
     assert not resolve_kill_switch({}).active
     with pytest.raises(ValueError, match="FORCE"):
         resolve_kill_switch({"OMNIGENT_KILL_SWITCH_FORCE": "on"})
-    with pytest.raises(ValueError, match="POLL_INTERVAL"):
-        resolve_kill_switch({"OMNIGENT_KILL_SWITCH_POLL_INTERVAL_S": "0"})
+    for bad in ("0", "-1", "nan", "inf", "abc"):
+        with pytest.raises(ValueError, match="POLL_INTERVAL"):
+            resolve_kill_switch({"OMNIGENT_KILL_SWITCH_POLL_INTERVAL_S": bad})
+        with pytest.raises(ValueError, match="INIT_TIMEOUT"):
+            resolve_kill_switch({"OMNIGENT_KILL_SWITCH_INIT_TIMEOUT_S": bad})
 
 
 def test_datadog_source_maps_openfeature_details() -> None:
@@ -162,19 +165,96 @@ def test_datadog_source_maps_openfeature_details() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_not_ready_is_unavailable_and_init_waits_for_ready() -> None:
+    pytest.importorskip("openfeature")
+    from openfeature.provider import ProviderStatus
+    from openfeature.provider.in_memory_provider import InMemoryFlag, InMemoryProvider
+
+    from omnigent.server.kill_switch_datadog import DatadogFlagSource
+
+    provider = InMemoryProvider({"kill": InMemoryFlag("on", {"on": True, "off": False})})
+    source = DatadogFlagSource("kill", environ={}, provider=provider)
+    source.evaluate(False)  # registers the provider
+    real_client = source._client
+    status = {"value": ProviderStatus.NOT_READY}
+
+    class _AsyncInitClient:
+        def get_provider_status(self) -> ProviderStatus:
+            return status["value"]
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_client, name)
+
+    source._client = _AsyncInitClient()
+    reading = source.evaluate(False)
+    assert reading.engaged is None and "NOT_READY" in (reading.error or "")
+
+    # The bounded init wait retries until READY instead of starting disengaged.
+    controller, _meter = _controller(source, init_timeout_s=2.0)
+    asyncio.get_running_loop().call_later(0.05, status.update, {"value": ProviderStatus.READY})
+    await controller.start()
+    assert controller.engaged and controller.state.source_status == "ready"
+    await controller.stop()
+
+
+@pytest.mark.asyncio
+async def test_forced_engaged_sweeps_and_staleness_counts_outage() -> None:
+    halted: list[str] = []
+
+    async def _interrupt(session_id: str) -> bool:
+        halted.append(session_id)
+        return True
+
+    forced, _meter = _controller(None, force=True)
+    forced.sweep_targets = lambda: [(0, "conv_running")]
+    forced.interrupter = _interrupt
+    await forced.start()
+    assert halted == ["conv_running"]
+    for _ in range(100):
+        if len(halted) > 1:
+            break
+        await asyncio.sleep(0.01)
+    assert len(halted) > 1, "forced mode keeps sweeping on every poll"
+    await forced.stop()
+
+    now = {"t": 100.0}
+    source = FakeSource(FlagReading(engaged=None, error="down"))
+    controller, meter = _controller(source, clock=lambda: now["t"])
+    await controller.refresh()
+    now["t"] = 160.0
+    assert meter.gauge("omnigent.kill_switch.staleness") == [60.0]
+    source.reading = FlagReading(engaged=False)
+    await controller.refresh()
+    source.reading = FlagReading(engaged=None, error="down")
+    now["t"] = 190.0
+    await controller.refresh()
+    assert meter.gauge("omnigent.kill_switch.staleness") == [30.0]
+
+
+@pytest.mark.asyncio
 async def test_app_refuses_new_work_halts_turns_and_keeps_reads(
     app: FastAPI,
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from omnigent.server.routes import sessions as sessions_module
-    from omnigent.server.routes._sessions.common import _session_status_cache
+    from omnigent.server.routes._sessions.common import (
+        _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+        _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
+        _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+        _session_active_response_cache,
+        _session_status_cache,
+    )
 
     interrupts: list[str] = []
+    side_bodies: list[dict[str, Any]] = []
 
     def _handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST" and request.url.path.endswith("/events"):
             interrupts.append(request.url.path)
+            body = json.loads(request.content or b"{}")
+            if "codex_side_turn_id" in body:
+                side_bodies.append(body)
         return httpx.Response(204)
 
     fake_runner = httpx.AsyncClient(transport=httpx.MockTransport(_handler), base_url="http://r")
@@ -191,19 +271,42 @@ async def test_app_refuses_new_work_halts_turns_and_keeps_reads(
     assert created.status_code == 201, created.text
     session_id = created.json()["id"]
 
-    source = FakeSource(FlagReading(engaged=False))
-    controller, meter = _controller(source)
+    # A Codex side chat whose parent is idle must be halted on its own.
+    side_chat = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "parent_session_id": session_id}
+    )
+    assert side_chat.status_code == 201, side_chat.text
+    side_chat_id: str | None = side_chat.json()["id"]
+
+    source = FakeSource(FlagReading(engaged=True))
+    controller = KillSwitchController(source, poll_interval_s=3600, meter=RecordingMeter())
     app.state.kill_switch = controller
-    _wire_kill_switch_sweep(app)
     _session_status_cache[session_id] = "running"
+    if side_chat_id is not None:
+        conv_store = app.state.kill_switch_conversation_store
+        assert conv_store.get_conversation(side_chat_id).kind == "sub_agent"
+        conv_store.set_labels(
+            side_chat_id,
+            {
+                _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _CODEX_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
+                _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY: "thread_1",
+            },
+        )
+        _session_status_cache[side_chat_id] = "running"
+        _session_active_response_cache[side_chat_id] = "codex_turn_1"
+    lifespan = app.router.lifespan_context(app)
+    await lifespan.__aenter__()
     try:
-        source.reading = FlagReading(engaged=True)
-        await controller.refresh()
-        # Engaging halts the in-flight turn, and each later poll sweeps again.
-        assert interrupts == [f"/v1/sessions/{session_id}/events"]
-        await controller.refresh()
-        assert len(interrupts) == 2
-        assert meter.adds[("omnigent.kill_switch.halted_turns", (("outcome", "delivered"),))] == 2
+        # Startup wires the sweep and the engaged first reading halts running turns.
+        assert controller.engaged
+        assert f"/v1/sessions/{session_id}/events" in interrupts
+        if side_chat_id is not None:
+            # Parent was running, so the parent interrupt covers the side chat.
+            _session_status_cache[session_id] = "idle"
+            interrupts.clear()
+            await controller.refresh()
+            assert interrupts == [f"/v1/sessions/{session_id}/events"]
+            assert side_bodies[-1]["codex_side_turn_id"] == "turn_1"
 
         message = {
             "type": "message",
@@ -234,8 +337,13 @@ async def test_app_refuses_new_work_halts_turns_and_keeps_reads(
         _session_status_cache.pop(session_id, None)
         await controller.refresh()
         resp = await client.post(f"/v1/sessions/{session_id}/events", json=message)
-        assert resp.status_code != 503, resp.text
+        assert resp.status_code == 202, resp.text
+        assert resp.json()["queued"] is True
         assert (await client.get("/health")).json()["kill_switch"] == "disengaged"
     finally:
-        _session_status_cache.pop(session_id, None)
+        await lifespan.__aexit__(None, None, None)
+        for key in (session_id, side_chat_id):
+            if key is not None:
+                _session_status_cache.pop(key, None)
+                _session_active_response_cache.pop(key, None)
         await fake_runner.aclose()
