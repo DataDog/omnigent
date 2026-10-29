@@ -86,18 +86,23 @@ Meter `omnigent.server.kill_switch`:
 Recommended monitors:
 
 - `engaged == 1` for any replica: notify the owning team.
-- `staleness > 300s` while configured: the flag source is down.
+- `staleness > 300s` while configured: the provider is not ready or reports
+  stale/error evaluations (see Limits for outages it cannot see).
 - Spike in `rejected_requests`: measures client impact while engaged.
 
 ## Failure modes
 
-- **Datadog unreachable**: the last known state is kept; `source_status`
-  becomes `unavailable`, `last_error` is set and staleness grows. A server that
-  never reached Datadog stays disengaged.
+- **Provider not ready or evaluations stale/erroring**: the last known state
+  is kept; `source_status` becomes `unavailable`, `last_error` is set and
+  staleness grows. A server that never got a reading stays disengaged.
+- **Datadog unreachable after the provider got a config**: ddtrace keeps
+  serving its cached flag config, so readings keep succeeding with the cached
+  value and staleness does not grow. Flag changes made during the outage are
+  not seen until the config refreshes.
 - **Restart while engaged**: startup waits up to the init timeout for the first
   evaluation, retrying while the Datadog provider is still initializing, so the
-  service does not briefly reopen. The scheduler starts only after that. On timeout it starts
-  disengaged and logs a warning.
+  service does not briefly reopen. The scheduler starts only after that. On
+  timeout it starts disengaged and logs a warning.
 - **Feature Flags itself broken**: set `OMNIGENT_KILL_SWITCH_FORCE` and restart.
 
 ## Limits
