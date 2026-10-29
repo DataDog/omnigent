@@ -15,8 +15,9 @@ While **engaged**:
 - Running turns are interrupted as soon as the switch engages, and again on
   every poll, so a turn started later (for example typed into a native
   terminal) is stopped too. Each replica halts the sessions whose runner
-  tunnel it holds. Codex side chats are halted through their parent's runner
-  unless the parent itself is being interrupted. Forced mode sweeps the same way.
+  tunnel it holds. Codex side chats are interrupted directly through their
+  parent's runner, even when the parent is interrupted too. Forced mode sweeps
+  the same way.
 - Scheduled task fires are recorded as `skipped` with
   `error_code=kill_switch_engaged`.
 - `POST /v1/sessions/{id}/policies/evaluate` denies tool-call and LLM-request
@@ -95,7 +96,7 @@ Recommended monitors:
   never reached Datadog stays disengaged.
 - **Restart while engaged**: startup waits up to the init timeout for the first
   evaluation, retrying while the Datadog provider is still initializing, so the
-  service does not briefly reopen. On timeout it starts
+  service does not briefly reopen. The scheduler starts only after that. On timeout it starts
   disengaged and logs a warning.
 - **Feature Flags itself broken**: set `OMNIGENT_KILL_SWITCH_FORCE` and restart.
 
@@ -106,3 +107,7 @@ Recommended monitors:
 - Native-terminal turns are stopped by the sweep and the policy deny, not
   prevented.
 - The switch is service-wide; per-workspace control is out of scope.
+- Staleness counts a reading as fresh when the provider is READY and the
+  evaluation reason is not `STALE` or `ERROR`. ddtrace exposes no signal for
+  "config fetch failing while cached config is served", so an outage that keeps
+  serving cached flags with a normal reason is not visible as staleness.

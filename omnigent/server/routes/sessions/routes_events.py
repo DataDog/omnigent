@@ -1078,9 +1078,9 @@ def register_events_routes(
             if await _get_runner_client(session_id, runner_router, conversation=conv) is None:
                 return False
             return await _interrupt_active_turn(session_id)
+        # Interrupted directly even when the parent runs: a parent interrupt
+        # does not guarantee its side chats stop.
         parent_id = conv.parent_conversation_id
-        if parent_id and _session_status_cache.get(parent_id) in ("running", "waiting"):
-            return False  # The parent's interrupt in this sweep covers the side chat.
         child_thread_id = (conv.labels or {}).get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY)
         response_id = _session_active_response_cache.get(session_id)
         if (

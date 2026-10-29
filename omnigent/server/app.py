@@ -1780,83 +1780,91 @@ def create_app(
         # which would run context-free (default workspace) over a
         # workspace-blind registry and never stamp a multi-tenant row.
 
-        # Recurring-task scheduler: arm a timer per active
-        # scheduled task and fire the injected ``on_fire`` callback on
-        # schedule. The callback (see scheduled.fire) re-reads the row,
-        # creates + owner-grants a session, launches its runner, and records
-        # the run — all fire-and-forget so the timer re-arms immediately.
-        scheduled_task_scheduler: ScheduledTaskScheduler | None = None
-        if scheduled_task_store is not None:
-            from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
-
-            fire_deps = FireDeps(
-                scheduled_task_store=scheduled_task_store,
-                agent_store=agent_store,
-                conversation_store=conversation_store,
-                permission_store=permission_store,
-                policy_store=policy_store,
-                host_store=host_store,
-                host_registry=host_registry,
-                agent_cache=agent_cache,
-                runner_router=runner_router,
-                tunnel_registry=tunnel_registry,
-                file_store=file_store,
-                artifact_store=artifact_store,
-                # Managed-sandbox execution target: provision a fresh sandbox per
-                # fire. ``managed_launches`` is created during app construction
-                # (before this lifespan runs), so it is already on state here.
-                sandbox_config=sandbox_config,
-                managed_launches=app_inst.state.managed_launches,
-                app_state=app_inst.state,
-            )
-            on_fire = build_on_fire(fire_deps)
-            # The manual "run now" trigger reuses the same fire path (dispatch /
-            # preflight / in-flight guard) as the scheduler; it only differs in
-            # allowing a paused task to fire. Exposed on app.state for the
-            # POST /v1/scheduled-tasks/{id}/run route.
-            app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
-            scheduled_task_scheduler = ScheduledTaskScheduler(
-                store=scheduled_task_store,
-                on_fire=on_fire,
-            )
-            app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
-            # Scheduled tasks are a non-critical subsystem: a failure loading the
-            # schedule (e.g. a DB error listing active tasks) must not take
-            # down server boot. Log and continue with the scheduler unstarted.
-            try:
-                await scheduled_task_scheduler.start()
-            except Exception as exc:
-                _logger.exception(
-                    "scheduled task scheduler failed to start; continuing "
-                    "without recurring tasks (%s)",
-                    exc,
-                )
-
-            # Run completion is event-driven (persist_scheduled_run_completion
-            # fires from _publish_status the instant a fired conversation's turn
-            # ends — no poll). The only orphan backstop is a lazy-on-read
-            # force-fail of stale ``running`` runs on the scheduled-task read
-            # endpoints (see routes/scheduled_tasks.py); there is no startup
-            # sweep and no periodic reconcile.
-
-        managed_sandbox_reaper: ManagedSandboxReaper | None = None
-        if sandbox_config is not None and sandbox_config.reaper.enabled:
-            if host_store is None:
-                _logger.warning(
-                    "Managed sandbox reaper is enabled but no host store is configured; "
-                    "the reaper will not run"
-                )
-            else:
-                managed_sandbox_reaper = ManagedSandboxReaper(
-                    host_store=host_store,
-                    sandbox_config=sandbox_config,
-                )
-                app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
-                await managed_sandbox_reaper.start()
-
+        # Before the scheduler starts, so no fire runs while the first
+        # kill-switch reading is pending.
         _wire_kill_switch_sweep(app_inst)
         kill_switch_controller: KillSwitchController = app_inst.state.kill_switch
         await kill_switch_controller.start()
+
+        try:
+            # Recurring-task scheduler: arm a timer per active
+            # scheduled task and fire the injected ``on_fire`` callback on
+            # schedule. The callback (see scheduled.fire) re-reads the row,
+            # creates + owner-grants a session, launches its runner, and records
+            # the run — all fire-and-forget so the timer re-arms immediately.
+            scheduled_task_scheduler: ScheduledTaskScheduler | None = None
+            if scheduled_task_store is not None:
+                from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+
+                fire_deps = FireDeps(
+                    scheduled_task_store=scheduled_task_store,
+                    agent_store=agent_store,
+                    conversation_store=conversation_store,
+                    permission_store=permission_store,
+                    policy_store=policy_store,
+                    host_store=host_store,
+                    host_registry=host_registry,
+                    agent_cache=agent_cache,
+                    runner_router=runner_router,
+                    tunnel_registry=tunnel_registry,
+                    file_store=file_store,
+                    artifact_store=artifact_store,
+                    # Managed-sandbox execution target: provision a fresh sandbox per
+                    # fire. ``managed_launches`` is created during app construction
+                    # (before this lifespan runs), so it is already on state here.
+                    sandbox_config=sandbox_config,
+                    managed_launches=app_inst.state.managed_launches,
+                    app_state=app_inst.state,
+                )
+                on_fire = build_on_fire(fire_deps)
+                # The manual "run now" trigger reuses the same fire path (dispatch /
+                # preflight / in-flight guard) as the scheduler; it only differs in
+                # allowing a paused task to fire. Exposed on app.state for the
+                # POST /v1/scheduled-tasks/{id}/run route.
+                app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
+                scheduled_task_scheduler = ScheduledTaskScheduler(
+                    store=scheduled_task_store,
+                    on_fire=on_fire,
+                )
+                app_inst.state.scheduled_task_scheduler = scheduled_task_scheduler
+                # Scheduled tasks are a non-critical subsystem: a failure loading the
+                # schedule (e.g. a DB error listing active tasks) must not take
+                # down server boot. Log and continue with the scheduler unstarted.
+                try:
+                    await scheduled_task_scheduler.start()
+                except Exception as exc:
+                    _logger.exception(
+                        "scheduled task scheduler failed to start; continuing "
+                        "without recurring tasks (%s)",
+                        exc,
+                    )
+
+                # Run completion is event-driven (persist_scheduled_run_completion
+                # fires from _publish_status the instant a fired conversation's turn
+                # ends — no poll). The only orphan backstop is a lazy-on-read
+                # force-fail of stale ``running`` runs on the scheduled-task read
+                # endpoints (see routes/scheduled_tasks.py); there is no startup
+                # sweep and no periodic reconcile.
+
+            managed_sandbox_reaper: ManagedSandboxReaper | None = None
+            if sandbox_config is not None and sandbox_config.reaper.enabled:
+                if host_store is None:
+                    _logger.warning(
+                        "Managed sandbox reaper is enabled but no host store is configured; "
+                        "the reaper will not run"
+                    )
+                else:
+                    managed_sandbox_reaper = ManagedSandboxReaper(
+                        host_store=host_store,
+                        sandbox_config=sandbox_config,
+                    )
+                    app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
+                    await managed_sandbox_reaper.start()
+        except BaseException:
+            # Startup failed after the controller started; stop its poll task.
+            await kill_switch_controller.stop()
+            raise
+
         try:
             yield
         finally:

@@ -44,7 +44,10 @@ class DatadogFlagSource:
         from openfeature.provider import ProviderStatus
 
         self._api = api
+        from openfeature.flag_evaluation import Reason
+
         self._ready_status = ProviderStatus.READY
+        self._unhealthy_reasons = frozenset({Reason.STALE, Reason.ERROR, "STALE", "ERROR"})
         self._flag_key = flag_key
         self._provider = provider
         self._client: Any = None
@@ -70,6 +73,9 @@ class DatadogFlagSource:
         if details.error_code is not None:
             message = details.error_message or str(details.error_code)
             return FlagReading(engaged=None, error=f"{details.error_code}: {message}")
+        if details.reason in self._unhealthy_reasons:
+            # Cached data served during an outage is not a fresh reading.
+            return FlagReading(engaged=None, error=f"flag reason {details.reason}")
         return FlagReading(engaged=bool(details.value))
 
     def close(self) -> None:
