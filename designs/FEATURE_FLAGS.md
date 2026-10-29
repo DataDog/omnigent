@@ -58,3 +58,10 @@ for Claude working-status acceptance and kill-switch verification.
 5. Roll back with `-feature_name` and redeploy the same image. For runner
    features, apply the override to the host/runner environment, restart those
    processes, and launch fresh terminals.
+
+## Service kill switch
+
+The service-wide kill switch is permanent operator configuration, not a
+release flag, so it is not in `FEATURE_DEFINITIONS` and is not controlled by
+`OMNIGENT_FEATURES`. It reads a boolean Datadog Feature Flag at runtime and
+refuses new work while engaged. See [KILL_SWITCH.md](KILL_SWITCH.md).

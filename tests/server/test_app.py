@@ -38,7 +38,7 @@ async def test_health_returns_ok(client: httpx.AsyncClient) -> None:
     assert resp.status_code == 200
     # Exact shape — a regression that changes the key name or value
     # would break health-check integrations that parse this response.
-    assert resp.json() == {"status": "ok"}
+    assert resp.json() == {"status": "ok", "kill_switch": "disengaged"}
 
 
 @pytest.mark.asyncio
@@ -797,7 +797,7 @@ async def test_health_bare_returns_status_ok(db_uri: str, tmp_path: Path) -> Non
         resp = await c.get("/health")
     assert resp.status_code == 200
     # Exact shape — no session/sessions keys leak in when none were asked for.
-    assert resp.json() == {"status": "ok"}
+    assert resp.json() == {"status": "ok", "kill_switch": "disengaged"}
 
 
 @pytest.mark.asyncio
@@ -1968,7 +1968,7 @@ async def test_api_only_root_does_not_shadow_real_routes(
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         resp = await c.get("/health", headers={"accept": "text/html"})
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    assert resp.json() == {"status": "ok", "kill_switch": "disengaged"}
 
 
 @pytest.mark.asyncio

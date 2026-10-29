@@ -330,6 +330,7 @@ def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
         artifact_store=overrides.get("artifact_store"),
         sandbox_config=overrides.get("sandbox_config"),
         managed_launches=overrides.get("managed_launches"),
+        app_state=overrides.get("app_state"),
     )
 
 
@@ -547,6 +548,39 @@ async def test_deleted_owner_disables_task_and_records_failed_run() -> None:
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "owner_deleted"
     assert "alice" in store.runs[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_engaged_records_skipped_run() -> None:
+    """An engaged kill switch skips the fire without creating a session."""
+    from types import SimpleNamespace
+
+    from omnigent.server.kill_switch import KillSwitchController
+
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    app_state = SimpleNamespace(kill_switch=KillSwitchController(None, force=True))
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            permission_store=FakePermissionStore(),
+            conversation_store=conv_store,
+            app_state=app_state,
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert launched == []
+    assert conv_store.created == []
+    assert [run["status"] for run in store.runs] == ["skipped"]
+    assert store.runs[0]["error_code"] == "kill_switch_engaged"
 
 
 def _claude_agent_deps(

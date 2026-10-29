@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import socket
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from omnigent.server.kill_switch import FlagReading
 
@@ -39,7 +39,7 @@ class DatadogFlagSource:
                 from ddtrace.openfeature import DataDogProvider
             except ImportError as exc:
                 raise RuntimeError(_INSTALL_HINT) from exc
-            provider = DataDogProvider()
+            provider = cast(Any, DataDogProvider())
         env = os.environ if environ is None else environ
         self._api = api
         self._flag_key = flag_key

@@ -1484,6 +1484,19 @@ Updated clients preserve later bubbles when that older server's receipt arrives.
 
 ---
 
+## Service kill switch
+
+Operator kill switch (see `designs/KILL_SWITCH.md`).
+
+- `GET /v1/kill-switch` (unauthenticated, read-only) returns
+  `{"engaged": bool, "since": float | null, "source_status": "disabled" | "ready" | "unavailable" | "forced", "last_success_at": float | null, "last_error": str | null, "message": str | null}`.
+- `GET /health` always returns 200 and carries `"kill_switch": "engaged" | "disengaged"`.
+- While engaged, `POST /v1/sessions`, `POST /v1/sessions/{id}/fork` and
+  turn-starting events (`message`, `compact`, `slash_command`,
+  `retry_session`, `approval`, `mcp_elicitation`) fail with HTTP 503 and
+  error code `service_disabled`. Reads, `interrupt`, `stop_session` and
+  runner `external_*` events stay available.
+
 ## Not Yet
 
 - `PUT /api/agents/{id}` — update agent (new bundle)
