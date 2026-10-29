@@ -62,6 +62,7 @@ from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
+from omnigent.server.kill_switch import kill_switch_engaged
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
     validate_session_agent,
@@ -384,6 +385,19 @@ async def _run_fire_for_task(
                 status="failed",
                 error=f"owner {task.user_id!r} registration is no longer active; task disabled",
                 error_code="owner_deleted",
+            )
+            return
+        if kill_switch_engaged(deps.app_state) is not None:
+            _logger.warning("scheduled fire: task %s skipped, kill switch engaged", task.id)
+            await asyncio.to_thread(
+                _record_run_sync,
+                deps,
+                task,
+                None,
+                scheduled_at,
+                "skipped",
+                error="service disabled by the operator kill switch",
+                error_code="kill_switch_engaged",
             )
             return
         managed = task.execution_target == "managed_sandbox"

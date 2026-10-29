@@ -166,6 +166,9 @@ kms = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 # lazily, so only users of this backend need the extra.
 s3 = ["boto3>=1.30,<2", "botocore>=1.30,<2"]
 vertex = ["google-auth>=2.0,<3"]
+# Service kill switch backed by Datadog Feature Flags (omnigent/server/kill_switch_datadog.py).
+# Imported lazily only when OMNIGENT_KILL_SWITCH_FLAG_KEY is set; kept out of `all`.
+datadog-flags = ["ddtrace>=4.14.0", "openfeature-sdk>=0.7.0"]
 # Modal sandbox launcher (`omnigent sandbox --provider modal`). The
 # launcher module ships in the base package and imports the SDK lazily,
 # so only users of the provider need this extra.

@@ -261,6 +261,8 @@ class ErrorCode:
     STALE_CURSOR = "stale_cursor"
     PROVIDER_IDENTITY_NOT_SUPPORTED = "provider_identity_not_supported"
     REAUTHENTICATION_REQUIRED = "reauthentication_required"
+    # The operator kill switch is engaged; new work is refused (HTTP 503).
+    SERVICE_DISABLED = "service_disabled"
 
 
 # Client-facing text for ``SESSION_AGENT_MISSING``: the session's agent was
@@ -322,6 +324,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     ErrorCode.STALE_CURSOR: 400,
     ErrorCode.PROVIDER_IDENTITY_NOT_SUPPORTED: 400,
     ErrorCode.REAUTHENTICATION_REQUIRED: 401,
+    ErrorCode.SERVICE_DISABLED: 503,
 }
 
 
@@ -347,6 +350,7 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # A valid request the caller cannot fix by retry or re-input; the
     # deployment/host must change.
     ErrorCode.RUNNER_UNAVAILABLE: ErrorCategory.CONFIG,
+    ErrorCode.SERVICE_DISABLED: ErrorCategory.CONFIG,
     # The human's own machine is asleep or disconnected.
     ErrorCode.HOST_OFFLINE: ErrorCategory.USER,
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorCategory.CONFIG,
@@ -400,6 +404,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.SESSION_AGENT_MISSING: ErrorImpact.BLOCKING,
     ErrorCode.PROVIDER_IDENTITY_NOT_SUPPORTED: ErrorImpact.BLOCKING,
     ErrorCode.REAUTHENTICATION_REQUIRED: ErrorImpact.BLOCKING,
+    ErrorCode.SERVICE_DISABLED: ErrorImpact.BLOCKING,
     # Self-healing: a session state that resumes on reconnect, a routing
     # artifact the client re-addresses, and an upstream cancellation a retry
     # outlives. No progress is lost.
@@ -442,6 +447,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.INVALID_INPUT: ErrorPhase.REQUEST,
     ErrorCode.ALREADY_EXISTS: ErrorPhase.REQUEST,
     ErrorCode.CONFLICT: ErrorPhase.REQUEST,
+    ErrorCode.SERVICE_DISABLED: ErrorPhase.REQUEST,
     ErrorCode.WRONG_REPLICA: ErrorPhase.ROUTING,
     ErrorCode.RUNNER_UNAVAILABLE: ErrorPhase.RUNNER_LAUNCH,
     ErrorCode.HOST_OFFLINE: ErrorPhase.RUNNER_LAUNCH,

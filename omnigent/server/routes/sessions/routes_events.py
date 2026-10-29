@@ -107,6 +107,7 @@ from omnigent.server.feature_usage_metrics import (
     get_feature_usage_recorder,
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
+from omnigent.server.kill_switch import require_service_enabled
 from omnigent.server.managed_sandbox_identity import (
     ManagedSandboxIdentityNotSupported,
     ManagedSandboxIdentityUnavailable,
@@ -751,6 +752,19 @@ _RUNNER_EVENT_TYPES = frozenset(
 )
 
 
+# Event types that start or resume a turn; refused while the kill switch is engaged.
+_TURN_STARTING_EVENT_TYPES = frozenset(
+    {
+        "message",
+        _COMPACT_TYPE,
+        _SLASH_COMMAND_TYPE,
+        _RETRY_SESSION_TYPE,
+        _APPROVAL_TYPE,
+        _MCP_ELICITATION_TYPE,
+    }
+)
+
+
 def register_events_routes(
     router: APIRouter,
     *,
@@ -770,6 +784,7 @@ def register_events_routes(
     register_runner_ingest: Callable[[Callable[..., Awaitable[EventAckFrame]]], None]
     | None = None,
     register_startup_dispatch: Callable[[StartupDispatch], None] | None = None,
+    register_turn_interrupter: Callable[[Callable[[str], Awaitable[bool]]], None] | None = None,
 ) -> None:
     """Register the events, stream, and delete routes on router."""
 
@@ -1022,6 +1037,42 @@ def register_events_routes(
     if register_runner_ingest is not None:
         register_runner_ingest(ingest_runner_batch)
 
+    async def _interrupt_active_turn(session_id: str) -> bool:
+        """Interrupt a session's running turn; return whether the runner accepted it.
+
+        Publishes the interrupted event, fences the turn's late output, forwards
+        the interrupt to the local runner and marks pending inputs interrupted.
+        """
+        _publish_interrupted(session_id)
+        # Fence the cancelled turn (see _interrupt_fenced_sessions).
+        _interrupt_fenced_sessions.add(session_id)
+        # Read before the forward so a message sent after Stop stays live;
+        # marked only if the interrupt lands, else the turn may still run them.
+        queued_pending_ids = pending_inputs.pending_ids(session_id)
+        runner_client = await _get_runner_client(session_id, runner_router)
+        delivered = False
+        if runner_client is not None:
+            try:
+                resp = await runner_client.post(
+                    f"/v1/sessions/{session_id}/events",
+                    json={"type": "interrupt"},
+                    timeout=5.0,
+                )
+                delivered = resp.status_code < 400
+            except (httpx.HTTPError, ConnectionError):
+                # WSTunnelTransport raises bare ConnectionError on tunnel close.
+                _logger.exception("Interrupt forward failed for %r", session_id)
+        if delivered:
+            pending_inputs.mark_interrupted(session_id, queued_pending_ids)
+        else:
+            # The turn keeps running and nothing else lifts the fence —
+            # remove it so the turn's remaining output isn't dropped.
+            _interrupt_fenced_sessions.discard(session_id)
+        return delivered
+
+    if register_turn_interrupter is not None:
+        register_turn_interrupter(_interrupt_active_turn)
+
     async def _post_event_impl(
         request: Request | _RunnerEventContext | StartupInputContext,
         session_id: str,
@@ -1174,6 +1225,8 @@ def register_events_routes(
         # Transient per-chunk echoes suppress the row entirely (they are the
         # firehose; the content is already on the SSE-event logger).
         add_audit_attrs(event_type=body.type)
+        if body.type in _TURN_STARTING_EVENT_TYPES:
+            require_service_enabled(request, f"event:{body.type}")
         if body.type in _TRANSIENT_AUDIT_EVENT_TYPES:
             mark_request_audit_suppressed()
         # Refresh identity within the reporting window, including resumed sessions.
@@ -1634,7 +1687,15 @@ def register_events_routes(
             interrupt_payload: dict[str, Any] = {"type": "interrupt"}
             codex_child = conv.kind == "sub_agent" and _is_codex_native_subagent(conv)
             response_id = None
-            queued_pending_ids: list[str] = []
+            if not codex_child:
+                await _interrupt_active_turn(session_id)
+                if stop_codex_side_chat:
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        session_id,
+                        {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
+                    )
+                return {"queued": False}
             if codex_child:
                 # Native child boundaries come from the Codex forwarder.
                 child_thread_id = (conv.labels or {}).get(
@@ -1673,13 +1734,6 @@ def register_events_routes(
                     codex_side_thread_id=child_thread_id,
                     codex_side_turn_id=response_id.removeprefix("codex_"),
                 )
-            else:
-                _publish_interrupted(session_id)
-                # Fence the cancelled turn (see _interrupt_fenced_sessions).
-                _interrupt_fenced_sessions.add(session_id)
-                # Read before the forward so a message sent after Stop stays live;
-                # marked only if the interrupt lands, else the turn may still run them.
-                queued_pending_ids = pending_inputs.pending_ids(session_id)
             runner_client = await _get_runner_client(
                 target_session_id,
                 runner_router,
@@ -1700,16 +1754,10 @@ def register_events_routes(
                         session_id,
                     )
             if not interrupt_delivered:
-                if codex_child:
-                    raise OmnigentError(
-                        "Couldn't interrupt the side chat. Please try again.",
-                        code=ErrorCode.RUNNER_UNAVAILABLE,
-                    )
-                # The turn keeps running and nothing else lifts the fence —
-                # remove it so the turn's remaining output isn't dropped.
-                _interrupt_fenced_sessions.discard(session_id)
-            elif not codex_child:
-                pending_inputs.mark_interrupted(session_id, queued_pending_ids)
+                raise OmnigentError(
+                    "Couldn't interrupt the side chat. Please try again.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
             if stop_codex_side_chat:
                 await asyncio.to_thread(
                     conversation_store.set_labels,

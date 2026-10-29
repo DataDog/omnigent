@@ -148,6 +148,10 @@ class WorkspaceScopedCache(Generic[K, V]):
         """
         return list(self._backing.values())
 
+    def all_items(self) -> list[tuple[int, K, V]]:
+        """Every workspace's ``(workspace_id, key, value)`` triples (a snapshot)."""
+        return [(ws, key, value) for (ws, key), value in self._backing.items()]
+
 
 class WorkspaceScopedSet(Generic[K]):
     """A set whose members are transparently namespaced by workspace.

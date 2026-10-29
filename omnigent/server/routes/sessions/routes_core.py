@@ -83,6 +83,7 @@ from omnigent.server.feature_usage_metrics import (
     get_feature_usage_recorder,
 )
 from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.kill_switch import require_service_enabled
 from omnigent.server.managed_sandbox_identity import (
     ManagedSandboxIdentityNotSupported,
     ManagedSandboxIdentityUnavailable,
@@ -987,6 +988,7 @@ def register_core_routes(
             validation fails, artifact storage is unavailable, or
             database creation fails.
         """
+        require_service_enabled(request, "create_session")
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
         form = await request.form(max_files=21) if content_type == "multipart/form-data" else None
@@ -3593,6 +3595,7 @@ def register_core_routes(
             source's agent was removed or a required bundle copy finds
             its source missing.
         """
+        require_service_enabled(request, "fork_session")
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
             user_id, source_id, LEVEL_READ, permission_store, conversation_store

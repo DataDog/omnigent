@@ -90,6 +90,7 @@ from omnigent.server.background_session_titles import (
     RunnerBackgroundTitleGenerator,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
+from omnigent.server.kill_switch import KillSwitchController, resolve_kill_switch
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_gateway import McpGatewayBackend
@@ -1320,6 +1321,42 @@ def _ensure_default_polly_agent(
     )
 
 
+def _wire_kill_switch_sweep(app_inst: FastAPI) -> None:
+    """Connect the kill switch to the in-flight turn sweep for this replica."""
+    from omnigent.server.routes._sessions.common import _session_status_cache
+    from omnigent.server.routes._sessions.helpers import (
+        _get_runner_client,
+        _is_codex_native_subagent,
+    )
+
+    controller: KillSwitchController = app_inst.state.kill_switch
+    interrupt = getattr(app_inst.state, "turn_interrupter", None)
+    store = getattr(app_inst.state, "kill_switch_conversation_store", None)
+    router = getattr(app_inst.state, "runner_router", None)
+    if interrupt is None or store is None:
+        return
+
+    def _targets() -> list[tuple[int, str]]:
+        return [
+            (workspace_id, session_id)
+            for workspace_id, session_id, status in _session_status_cache.all_items()
+            if status in ("running", "waiting")
+        ]
+
+    async def _halt(session_id: str) -> bool:
+        conv = await asyncio.to_thread(store.get_conversation, session_id)
+        # Codex side-chat children are halted by their parent's interrupt.
+        if conv is None or (conv.kind == "sub_agent" and _is_codex_native_subagent(conv)):
+            return False
+        # No local runner tunnel: another replica owns this session.
+        if await _get_runner_client(session_id, router, conversation=conv) is None:
+            return False
+        return await interrupt(session_id)
+
+    controller.sweep_targets = _targets
+    controller.interrupter = _halt
+
+
 def create_app(
     agent_store: AgentStore,
     file_store: FileStore,
@@ -1353,6 +1390,7 @@ def create_app(
     default_public_sessions: str | Callable[[], str] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
+    kill_switch: KillSwitchController | None = None,
     extension_state: ExtensionPluginState | None = None,
     base_path: str | None = None,
     host_sharded: bool = False,
@@ -1523,6 +1561,7 @@ def create_app(
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
+    resolved_kill_switch = kill_switch or resolve_kill_switch()
     resolved_extension_state = _resolve_extension_state(extension_state)
     extension_bundles, extension_asset_errors = _resolve_extension_assets(resolved_extension_state)
 
@@ -1824,9 +1863,12 @@ def create_app(
                 app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
                 await managed_sandbox_reaper.start()
 
+        _wire_kill_switch_sweep(app_inst)
+        await resolved_kill_switch.start()
         try:
             yield
         finally:
+            await resolved_kill_switch.stop()
             if managed_sandbox_reaper is not None:
                 await managed_sandbox_reaper.shutdown()
             # Run completion is event-driven (the _publish_status hook) plus a
@@ -1879,6 +1921,7 @@ def create_app(
     # and WSTunnelTransport to the same session registry.
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
+    app.state.kill_switch_conversation_store = conversation_store
     app.state.runner_session_initializer = runner_session_initializer
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
@@ -1937,6 +1980,7 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    app.state.kill_switch = resolved_kill_switch
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
     # strip) can prefix it themselves. "" for a root deployment.
@@ -2856,7 +2900,11 @@ def create_app(
             bound host's reported version, or ``None`` when there's no
             host binding / the version isn't resolvable on this replica.
         """
-        result: dict[str, Any] = {"status": "ok"}
+        # Never fails on the kill switch: replicas must stay in rotation for reads.
+        result: dict[str, Any] = {
+            "status": "ok",
+            "kill_switch": "engaged" if app.state.kill_switch.engaged else "disengaged",
+        }
         batch_ids = [s.strip() for s in session_ids.split(",") if s.strip()] if session_ids else []
         # Resolve every requested id (single + batch) in ONE lookup. The
         # online-dot lookups hit the database (conversations + hosts
@@ -3001,6 +3049,11 @@ def create_app(
             },
             "server_name": branding_snapshot.server_name,
         }
+
+    @app.get("/v1/kill-switch")
+    async def kill_switch_status() -> dict[str, Any]:
+        """Unauthenticated read-only kill switch snapshot (see designs/KILL_SWITCH.md)."""
+        return app.state.kill_switch.state.to_dict()
 
     @app.get("/v1/info", response_model=ServerInfoResponse)
     async def info() -> ServerInfoResponse:
@@ -3308,6 +3361,9 @@ def create_app(
             ),
             register_runner_ingest=lambda handler: setattr(
                 app.state, "runner_event_ingest", handler
+            ),
+            register_turn_interrupter=lambda handler: setattr(
+                app.state, "turn_interrupter", handler
             ),
         ),
         prefix="/v1",

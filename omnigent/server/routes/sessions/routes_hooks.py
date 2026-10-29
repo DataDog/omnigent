@@ -49,6 +49,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     AuthProvider,
 )
+from omnigent.server.kill_switch import kill_switch_engaged
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -825,6 +826,15 @@ def register_hooks_routes(
         # is gated here — the hook is its only request-phase gate. The signal
         # is "is a web prompt in flight", not text correlation (the native
         # transcript gives no reliable id channel — see ``pending_inputs``).
+        engaged_state = kill_switch_engaged(request.app.state)
+        if engaged_state is not None and phase in (Phase.TOOL_CALL, Phase.LLM_REQUEST):
+            # Stops native turns mid-flight while the operator kill switch is engaged.
+            return Response(
+                content=json.dumps(
+                    {"result": "POLICY_ACTION_DENY", "reason": engaged_state.message}
+                ),
+                media_type="application/json",
+            )
         if phase == Phase.REQUEST and pending_inputs.snapshot_for(session_id):
             return Response(
                 content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
