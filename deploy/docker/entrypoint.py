@@ -501,6 +501,9 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
 
             databricks_store = DatabricksConnectionStore(database_url, dbx_cipher)
 
+    from omnigent.server.external_middleware import load_external_middlewares
+
+    external_middlewares = load_external_middlewares(cfg)
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -520,6 +523,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
         # union with their runtime-editable files under <data_dir>.
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
+        external_middlewares=external_middlewares,
         sandbox_config=sandbox_config,
         server_config=cfg,
         github_config=github_config,

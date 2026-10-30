@@ -10,7 +10,7 @@ import re
 import tarfile
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
 from importlib import import_module
 from itertools import batched, groupby
@@ -1356,6 +1356,7 @@ def create_app(
     extension_state: ExtensionPluginState | None = None,
     base_path: str | None = None,
     host_sharded: bool = False,
+    external_middlewares: Sequence[Callable[[ASGIApp], ASGIApp]] | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -4550,8 +4551,22 @@ def create_app(
         # Only wired when a base path is configured: a root deployment pays
         # no per-request cost.
         app.add_middleware(BasePathMiddleware, base_path=resolved_base_path)
+    # Operator middlewares (OMNIGENT_MIDDLEWARE_MODULES) wrap outside every
+    # built-in layer; reversed so the first entry ends up outermost.
+    for factory in reversed(list(external_middlewares or ())):
+        app.add_middleware(_ExternalMiddlewareAdapter, factory=factory)
 
     return app
+
+
+class _ExternalMiddlewareAdapter:
+    """Adapt a ``Callable[[ASGIApp], ASGIApp]`` factory to ``add_middleware``."""
+
+    def __init__(self, app: ASGIApp, factory: Callable[[ASGIApp], ASGIApp]) -> None:
+        self._wrapped = factory(app)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        await self._wrapped(scope, receive, send)
 
 
 class _SPAStaticFiles(StaticFiles):

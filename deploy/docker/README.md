@@ -405,10 +405,35 @@ trusts whatever value reaches it.
 | `OMNIGENT_AUTH_HEADER_STRIP_PREFIX` | unset (strip nothing) | Header-mode only: prefix removed from the identity header value. Set to `accounts.google.com:` for Google IAP's `X-Goog-Authenticated-User-Email`. |
 | `OMNIGENT_OIDC_*` | unset | OIDC config — required in oidc mode (issuer set, or `AUTH_PROVIDER=oidc`). See `.env.example`. |
 | `OMNIGENT_BUILTIN_AGENT_DIRS` | unset | Colon-separated paths (in-container) to extra always-available built-in agents, seeded once at startup. See [Extra built-in agents](#extra-built-in-agents). |
+| `OMNIGENT_MIDDLEWARE_MODULES` | unset | Comma-separated dotted module paths that add outer ASGI middlewares to the server. See [External middlewares](#external-middlewares-omnigent_middleware_modules). |
 | `PYPI_INDEX_URL` | `https://pypi.org/simple` | Build-time PyPI index — override only behind a corporate proxy. |
 
 `DATABASE_URL` and `ARTIFACT_DIR` are computed by compose and
 injected into the container.
+
+### External middlewares (`OMNIGENT_MIDDLEWARE_MODULES`)
+
+Operators can wrap the server app (both `omnigent server` and this image's
+entrypoint; not runners or harnesses) in their own ASGI middlewares, e.g. a
+kill switch shipped in a separate wheel. Each listed module must expose:
+
+```python
+def create_middlewares(
+    server_cfg: Mapping[str, object],
+) -> Sequence[Callable[[ASGIApp], ASGIApp]]: ...
+```
+
+- `server_cfg` is the parsed server config mapping.
+- Order: modules in list order, then each module's list order; the first
+  module's first middleware is the outermost layer.
+- All external middlewares wrap outside every built-in middleware, so they run
+  before authentication and before `BasePathMiddleware`: they see the original
+  path including any `OMNIGENT_WEB_BASE_PATH` prefix.
+- They receive every ASGI scope (`http`, `websocket`, `lifespan`); pass
+  scopes you do not handle (always `lifespan`) to the wrapped app.
+- Startup fails with a `RuntimeError` if a module cannot be imported, lacks a
+  callable `create_middlewares`, it raises, or it returns anything other than a
+  sequence of callables. Unset or empty means no change.
 
 ## Host image (`--target host`)
 

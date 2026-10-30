@@ -4658,6 +4658,12 @@ def server(
         logger_names=("omnigent", "uvicorn", "uvicorn.error", "uvicorn.access"),
     )
 
+    from omnigent.server.external_middleware import load_external_middlewares
+
+    try:
+        external_middlewares = load_external_middlewares(cfg)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
     app = create_app(
         agent_store=agent_store,
         file_store=file_store,
@@ -4677,6 +4683,7 @@ def server(
         debug_router_modules=config_str_list(cfg.get("debug_router_modules")),
         admins=config_str_list(cfg.get("admins")),
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
+        external_middlewares=external_middlewares,
         sandbox_config=sandbox_config,
         github_config=github_config,
         github_store=github_store,
