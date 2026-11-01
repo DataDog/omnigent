@@ -205,6 +205,20 @@ class ServerInfoResponse(BaseModel):
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.
     request_managed_sandbox_host_id: bool = True
+    # GET /v1/sessions/{id} carries SessionResponse.pending_client_tool_calls
+    # (outstanding action_required client-tool calls survive a client
+    # disconnect/reconnect); older servers never populate the field, so a
+    # client should keep its own reconnect workaround when this is False.
+    pending_client_tool_calls: bool = True
+    # A parked client-owned tool call (action_required) holds the harness
+    # idle watchdog open instead of counting toward HARNESS_TURN_TIMEOUT_S,
+    # so a slow human answer alone never fails the turn (the absolute
+    # per-turn ceiling still bounds it). Independent of
+    # ``pending_client_tool_calls`` above: a client can hold off a
+    # reconnect-driven interrupt-and-nudge on this flag alone, without
+    # needing the snapshot field too. Older servers omit this flag and
+    # may fail a long-parked call via the idle watchdog.
+    client_tool_wait_exempt_from_idle_watchdog: bool = True
     # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
     # older servers, which clients treat as unsupported.
     agent_install: bool = False
@@ -3174,6 +3188,8 @@ def create_app(
                 "dictation_available": dictation_available,
                 "archive_worktree_cleanup": True,
                 "request_managed_sandbox_host_id": True,
+                "pending_client_tool_calls": True,
+                "client_tool_wait_exempt_from_idle_watchdog": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit
