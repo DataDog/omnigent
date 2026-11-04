@@ -663,9 +663,9 @@ def test_replaced_index_lock_is_left_for_the_foreign_git(repo: Path, monkeypatch
     with pytest.raises(WorktreeAttemptError) as exc:
         _create(repo)
     foreign_lock_survived = lock.exists() and foreign[0].poll() is None
+    assert foreign_lock_survived, "our cleanup removed the foreign git's index.lock"
     assert _code(exc) == NEEDS_ATTENTION
     assert "index.lock was replaced by another process" in exc.value.message
-    assert foreign_lock_survived, "our cleanup removed the foreign git's index.lock"
     _, stderr = foreign[0].communicate(timeout=20)
     assert foreign[0].returncode == 0, stderr
     assert store_for_repo(str(repo)).load(A1).phase != gwa.PHASE_READY
