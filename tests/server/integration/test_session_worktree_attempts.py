@@ -480,7 +480,7 @@ def test_label_lookup_is_not_hidden_by_other_hosts(db_uri: str) -> None:
     HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
     HostStore(db_uri).upsert_on_connect(other_host, "other", RESERVED_USER_LOCAL)
     label = {"omnigent.git.worktree_attempt": ATTEMPT}
-    for _ in range(40):
+    for _ in range(65):
         store.create_conversation(
             agent_id=None, host_id=other_host, workspace="/w/run-a", labels=label
         )
@@ -491,3 +491,45 @@ def test_label_lookup_is_not_hidden_by_other_hosts(db_uri: str) -> None:
         host_id=_HOST_ID, key="omnigent.git.worktree_attempt", value=ATTEMPT
     )
     assert found == [mine.id]
+
+
+def test_label_page_query_is_an_index_range(db_uri: str) -> None:
+    """Each label page seeks the label index in order: no temp sort, no OFFSET."""
+    from sqlalchemy import event
+
+    store = SqlAlchemyConversationStore(db_uri)
+    other_host = "5e8753b34a61b09af35a01136d40fadf"
+    HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
+    HostStore(db_uri).upsert_on_connect(other_host, "other", RESERVED_USER_LOCAL)
+    for _ in range(20):  # off-host matches force a keyset continuation page
+        store.create_conversation(
+            agent_id=None,
+            host_id=other_host,
+            workspace="/w/run-a",
+            labels={"omnigent.git.worktree_attempt": ATTEMPT},
+        )
+    engine = store._conv_engine
+    seen: list[tuple[str, object]] = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if "FROM conversation_labels" in statement:
+            seen.append((statement, parameters))
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        store.find_live_sessions_with_label(
+            host_id=_HOST_ID, key="omnigent.git.worktree_attempt", value=ATTEMPT
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert len(seen) == 2  # a full page, then the keyset continuation
+    with engine.connect() as conn:
+        for statement, parameters in seen:
+            if "OFFSET" in statement.upper():  # SQLite always renders it; keyset keeps it 0
+                assert list(parameters)[-1] == 0
+            plan = " ".join(
+                str(row[-1])
+                for row in conn.exec_driver_sql(f"EXPLAIN QUERY PLAN {statement}", parameters)
+            )
+            assert "ix_conversation_labels_key_value" in plan, plan
+            assert "TEMP B-TREE" not in plan.upper(), plan

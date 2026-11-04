@@ -175,6 +175,8 @@ _LIST_ITEMS_MAX_ROWS_PER_STATEMENT = 200
 _WORKSPACE_SHARER_SCAN_LIMIT = 32
 # Upper bound on live sessions returned for one label (e.g. a worktree attempt id).
 _LABELED_SESSION_SCAN_LIMIT = 16
+# Hard stop for one label lookup (16 x 64 = 1024 matching label rows).
+_LABELED_SESSION_MAX_PAGES = 64
 
 
 class _RowCountResult(Protocol):
@@ -5061,51 +5063,61 @@ class SqlAlchemyConversationStore(ConversationStore):
         Ids of non-archived conversations on ``host_id`` labeled ``key=value``.
         See the protocol docstring.
 
-        Pages through label matches in bounded batches and applies the host
-        filter per page (metadata may live on another engine), so matches on
-        other hosts can never hide one on ``host_id``.
+        Keyset-paginates ``ix_conversation_labels_key_value`` by ``conversation_id``
+        so each page is a bounded index range; the archived and host filters run
+        per page by primary key (metadata may live on another engine).
         """
         found: list[str] = []
-        offset = 0
-        while len(found) < _LABELED_SESSION_SCAN_LIMIT:
-            with self._conv_session("find_live_sessions_with_label") as conv_sess:
+        last: str | None = None
+        for _ in range(_LABELED_SESSION_MAX_PAGES):
+            with self._conv_session("find_labeled_conversation_ids") as conv_sess:
+                query = select(SqlConversationLabel.conversation_id).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.key == key,
+                    SqlConversationLabel.value == value,
+                )
+                if last is not None:
+                    query = query.where(SqlConversationLabel.conversation_id > last)
                 page = list(
                     conv_sess.scalars(
-                        select(SqlConversation.id)
-                        .join(
-                            SqlConversationLabel,
-                            and_(
-                                SqlConversationLabel.workspace_id == SqlConversation.workspace_id,
-                                SqlConversationLabel.conversation_id == SqlConversation.id,
-                            ),
+                        query.order_by(SqlConversationLabel.conversation_id).limit(
+                            _LABELED_SESSION_SCAN_LIMIT
                         )
-                        .where(
-                            SqlConversationLabel.workspace_id == current_workspace_id(),
-                            SqlConversationLabel.key == key,
-                            SqlConversationLabel.value == value,
+                    )
+                )
+                if not page:
+                    break
+                last = page[-1]
+                live = set(
+                    conv_sess.scalars(
+                        select(SqlConversation.id).where(
+                            SqlConversation.workspace_id == current_workspace_id(),
+                            SqlConversation.id.in_(page),
                             SqlConversation.archived.is_(False),
                         )
-                        .order_by(SqlConversation.created_at, SqlConversation.id)
-                        .offset(offset)
-                        .limit(_LABELED_SESSION_SCAN_LIMIT)
                     )
                 )
-            if not page:
-                break
-            offset += len(page)
-            with self._session("filter_labeled_sessions_by_host") as meta_sess:
-                on_host = set(
-                    meta_sess.scalars(
-                        select(SqlConversationMetadata.id).where(
-                            SqlConversationMetadata.workspace_id == current_workspace_id(),
-                            SqlConversationMetadata.host_id == host_id,
-                            SqlConversationMetadata.id.in_(page),
+            if live:
+                with self._session("filter_labeled_sessions_by_host") as meta_sess:
+                    on_host = set(
+                        meta_sess.scalars(
+                            select(SqlConversationMetadata.id).where(
+                                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                                SqlConversationMetadata.host_id == host_id,
+                                SqlConversationMetadata.id.in_(live),
+                            )
                         )
                     )
-                )
-            found += [conversation_id for conversation_id in page if conversation_id in on_host]
-            if len(page) < _LABELED_SESSION_SCAN_LIMIT:
+                found += [cid for cid in page if cid in on_host]
+            if (
+                len(found) >= _LABELED_SESSION_SCAN_LIMIT
+                or len(page) < _LABELED_SESSION_SCAN_LIMIT
+            ):
                 break
+        else:
+            _logger.warning(
+                "label lookup %s=%s stopped after %d pages", key, value, _LABELED_SESSION_MAX_PAGES
+            )
         return found[:_LABELED_SESSION_SCAN_LIMIT]
 
     async def delete_conversation(self, conversation_id: str) -> bool:
