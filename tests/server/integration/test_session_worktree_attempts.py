@@ -493,9 +493,13 @@ def test_label_lookup_is_not_hidden_by_other_hosts(db_uri: str) -> None:
     assert found == [mine.id]
 
 
-def test_label_page_query_is_an_index_range(db_uri: str) -> None:
+def test_label_page_query_is_an_index_range(db_uri: str, monkeypatch) -> None:
     """Each label page seeks the label index in order: no temp sort, no OFFSET."""
     from sqlalchemy import event
+
+    import omnigent.stores.conversation_store.sqlalchemy_store as sql_store
+
+    monkeypatch.setattr(sql_store, "_LABELED_SESSION_PAGE_SIZE", 16)
 
     if not db_uri.startswith("sqlite"):
         pytest.skip("EXPLAIN QUERY PLAN is SQLite syntax")
