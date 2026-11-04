@@ -852,10 +852,11 @@ def _fail_on_our_lock(monkeypatch, path: Path, name: str, error: Exception) -> N
     """Make ``os.<name>(fd, ...)`` fail only for our index.lock's descriptor."""
     lock = _git_dir(path) / "index.lock"
     real = getattr(gwa.os, name)
+    real_fstat = os.fstat if name != "fstat" else real
 
     def fake(fd, *args):
         try:
-            if os.fstat(fd).st_ino == os.lstat(lock).st_ino:
+            if real_fstat(fd).st_ino == os.lstat(lock).st_ino:
                 raise error
         except FileNotFoundError:
             pass
@@ -930,3 +931,22 @@ def test_lock_swapped_in_the_final_window_is_restored_not_deleted(repo: Path, mo
     assert _code(exc) == NEEDS_ATTENTION
     assert lock.read_text() == "foreign git lock\n"
     assert not list(lock.parent.glob("index.lock.omnigent-release-*"))
+
+
+def test_fstat_failure_falls_back_to_the_token_and_releases(repo: Path, monkeypatch) -> None:
+    """fstat of our fresh lock fails: the unique token still proves it ours."""
+    path = _make_partial(repo, monkeypatch)
+    _fail_on_our_lock(monkeypatch, path, "fstat", OSError(5, "EIO"))
+    assert _create(repo).outcome == "resumed"
+    assert not (_git_dir(path) / "index.lock").exists()
+
+
+def test_lock_with_no_proof_is_left_and_reported(repo: Path, monkeypatch) -> None:
+    """Both fstat and the token write fail: nothing proves the lock ours, so it stays."""
+    path = _make_partial(repo, monkeypatch)
+    _fail_on_our_lock(monkeypatch, path, "fstat", OSError(5, "EIO"))
+    _fail_on_our_lock(monkeypatch, path, "write", OSError(28, "ENOSPC"))
+    with pytest.raises(WorktreeAttemptError) as exc:
+        _create(repo)
+    assert _code(exc) == NEEDS_ATTENTION and "left in place" in exc.value.message
+    assert (_git_dir(path) / "index.lock").exists()

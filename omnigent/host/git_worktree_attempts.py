@@ -941,22 +941,29 @@ def _hold_index_lock(receipt: Receipt, git_dir: Path) -> Iterator[None]:
     except OSError as exc:
         raise gw.WorktreeError(f"could not create {lock}: {exc}") from exc
     ours: os.stat_result | None = None
+    with contextlib.suppress(OSError):
+        ours = os.fstat(fd)  # without it, the unique token alone proves ownership
     try:
-        ours = os.fstat(fd)
         _write_all(fd, token)
         os.fsync(fd)
     except BaseException as exc:
         with contextlib.suppress(OSError):
             os.close(fd)
-        if ours is not None:
-            _release_index_lock(lock, ours, None)
+        if ours is None:
+            # Neither the inode nor the token is known to be on disk: leave it.
+            raise _attention(
+                receipt,
+                f"could not set up or verify the index.lock it just created ({exc}); "
+                "it was left in place",
+            ) from exc
+        _release_index_lock(lock, ours, None)
         if isinstance(exc, OSError):
             raise gw.WorktreeError(f"could not set up {lock}: {exc}") from exc
         raise
     try:
         os.close(fd)
     except OSError as exc:
-        _release_index_lock(lock, ours, None)
+        _release_index_lock(lock, ours, token)
         raise gw.WorktreeError(f"could not set up {lock}: {exc}") from exc
     body_error: BaseException | None = None
     try:
@@ -985,11 +992,13 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
-def _is_our_lock(path: Path, ours: os.stat_result, token: bytes | None) -> bool:
-    """Whether ``path`` is the file we created (same inode, and token when given)."""
+def _is_our_lock(path: Path, ours: os.stat_result | None, token: bytes | None) -> bool:
+    """Whether ``path`` is the file we created: same inode and/or our unique token."""
+    if ours is None and token is None:
+        return False
     try:
         current = os.lstat(path)
-        if (current.st_dev, current.st_ino) != (ours.st_dev, ours.st_ino):
+        if ours is not None and (current.st_dev, current.st_ino) != (ours.st_dev, ours.st_ino):
             return False
         if token is None:
             return True
@@ -999,7 +1008,7 @@ def _is_our_lock(path: Path, ours: os.stat_result, token: bytes | None) -> bool:
         return False
 
 
-def _release_index_lock(lock: Path, ours: os.stat_result, token: bytes | None) -> bool:
+def _release_index_lock(lock: Path, ours: os.stat_result | None, token: bytes | None) -> bool:
     """Remove our lock; ``False`` (and nothing deleted) unless it is provably ours.
 
     The lock is first renamed to a private name and re-verified there, so a lock
