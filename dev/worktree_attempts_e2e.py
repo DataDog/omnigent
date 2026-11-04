@@ -62,6 +62,7 @@ class Stack:
         self.env.pop("OMNIGENT_HOST_GIT_TIMEOUT_S", None)
         self.server: subprocess.Popen[bytes] | None = None
         self.host: subprocess.Popen[bytes] | None = None
+        self.sessions: set[str] = set()
 
     def _spawn(self, argv: list[str], log: str, env: dict[str, str]) -> subprocess.Popen[bytes]:
         out = open(self.root / log, "ab")  # noqa: SIM115 — lives as long as the process
@@ -118,6 +119,10 @@ class Stack:
         _wait(lambda: self.host_id() is None, 30, "host offline")
 
     def teardown(self) -> None:
+        # Deleting sessions first lets the runner close the terminals it spawned.
+        for session_id in self.sessions:
+            with contextlib.suppress(OSError, ValueError):
+                _http("DELETE", f"{self.url}/v1/sessions/{session_id}", timeout=30)
         for proc in (self.host, self.server):
             if proc is not None and proc.poll() is None:
                 _killpg(proc.pid, signal.SIGTERM)
@@ -188,7 +193,7 @@ def main() -> int:
         print(f"server={stack.url} host_id={host_id} repo={repo}", flush=True)
 
         def post(attempt: str, branch: str) -> tuple[int, dict]:
-            return _http(
+            status, body = _http(
                 "POST",
                 f"{stack.url}/v1/sessions",
                 {
@@ -198,6 +203,9 @@ def main() -> int:
                     "git": {"branch_name": branch, "attempt_id": attempt},
                 },
             )
+            if isinstance(body.get("id"), str):
+                stack.sessions.add(body["id"])
+            return status, body
 
         def receipt(attempt: str) -> dict:
             return json.loads(
@@ -268,6 +276,13 @@ def main() -> int:
         )
     finally:
         stack.teardown()
+    time.sleep(3)
+    leftovers = subprocess.run(
+        ["ps", "-A", "-o", "pid=,command="], capture_output=True, text=True, check=False
+    ).stdout
+    markers = (f"127.0.0.1:{stack.port}", f"--port {stack.port}", str(root))
+    leaked = [line for line in leftovers.splitlines() if any(m in line for m in markers)]
+    check("teardown leaves no stack processes", not leaked, f"{len(leaked)} left")
     failed = [name for name, ok, _ in results if not ok]
     print(f"{len(results) - len(failed)}/{len(results)} passed", flush=True)
     return 1 if failed or not results else 0
