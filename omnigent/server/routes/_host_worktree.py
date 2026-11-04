@@ -16,6 +16,7 @@ import secrets
 import weakref
 from dataclasses import dataclass
 from pathlib import PurePosixPath, PureWindowsPath
+from typing import Any
 
 from omnigent.host.frames import (
     CAP_GIT_WORKTREE_ATTEMPTS,
@@ -475,3 +476,64 @@ def attempt_create_lock(host_id: str, attempt_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _attempt_locks[key] = lock
     return lock
+
+
+# Fingerprint of the source repository an attempt-labeled session was created from.
+WORKTREE_ATTEMPT_REPO_LABEL_KEY = "omnigent.git.worktree_attempt_repo_sha256"
+
+
+def attempt_labels(attempt_id: str, source_repo: str) -> dict[str, str]:
+    """Labels stamped on a session bound to an attempt-mode worktree."""
+    return {
+        WORKTREE_ATTEMPT_LABEL_KEY: attempt_id,
+        WORKTREE_ATTEMPT_REPO_LABEL_KEY: worktree_root_fingerprint(source_repo),
+    }
+
+
+async def find_attempt_session(
+    conversation_store: Any,
+    permission_store: Any,
+    *,
+    user_id: str | None,
+    host_id: str,
+    attempt_id: str,
+    source_repo: str,
+) -> Any:
+    """
+    The live session an earlier request bound to ``attempt_id`` on this host.
+
+    :param source_repo: Canonical source repository of this request.
+    :returns: The caller-owned session, or ``None``.
+    :raises WorktreeAttemptError: ``worktree_attempt_mismatch`` when the attempt
+        was used with another repository; ``worktree_attempt_conflict`` when
+        another user's session owns it.
+    """
+    from omnigent.server.auth import LEVEL_OWNER
+
+    ids = await asyncio.to_thread(
+        conversation_store.find_live_sessions_with_label,
+        host_id=host_id,
+        key=WORKTREE_ATTEMPT_LABEL_KEY,
+        value=attempt_id,
+    )
+    expected = worktree_root_fingerprint(source_repo)
+    for conversation_id in ids:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, conversation_id)
+        if conv is None:
+            continue
+        recorded = conv.labels.get(WORKTREE_ATTEMPT_REPO_LABEL_KEY)
+        if recorded is not None and recorded != expected:
+            raise WorktreeAttemptError(
+                "worktree_attempt_mismatch",
+                f"attempt {attempt_id} was used with a different source repository; "
+                "use a new attempt_id for a different worktree",
+            )
+        if user_id is not None and permission_store is not None:
+            grant = await asyncio.to_thread(permission_store.get, user_id, conversation_id)
+            if grant is None or grant.level < LEVEL_OWNER:
+                raise WorktreeAttemptError(
+                    "worktree_attempt_conflict",
+                    f"attempt {attempt_id} belongs to another user's session",
+                )
+        return conv
+    return None

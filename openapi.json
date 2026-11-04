@@ -5224,6 +5224,11 @@
           },
           "smart_routing_sources": {
             "$ref": "#/components/schemas/SmartRoutingSourcesInfo"
+          },
+          "worktree_creation_attempts": {
+            "default": true,
+            "title": "Worktree Creation Attempts",
+            "type": "boolean"
           }
         },
         "required": [
@@ -5949,6 +5954,19 @@
       "SessionGitOptions": {
         "description": "Git worktree options for `POST /v1/sessions`.\n\nRequires `host_id` to be set (and therefore `workspace`, which\nis interpreted as the source repository directory). Two modes,\nselected by `existing_worktree`:\n\n- **create** (default): the server creates a git worktree on the\n  host for a new branch and starts the runner in that worktree\n  instead of the picked directory.\n- **bind** (`existing_worktree=True`): `workspace` already IS a\n  pre-existing worktree; no worktree is created. `branch_name` is\n  recorded as the session's `git_branch` for display and opt-in\n  cleanup, and `base_branch` must not be set.\n\nSee designs/SESSION_GIT_WORKTREE.md.",
         "properties": {
+          "attempt_id": {
+            "anyOf": [
+              {
+                "pattern": "^[A-Za-z0-9_-]{16,128}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Client-generated id for idempotent, resumable creation (create mode only). Reuse it on every retry of the same create; `None` keeps legacy behavior.",
+            "title": "Attempt Id"
+          },
           "base_branch": {
             "anyOf": [
               {
@@ -5983,6 +6001,66 @@
           "branch_name"
         ],
         "title": "SessionGitOptions",
+        "type": "object"
+      },
+      "SessionGitWorktreeReceipt": {
+        "description": "Ownership/readiness receipt for an attempt-mode worktree create.",
+        "properties": {
+          "attempt_id": {
+            "description": "The request's `git.attempt_id`.",
+            "title": "Attempt Id",
+            "type": "string"
+          },
+          "branch": {
+            "description": "Branch checked out in the worktree.",
+            "title": "Branch",
+            "type": "string"
+          },
+          "outcome": {
+            "description": "`created` (this request), `resumed` (finished a partial from the same attempt) or `existing` (already done).",
+            "enum": [
+              "created",
+              "resumed",
+              "existing"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "session_reused": {
+            "default": false,
+            "description": "`True` when an earlier request with this attempt already created the session and it is returned instead of a new one.",
+            "title": "Session Reused",
+            "type": "boolean"
+          },
+          "state": {
+            "description": "Always `\"ready\"` on a successful create.",
+            "enum": [
+              "ready",
+              "partial"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "workspace": {
+            "description": "Session directory inside the worktree.",
+            "title": "Workspace",
+            "type": "string"
+          },
+          "worktree_path": {
+            "description": "Worktree root on the host.",
+            "title": "Worktree Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attempt_id",
+          "state",
+          "outcome",
+          "worktree_path",
+          "branch",
+          "workspace"
+        ],
+        "title": "SessionGitWorktreeReceipt",
         "type": "object"
       },
       "SessionHeartbeatEvent": {
@@ -7140,6 +7218,17 @@
             ],
             "description": "Git branch checked out in the session's worktree, e.g. `\"feature/login\"`. Set only when the session was created with a server-created git worktree; `None` otherwise. The Web UI uses a non-`None` value to offer the \"delete local branch\" cleanup checkbox on session delete. See designs/SESSION_GIT_WORKTREE.md.",
             "title": "Git Branch"
+          },
+          "git_worktree": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionGitWorktreeReceipt"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Attempt-mode create receipt; `None` on reads and legacy creates."
           },
           "harness": {
             "anyOf": [

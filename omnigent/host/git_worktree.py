@@ -14,6 +14,8 @@ import os
 import re
 import signal
 import subprocess
+from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -115,6 +117,12 @@ def _git_timeout_s() -> float:
     return _GIT_TIMEOUT_S
 
 
+# Called with (pid, started) around each git process group; attempt mode records them so a
+# restarted host can stop groups a crashed host left running.
+git_spawn_hook: ContextVar[Callable[[int, bool], None] | None] = ContextVar(
+    "git_spawn_hook", default=None
+)
+
 # Grace between SIGTERM and SIGKILL for a timed-out git process group.
 _GIT_TERM_GRACE_S: float = 5.0
 
@@ -173,6 +181,9 @@ def _run_git(
         )
     except FileNotFoundError as exc:
         raise WorktreeError("git is not installed on the host") from exc
+    hook = git_spawn_hook.get()
+    if hook is not None:
+        hook(proc.pid, True)
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
@@ -183,6 +194,9 @@ def _run_git(
     except BaseException:
         _terminate_group(proc)
         raise
+    finally:
+        if hook is not None:
+            hook(proc.pid, False)
     return subprocess.CompletedProcess(argv, proc.returncode or 0, stdout, stderr)
 
 

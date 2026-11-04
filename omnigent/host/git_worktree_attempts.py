@@ -128,6 +128,7 @@ class ReceiptStore:
     """Receipt files plus the per-repository creation lock."""
 
     def __init__(self, common_dir: Path) -> None:
+        self.common = common_dir
         self.base = common_dir / "omnigent"
         self.dir = self.base / "worktree-attempts"
 
@@ -149,6 +150,44 @@ class ReceiptStore:
             yield
         finally:
             lock.release()
+
+    def pgids_path(self, attempt_id: str) -> Path:
+        return self.dir / f"{attempt_id}.pgids"
+
+    @contextmanager
+    def track_git_groups(self, attempt_id: str) -> Iterator[None]:
+        """Record live git process groups for this attempt while the body runs."""
+        live: set[int] = set()
+        path = self.pgids_path(attempt_id)
+
+        def record(pid: int, started: bool) -> None:
+            (live.add if started else live.discard)(pid)
+            tmp = path.with_suffix(".pgids.tmp")
+            tmp.write_text(json.dumps(sorted(live)))
+            os.replace(tmp, path)
+
+        token = gw.git_spawn_hook.set(record)
+        try:
+            yield
+        finally:
+            gw.git_spawn_hook.reset(token)
+
+    def reap_orphan_git_groups(self, attempt_id: str) -> list[int]:
+        """Stop git process groups a crashed host left running for this attempt.
+
+        A group is stopped only when one of its members is still a ``git`` process,
+        so a recycled process-group id is never signaled.
+        """
+        path = self.pgids_path(attempt_id)
+        try:
+            recorded = [int(pgid) for pgid in json.loads(path.read_text())]
+        except (OSError, ValueError, TypeError):
+            return []
+        stopped = [pgid for pgid in recorded if os.name == "posix" and _is_git_group(pgid)]
+        for pgid in stopped:
+            _stop_group(pgid)
+        path.unlink(missing_ok=True)
+        return stopped
 
     def path(self, attempt_id: str) -> Path:
         return self.dir / f"{attempt_id}.json"
@@ -196,6 +235,68 @@ def _read_receipt(path: Path) -> Receipt | None:
     except (OSError, ValueError, TypeError):
         gw._logger.warning("ignoring unreadable worktree attempt receipt %s", path)
         return None
+
+
+def _is_git_group(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    import subprocess
+
+    listing = subprocess.run(
+        ["ps", "-A", "-o", "pgid=,command="], capture_output=True, text=True, check=False
+    ).stdout
+    for line in listing.splitlines():
+        group, _, command = line.strip().partition(" ")
+        if group == str(pgid) and "git" in command.split(" ", 1)[0]:
+            return True
+    return False
+
+
+def _stop_group(pgid: int) -> None:
+    import signal
+
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + gw._GIT_TERM_GRACE_S
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+
+
+def _claim_attempt_for_repo(attempt_id: str, common_dir: Path) -> None:
+    """Bind ``attempt_id`` to one repository host-wide; another repository is a mismatch."""
+    from omnigent.process_logging import data_dir
+
+    index = data_dir() / "worktree-attempts"
+    index.mkdir(parents=True, exist_ok=True)
+    entry = index / attempt_id
+    # Publish the owner atomically (link a complete temp file) so a reader never sees it empty.
+    fd, tmp = tempfile.mkstemp(dir=index, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(str(common_dir))
+        try:
+            os.link(tmp, entry)
+            return
+        except FileExistsError:
+            pass
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    owner = entry.read_text().strip()
+    if not _same_path(owner, str(common_dir)):
+        raise WorktreeAttemptError(
+            ATTEMPT_MISMATCH,
+            f"attempt {attempt_id} belongs to the repository at {Path(owner).parent}; "
+            "use a new attempt_id for a different repository",
+        )
 
 
 def store_for_repo(repo_root: str) -> ReceiptStore:
@@ -315,7 +416,11 @@ def create_worktree_attempt(
     _check(prefix, "could not resolve selected repository directory")
     relative_directory = prefix.stdout.rstrip("\n")
     store = store_for_repo(repo_root)
-    with store.lock():
+    _claim_attempt_for_repo(attempt_id, store.common)
+    with store.lock(), store.track_git_groups(attempt_id):
+        stopped = store.reap_orphan_git_groups(attempt_id)
+        if stopped:
+            gw._logger.warning("stopped orphaned git process groups %s", stopped)
         receipt = store.load(attempt_id)
         if receipt is None:
             receipt = _reserve(
@@ -345,7 +450,7 @@ def create_worktree_attempt(
                 "this request differs. Use a new attempt_id for a different worktree.",
             )
         if receipt.phase == PHASE_READY:
-            return _ready(receipt)
+            return _ready(store, receipt)
         return _advance(store, receipt, resume_started=True)
 
 
@@ -412,7 +517,7 @@ def _reserve(
     return receipt
 
 
-def _ready(receipt: Receipt) -> AttemptResult:
+def _ready(store: ReceiptStore, receipt: Receipt) -> AttemptResult:
     entry = _entry_at(receipt)
     if entry is None or entry.branch != receipt.branch or not Path(receipt.worktree_path).is_dir():
         raise WorktreeAttemptError(
@@ -422,6 +527,7 @@ def _ready(receipt: Receipt) -> AttemptResult:
             "it is not recreated automatically",
         )
     # Later edits and commits are the user's work: no tip or clean checks.
+    _verify_identity(store, receipt, check_commit=False)
     return _result(receipt, "existing", resume_started=False)
 
 
@@ -525,26 +631,62 @@ def _advance_steps(
                 "it is not adopted",
             )
         path.parent.mkdir(parents=True, exist_ok=True)
+        # --no-checkout: git's own checkout force-writes files; the fill below never does.
         _check(
             gw._run_git(
-                ["worktree", "add", str(path), "--end-of-options", receipt.branch], cwd=repo
+                [
+                    "worktree",
+                    "add",
+                    "--no-checkout",
+                    str(path),
+                    "--end-of-options",
+                    receipt.branch,
+                ],
+                cwd=repo,
             ),
             "git worktree add failed",
         )
-        _verify_head(receipt)
+        _complete_partial(store, receipt, locked=None)
         return _finish(store, receipt, "resumed" if resume_started else "created", resume_started)
     if ours.detached or ours.branch != receipt.branch:
         raise _attention(
             receipt, f"the registration at that path has {ours.branch or 'a detached HEAD'}"
         )
-    _complete_partial(receipt, locked=ours.locked)
+    _complete_partial(store, receipt, locked=ours.locked)
     return _finish(store, receipt, "resumed", True)
 
 
-def _verify_head(receipt: Receipt) -> None:
-    head = _rev(receipt.worktree_path, "HEAD")
-    if head != receipt.start_commit:
-        raise _attention(receipt, f"HEAD is {head}, expected {receipt.start_commit}")
+def _verify_identity(store: ReceiptStore, receipt: Receipt, *, check_commit: bool) -> None:
+    """Prove the directory is this repository's linked worktree with our branch checked out."""
+    path = Path(receipt.worktree_path)
+    dotgit = path / ".git"
+    if dotgit.is_symlink() or not dotgit.is_file():
+        raise _attention(receipt, ".git is not a linked-worktree pointer file")
+    git_dir = gw._run_git(["rev-parse", "--absolute-git-dir"], cwd=str(path))
+    common = gw._run_git(
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=str(path)
+    )
+    if git_dir.returncode != 0 or common.returncode != 0:
+        raise _attention(receipt, "its .git pointer does not resolve to a repository")
+    admin = Path(git_dir.stdout.strip())
+    if not _same_path(common.stdout.strip(), str(store.common)) or not _same_path(
+        str(admin.parent), str(store.common / "worktrees")
+    ):
+        raise _attention(receipt, "its .git pointer belongs to a different repository")
+    try:
+        back = (admin / "gitdir").read_text().strip()
+    except OSError:
+        back = ""
+    if not back or not _same_path(back, str(dotgit)):
+        raise _attention(receipt, "its worktree registration points at a different directory")
+    head_ref = gw._run_git(["symbolic-ref", "-q", "HEAD"], cwd=str(path))
+    if head_ref.stdout.strip() != f"refs/heads/{receipt.branch}":
+        found = head_ref.stdout.strip() or "a detached HEAD"
+        raise _attention(receipt, f"HEAD is {found}, not branch {receipt.branch!r}")
+    if check_commit:
+        head = _rev(str(path), "HEAD")
+        if head != receipt.start_commit:
+            raise _attention(receipt, f"HEAD is {head}, expected {receipt.start_commit}")
 
 
 def _finish(
@@ -559,52 +701,78 @@ def _finish(
     return _result(receipt, outcome, resume_started)
 
 
-def _dirty_files(worktree: str) -> tuple[list[str], list[str]]:
-    """Return (changed-or-untracked files, missing files) relative to the index."""
+def _z(worktree: str, args: list[str]) -> list[str]:
+    result = gw._run_git(args, cwd=worktree)
+    _check(result, f"git {args[0]} failed")
+    return [item for item in result.stdout.split("\0") if item]
+
+
+def _dirty_files(receipt: Receipt) -> tuple[list[str], list[str]]:
+    """Compare index and working tree with ``start_commit``.
+
+    :returns: (changed, staged or untracked paths; tracked paths missing from disk).
+    """
+    worktree = receipt.worktree_path
+    commit = str(receipt.start_commit)
     gw._run_git(["update-index", "-q", "--refresh"], cwd=worktree)
-    changed: list[str] = []
+    changed = set(_z(worktree, ["diff", "--cached", "--name-only", "--no-renames", "-z", commit]))
     missing: list[str] = []
-    for line in _lines(worktree, ["diff-files", "--name-status", "--no-renames"]):
-        status, _, name = line.partition("\t")
-        (missing if status == "D" else changed).append(name)
-    changed += _lines(worktree, ["ls-files", "--others", "--exclude-standard", "-z"])
-    return changed, missing
+    fields = _z(worktree, ["diff", "--name-status", "--no-renames", "-z", commit])
+    for status, name in zip(fields[::2], fields[1::2], strict=False):
+        if status == "D" and name not in changed:
+            missing.append(name)
+        else:
+            changed.add(name)
+    changed.update(_z(worktree, ["ls-files", "--others", "--exclude-standard", "-z"]))
+    return sorted(changed), missing
 
 
 def _fill_missing_files(worktree: str) -> None:
-    """Write only missing tracked files; never ``--force`` (existing files are kept)."""
+    """Write only missing tracked files.
+
+    Without ``--force`` checkout-index skips existing paths without unlinking them and
+    creates files with ``O_EXCL``, so a file that appears concurrently is never replaced.
+    """
     # --quiet silences "already exists" skips (still exit 1); other stderr is a real failure.
     result = gw._run_git(["checkout-index", "--all", "--quiet"], cwd=worktree)
     if result.returncode != 0 and result.stderr.strip():
         raise gw._git_error("git checkout-index failed", result)
 
 
-def _complete_partial(receipt: Receipt, *, locked: str | None) -> None:
+def _complete_partial(store: ReceiptStore, receipt: Receipt, *, locked: str | None) -> None:
     """Finish a registered, partly checked-out worktree without overwriting anything."""
     worktree = receipt.worktree_path
-    git_dir_result = gw._run_git(["rev-parse", "--absolute-git-dir"], cwd=worktree)
-    _check(git_dir_result, "could not resolve worktree git dir")
-    git_dir = Path(git_dir_result.stdout.strip())
+    _verify_identity(store, receipt, check_commit=True)
+    git_dir = Path(gw._run_git(["rev-parse", "--absolute-git-dir"], cwd=worktree).stdout.strip())
     if (git_dir / "index.lock").exists():
         raise _attention(
             receipt, "an index.lock is present, so a git process may still be writing"
         )
-    _verify_head(receipt)
-    if not (git_dir / "index").exists():
-        # Only the index changes; working-tree files are untouched.
-        _check(gw._run_git(["read-tree", "HEAD"], cwd=worktree), "git read-tree failed")
-    changed, missing = _dirty_files(worktree)
+    if (git_dir / "index").exists():
+        # Never replace an index: a staged snapshot is user work.
+        staged = _z(
+            worktree,
+            ["diff", "--cached", "--name-only", "--no-renames", "-z", str(receipt.start_commit)],
+        )
+        if staged:
+            raise _attention(receipt, "the index has staged changes", staged)
+    else:
+        _check(
+            gw._run_git(["read-tree", str(receipt.start_commit)], cwd=worktree),
+            "git read-tree failed",
+        )
+    changed, missing = _dirty_files(receipt)
     if changed:
         raise _attention(receipt, "files differ from the branch", changed)
     if missing:
         _fill_missing_files(worktree)
     # Re-verify under the lock: anything edited after inspection is reported, never rewritten.
-    changed, missing = _dirty_files(worktree)
+    changed, missing = _dirty_files(receipt)
     if changed or missing:
         raise _attention(
             receipt, "files changed while the checkout was being finished", changed + missing
         )
-    _verify_head(receipt)
+    _verify_identity(store, receipt, check_commit=True)
     if locked == "initializing":
         gw._run_git(["worktree", "unlock", worktree], cwd=receipt.repo_root)
 

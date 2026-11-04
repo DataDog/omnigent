@@ -36,6 +36,12 @@ A1 = "attempt-0000000000000001"
 A2 = "attempt-0000000000000002"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_attempt_index(tmp_path_factory: pytest.TempPathFactory, monkeypatch) -> None:
+    """Fresh host-wide attempt→repository index per test (attempt ids repeat across tests)."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path_factory.mktemp("omnigent-data")))
+
+
 def _git(cwd: Path | str, *args: str) -> str:
     return subprocess.run(
         ["git", "-c", "commit.gpgsign=false", *args],
@@ -367,3 +373,126 @@ def test_timeout_kills_checkout_process_group(repo: Path, monkeypatch, tmp_path:
     result = _create(repo)
     assert result.outcome == "resumed"
     assert (Path(result.worktree.worktree_path) / "f0.txt").read_text() == "content 0\n"
+
+
+def _install_filter(repo: Path, tmp_path: Path, body: str) -> None:
+    script = tmp_path / "smudge.sh"
+    script.write_text("#!/bin/sh\n" + body + "\ncat\n")
+    script.chmod(0o755)
+    _git(repo, "config", "filter.side.smudge", f"{script} %f")
+    _git(repo, "config", "filter.side.clean", "cat")
+    (repo / ".gitattributes").write_text("*.txt filter=side\n")
+    _git(repo, "add", ".gitattributes")
+    _git(repo, "commit", "-q", "-m", "attrs")
+
+
+@pytest.mark.parametrize("branch_only_retry", [False, True])
+def test_file_written_during_fill_is_never_overwritten(
+    repo: Path, monkeypatch, tmp_path: Path, branch_only_retry: bool
+) -> None:
+    """A file that appears while missing files are written is kept and reported."""
+    _install_filter(
+        repo,
+        tmp_path,
+        'if [ "$1" = f0.txt ] && [ ! -e f1.txt ]; then printf "user edit\\n" > f1.txt; fi',
+    )
+    if branch_only_retry:
+        with monkeypatch.context() as m:
+            _timeout_at(m, ["worktree", "add"])
+            with pytest.raises(WorktreeAttemptError):
+                _create(repo)
+    with pytest.raises(WorktreeAttemptError) as exc:
+        _create(repo)
+    assert _code(exc) == NEEDS_ATTENTION
+    assert "f1.txt" in str(exc.value)
+    path = Path(store_for_repo(str(repo)).load(A1).worktree_path)
+    assert (path / "f1.txt").read_text() == "user edit\n"
+
+
+def test_staged_snapshot_is_never_replaced(repo: Path, monkeypatch) -> None:
+    path = _make_partial(repo, monkeypatch)
+    _git(path, "read-tree", "HEAD")
+    (path / "f2.txt").write_text("staged\n")
+    _git(path, "add", "f2.txt")
+    (path / "f2.txt").write_text("content 2\n")  # working tree matches the commit again
+    tree_before = _git(path, "write-tree").strip()
+    with pytest.raises(WorktreeAttemptError) as exc:
+        _create(repo)
+    assert _code(exc) == NEEDS_ATTENTION and "f2.txt" in str(exc.value)
+    assert _git(path, "write-tree").strip() == tree_before
+
+
+def _point_at_foreign_clone(path: Path, tmp_path: Path) -> None:
+    other = (tmp_path / "other").resolve()
+    other.mkdir()
+    _git(other, "init", "-q", "-b", "main")
+    (other / "x").write_text("x")
+    _git(other, "add", "-A")
+    _git(other, "commit", "-q", "-m", "x")
+    (path / ".git").write_text(f"gitdir: {other / '.git'}\n")
+
+
+def test_foreign_pointer_in_partial_is_not_adopted(repo: Path, monkeypatch, tmp_path) -> None:
+    path = _make_partial(repo, monkeypatch)
+    _point_at_foreign_clone(path, tmp_path)
+    with pytest.raises(WorktreeAttemptError) as exc:
+        _create(repo)
+    assert _code(exc) == NEEDS_ATTENTION
+    assert "different repository" in str(exc.value)
+    assert len(list(path.glob("f*.txt"))) == 5
+
+
+def test_foreign_pointer_after_ready_is_not_existing(repo: Path, tmp_path: Path) -> None:
+    path = Path(_create(repo).worktree.worktree_path)
+    _point_at_foreign_clone(path, tmp_path)
+    with pytest.raises(WorktreeAttemptError) as exc:
+        _create(repo)
+    assert _code(exc) == NEEDS_ATTENTION
+
+
+def test_same_attempt_in_another_repository_is_a_mismatch(repo: Path, tmp_path: Path) -> None:
+    other = (tmp_path / "repo2").resolve()
+    other.mkdir()
+    _git(other, "init", "-q", "-b", "main")
+    (other / "a").write_text("a")
+    _git(other, "add", "-A")
+    _git(other, "commit", "-q", "-m", "a")
+    _create(repo)
+    with pytest.raises(WorktreeAttemptError) as exc:
+        create_worktree_attempt(repo_path=str(other), branch_name="vitrine/run-a", attempt_id=A1)
+    assert _code(exc) == ATTEMPT_MISMATCH
+    assert not (other.parent / "repo2-worktrees").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-only")
+def test_restart_stops_git_group_left_by_crashed_host(repo: Path, tmp_path: Path) -> None:
+    """Host-only SIGKILL leaves git (own process group) running; the restarted host stops it."""
+    marker = tmp_path / "late-write"
+    _install_filter(
+        repo,
+        tmp_path,
+        f'if [ -n "$SLOW_SMUDGE" ] && [ "$1" = f0.txt ]; then sleep 4; touch {marker}; fi',
+    )
+    script = (
+        "from omnigent.host.git_worktree_attempts import create_worktree_attempt as c;"
+        f"c(repo_path={str(repo)!r}, branch_name='vitrine/run-a', attempt_id={A1!r})"
+    )
+    host = subprocess.Popen([sys.executable, "-c", script], env={**os.environ, "SLOW_SMUDGE": "1"})
+    pgids = store_for_repo(str(repo)).pgids_path(A1)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and (pgids.read_text() if pgids.exists() else "[]") == "[]":
+        time.sleep(0.05)
+    time.sleep(0.5)  # git checkout-index is now blocked in the slow smudge
+    host.kill()  # host only: the git group survives
+    host.wait()
+    restart = subprocess.run(
+        [sys.executable, "-c", script.replace("c(", "r=c(") + ";print(r.outcome)"],
+        capture_output=True,
+        text=True,
+    )
+    time.sleep(5)
+    assert not marker.exists(), "the orphaned git group kept writing after the restart"
+    assert restart.returncode == 0, restart.stderr
+    assert restart.stdout.strip() == "resumed"
+    path = Path(store_for_repo(str(repo)).load(A1).worktree_path)
+    assert (path / "f0.txt").read_text() == "content 0\n"

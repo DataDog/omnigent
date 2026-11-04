@@ -66,6 +66,12 @@ def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_attempt_index(tmp_path_factory: pytest.TempPathFactory, monkeypatch) -> None:
+    """Fresh host-wide attempt→repository index per test (attempt ids repeat across tests)."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path_factory.mktemp("omnigent-data")))
+
+
 class _FakeWebSocket:
     async def send_text(self, data: str) -> None:
         """Frames flow through the outbound queue instead."""
@@ -377,3 +383,91 @@ async def test_launch_runner_attempt_receipt_and_removed(register_host, client, 
     gone = await launch(second_session["id"])
     assert gone.status_code == 410
     assert gone.json()["error"]["code"] == "worktree_attempt_removed"
+
+
+def _launches(frames: list[Any]) -> list[HostLaunchRunnerFrame]:
+    return [f for f in frames if isinstance(f, HostLaunchRunnerFrame)]
+
+
+async def _bare_session(client: httpx.AsyncClient, agent_id: str) -> str:
+    return (await client.post("/v1/sessions", json={"agent_id": agent_id})).json()["id"]
+
+
+async def _launch(client: httpx.AsyncClient, session_id: str, repo: Path, attempt: str = ATTEMPT):
+    return await client.post(
+        f"/v1/hosts/{_HOST_ID}/runners",
+        json={
+            "session_id": session_id,
+            "workspace": str(repo),
+            "git": {"branch_name": "vitrine/run-a", "attempt_id": attempt},
+        },
+    )
+
+
+async def test_runner_route_retry_is_idempotent(register_host, client, repo) -> None:
+    """A same-session, same-attempt runner retry returns the first binding; one launch."""
+    frames = register_host()
+    agent = await create_test_agent(client, name="wt-attempt-runner-retry")
+    session_id = await _bare_session(client, agent["id"])
+    first = await _launch(client, session_id, repo)
+    assert first.status_code == 200, first.text
+    again = await _launch(client, session_id, repo)
+    assert again.status_code == 200, again.text
+    assert again.json()["runner_id"] == first.json()["runner_id"]
+    assert again.json()["git_worktree"]["session_reused"] is True
+    assert len(_launches(frames)) == 1
+    labels = (await client.get(f"/v1/sessions/{session_id}")).json()["labels"]
+    assert labels["omnigent.git.worktree_attempt"] == ATTEMPT
+
+
+async def test_cross_route_retry_reuses_runner_session(register_host, client, repo) -> None:
+    """Runner-route create, then POST /v1/sessions with the same attempt: one session/launch."""
+    frames = register_host()
+    agent = await create_test_agent(client, name="wt-attempt-cross")
+    session_id = await _bare_session(client, agent["id"])
+    assert (await _launch(client, session_id, repo)).status_code == 200
+    resp = await _post(client, agent["id"], repo)
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["id"] == session_id
+    assert resp.json()["git_worktree"]["session_reused"] is True
+    assert len(_launches(frames)) == 1
+    other = await _bare_session(client, agent["id"])
+    taken = await _launch(client, other, repo)
+    assert taken.status_code == 409
+    assert taken.json()["error"]["code"] == "worktree_attempt_conflict"
+
+
+async def test_attempt_with_another_repository_is_a_mismatch(
+    register_host, client, repo, tmp_path
+) -> None:
+    register_host()
+    agent = await create_test_agent(client, name="wt-attempt-other-repo")
+    assert (await _post(client, agent["id"], repo)).status_code == 201
+    other = (tmp_path / "repo2").resolve()
+    other.mkdir()
+    _git(other, "init", "-q", "-b", "main")
+    (other / "a.txt").write_text("a\n")
+    _git(other, "add", "-A")
+    _git(other, "commit", "-q", "-m", "init")
+    resp = await _post(client, agent["id"], other)
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "worktree_attempt_mismatch"
+    assert not (other.parent / "repo2-worktrees").exists()
+
+
+def test_label_lookup_is_not_truncated_by_archived_sessions(db_uri: str) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
+    label = {"omnigent.git.worktree_attempt": ATTEMPT}
+    for _ in range(40):
+        conv = store.create_conversation(
+            agent_id=None, host_id=_HOST_ID, workspace="/w/run-a", labels=label
+        )
+        store.update_conversation(conv.id, archived=True)
+    live = store.create_conversation(
+        agent_id=None, host_id=_HOST_ID, workspace="/w/run-a", labels=label
+    )
+    found = store.find_live_sessions_with_label(
+        host_id=_HOST_ID, key="omnigent.git.worktree_attempt", value=ATTEMPT
+    )
+    assert found == [live.id]

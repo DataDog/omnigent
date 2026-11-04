@@ -5054,37 +5054,44 @@ class SqlAlchemyConversationStore(ConversationStore):
                 is not None
             )
 
-    def find_live_sessions_in_workspace(self, *, host_id: str, workspace: str) -> list[str]:
+    def find_live_sessions_with_label(self, *, host_id: str, key: str, value: str) -> list[str]:
         """
-        Ids of non-archived conversations in exactly ``(host_id, workspace)``.
+        Ids of non-archived conversations on ``host_id`` labeled ``key=value``.
         See the protocol docstring.
         """
-        with self._session("find_sessions_in_workspace") as meta_sess:
+        with self._conv_session("find_live_sessions_with_label") as conv_sess:
             ids = list(
-                meta_sess.scalars(
-                    select(SqlConversationMetadata.id)
-                    .where(
-                        SqlConversationMetadata.workspace_id == current_workspace_id(),
-                        SqlConversationMetadata.host_id == host_id,
-                        SqlConversationMetadata.workspace == workspace,
-                    )
-                    .limit(_WORKSPACE_SHARER_SCAN_LIMIT)
-                )
-            )
-        if not ids:
-            return []
-        with self._conv_session("find_live_sessions_in_workspace") as conv_sess:
-            return list(
                 conv_sess.scalars(
                     select(SqlConversation.id)
+                    .join(
+                        SqlConversationLabel,
+                        and_(
+                            SqlConversationLabel.workspace_id == SqlConversation.workspace_id,
+                            SqlConversationLabel.conversation_id == SqlConversation.id,
+                        ),
+                    )
                     .where(
-                        SqlConversation.workspace_id == current_workspace_id(),
-                        SqlConversation.id.in_(ids),
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.key == key,
+                        SqlConversationLabel.value == value,
                         SqlConversation.archived.is_(False),
                     )
                     .order_by(SqlConversation.created_at)
                 )
             )
+        if not ids:
+            return []
+        with self._session("filter_labeled_sessions_by_host") as meta_sess:
+            on_host = set(
+                meta_sess.scalars(
+                    select(SqlConversationMetadata.id).where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.host_id == host_id,
+                        SqlConversationMetadata.id.in_(ids),
+                    )
+                )
+            )
+        return [conversation_id for conversation_id in ids if conversation_id in on_host]
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         """

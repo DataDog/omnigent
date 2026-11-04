@@ -1935,13 +1935,16 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def find_live_sessions_in_workspace(self, *, host_id: str, workspace: str) -> list[str]:
+    def find_live_sessions_with_label(self, *, host_id: str, key: str, value: str) -> list[str]:
         """
-        Ids of non-archived conversations whose workspace is exactly ``workspace``.
+        Ids of non-archived conversations on ``host_id`` labeled ``key=value``.
 
-        :param host_id: Host owning the workspace, e.g. ``"host_a1b2..."``.
-        :param workspace: Canonical session directory, e.g. ``"/w/feature-login"``.
-        :returns: Matching conversation ids, oldest first (bounded).
+        Backed by the ``(workspace_id, key, value)`` label index; no truncation.
+
+        :param host_id: Host the session is bound to, e.g. ``"host_a1b2..."``.
+        :param key: Label key, e.g. ``"omnigent.git.worktree_attempt"``.
+        :param value: Label value, e.g. an attempt id.
+        :returns: Matching conversation ids, oldest first.
         """
         ...
 

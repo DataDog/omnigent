@@ -10645,6 +10645,7 @@ async def _create_session_from_existing_agent(
     created_worktree_path: str | None = None
     # Host receipt for attempt-mode creates (``git.attempt_id``); disables rollback.
     attempt_creation: dict[str, object] | None = None
+    attempt_source_repo: str | None = None
     if body.git is not None:
         if body.git.existing_worktree:
             # Starting in a pre-existing worktree: no worktree is created, but
@@ -10661,6 +10662,30 @@ async def _create_session_from_existing_agent(
                 await _ensure_bind_target_ready(body.host_id, canonical_workspace, request)
             git_branch = body.git.branch_name
         else:
+            attempt_session = None
+            attempt_source_repo = canonical_workspace
+            if (
+                body.git.attempt_id is not None
+                and body.host_id is not None
+                and canonical_workspace is not None
+            ):
+                from omnigent.server.routes._host_worktree import (
+                    WorktreeAttemptError,
+                    find_attempt_session,
+                )
+
+                try:
+                    # Before any host call: a reused id with another repository is refused.
+                    attempt_session = await find_attempt_session(
+                        conversation_store,
+                        permission_store,
+                        user_id=user_id,
+                        host_id=body.host_id,
+                        attempt_id=body.git.attempt_id,
+                        source_repo=canonical_workspace,
+                    )
+                except WorktreeAttemptError as exc:
+                    raise OmnigentError(exc.message, code=exc.code) from exc
             created_worktree = await _create_session_worktree(
                 host_id=body.host_id,
                 source_repo=canonical_workspace,
@@ -10677,13 +10702,11 @@ async def _create_session_from_existing_agent(
                 and body.host_id is not None
                 and body.git.attempt_id is not None
             ):
-                reused = await _find_attempt_session(
-                    conversation_store,
-                    permission_store,
-                    user_id=user_id,
-                    host_id=body.host_id,
-                    workspace=canonical_workspace,
-                    attempt_id=body.git.attempt_id,
+                reused = (
+                    attempt_session
+                    if attempt_session is not None
+                    and attempt_session.workspace == canonical_workspace
+                    else None
                 )
                 if reused is not None:
                     reused_response = await _get_session_snapshot(
@@ -10802,10 +10825,15 @@ async def _create_session_from_existing_agent(
         )
 
         initial_labels[WORKTREE_ROOT_LABEL_KEY] = worktree_root_fingerprint(created_worktree_path)
-    if attempt_creation is not None and body.git is not None and body.git.attempt_id:
-        from omnigent.server.routes._host_worktree import WORKTREE_ATTEMPT_LABEL_KEY
+    if (
+        attempt_creation is not None
+        and body.git is not None
+        and body.git.attempt_id
+        and attempt_source_repo is not None
+    ):
+        from omnigent.server.routes._host_worktree import attempt_labels
 
-        initial_labels[WORKTREE_ATTEMPT_LABEL_KEY] = body.git.attempt_id
+        initial_labels.update(attempt_labels(body.git.attempt_id, attempt_source_repo))
     if native_agent is not None:
         initial_labels.update(native_agent.presentation_labels)
     elif (
@@ -11170,38 +11198,6 @@ async def _ensure_bind_target_ready(host_id: str, workspace: str, request: Reque
         )
     except WorktreeAttemptError as exc:
         raise OmnigentError(exc.message, code=exc.code) from exc
-
-
-async def _find_attempt_session(
-    conversation_store: ConversationStore,
-    permission_store: PermissionStore | None,
-    *,
-    user_id: str | None,
-    host_id: str,
-    workspace: str | None,
-    attempt_id: str,
-) -> Conversation | None:
-    """Live session an earlier request with ``attempt_id`` created, owned by the caller."""
-    from omnigent.server.auth import LEVEL_OWNER
-    from omnigent.server.routes._host_worktree import WORKTREE_ATTEMPT_LABEL_KEY
-
-    if workspace is None:
-        return None
-    ids = await asyncio.to_thread(
-        conversation_store.find_live_sessions_in_workspace,
-        host_id=host_id,
-        workspace=workspace,
-    )
-    for conversation_id in ids:
-        conv = await asyncio.to_thread(conversation_store.get_conversation, conversation_id)
-        if conv is None or conv.labels.get(WORKTREE_ATTEMPT_LABEL_KEY) != attempt_id:
-            continue
-        if user_id is not None and permission_store is not None:
-            grant = await asyncio.to_thread(permission_store.get, user_id, conversation_id)
-            if grant is None or grant.level < LEVEL_OWNER:
-                continue
-        return conv
-    return None
 
 
 def _create_session_from_bundle(
