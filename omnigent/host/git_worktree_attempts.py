@@ -187,21 +187,48 @@ class ReceiptStore:
     def reap_orphan_git_groups(self, attempt_id: str) -> list[int]:
         """Stop git process groups a crashed host left running for this attempt.
 
-        A group is signaled only while its leader still has the exact pid, pgid,
-        start time, command line, executable path and cwd recorded at spawn,
-        re-checked before every signal, so a reused id is never hit.
+        Fails closed: a group is signaled only while its leader still has the exact
+        pid, pgid, start time, command line, executable path and cwd recorded at
+        spawn (re-checked before every signal). A recorded group that is still
+        alive but cannot be proven ours, or survives the signals, keeps its record
+        and stops the resume, because it may still be writing.
         """
         path = self.pgids_path(attempt_id)
+        if not path.exists():
+            return []
         try:
             recorded = json.loads(path.read_text())
-        except (OSError, ValueError, TypeError):
-            return []
+            if not isinstance(recorded, list):
+                raise ValueError("not a list")
+        except (OSError, ValueError, TypeError) as exc:
+            raise WorktreeAttemptError(
+                NEEDS_ATTENTION,
+                f"the record of git processes started for attempt {attempt_id} ({path}) is "
+                "unreadable, so an earlier git may still be writing; nothing was changed",
+            ) from exc
         stopped: list[int] = []
-        if os.name == "posix" and isinstance(recorded, list):
-            for identity in recorded:
-                if isinstance(identity, dict) and _is_recorded_group(identity):
-                    if _stop_group(identity):
-                        stopped.append(int(identity["pgid"]))
+        unresolved: list[int] = []
+        for identity in recorded:
+            try:
+                pgid = int(identity["pgid"])
+            except (KeyError, TypeError, ValueError):
+                unresolved.append(-1)
+                continue
+            if not _group_alive(pgid):
+                continue
+            if os.name == "posix" and _is_recorded_group(identity):
+                _stop_group(identity)
+            if _group_alive(pgid):
+                unresolved.append(pgid)
+            else:
+                stopped.append(pgid)
+        if unresolved:
+            raise WorktreeAttemptError(
+                INCOMPLETE,
+                f"git process group(s) {unresolved} started by an earlier run of attempt "
+                f"{attempt_id} may still be writing and can't be proven safe to stop; "
+                "nothing was changed. Retry with the same attempt_id once they exit.",
+            )
         path.unlink(missing_ok=True)
         return stopped
 
@@ -262,7 +289,22 @@ def _resolved_git_executable() -> str | None:
 
 
 def _probe_process(pid: int, *, with_exe_and_cwd: bool = True) -> dict[str, object] | None:
-    """Return ``{pid, pgid, started, command}`` for a live process, or ``None``."""
+    """Return ``{pid, pgid, started, command, exe, cwd}`` for a live process, or ``None``.
+
+    The ps fields are read before and after exe/cwd; a process that changed in
+    between (a torn snapshot) yields ``None``.
+    """
+    first = _ps_snapshot(pid)
+    if first is None or not with_exe_and_cwd:
+        return None if first is None else {**first, "exe": None, "cwd": None}
+    exe, cwd = _process_exe_and_cwd(pid)
+    if _ps_snapshot(pid) != first:
+        return None
+    return {**first, "exe": exe, "cwd": cwd}
+
+
+def _ps_snapshot(pid: int) -> dict[str, object] | None:
+    """``{pid, pgid, started, command}`` from one ``ps`` call, or ``None``."""
     if os.name != "posix":
         return None
     import subprocess
@@ -281,14 +323,11 @@ def _probe_process(pid: int, *, with_exe_and_cwd: bool = True) -> dict[str, obje
     # lstart is five fields, e.g. "Wed Nov  4 13:40:12 2026".
     if len(parts) < 8 or not parts[0].isdigit() or not parts[1].isdigit():
         return None
-    exe, cwd = _process_exe_and_cwd(pid) if with_exe_and_cwd else (None, None)
     return {
         "pid": int(parts[0]),
         "pgid": int(parts[1]),
         "started": " ".join(parts[2:7]),
         "command": " ".join(parts[7:]),
-        "exe": exe,
-        "cwd": cwd,
     }
 
 
@@ -362,6 +401,26 @@ def _signal_group(pgid: int, sig: int) -> bool:
     return True
 
 
+def _group_alive(pgid: int) -> bool:
+    """Whether a process group of ours still exists (EPERM: gone or not ours)."""
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def _ps_still_matches(identity: dict[str, object]) -> bool:
+    """Cheap last-moment re-read of the ps fields right before a signal."""
+    try:
+        current = _ps_snapshot(int(identity["pid"]))  # type: ignore[arg-type]
+    except (KeyError, TypeError, ValueError):
+        return False
+    return current is not None and all(
+        current[key] == identity.get(key) for key in ("pid", "pgid", "started", "command")
+    )
+
+
 def _stop_group(identity: dict[str, object]) -> bool:
     """SIGTERM, then SIGKILL after a grace period, re-proving identity before each signal.
 
@@ -372,7 +431,7 @@ def _stop_group(identity: dict[str, object]) -> bool:
     pgid = int(identity["pgid"])  # type: ignore[arg-type]
     signaled = False
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        if not _is_recorded_group(identity):
+        if not _is_recorded_group(identity) or not _ps_still_matches(identity):
             return signaled
         if not _signal_group(pgid, sig):
             return signaled

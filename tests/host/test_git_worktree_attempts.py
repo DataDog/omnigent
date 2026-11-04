@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -584,30 +585,68 @@ _RECORDED = {
     "exe": "/usr/bin/git",
     "cwd": "/repo-worktrees/vitrine-run-a",
 }
+_PS_KEYS = ("pid", "pgid", "started", "command")
 
 
-def _reap_with(monkeypatch, repo: Path, current: dict | None, kill_error: type | None = None):
-    """Run the reaper against a recorded identity with ps and signals faked (none sent)."""
+class _FakeGroup:
+    """A fake process table entry: no real process is ever signaled."""
+
+    def __init__(self, probes: list, *, alive=True, dies_on=(), probe_error=None, term_error=None):
+        self.probes = list(probes)
+        self.current = self.probes[0] if self.probes else None
+        self.alive = alive
+        self.dies_on = set(dies_on)
+        self.probe_error = probe_error
+        self.term_error = term_error
+        self.sent: list[int] = []
+
+    def probe(self, pid: int):
+        if self.probes:
+            self.current = self.probes.pop(0) if len(self.probes) > 1 else self.probes[0]
+        return None if self.current is None else dict(self.current)
+
+    def ps(self, pid: int):
+        if self.current is None:
+            return None
+        return {key: self.current[key] for key in _PS_KEYS}
+
+    def killpg(self, pgid: int, sig: int) -> None:
+        if sig == 0:
+            if self.probe_error is not None and self.sent:
+                raise self.probe_error()
+            if not self.alive:
+                raise ProcessLookupError()
+            return
+        if self.term_error is not None:
+            raise self.term_error()
+        self.sent.append(sig)
+        if sig in self.dies_on:
+            self.alive = False
+
+
+def _reap(monkeypatch, repo: Path, group: _FakeGroup, recorded: dict | None = None):
     store = store_for_repo(str(repo))
     store.dir.mkdir(parents=True, exist_ok=True)
-    store.pgids_path(A1).write_text(json.dumps([_RECORDED]))
-    sent: list[tuple[int, int]] = []
-
-    def fake_killpg(pgid: int, sig: int) -> None:
-        if kill_error is not None:
-            raise kill_error()
-        sent.append((pgid, sig))
-        if sig == 0 and any(s != 0 for _, s in sent):
-            raise ProcessLookupError()
-
-    monkeypatch.setattr(gwa, "_probe_process", lambda pid: current)
-    monkeypatch.setattr(gwa.os, "killpg", fake_killpg)
-    return store.reap_orphan_git_groups(A1), sent
+    store.pgids_path(A1).write_text(json.dumps([recorded or _RECORDED]))
+    monkeypatch.setattr(gwa, "_probe_process", group.probe)
+    monkeypatch.setattr(gwa, "_ps_snapshot", group.ps)
+    monkeypatch.setattr(gwa.os, "killpg", group.killpg)
+    monkeypatch.setattr(gw, "_GIT_TERM_GRACE_S", 0.05)
+    try:
+        return store.reap_orphan_git_groups(A1), None
+    except WorktreeAttemptError as exc:
+        return None, exc
 
 
-def test_reaper_signals_only_the_recorded_group(repo: Path, monkeypatch) -> None:
-    stopped, sent = _reap_with(monkeypatch, repo, dict(_RECORDED))
-    assert stopped == [4242] and (4242, signal.SIGTERM) in sent
+def _record_kept(repo: Path) -> bool:
+    return store_for_repo(str(repo)).pgids_path(A1).exists()
+
+
+def test_reaper_stops_a_proven_group_and_drops_its_record(repo: Path, monkeypatch) -> None:
+    group = _FakeGroup([dict(_RECORDED)], dies_on={signal.SIGTERM})
+    stopped, exc = _reap(monkeypatch, repo, group)
+    assert exc is None and stopped == [4242] and group.sent == [signal.SIGTERM]
+    assert not _record_kept(repo)
 
 
 @pytest.mark.parametrize(
@@ -626,42 +665,89 @@ def test_reaper_signals_only_the_recorded_group(repo: Path, monkeypatch) -> None
         "left-group",
         "other-exe",
         "other-cwd",
-        "gone",
+        "no-leader",
     ],
 )
-def test_reaper_never_signals_an_unproven_group(repo: Path, monkeypatch, current) -> None:
-    stopped, sent = _reap_with(monkeypatch, repo, current)
-    assert stopped == [] and sent == []
+def test_reaper_fails_closed_on_a_live_unproven_group(repo: Path, monkeypatch, current) -> None:
+    """The group still exists but can't be proven ours: no signal, record kept, no resume."""
+    group = _FakeGroup([current])
+    _, exc = _reap(monkeypatch, repo, group)
+    assert group.sent == []
+    assert exc is not None and exc.code == INCOMPLETE and "4242" in exc.message
+    assert _record_kept(repo)
 
 
-def test_reaper_treats_permission_error_as_not_ours(repo: Path, monkeypatch, caplog) -> None:
+def test_reaper_drops_the_record_of_a_group_that_is_gone(repo: Path, monkeypatch) -> None:
+    group = _FakeGroup([None], alive=False)
+    stopped, exc = _reap(monkeypatch, repo, group)
+    assert exc is None and stopped == [] and group.sent == []
+    assert not _record_kept(repo)
+
+
+def test_reaper_keeps_the_record_when_signaling_is_refused(
+    repo: Path, monkeypatch, caplog
+) -> None:
+    group = _FakeGroup([dict(_RECORDED)], term_error=PermissionError)
     with caplog.at_level("WARNING", logger=gw._logger.name):
-        stopped, _ = _reap_with(monkeypatch, repo, dict(_RECORDED), kill_error=PermissionError)
-    assert stopped == []
+        _, exc = _reap(monkeypatch, repo, group)
+    assert exc is not None and exc.code == INCOMPLETE
     assert "not signaling process group 4242: permission denied" in caplog.text
-    assert not store_for_repo(str(repo)).pgids_path(A1).exists()
+    assert _record_kept(repo)
 
 
 def test_reaper_probe_eperm_after_signal_is_logged_and_treated_as_gone(
     repo: Path, monkeypatch, caplog
 ) -> None:
     """macOS reports EPERM polling a group whose members exited; that ends the wait."""
-    store = store_for_repo(str(repo))
-    store.dir.mkdir(parents=True, exist_ok=True)
-    store.pgids_path(A1).write_text(json.dumps([_RECORDED]))
-    sent: list[int] = []
-
-    def fake_killpg(pgid: int, sig: int) -> None:
-        if sig == 0:
-            raise PermissionError()
-        sent.append(sig)
-
-    monkeypatch.setattr(gwa, "_probe_process", lambda pid: dict(_RECORDED))
-    monkeypatch.setattr(gwa.os, "killpg", fake_killpg)
+    group = _FakeGroup([dict(_RECORDED)], probe_error=PermissionError)
     with caplog.at_level("DEBUG", logger=gw._logger.name):
-        assert store.reap_orphan_git_groups(A1) == [4242]
-    assert sent == [signal.SIGTERM]
+        stopped, exc = _reap(monkeypatch, repo, group)
+    assert exc is None and stopped == [4242] and group.sent == [signal.SIGTERM]
     assert "process group 4242 no longer signalable (EPERM)" in caplog.text
+
+
+def test_reaper_rechecks_identity_before_kill(repo: Path, monkeypatch) -> None:
+    """Identity changes after SIGTERM (an unrelated git took the pid): no SIGKILL, fail closed."""
+    changed = {**_RECORDED, "command": "/unrelated/git status", "cwd": "/unrelated"}
+    group = _FakeGroup([dict(_RECORDED), dict(_RECORDED), changed])
+    _, exc = _reap(monkeypatch, repo, group)
+    assert group.sent == [signal.SIGTERM]
+    assert exc is not None and exc.code == INCOMPLETE and _record_kept(repo)
+
+
+def test_reaper_escalates_while_identity_holds(repo: Path, monkeypatch) -> None:
+    group = _FakeGroup([dict(_RECORDED)], dies_on={signal.SIGKILL})
+    stopped, exc = _reap(monkeypatch, repo, group)
+    assert exc is None and group.sent == [signal.SIGTERM, signal.SIGKILL] and stopped == [4242]
+
+
+def test_reaper_never_signals_a_record_without_exe_and_cwd(repo: Path, monkeypatch) -> None:
+    legacy = {key: value for key, value in _RECORDED.items() if key not in ("exe", "cwd")}
+    group = _FakeGroup([dict(_RECORDED)])
+    _, exc = _reap(monkeypatch, repo, group, recorded=legacy)
+    assert group.sent == [] and exc is not None and exc.code == INCOMPLETE and _record_kept(repo)
+
+
+def test_reaper_skips_the_signal_when_ps_changes_at_the_last_moment(
+    repo: Path, monkeypatch
+) -> None:
+    group = _FakeGroup([dict(_RECORDED)])
+    monkeypatch.setattr(gwa, "_ps_still_matches", lambda identity: False)
+    _, exc = _reap(monkeypatch, repo, group)
+    assert group.sent == [] and exc is not None and exc.code == INCOMPLETE
+
+
+def test_probe_rejects_a_torn_ps_snapshot(monkeypatch) -> None:
+    """The ps fields changed while exe/cwd were read: no identity is reported."""
+    snapshots = iter(
+        [
+            {key: _RECORDED[key] for key in _PS_KEYS},
+            {**{key: _RECORDED[key] for key in _PS_KEYS}, "started": "Thu Nov  5 09:00:00 2026"},
+        ]
+    )
+    monkeypatch.setattr(gwa, "_ps_snapshot", lambda pid: next(snapshots))
+    monkeypatch.setattr(gwa, "_process_exe_and_cwd", lambda pid: ("/usr/bin/git", "/w"))
+    assert gwa._probe_process(4242) is None
 
 
 def test_replaced_index_lock_is_left_for_the_foreign_git(repo: Path, monkeypatch) -> None:
@@ -703,40 +789,6 @@ def test_replaced_index_lock_is_left_for_the_foreign_git(repo: Path, monkeypatch
     assert store_for_repo(str(repo)).load(A1).phase != gwa.PHASE_READY
 
 
-def _signals_with_identity_sequence(monkeypatch, repo: Path, recorded: dict, probes: list):
-    """Reap with ``_probe_process`` answering ``probes`` in order; the group never exits."""
-    store = store_for_repo(str(repo))
-    store.dir.mkdir(parents=True, exist_ok=True)
-    store.pgids_path(A1).write_text(json.dumps([recorded]))
-    answers = iter(probes)
-    sent: list[int] = []
-    monkeypatch.setattr(gwa, "_probe_process", lambda pid: next(answers, probes[-1]))
-    monkeypatch.setattr(gwa.os, "killpg", lambda pgid, sig: sent.append(sig))
-    monkeypatch.setattr(gw, "_GIT_TERM_GRACE_S", 0.05)
-    store.reap_orphan_git_groups(A1)
-    return [sig for sig in sent if sig != 0]
-
-
-def test_reaper_rechecks_identity_before_kill(repo: Path, monkeypatch) -> None:
-    """Identity changes after SIGTERM (pid reused by an unrelated git): no SIGKILL."""
-    changed = {**_RECORDED, "command": "/unrelated/git status", "cwd": "/unrelated"}
-    sent = _signals_with_identity_sequence(
-        monkeypatch, repo, dict(_RECORDED), [dict(_RECORDED), dict(_RECORDED), changed]
-    )
-    assert sent == [signal.SIGTERM]
-
-
-def test_reaper_escalates_while_identity_holds(repo: Path, monkeypatch) -> None:
-    sent = _signals_with_identity_sequence(monkeypatch, repo, dict(_RECORDED), [dict(_RECORDED)])
-    assert sent == [signal.SIGTERM, signal.SIGKILL]
-
-
-def test_reaper_never_signals_without_exe_and_cwd_proof(repo: Path, monkeypatch) -> None:
-    weak = {key: value for key, value in _RECORDED.items() if key not in ("exe", "cwd")}
-    sent = _signals_with_identity_sequence(monkeypatch, repo, weak, [dict(_RECORDED)])
-    assert sent == []
-
-
 def test_probe_reports_exe_and_cwd_of_a_real_process(tmp_path: Path) -> None:
     proc = subprocess.Popen(["sleep", "5"], cwd=tmp_path)
     try:
@@ -747,3 +799,50 @@ def test_probe_reports_exe_and_cwd_of_a_real_process(tmp_path: Path) -> None:
     finally:
         proc.kill()
         proc.wait()
+
+
+def test_live_unprovable_writer_blocks_resume_and_later_edit_survives(
+    repo: Path, tmp_path: Path
+) -> None:
+    """A legacy record (no exe/cwd) of a still-running git: the retry must not resume."""
+    entered = tmp_path / "smudge-entered"
+    _install_filter(
+        repo,
+        tmp_path,
+        f'if [ -n "$SLOW_SMUDGE" ] && [ "$1" = f0.txt ]; then touch {entered}; sleep 3; '
+        'printf "filter wrote\\n" > f1.txt; fi',
+    )
+    script = (
+        "from omnigent.host.git_worktree_attempts import create_worktree_attempt as c;"
+        f"c(repo_path={str(repo)!r}, branch_name='vitrine/run-a', attempt_id={A1!r})"
+    )
+    host = subprocess.Popen([sys.executable, "-c", script], env={**os.environ, "SLOW_SMUDGE": "1"})
+    store = store_for_repo(str(repo))
+    try:
+        deadline = time.monotonic() + 60
+        while not entered.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert entered.exists()
+    finally:
+        host.kill()
+        host.wait()
+    records = json.loads(store.pgids_path(A1).read_text())
+    legacy = [{k: v for k, v in r.items() if k not in ("exe", "cwd")} for r in records]
+    store.pgids_path(A1).write_text(json.dumps(legacy))
+    groups = [int(r["pgid"]) for r in legacy]
+    assert any(_group_alive(pgid) for pgid in groups)
+
+    with pytest.raises(WorktreeAttemptError) as exc:
+        _create(repo)
+    assert _code(exc) == INCOMPLETE
+    assert store.load(A1).phase != gwa.PHASE_READY
+    assert store.pgids_path(A1).exists()
+
+    deadline = time.monotonic() + 30
+    while any(_group_alive(pgid) for pgid in groups) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    path = Path(store.load(A1).worktree_path)
+    (path / "f1.txt").write_text("user edit\n")
+    with contextlib.suppress(WorktreeAttemptError):
+        _create(repo)
+    assert (path / "f1.txt").read_text() == "user edit\n"
