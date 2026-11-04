@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import tempfile
 import time
 from collections.abc import Iterator
@@ -798,8 +799,14 @@ def _fill_missing_files(worktree: str) -> None:
 
 @contextmanager
 def _hold_index_lock(receipt: Receipt, git_dir: Path) -> Iterator[None]:
-    """Own ``index.lock`` (O_EXCL) so no git process can write the index meanwhile."""
+    """Own ``index.lock`` (O_EXCL) so no git process can write the index meanwhile.
+
+    The lock carries a unique token; on release it is removed only while the path
+    is still that same file with that token. A lock someone replaced is left alone
+    and reported, so a foreign git's lock is never deleted.
+    """
     lock = git_dir / "index.lock"
+    token = f"omnigent-attempt {receipt.attempt_id} {secrets.token_hex(16)}\n".encode()
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
     except FileExistsError as exc:
@@ -807,10 +814,45 @@ def _hold_index_lock(receipt: Receipt, git_dir: Path) -> Iterator[None]:
             receipt, "an index.lock is present, so a git process may still be writing"
         ) from exc
     try:
-        yield
+        os.write(fd, token)
+        os.fsync(fd)
+        ours = os.fstat(fd)
     finally:
         os.close(fd)
-        lock.unlink(missing_ok=True)
+    body_error: BaseException | None = None
+    try:
+        yield
+    except BaseException as exc:
+        body_error = exc
+        raise
+    finally:
+        if not _release_index_lock(lock, ours, token):
+            replaced = _attention(
+                receipt,
+                "the index.lock was replaced by another process while the checkout was "
+                "being finished; it was left in place",
+            )
+            if body_error is None:
+                raise replaced
+            gw._logger.warning("%s", replaced.message)
+
+
+def _release_index_lock(lock: Path, ours: os.stat_result, token: bytes) -> bool:
+    """Unlink ``lock`` only if it is still our file; ``False`` if it was replaced."""
+    try:
+        current = os.lstat(lock)
+    except FileNotFoundError:
+        return False
+    if (current.st_dev, current.st_ino) != (ours.st_dev, ours.st_ino):
+        return False
+    try:
+        with open(lock, "rb") as handle:
+            if handle.read(len(token) + 1) != token:
+                return False
+    except OSError:
+        return False
+    lock.unlink()
+    return True
 
 
 def _create_index(receipt: Receipt, git_dir: Path) -> None:
