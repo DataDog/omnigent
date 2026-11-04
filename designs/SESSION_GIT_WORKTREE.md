@@ -165,3 +165,12 @@ Server and hosts deploy independently.
   the attempt label.
 - Receipts are not garbage-collected (a few hundred bytes each).
 - A resume via `checkout-index` does not run the `post-checkout` hook.
+
+## Live end-to-end check
+
+`uv run python dev/worktree_attempts_e2e.py [--root DIR] [--port N]` builds an
+isolated server + host + slow-checkout repository and checks: timeout →
+`incomplete` → host restart → `resumed`; a repeat → `existing` with
+`session_reused`; a host-only SIGKILL mid-checkout → restart → `resumed` with
+no late writes from the orphaned git group; a pre-existing branch → `conflict`.
+It stops only the process groups it started.
