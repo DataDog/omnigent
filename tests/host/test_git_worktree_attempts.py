@@ -470,35 +470,55 @@ def test_same_attempt_in_another_repository_is_a_mismatch(repo: Path, tmp_path: 
 @pytest.mark.skipif(os.name != "posix", reason="process groups are POSIX-only")
 def test_restart_stops_git_group_left_by_crashed_host(repo: Path, tmp_path: Path) -> None:
     """Host-only SIGKILL leaves git (own process group) running; the restarted host stops it."""
-    marker = tmp_path / "late-write"
+    entered = tmp_path / "smudge-entered"
+    late = tmp_path / "late-write"
     _install_filter(
         repo,
         tmp_path,
-        f'if [ -n "$SLOW_SMUDGE" ] && [ "$1" = f0.txt ]; then sleep 4; touch {marker}; fi',
+        f'if [ -n "$SLOW_SMUDGE" ] && [ "$1" = f0.txt ]; then touch {entered}; sleep 30; '
+        f"touch {late}; fi",
     )
     script = (
         "from omnigent.host.git_worktree_attempts import create_worktree_attempt as c;"
         f"c(repo_path={str(repo)!r}, branch_name='vitrine/run-a', attempt_id={A1!r})"
     )
     host = subprocess.Popen([sys.executable, "-c", script], env={**os.environ, "SLOW_SMUDGE": "1"})
-    pgids = store_for_repo(str(repo)).pgids_path(A1)
-    deadline = time.monotonic() + 20
-    while time.monotonic() < deadline and (pgids.read_text() if pgids.exists() else "[]") == "[]":
-        time.sleep(0.05)
-    time.sleep(0.5)  # git checkout-index is now blocked in the slow smudge
-    host.kill()  # host only: the git group survives
-    host.wait()
+    try:
+        # Barrier: git is now blocked inside the smudge filter of the real checkout.
+        deadline = time.monotonic() + 60
+        while not entered.exists() and time.monotonic() < deadline:
+            assert host.poll() is None, "host exited before reaching the checkout"
+            time.sleep(0.02)
+        assert entered.exists(), "checkout never reached the smudge filter"
+        groups = [
+            int(g["pgid"])
+            for g in json.loads(store_for_repo(str(repo)).pgids_path(A1).read_text())
+        ]
+        assert groups, "no git process group was recorded"
+    finally:
+        host.kill()  # host only: the git group survives
+        host.wait()
+    assert any(_group_alive(pgid) for pgid in groups), "the git group died with the host"
     restart = subprocess.run(
         [sys.executable, "-c", script.replace("c(", "r=c(") + ";print(r.outcome)"],
         capture_output=True,
         text=True,
     )
-    time.sleep(5)
-    assert not marker.exists(), "the orphaned git group kept writing after the restart"
     assert restart.returncode == 0, restart.stderr
     assert restart.stdout.strip() == "resumed"
+    assert not any(_group_alive(pgid) for pgid in groups), "the orphaned git group survived"
+    assert not late.exists(), "the orphaned git group kept writing after the restart"
     path = Path(store_for_repo(str(repo)).load(A1).worktree_path)
     assert (path / "f0.txt").read_text() == "content 0\n"
+    assert not (_git_dir(path) / "index.lock").exists()
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
 
 
 def _git_dir(path: Path) -> Path:
