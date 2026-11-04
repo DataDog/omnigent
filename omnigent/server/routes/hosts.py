@@ -856,7 +856,8 @@ def create_hosts_router(
 
         async def _rollback_worktree() -> None:
             """Remove a worktree created by this request."""
-            if worktree is None:
+            # Attempt mode keeps its ready worktree; a retry with the same id reuses it.
+            if worktree is None or worktree.creation is not None:
                 return
             from omnigent.server.routes._host_worktree import (
                 WorktreeProxyError,
@@ -931,15 +932,23 @@ def create_hosts_router(
                     )
 
             if body.git is not None:
+                from omnigent.server.routes._host_worktree import (
+                    WorktreeAttemptError,
+                    WorktreeHostUnavailableError,
+                    WorktreeProxyError,
+                    create_worktree_on_host,
+                    ensure_bind_target_ready,
+                )
+
                 if body.git.existing_worktree:
+                    try:
+                        await ensure_bind_target_ready(
+                            host_registry=host_registry, host_conn=conn, workspace=workspace
+                        )
+                    except WorktreeAttemptError as exc:
+                        raise OmnigentError(exc.message, code=exc.code) from exc
                     git_branch = body.git.branch_name
                 else:
-                    from omnigent.server.routes._host_worktree import (
-                        WorktreeHostUnavailableError,
-                        WorktreeProxyError,
-                        create_worktree_on_host,
-                    )
-
                     try:
                         worktree = await create_worktree_on_host(
                             host_registry=host_registry,
@@ -948,7 +957,10 @@ def create_hosts_router(
                             branch_name=body.git.branch_name,
                             base_branch=body.git.base_branch,
                             existing_branch=body.git.existing_branch,
+                            attempt_id=body.git.attempt_id,
                         )
+                    except WorktreeAttemptError as exc:
+                        raise OmnigentError(exc.message, code=exc.code) from exc
                     except WorktreeHostUnavailableError as exc:
                         raise HTTPException(status_code=409, detail=exc.message) from exc
                     except WorktreeProxyError as exc:
@@ -1119,10 +1131,15 @@ def create_hosts_router(
         # path); the middleware promotes a bag session_id to the audit row's
         # session_id column. Host is an attribute.
         add_audit_attrs(session_id=body.session_id, host_id=host_id, runner_id=runner_id)
-        return {
+        response: dict[str, Any] = {
             "runner_id": runner_id,
             "status": "launching",
         }
+        if worktree is not None and worktree.creation is not None:
+            from omnigent.server.routes._host_worktree import git_worktree_receipt
+
+            response["git_worktree"] = git_worktree_receipt(worktree.creation)
+        return response
 
     @router.get("/hosts/{host_id}/filesystem")
     async def list_host_filesystem_root(

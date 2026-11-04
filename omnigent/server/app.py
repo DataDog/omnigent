@@ -185,6 +185,8 @@ class ServerInfoResponse(BaseModel):
     dictation_available: bool
     # The archive PATCH accepts ``delete_worktree``; older servers reject it.
     archive_worktree_cleanup: bool = True
+    # ``git.attempt_id`` is honored on worktree creation; older servers ignore it.
+    worktree_creation_attempts: bool = True
     branding: BrandingInfo
 
 
@@ -3002,6 +3004,7 @@ def create_app(
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
                 "archive_worktree_cleanup": True,
+                "worktree_creation_attempts": True,
                 "branding": branding_snapshot.config(),
             }
         )

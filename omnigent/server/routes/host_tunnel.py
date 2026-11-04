@@ -752,15 +752,7 @@ async def _receive_loop(
         if isinstance(frame, HostCreateWorktreeResultFrame):
             create_wt_future = conn.pending_create_worktrees.pop(frame.request_id, None)
             if create_wt_future is not None and not create_wt_future.done():
-                create_wt_future.set_result(
-                    {
-                        "status": frame.status,
-                        "worktree_path": frame.worktree_path,
-                        "workspace": frame.workspace,
-                        "branch": frame.branch,
-                        "error": frame.error,
-                    }
-                )
+                create_wt_future.set_result(create_worktree_result_payload(frame))
             continue
 
         if isinstance(frame, HostRemoveWorktreeResultFrame):
@@ -1012,3 +1004,16 @@ async def _ping_loop(
             conn.outbound_queue.put_nowait(ping_text)
         except Exception:  # noqa: BLE001
             return
+
+
+def create_worktree_result_payload(frame: HostCreateWorktreeResultFrame) -> dict[str, object]:
+    """Result dict handed to the ``create_worktree_on_host`` waiter."""
+    return {
+        "status": frame.status,
+        "worktree_path": frame.worktree_path,
+        "workspace": frame.workspace,
+        "branch": frame.branch,
+        "error": frame.error,
+        "error_code": frame.error_code,
+        "creation": frame.creation,
+    }

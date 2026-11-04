@@ -5054,6 +5054,38 @@ class SqlAlchemyConversationStore(ConversationStore):
                 is not None
             )
 
+    def find_live_sessions_in_workspace(self, *, host_id: str, workspace: str) -> list[str]:
+        """
+        Ids of non-archived conversations in exactly ``(host_id, workspace)``.
+        See the protocol docstring.
+        """
+        with self._session("find_sessions_in_workspace") as meta_sess:
+            ids = list(
+                meta_sess.scalars(
+                    select(SqlConversationMetadata.id)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.host_id == host_id,
+                        SqlConversationMetadata.workspace == workspace,
+                    )
+                    .limit(_WORKSPACE_SHARER_SCAN_LIMIT)
+                )
+            )
+        if not ids:
+            return []
+        with self._conv_session("find_live_sessions_in_workspace") as conv_sess:
+            return list(
+                conv_sess.scalars(
+                    select(SqlConversation.id)
+                    .where(
+                        SqlConversation.workspace_id == current_workspace_id(),
+                        SqlConversation.id.in_(ids),
+                        SqlConversation.archived.is_(False),
+                    )
+                    .order_by(SqlConversation.created_at)
+                )
+            )
+
     async def delete_conversation(self, conversation_id: str) -> bool:
         """
         Delete a conversation and all of its descendants, cleaning up

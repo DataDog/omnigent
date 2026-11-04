@@ -1935,6 +1935,17 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def find_live_sessions_in_workspace(self, *, host_id: str, workspace: str) -> list[str]:
+        """
+        Ids of non-archived conversations whose workspace is exactly ``workspace``.
+
+        :param host_id: Host owning the workspace, e.g. ``"host_a1b2..."``.
+        :param workspace: Canonical session directory, e.g. ``"/w/feature-login"``.
+        :returns: Matching conversation ids, oldest first (bounded).
+        """
+        ...
+
+    @abstractmethod
     async def delete_conversation(self, conversation_id: str) -> bool:
         """
         Delete a conversation and all its items.
