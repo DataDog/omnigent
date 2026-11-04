@@ -177,13 +177,54 @@ It stops only the process groups it started.
 
 ## Orphaned git groups and index locks
 
+### Reaping (fails closed)
+
 Each git process group an attempt starts is recorded with its pid, pgid, start
-time, command line, resolved git executable and cwd. On the next attempt run
-the host re-proves all of these against the live group leader immediately
-before SIGTERM and again before SIGKILL; a record without executable and cwd
-proof is never signaled. SIGTERM lets git remove its own `index.lock`. If a
-lock remains (git needed SIGKILL, or the group could not be proven), the
-resume reports `worktree_needs_attention` and the lock is left in place:
-Omnigent never deletes a lock it cannot prove it created. Its own
-`index.lock` carries a unique token and is removed only while the path still
-has that token and inode.
+time, command line, resolved git executable and cwd. On the next run of that
+attempt, for every recorded group that still exists:
+
+- The identity is read as one `ps` snapshot (pid, pgid, lstart, command), then
+  exe and cwd (`/proc` or `lsof`), then `ps` again; a changed snapshot is
+  rejected as torn. All six fields must match the record.
+- `ps` is re-read immediately before SIGTERM and again before SIGKILL.
+- A group that is alive but unprovable (including legacy records without exe
+  and cwd), or that survives the signals, keeps its record and the run stops
+  with `worktree_creation_incomplete`; nothing resumes or reports ready while
+  a possible writer is alive. An unreadable record stops the run with
+  `worktree_needs_attention`.
+
+Residual window: between the final `ps` re-read and `killpg` (microseconds),
+the leader could exit and its pgid be reused by an unrelated group. POSIX has
+no group-scoped process handle; pidfd is per process, so it isn't used. A
+reused pgid would also need to match nothing else for this to matter, since
+the whole group is signaled only after a fresh match.
+
+### Our index.lock
+
+The resume creates `index.lock` with `O_EXCL`, writes a unique 128-bit token,
+fsyncs, and keeps its inode.
+
+- Any failure after the exclusive create removes the lock again, proven by its
+  inode, or by the token when `fstat` failed. If neither the inode nor the
+  token is known, the lock is left and the run reports
+  `worktree_needs_attention`.
+- A crash between the create and the token write leaves a lock without a
+  token. The retry sees `index.lock` and reports `worktree_needs_attention`;
+  the lock is never deleted automatically.
+- Release first checks inode and token at `index.lock`, renames it to a
+  private `index.lock.omnigent-release-*` name, re-verifies inode and token
+  there, and only then unlinks the private name. If the renamed file is not
+  ours (a lock swapped in between the check and the rename), it is linked
+  back to `index.lock` when that path is free, else left under the private
+  name and logged; it is never unlinked.
+
+Residual window: between the first check and the rename, a swapped-in foreign
+lock is briefly moved to the private name and back. A foreign git that tries
+to commit its lock in exactly that interval would fail and could be retried by
+the user; nothing is deleted. POSIX has no atomic compare-and-unlink.
+
+### Locks left by a killed git
+
+SIGTERM lets git remove its own `index.lock`. A lock still present after a
+group was stopped (git needed SIGKILL) means `worktree_needs_attention`; it
+is never deleted by Omnigent.
