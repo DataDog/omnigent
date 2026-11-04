@@ -8508,3 +8508,39 @@ async def test_host_mcp_tools_failure_is_private(monkeypatch, caplog, error, sta
     )
     assert result.status == status
     assert "synthetic-private-config" not in encode_host_frame(result) + caplog.text
+
+
+def test_create_worktree_attempt_passes_receipt_and_error_code(tmp_path: Path) -> None:
+    """Attempt-mode create returns the receipt, retries are idempotent, listing shows it."""
+    from omnigent.host.frames import (
+        HostCreateWorktreeFrame,
+        HostListWorktreesFrame,
+    )
+
+    repo = (tmp_path / "repo").resolve()
+    repo.mkdir()
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
+    subprocess.run([*git, "init", "-q"], cwd=repo, check=True)
+    (repo / "a.txt").write_text("a")
+    subprocess.run([*git, "add", "-A"], cwd=repo, check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "init"], cwd=repo, check=True)
+    host = _make_host_process()
+    frame = HostCreateWorktreeFrame(
+        request_id="r1", repo_path=str(repo), branch_name="run-a", attempt_id="a" * 20
+    )
+    first = asyncio.run(host._handle_create_worktree(frame))
+    assert first.status == "ok" and first.creation["outcome"] == "created"
+    again = asyncio.run(host._handle_create_worktree(frame))
+    assert again.creation["outcome"] == "existing"
+    assert again.worktree_path == first.worktree_path
+    other = HostCreateWorktreeFrame(
+        request_id="r2", repo_path=str(repo), branch_name="run-a", attempt_id="b" * 20
+    )
+    refused = asyncio.run(host._handle_create_worktree(other))
+    assert refused.status == "failed" and refused.error_code == "worktree_attempt_conflict"
+    listed = asyncio.run(
+        host._handle_list_worktrees(HostListWorktreesFrame(request_id="r3", repo_path=str(repo)))
+    )
+    row = next(w for w in listed.worktrees if w["branch"] == "run-a")
+    assert row["creation"]["state"] == "ready"
+    assert "creation" not in listed.worktrees[0]
