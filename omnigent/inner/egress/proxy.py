@@ -814,7 +814,11 @@ class EgressProxy:
         # Swap any synthetic credential placeholder for the real secret,
         # bound to this host (rejects cross-host replay with 403).
         rewrite = await self._rewrite_authorization_async(
-            method=method, host=host, headers_raw=headers_raw
+            method=method,
+            host=host,
+            headers_raw=headers_raw,
+            is_https=True,
+            port=port,
         )
         if rewrite.error is not None:
             if rewrite.status_code == 502:
@@ -973,7 +977,11 @@ class EgressProxy:
 
         relative_line = f"{method} {path} HTTP/1.1\r\n".encode("latin-1")
         rewrite = await self._rewrite_authorization_async(
-            method=method, host=host, headers_raw=headers_raw
+            method=method,
+            host=host,
+            headers_raw=headers_raw,
+            is_https=False,
+            port=port,
         )
         if rewrite.error is not None:
             if rewrite.status_code == 502:
@@ -1246,7 +1254,13 @@ class EgressProxy:
             pass
 
     async def _rewrite_authorization_async(
-        self, *, method: str, host: str, headers_raw: bytes
+        self,
+        *,
+        method: str,
+        host: str,
+        headers_raw: bytes,
+        is_https: bool = True,
+        port: int | None = None,
     ) -> _AuthRewriteResult:
         """
         Async wrapper around :meth:`_rewrite_authorization`.
@@ -1258,6 +1272,8 @@ class EgressProxy:
         :param method: HTTP method (case-insensitive), e.g. ``"GET"``.
         :param host: Upstream request host (case-insensitive).
         :param headers_raw: Raw HTTP header block (CRLF-separated).
+        :param is_https: Whether the request is inside a verified TLS tunnel.
+        :param port: Upstream destination port, when known.
         :returns: The rewrite result.
         """
         if not self._cred_by_host:
@@ -1269,7 +1285,12 @@ class EgressProxy:
             return ""
 
         result = self._rewrite_authorization(
-            method=method, host=host, headers_raw=headers_raw, format_auth=defer_auth
+            method=method,
+            host=host,
+            headers_raw=headers_raw,
+            format_auth=defer_auth,
+            is_https=is_https,
+            port=port,
         )
         if result.error is not None or not pending:
             return result
@@ -1283,6 +1304,8 @@ class EgressProxy:
                 host=host,
                 headers_raw=headers_raw,
                 format_auth=lambda rule: auth_values[id(rule)],
+                is_https=is_https,
+                port=port,
             )
         except CredentialSourceUnavailable:
             logger.warning("CREDENTIAL-REFRESH-FAILED %s %s", method, host)
@@ -1319,6 +1342,8 @@ class EgressProxy:
         host: str,
         headers_raw: bytes,
         format_auth: Callable[[CredentialRewriteRule], str] | None = None,
+        is_https: bool = True,
+        port: int | None = None,
     ) -> _AuthRewriteResult:
         """
         Attach the real credential to a bound-host request.
@@ -1353,6 +1378,8 @@ class EgressProxy:
         :param method: HTTP method (case-insensitive), e.g. ``"GET"``.
         :param host: Upstream request host (case-insensitive).
         :param headers_raw: Raw HTTP header block (CRLF-separated).
+        :param is_https: Whether the request is inside a verified TLS tunnel.
+        :param port: Upstream destination port, when known.
         :returns: An :class:`_AuthRewriteResult` carrying either the
             (possibly rewritten / injected) headers or a rejection reason.
         """
@@ -1366,6 +1393,10 @@ class EgressProxy:
         format_auth = format_auth or self._format_real_auth
         host_key = host.lower()
         host_rule = self._cred_by_host.get(host_key)
+        if host_rule is not None and not self._credential_rule_matches_transport(
+            host_rule, is_https=is_https, port=port
+        ):
+            host_rule = None
         msg = _parse_http_headers(headers_raw)
         existing = msg.get_all("Authorization")
         changed = False
@@ -1380,6 +1411,10 @@ class EgressProxy:
                     continue
                 rules = self._cred_by_synthetic.get(synthetic)
                 rule = rules.get(host_key) if rules is not None else None
+                if rule is not None and not self._credential_rule_matches_transport(
+                    rule, is_https=is_https, port=port
+                ):
+                    rule = None
                 if rule is None:
                     # A value carrying our placeholder prefix that we don't
                     # recognise for this host. Refuse rather than forward —
@@ -1395,7 +1430,7 @@ class EgressProxy:
                 del msg["Authorization"]
                 for value in rewritten:
                     msg["Authorization"] = value
-        elif host_rule is not None:
+        elif host_rule is not None and not host_rule.require_placeholder:
             # Swap-on-access: the request reached a bound host with no
             # Authorization header, so attach the real credential now.
             msg["Authorization"] = format_auth(host_rule)
@@ -1405,6 +1440,15 @@ class EgressProxy:
             # than round-tripping them through the serializer.
             return _AuthRewriteResult(headers=headers_raw, error=None)
         return _AuthRewriteResult(headers=msg.as_bytes(policy=email.policy.HTTP), error=None)
+
+    @staticmethod
+    def _credential_rule_matches_transport(
+        rule: CredentialRewriteRule, *, is_https: bool, port: int | None
+    ) -> bool:
+        """Return whether a request matches a rule's transport/origin binding."""
+        if rule.https_only and not is_https:
+            return False
+        return rule.port is None or port is None or rule.port == port
 
     @staticmethod
     def _extract_synthetic(auth_value: str) -> str | None:

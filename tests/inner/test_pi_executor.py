@@ -7,6 +7,7 @@ import os
 import shlex
 import shutil
 import socket
+import subprocess
 import tempfile
 import textwrap
 import unittest
@@ -1984,6 +1985,354 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         assert (managed_dir / "npm").is_symlink()
     finally:
         shutil.rmtree(config.tmp_dir, ignore_errors=True)
+
+
+_TEST_PI_GATEWAY_HOST = "gateway.example.test"
+_TEST_PI_TOKEN_ARGS = ("issue-token", "test-audience", "--region", "test-region")
+_TEST_PI_GENERATED_COMMAND = (
+    "credential-helper issue-token test-audience --region test-region 2>/dev/null | "
+    "grep -E '^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$' | head -1"
+)
+
+
+def _write_pi_operator_credential_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    executable: str = "/opt/example/bin/credential-helper",
+) -> Path:
+    path = tmp_path / "pi-credential.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "origin": {"host": _TEST_PI_GATEWAY_HOST, "port": 443},
+                "credential": {
+                    "executable": executable,
+                    "args": list(_TEST_PI_TOKEN_ARGS),
+                },
+                "acceptedModelCommands": [["sh", "-c", _TEST_PI_GENERATED_COMMAND]],
+            }
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    monkeypatch.setenv("OMNIGENT_PI_CREDENTIAL_CONFIG", str(path))
+    return path
+
+
+async def test_sandboxed_pi_uses_operator_configured_host_bound_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the approved helper+origin becomes a synthetic credential."""
+    from omnigent.inner import pi_executor
+
+    global_agent = tmp_path / "pi-agent"
+    global_agent.mkdir()
+    _write_pi_operator_credential_config(tmp_path, monkeypatch)
+    source_models = {
+        "providers": {
+            "approved": {
+                "apiKey": f'!sh -c "{_TEST_PI_GENERATED_COMMAND}"',
+                "baseUrl": f"https://{_TEST_PI_GATEWAY_HOST}/v1",
+                "models": [],
+            },
+            "arbitrary-command": {"apiKey": "!touch /tmp/host-escape", "models": []},
+            "wrong-origin": {
+                "apiKey": f"!credential-helper {' '.join(_TEST_PI_TOKEN_ARGS)}",
+                "baseUrl": "https://attacker.example/v1",
+                "models": [],
+            },
+            "wrong-port": {
+                "apiKey": f"!credential-helper {' '.join(_TEST_PI_TOKEN_ARGS)}",
+                "baseUrl": f"https://{_TEST_PI_GATEWAY_HOST}:8443/v1",
+                "models": [],
+            },
+            "insecure-origin": {
+                "apiKey": f"!credential-helper {' '.join(_TEST_PI_TOKEN_ARGS)}",
+                "baseUrl": f"http://{_TEST_PI_GATEWAY_HOST}/v1",
+                "models": [],
+            },
+            "literal-provider": {"apiKey": "literal-key", "models": []},
+        }
+    }
+    models_path = global_agent / "models.json"
+    models_path.write_text(json.dumps(source_models), encoding="utf-8")
+    (global_agent / "settings.json").write_text(
+        json.dumps({"extensions": ["/ext/demo.ts"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", global_agent)
+    fetch_token = MagicMock(return_value="resolved-token")
+    monkeypatch.setattr(pi_executor, "_fetch_pi_operator_credential", fetch_token)
+
+    executor = PiExecutor(pi_path="/usr/bin/pi")
+    executor._sandboxed = True
+    resolved = await executor._resolved_sandbox_models_json()
+
+    fetch_token.assert_not_called()
+    assert resolved is not None
+    assert json.loads(models_path.read_text(encoding="utf-8")) == source_models
+    config = executor._build_env_and_dir(
+        [],
+        None,
+        None,
+        resolved.models_json,
+        session_key="omnigent-session-123",
+    )
+    try:
+        assert config.env["PI_CLIENT_SESSION_ID"] == "omnigent-session-123"
+        assert "OMNIGENT_PI_CREDENTIAL_CONFIG" not in config.env
+        managed_dir = Path(config.env["PI_CODING_AGENT_DIR"])
+        managed_models = json.loads((managed_dir / "models.json").read_text(encoding="utf-8"))
+        placeholder = managed_models["providers"]["approved"]["apiKey"]
+        assert placeholder.startswith("oa_cred_")
+        assert managed_models["providers"]["arbitrary-command"]["apiKey"] == (
+            "!touch /tmp/host-escape"
+        )
+        assert managed_models["providers"]["wrong-origin"]["apiKey"].startswith(
+            "!credential-helper "
+        )
+        assert managed_models["providers"]["wrong-port"]["apiKey"].startswith(
+            "!credential-helper "
+        )
+        assert managed_models["providers"]["insecure-origin"]["apiKey"].startswith(
+            "!credential-helper "
+        )
+        assert managed_models["providers"]["literal-provider"]["apiKey"] == "literal-key"
+        serialized_files = "".join(
+            path.read_text(encoding="utf-8", errors="replace")
+            for path in managed_dir.rglob("*")
+            if path.is_file()
+        )
+        assert "resolved-token" not in serialized_files
+        assert "resolved-token" not in json.dumps(config.env)
+        assert "resolved-token" not in " ".join(config.extra_args)
+        assert (managed_dir / "models.json").stat().st_mode & 0o777 == 0o600
+        settings = json.loads((managed_dir / "settings.json").read_text(encoding="utf-8"))
+        assert settings["extensions"] == ["/ext/demo.ts"]
+        assert "retry" in settings
+        assert resolved.rewrite.host == _TEST_PI_GATEWAY_HOST
+        assert resolved.rewrite.port == 443
+        assert resolved.rewrite.https_only is True
+        assert resolved.rewrite.require_placeholder is True
+        assert resolved.rewrite.synthetic == placeholder
+        fetch_token.assert_not_called()
+    finally:
+        await executor.close()
+        shutil.rmtree(config.tmp_dir, ignore_errors=True)
+
+
+async def test_unsandboxed_pi_leaves_command_api_keys_to_pi(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    global_agent = tmp_path / "pi-agent"
+    global_agent.mkdir()
+    (global_agent / "models.json").write_text(
+        json.dumps({"providers": {"custom": {"apiKey": "!fake-helper"}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", global_agent)
+    fetch_token = MagicMock(return_value="must-not-be-used")
+    monkeypatch.setattr("omnigent.inner.pi_executor._fetch_pi_operator_credential", fetch_token)
+
+    executor = PiExecutor(pi_path="/usr/bin/pi")
+
+    assert await executor._resolved_sandbox_models_json() is None
+    fetch_token.assert_not_called()
+
+
+async def test_sandboxed_pi_without_operator_config_leaves_command_api_keys_to_pi(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    global_agent = tmp_path / "pi-agent"
+    global_agent.mkdir()
+    (global_agent / "models.json").write_text(
+        json.dumps({"providers": {"custom": {"apiKey": "!fake-helper"}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("OMNIGENT_PI_CREDENTIAL_CONFIG", raising=False)
+    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", global_agent)
+    executor = PiExecutor(pi_path="/usr/bin/pi")
+    executor._sandboxed = True
+
+    assert await executor._resolved_sandbox_models_json() is None
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "permissions"])
+async def test_sandboxed_pi_rejects_unsafe_models_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_kind: str,
+) -> None:
+    from omnigent.inner.pi_executor import _PiAuthError
+
+    global_agent = tmp_path / "pi-agent"
+    global_agent.mkdir()
+    _write_pi_operator_credential_config(tmp_path, monkeypatch)
+    models_path = global_agent / "models.json"
+    content = json.dumps({"providers": {}})
+    if unsafe_kind == "symlink":
+        target = tmp_path / "models-target.json"
+        target.write_text(content, encoding="utf-8")
+        models_path.symlink_to(target)
+    else:
+        models_path.write_text(content, encoding="utf-8")
+        models_path.chmod(0o666)
+    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", global_agent)
+    executor = PiExecutor(pi_path="/usr/bin/pi")
+    executor._sandboxed = True
+
+    with pytest.raises(_PiAuthError, match="safe regular file"):
+        await executor._resolved_sandbox_models_json()
+
+
+def test_pi_operator_credential_config_adds_direct_structured_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.inner import pi_executor
+
+    _write_pi_operator_credential_config(tmp_path, monkeypatch)
+    config = pi_executor._load_pi_operator_credential_config()
+
+    assert config is not None
+    assert config.host == _TEST_PI_GATEWAY_HOST
+    assert config.port == 443
+    assert ("credential-helper", *_TEST_PI_TOKEN_ARGS) in config.accepted_model_commands
+    assert ("sh", "-c", _TEST_PI_GENERATED_COMMAND) in config.accepted_model_commands
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("version", 2),
+        ("host", "https://gateway.example.test"),
+        ("port", 0),
+        ("executable", "relative/credential-helper"),
+        ("args", []),
+    ],
+)
+def test_pi_operator_credential_config_rejects_invalid_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    from omnigent.inner import pi_executor
+
+    path = _write_pi_operator_credential_config(tmp_path, monkeypatch)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if field in {"host", "port"}:
+        raw["origin"][field] = value
+    elif field in {"executable", "args"}:
+        raw["credential"][field] = value
+    else:
+        raw[field] = value
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(pi_executor._PiAuthError, match="configuration is invalid"):
+        pi_executor._load_pi_operator_credential_config()
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "permissions"])
+def test_pi_operator_credential_config_rejects_unsafe_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_kind: str,
+) -> None:
+    from omnigent.inner import pi_executor
+
+    path = _write_pi_operator_credential_config(tmp_path, monkeypatch)
+    if unsafe_kind == "symlink":
+        link = tmp_path / "pi-credential-link.json"
+        link.symlink_to(path)
+        monkeypatch.setenv("OMNIGENT_PI_CREDENTIAL_CONFIG", str(link))
+        message = "configuration is unavailable"
+    else:
+        path.chmod(0o666)
+        message = "configuration is invalid"
+
+    with pytest.raises(pi_executor._PiAuthError, match=message):
+        pi_executor._load_pi_operator_credential_config()
+
+
+@pytest.mark.parametrize(
+    ("script_body", "expected_error"),
+    [
+        ("import sys; sys.stdout.write('two tokens')", "malformed"),
+        (
+            "import os; os.write(1, b'x' * 20000)",
+            "too large",
+        ),
+    ],
+)
+def test_operator_credential_helper_output_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    script_body: str,
+    expected_error: str,
+) -> None:
+    from omnigent.inner import pi_executor
+
+    helper = tmp_path / "credential-helper"
+    helper.write_text(f"#!/usr/bin/env python3\n{script_body}\n", encoding="utf-8")
+    helper.chmod(0o700)
+    _write_pi_operator_credential_config(tmp_path, monkeypatch, executable=str(helper))
+    config = pi_executor._load_pi_operator_credential_config()
+    assert config is not None
+
+    with pytest.raises(pi_executor._PiAuthError, match=expected_error):
+        pi_executor._fetch_pi_operator_credential(config)
+
+
+def test_operator_credential_helper_uses_structured_argv_without_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner import pi_executor
+
+    helper = tmp_path / "credential-helper"
+    helper.write_text("#!/bin/sh\nprintf approved-token\n", encoding="utf-8")
+    helper.chmod(0o700)
+    _write_pi_operator_credential_config(tmp_path, monkeypatch, executable=str(helper))
+    config = pi_executor._load_pi_operator_credential_config()
+    assert config is not None
+
+    with patch.object(subprocess, "Popen", wraps=subprocess.Popen) as popen:
+        token = pi_executor._fetch_pi_operator_credential(config)
+
+    assert token == "approved-token"
+    argv = popen.call_args.args[0]
+    assert argv == [
+        str(helper),
+        *_TEST_PI_TOKEN_ARGS,
+    ]
+    assert "approved-token" not in argv
+    assert "shell" not in popen.call_args.kwargs
+
+
+async def test_pi_session_close_removes_credential_proxy_registration(tmp_path: Path) -> None:
+    launcher = tmp_path / "launcher"
+    launcher.touch()
+    proxy_tmpdir = tmp_path / "proxy"
+    proxy_tmpdir.mkdir()
+    handle = MagicMock()
+    rpc = _PiRpcSession(
+        _sandbox_launcher=str(launcher),
+        _egress_handle=handle,
+        _egress_tmpdir=proxy_tmpdir,
+    )
+
+    await rpc.close()
+
+    handle.stop.assert_called_once_with()
+    assert not launcher.exists()
+    assert not proxy_tmpdir.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -4793,15 +5142,133 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     assert captured["policy"].read_roots == [tmp_path.resolve(), install.resolve()]
     allowlist = captured["policy"].spawn_env_allowlist
     assert allowlist is not None
-    # Per-spawn gateway var must be pruneproof even though it is not in
-    # the clean base env yet at construction time.
+    # Per-spawn vars must be pruneproof even though they are not in the clean
+    # base env yet at construction time.
     assert "PI_CODING_AGENT_DIR" in allowlist
+    assert "PI_CLIENT_SESSION_ID" in allowlist
     # A clean-env staple proves the executor's deliberate env names got
     # baked in (an empty allowlist would prune PATH and break node).
     assert "PATH" in allowlist
     # The host secret is not in the clean env, so it must not be in the
     # launcher's keep-set either.
     assert "FAKE_HOST_SECRET" not in allowlist
+
+
+def test_pi_credential_proxy_wires_exact_gateway_egress(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.inner import egress as egress_mod
+    from omnigent.inner import sandbox as sandbox_mod
+    from omnigent.inner.credential_proxy import CredentialRewriteRule
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.pi_executor import _try_sandbox_pi
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    captured: dict[str, object] = {}
+    handle = SimpleNamespace(
+        relay_port=43123,
+        socket_path=tmp_path / ".egress.sock",
+        ca_bundle_path=tmp_path / "ca.pem",
+        stop=MagicMock(),
+    )
+
+    def fake_resolve(_os_env, cwd):
+        return SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=[cwd],
+            write_roots=[cwd],
+            write_files=[],
+            allow_network=False,
+        )
+
+    def fake_start(**kwargs):
+        captured["start"] = kwargs
+        return handle
+
+    def fake_apply(env, **kwargs):
+        captured["apply"] = kwargs
+        env["HTTPS_PROXY"] = "http://127.0.0.1:43123"
+
+    def fake_launcher(_target, policy):
+        captured["policy"] = policy
+        return "/fake/credential-launcher"
+
+    monkeypatch.setattr(sandbox_mod, "resolve_sandbox", fake_resolve)
+    monkeypatch.setattr(sandbox_mod, "create_exec_launcher", fake_launcher)
+    monkeypatch.setattr(egress_mod, "start_egress_proxy", fake_start)
+    monkeypatch.setattr(egress_mod, "apply_egress_env", fake_apply)
+    env = {"PATH": os.environ["PATH"]}
+    rewrite = CredentialRewriteRule(
+        host=_TEST_PI_GATEWAY_HOST,
+        port=443,
+        scheme="bearer",
+        synthetic="oa_cred_test",
+        real_secret="must-not-enter-env",
+        require_placeholder=True,
+        https_only=True,
+    )
+
+    result = _try_sandbox_pi(
+        "/usr/bin/env",
+        OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+        str(tmp_path),
+        credential_rewrites=[rewrite],
+        spawn_env=env,
+    )
+
+    assert result.egress_handle is handle
+    start = captured["start"]
+    assert isinstance(start, dict)
+    assert start["rules"] == [f"* {_TEST_PI_GATEWAY_HOST}/**"]
+    assert start["credential_rewrites"] == [rewrite]
+    assert start["require_auth"] is False
+    assert start["allow_private_destinations"] is True
+    assert "must-not-enter-env" not in json.dumps(env)
+    policy = captured["policy"]
+    assert isinstance(policy, SandboxPolicy)
+    assert policy.egress_relay_port == 43123
+    assert policy.egress_socket_path == str(handle.socket_path)
+    assert "HTTPS_PROXY" in (policy.spawn_env_allowlist or [])
+    handle.stop()
+    assert result.egress_tmpdir is not None
+    shutil.rmtree(result.egress_tmpdir)
+
+
+def test_pi_client_session_id_reaches_actual_sandboxed_subprocess(tmp_path: Path) -> None:
+    """The launcher keeps the correlation ID through real sandbox activation."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.pi_executor import _try_sandbox_pi
+
+    repo_root = Path(__file__).resolve().parents[2]
+    launch = _try_sandbox_pi(
+        "/usr/bin/env",
+        OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap", read_paths=[str(repo_root)])),
+        str(tmp_path),
+        spawn_env_names=["HOME", "PATH", "PI_CLIENT_SESSION_ID", "PYTHONPATH"],
+    )
+    if not launch.sandboxed:
+        pytest.skip("linux_bwrap sandbox is unavailable")
+    env = {
+        "HOME": os.environ["HOME"],
+        "PATH": os.environ["PATH"],
+        "PI_CLIENT_SESSION_ID": "omnigent-session-actual",
+        "PYTHONPATH": str(repo_root),
+    }
+    try:
+        completed = subprocess.run(
+            [launch.launch_path],
+            cwd=tmp_path,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+    finally:
+        Path(launch.launch_path).unlink(missing_ok=True)
+    assert completed.returncode == 0, completed.stderr
+    assert "PI_CLIENT_SESSION_ID=omnigent-session-actual" in completed.stdout.splitlines()
 
 
 def test_run_turn_bridge_extension_carries_live_server_token(monkeypatch) -> None:

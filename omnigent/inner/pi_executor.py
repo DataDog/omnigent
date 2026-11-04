@@ -43,16 +43,19 @@ import os
 import pathlib
 import re
 import secrets
+import selectors
 import shlex
 import shutil
 import signal
+import stat
+import subprocess
 import tempfile
 import time
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from importlib.resources import files
-from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
+from typing import Any, NoReturn, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
 from omnigent.harnesses.pi_native.credentials import (
@@ -88,6 +91,7 @@ from omnigent.util.reasoning_effort import (
 
 from ._subprocess_lifecycle import close_subprocess_transport
 from .async_utils import run_sync_on_thread
+from .credential_proxy import SYNTHETIC_CREDENTIAL_PREFIX, CredentialRewriteRule
 from .databricks_executor import _read_databrickscfg
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
@@ -111,10 +115,125 @@ _GATEWAY_AUTH_REFRESH_MS = 900_000
 # Leave time for the bridge round trip within Pi's 10-second command deadline.
 _GATEWAY_AUTH_TIMEOUT_S = 7
 _GATEWAY_BRIDGE_TIMEOUT_S = 8
+_PI_CREDENTIAL_CONFIG_ENV = "OMNIGENT_PI_CREDENTIAL_CONFIG"
+_PI_CREDENTIAL_CONFIG_MAX_BYTES = 65_536
+_PI_CREDENTIAL_OUTPUT_MAX_BYTES = 16_384
+_PI_MODELS_MAX_BYTES = 2 * 1024 * 1024
 
 
-class _GatewayAuthError(OSError):
+class _PiAuthError(OSError):
     """Credential failure whose message is safe to show without redaction."""
+
+
+@dataclass(frozen=True)
+class _PiOperatorCredentialConfig:
+    """Trusted operator configuration for one sandbox credential boundary."""
+
+    host: str
+    port: int
+    executable: str
+    args: tuple[str, ...]
+    accepted_model_commands: frozenset[tuple[str, ...]]
+
+
+def _invalid_pi_credential_config() -> NoReturn:
+    raise _PiAuthError("Pi operator credential configuration is invalid")
+
+
+def _config_command(value: object, *, allow_empty: bool = False) -> tuple[str, ...]:
+    if not isinstance(value, list) or (not value and not allow_empty) or len(value) > 32:
+        _invalid_pi_credential_config()
+    if any(
+        not isinstance(part, str) or not part or "\0" in part or len(part) > 4096 for part in value
+    ):
+        _invalid_pi_credential_config()
+    return tuple(cast(list[str], value))
+
+
+def _load_pi_operator_credential_config() -> _PiOperatorCredentialConfig | None:
+    """Load a small, read-only operator file; absence disables the integration."""
+    configured_path = os.environ.get(_PI_CREDENTIAL_CONFIG_ENV, "").strip()
+    if not configured_path:
+        return None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(configured_path, flags)
+    except OSError as exc:
+        raise _PiAuthError("Pi operator credential configuration is unavailable") from exc
+    try:
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid not in (0, os.getuid())
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or metadata.st_size > _PI_CREDENTIAL_CONFIG_MAX_BYTES
+        ):
+            _invalid_pi_credential_config()
+        chunks: list[bytes] = []
+        size = 0
+        while size <= _PI_CREDENTIAL_CONFIG_MAX_BYTES:
+            chunk = os.read(fd, min(16_384, _PI_CREDENTIAL_CONFIG_MAX_BYTES + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > _PI_CREDENTIAL_CONFIG_MAX_BYTES:
+            _invalid_pi_credential_config()
+    finally:
+        os.close(fd)
+    try:
+        raw = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        _invalid_pi_credential_config()
+    if not isinstance(raw, dict) or set(raw) != {
+        "version",
+        "origin",
+        "credential",
+        "acceptedModelCommands",
+    }:
+        _invalid_pi_credential_config()
+    if raw["version"] != 1 or isinstance(raw["version"], bool):
+        _invalid_pi_credential_config()
+
+    origin = raw["origin"]
+    if not isinstance(origin, dict) or set(origin) != {"host", "port"}:
+        _invalid_pi_credential_config()
+    host = origin["host"]
+    port = origin["port"]
+    hostname_pattern = (
+        r"(?=.{1,253}\Z)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*"
+    )
+    if not isinstance(host, str) or re.fullmatch(hostname_pattern, host) is None:
+        _invalid_pi_credential_config()
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65_535:
+        _invalid_pi_credential_config()
+
+    credential = raw["credential"]
+    if not isinstance(credential, dict) or set(credential) != {"executable", "args"}:
+        _invalid_pi_credential_config()
+    executable = credential["executable"]
+    if (
+        not isinstance(executable, str)
+        or not os.path.isabs(executable)
+        or "\0" in executable
+        or len(executable) > 4096
+    ):
+        _invalid_pi_credential_config()
+    args = _config_command(credential["args"])
+
+    accepted_raw = raw["acceptedModelCommands"]
+    if not isinstance(accepted_raw, list) or len(accepted_raw) > 16:
+        _invalid_pi_credential_config()
+    accepted = {_config_command(command) for command in accepted_raw}
+    accepted.add((pathlib.Path(executable).name, *args))
+    return _PiOperatorCredentialConfig(
+        host=host,
+        port=port,
+        executable=executable,
+        args=args,
+        accepted_model_commands=frozenset(accepted),
+    )
 
 
 # Each line of Pi's JSONL output; the event schema is owned by the Pi CLI
@@ -143,13 +262,71 @@ async def _fetch_shell_command_token(command: str) -> str:
             await process.communicate()
             raise
         if process.returncode != 0:
-            raise _GatewayAuthError("Pi gateway auth command failed")
+            raise _PiAuthError("Pi gateway auth command failed")
         token = stdout.decode().strip()
         if not token:
-            raise _GatewayAuthError("Pi gateway auth command returned an empty token")
+            raise _PiAuthError("Pi gateway auth command returned an empty token")
         return token
     except TimeoutError:
-        raise _GatewayAuthError("Pi gateway auth command timed out") from None
+        raise _PiAuthError("Pi gateway auth command timed out") from None
+
+
+def _fetch_pi_operator_credential(config: _PiOperatorCredentialConfig) -> str:
+    """Run the operator-approved credential helper with bounded output."""
+    process = subprocess.Popen(
+        [config.executable, *config.args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    assert process.stdout is not None
+    output = bytearray()
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + _GATEWAY_AUTH_TIMEOUT_S
+    try:
+        os.set_blocking(process.stdout.fileno(), False)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _PiAuthError("Pi operator credential refresh timed out")
+            events = selector.select(min(remaining, 0.1))
+            for key, _ in events:
+                chunk = os.read(
+                    key.fd,
+                    min(4096, _PI_CREDENTIAL_OUTPUT_MAX_BYTES + 1 - len(output)),
+                )
+                if chunk:
+                    output.extend(chunk)
+                    if len(output) > _PI_CREDENTIAL_OUTPUT_MAX_BYTES:
+                        raise _PiAuthError("Pi operator credential output is too large")
+            if process.poll() is not None:
+                # Drain the final pipe bytes after process exit.
+                while len(output) <= _PI_CREDENTIAL_OUTPUT_MAX_BYTES:
+                    chunk = os.read(
+                        process.stdout.fileno(),
+                        min(4096, _PI_CREDENTIAL_OUTPUT_MAX_BYTES + 1 - len(output)),
+                    )
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                break
+        if process.returncode != 0:
+            raise _PiAuthError("Pi operator credential refresh failed")
+        try:
+            token = output.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            raise _PiAuthError("Pi operator credential output is malformed") from None
+        if not token or any(char.isspace() for char in token):
+            raise _PiAuthError("Pi operator credential output is malformed")
+        return token
+    finally:
+        selector.close()
+        if process.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=1)
 
 
 def _write_gateway_auth_client(tmp_dir: str, port: int, token: str) -> pathlib.Path:
@@ -1152,6 +1329,9 @@ class _PiRpcSession:
     _line_queue: Queue[str | None] = field(default_factory=Queue)
     _stderr_lines: list[str] = field(default_factory=list)
     _tmp_dir: str | None = None
+    _sandbox_launcher: str | None = None
+    _egress_handle: Any | None = None
+    _egress_tmpdir: pathlib.Path | None = None
 
     async def start(
         self,
@@ -1376,6 +1556,18 @@ class _PiRpcSession:
         if self._tmp_dir is not None:
             shutil.rmtree(self._tmp_dir, ignore_errors=True)
             self._tmp_dir = None
+        if self._sandbox_launcher is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(self._sandbox_launcher)
+            self._sandbox_launcher = None
+        if self._egress_handle is not None:
+            self._egress_handle.stop()
+            self._egress_handle = None
+        if self._egress_tmpdir is not None:
+            from .sandbox import cleanup_private_tmpdir
+
+            cleanup_private_tmpdir(self._egress_tmpdir)
+            self._egress_tmpdir = None
 
 
 # ---------------------------------------------------------------------------
@@ -1600,6 +1792,16 @@ class SandboxedPiCli:
 
     launch_path: str
     sandboxed: bool
+    egress_handle: Any | None = None
+    egress_tmpdir: pathlib.Path | None = None
+
+
+@dataclass(frozen=True)
+class _PiSandboxCredentialConfig:
+    """Placeholder-only Pi config plus its parent-side rewrite rule."""
+
+    models_json: _JsonObject
+    rewrite: CredentialRewriteRule
 
 
 def _try_sandbox_pi(
@@ -1607,6 +1809,8 @@ def _try_sandbox_pi(
     os_env: OSEnvSpec | None,
     cwd: str | None,
     spawn_env_names: Sequence[str] | None = None,
+    credential_rewrites: Sequence[CredentialRewriteRule] | None = None,
+    spawn_env: dict[str, str] | None = None,
 ) -> SandboxedPiCli:
     """Wrap the Pi CLI in a sandbox if ``os_env`` requests it.
 
@@ -1627,11 +1831,14 @@ def _try_sandbox_pi(
     sandbox_spec = os_env.sandbox or OSEnvSandboxSpec()
     if sandbox_spec.type == "none":
         return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
+    egress_handle = None
+    egress_tmpdir = None
     try:
         import pathlib
 
         from .sandbox import (
             create_exec_launcher,
+            create_private_tmpdir,
             resolve_sandbox,
             with_additional_read_roots,
             with_additional_write_roots,
@@ -1651,11 +1858,58 @@ def _try_sandbox_pi(
         sandbox = with_additional_read_roots(sandbox, [pi_dir])
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
         sandbox = with_additional_write_roots(sandbox, [home_pi])
-        sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
+        if credential_rewrites:
+            if spawn_env is None:
+                raise ValueError("spawn_env is required for Pi credential proxying")
+            from .egress import apply_egress_env, start_egress_proxy
+
+            egress_tmpdir = create_private_tmpdir()
+            sandbox = with_additional_write_roots(sandbox, [egress_tmpdir])
+            credential_hosts = sorted({rewrite.host for rewrite in credential_rewrites})
+            egress_handle = start_egress_proxy(
+                rules=[f"* {host}/**" for host in credential_hosts],
+                tmpdir=egress_tmpdir,
+                # Operator-configured gateways may resolve to private addresses.
+                # Egress remains limited to the exact configured hosts, and each
+                # credential rule additionally binds its HTTPS origin and port.
+                allow_private_destinations=True,
+                require_auth=False,
+                credential_rewrites=credential_rewrites,
+            )
+            apply_egress_env(
+                spawn_env,
+                relay_port=egress_handle.relay_port,
+                ca_bundle_path=egress_handle.ca_bundle_path,
+                auth_token=None,
+            )
+            sandbox = replace(
+                sandbox,
+                egress_relay_port=egress_handle.relay_port,
+                egress_socket_path=str(egress_handle.socket_path),
+            )
+        effective_spawn_env_names = (
+            list(spawn_env) if credential_rewrites and spawn_env is not None else spawn_env_names
+        )
+        sandbox = with_spawn_env_allowlist(sandbox, effective_spawn_env_names)
         # npm's .bin symlink can be hidden by the sandbox's dotfile mask.
         launcher = create_exec_launcher(str(executable), sandbox)
-        return SandboxedPiCli(launch_path=launcher, sandboxed=True)
-    except (OSError, ImportError, NotImplementedError) as exc:
+        return SandboxedPiCli(
+            launch_path=launcher,
+            sandboxed=True,
+            egress_handle=egress_handle,
+            egress_tmpdir=egress_tmpdir,
+        )
+    except Exception as exc:
+        if egress_handle is not None:
+            egress_handle.stop()
+        if egress_tmpdir is not None:
+            from .sandbox import cleanup_private_tmpdir as cleanup_egress_tmpdir
+
+            cleanup_egress_tmpdir(egress_tmpdir)
+        if credential_rewrites:
+            raise _PiAuthError("Could not secure the configured Pi provider credential") from exc
+        if not isinstance(exc, (OSError, ImportError, NotImplementedError, ValueError)):
+            raise
         logger.warning("Could not apply sandbox for Pi: %s", exc)
         return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
 
@@ -1996,6 +2250,14 @@ class PiExecutor(Executor):
         self._env: dict[str, str] = _clean_pi_env(
             os_env.sandbox.env_passthrough if os_env is not None and os_env.sandbox else None
         )
+        from omnigent.inner.pi_settings import DEFAULT_PI_AGENT_DIR
+
+        configured_pi_agent_dir = self._env.get("PI_CODING_AGENT_DIR")
+        self._pi_agent_dir = (
+            pathlib.Path(configured_pi_agent_dir)
+            if configured_pi_agent_dir
+            else DEFAULT_PI_AGENT_DIR
+        )
         # ``--no-tools`` in pi 0.68.x disables BOTH built-ins AND extension
         # tools by default; we re-enable just the bridged tool names per
         # turn via ``--tools <comma-list>`` in :meth:`_build_env_and_dir`.
@@ -2068,15 +2330,14 @@ class PiExecutor(Executor):
         )
 
         # Apply sandbox.
-        # ``PI_CODING_AGENT_DIR`` is added per-spawn by
-        # ``_build_env_and_dir`` on the gateway path, so it must be in
-        # the launcher's prune allowlist even though it's not in
-        # ``self._env`` yet.
+        # These variables are added per-spawn by ``_build_env_and_dir``, so
+        # they must be in the launcher's prune allowlist even though they are
+        # not in ``self._env`` yet.
         sandboxed = _try_sandbox_pi(
             self._pi_path,
             os_env,
             cwd,
-            spawn_env_names=[*self._env, "PI_CODING_AGENT_DIR"],
+            spawn_env_names=[*self._env, "PI_CODING_AGENT_DIR", "PI_CLIENT_SESSION_ID"],
         )
         self._pi_launch_path = sandboxed.launch_path
         self._sandboxed = sandboxed.sandboxed
@@ -2312,17 +2573,109 @@ class PiExecutor(Executor):
                         if creds is not None and not self._databricks_host:
                             self._databricks_host = creds.host
                     if not isinstance(token, str) or not token.strip():
-                        raise _GatewayAuthError("Pi gateway authentication returned no token")
-            except _GatewayAuthError:
+                        raise _PiAuthError("Pi gateway authentication returned no token")
+            except _PiAuthError:
                 raise
             except TimeoutError:
-                raise _GatewayAuthError("Pi gateway credential refresh timed out") from None
+                raise _PiAuthError("Pi gateway credential refresh timed out") from None
             except Exception:  # noqa: BLE001 — SDK/helper exceptions may contain credentials
-                raise _GatewayAuthError("Pi gateway credential refresh failed") from None
+                raise _PiAuthError("Pi gateway credential refresh failed") from None
             self._databricks_token = token
             self._gateway_workspace_url = self._gateway_model_service_workspace_url()
             self._gateway_refresh_after = time.monotonic() + self._gateway_auth_refresh_interval_s
             return token
+
+    async def _resolved_sandbox_models_json(self) -> _PiSandboxCredentialConfig | None:
+        """Replace only operator-approved credential helpers with a placeholder."""
+        if self._gateway or not self._sandboxed:
+            return None
+        operator_config = _load_pi_operator_credential_config()
+        if operator_config is None:
+            return None
+        models_path = self._pi_agent_dir / "models.json"
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(models_path, flags)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise _PiAuthError("Pi models.json is not a safe regular file") from exc
+        try:
+            metadata = os.fstat(fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                raise _PiAuthError("Pi models.json is not a safe regular file")
+            chunks: list[bytes] = []
+            size = 0
+            while size <= _PI_MODELS_MAX_BYTES:
+                chunk = os.read(fd, min(65_536, _PI_MODELS_MAX_BYTES + 1 - size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            if size > _PI_MODELS_MAX_BYTES:
+                raise _PiAuthError("Pi models.json is too large")
+        finally:
+            os.close(fd)
+        try:
+            raw = json.loads(b"".join(chunks).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        providers = raw.get("providers")
+        if not isinstance(providers, dict):
+            return None
+
+        synthetic = f"{SYNTHETIC_CREDENTIAL_PREFIX}{secrets.token_urlsafe(24)}"
+        found_approved_provider = False
+        for provider in providers.values():
+            if not isinstance(provider, dict):
+                continue
+            api_key = provider.get("apiKey")
+            if not isinstance(api_key, str) or not api_key.startswith("!"):
+                continue
+            try:
+                command_argv = tuple(shlex.split(api_key[1:].strip()))
+            except ValueError:
+                continue
+            if command_argv not in operator_config.accepted_model_commands:
+                continue
+            base_url = provider.get("baseUrl")
+            if not isinstance(base_url, str):
+                continue
+            parsed = _urlparse(base_url)
+            try:
+                port = parsed.port if parsed.port is not None else 443
+            except ValueError:
+                continue
+            if (
+                parsed.scheme.lower() != "https"
+                or parsed.hostname != operator_config.host
+                or port != operator_config.port
+                or parsed.username is not None
+                or parsed.password is not None
+            ):
+                continue
+            provider["apiKey"] = synthetic
+            found_approved_provider = True
+        if not found_approved_provider:
+            return None
+        return _PiSandboxCredentialConfig(
+            models_json=cast(_JsonObject, raw),
+            rewrite=CredentialRewriteRule(
+                host=operator_config.host,
+                port=operator_config.port,
+                scheme="bearer",
+                synthetic=synthetic,
+                secret_provider=lambda: _fetch_pi_operator_credential(operator_config),
+                require_placeholder=True,
+                https_only=True,
+            ),
+        )
 
     async def _gate_native_tool(  # type: ignore[explicit-any]
         self,
@@ -2362,7 +2715,8 @@ class PiExecutor(Executor):
         tools: list[ToolSpec],
         tool_server_port: int | None,
         tool_server_token: str | None,
-        models_json: _PiModelsConfig | None,
+        models_json: _JsonObject | None,
+        session_key: str | None = None,
     ) -> PiSubprocessConfig:
         """Build env dict, temp dir, and extra CLI args for a Pi subprocess.
 
@@ -2373,12 +2727,20 @@ class PiExecutor(Executor):
             (:attr:`_ToolServer.token`), embedded in the generated
             extension so requests authenticate. Non-``None`` whenever
             *tool_server_port* is.
-        :param models_json: Provider configuration resolved off-loop before
-            allocating session files; ``None`` for Pi-owned configuration.
+        :param models_json: Provider configuration prepared before allocating
+            session files; ``None`` when Pi can use its global configuration.
+        :param session_key: Omnigent session identifier used to seed Pi's
+            client-session header before extensions receive ``session_start``.
         """
         if self._gateway and models_json is None:
             raise ValueError("Gateway provider configuration must be resolved before startup")
         env = dict(self._env)
+        if session_key:
+            # Datadog's generated models.json references this variable from
+            # x-dd-tag-client_session_id. Pi validates provider headers before
+            # the refresh-models extension can replace it with Pi's own
+            # session ID, so give startup a stable non-secret value.
+            env["PI_CLIENT_SESSION_ID"] = session_key
         tmp_parent = None
         if self._sandboxed:
             tmp_parent = pathlib.Path.home() / ".pi"
@@ -2390,28 +2752,31 @@ class PiExecutor(Executor):
             assert tool_server_port is not None and tool_server_token is not None
             assert models_json is not None
             auth_client = _write_gateway_auth_client(tmp_dir, tool_server_port, tool_server_token)
-            for provider in models_json["providers"].values():
+            gateway_models = cast(_PiModelsConfig, models_json)
+            for provider in gateway_models["providers"].values():
                 provider["apiKey"] = f"!node {shlex.quote(str(auth_client))}"
+        if models_json is not None:
             models_path = os.path.join(tmp_dir, "models.json")
             with open(models_path, "w") as f:
                 json.dump(models_json, f)
+            os.chmod(models_path, 0o600)
             env["PI_CODING_AGENT_DIR"] = tmp_dir
-            # Gateway mode relocates Pi's agent root — copy the user's global
-            # settings (extensions, packages, …) and symlink install trees so
-            # ``pi install`` packages still resolve. See #1423.
+            # A managed models file relocates Pi's agent root. Preserve the
+            # user's settings and package trees without mutating the source.
             from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
             prepare_managed_pi_agent_dir(
                 pathlib.Path(tmp_dir),
                 overlay=self._retry_policy.pi.settings(),
+                global_agent_dir=self._pi_agent_dir,
             )
 
         # Pi natively supports retry config via ``.pi/settings.json``
         # (see ``RetryPolicy.pi.settings()`` for schema). On the non-gateway
         # path, merge the retry block into ``<cwd>/.pi/settings.json``.
-        # Gateway runs apply retry via :func:`prepare_managed_pi_agent_dir`
-        # into the managed agent dir instead.
-        if not self._gateway:
+        # Managed models files apply retry via
+        # :func:`prepare_managed_pi_agent_dir` instead.
+        if models_json is None:
             retry_settings = self._retry_policy.pi.settings()
             settings_dir_root = self._cwd or tmp_dir
             settings_path = os.path.join(settings_dir_root, ".pi", "settings.json")
@@ -2561,7 +2926,8 @@ class PiExecutor(Executor):
             return state.rpc
 
         wire_catalog = await self._load_gateway_model_wire_apis()
-        models_json = None
+        models_json: _JsonObject | None = None
+        sandbox_credential: _PiSandboxCredentialConfig | None = None
         if self._gateway:
             models_json = await run_sync_on_thread(
                 _build_models_json,
@@ -2573,6 +2939,10 @@ class PiExecutor(Executor):
                 model_wire_apis=wire_catalog,
                 openai_wire_api=self._openai_wire_api,
             )
+        else:
+            sandbox_credential = await self._resolved_sandbox_models_json()
+            if sandbox_credential is not None:
+                models_json = sandbox_credential.models_json
 
         if state.rpc is not None:
             await state.rpc.close()
@@ -2580,7 +2950,11 @@ class PiExecutor(Executor):
         tool_server_port = await self._ensure_tool_server(tools)
         tool_server_token = self._tool_server.token if self._tool_server is not None else None
         subprocess_config = self._build_env_and_dir(
-            tools, tool_server_port, tool_server_token, models_json
+            tools,
+            tool_server_port,
+            tool_server_token,
+            models_json,
+            session_key=session_key,
         )
         env = subprocess_config.env
         tmp_dir = subprocess_config.tmp_dir
@@ -2603,16 +2977,38 @@ class PiExecutor(Executor):
         else:
             pi_model = effective_model
 
-        await rpc.start(
-            self._pi_launch_path,
-            env=env,
-            cwd=self._cwd,
-            model=pi_model or None,
-            system_prompt=system_prompt or None,
-            system_prompt_mode=self._system_prompt_mode,
-            thinking=thinking,
-            extra_args=extra_args or None,
-        )
+        launch_path = self._pi_launch_path
+        try:
+            if sandbox_credential is not None:
+                sandboxed = _try_sandbox_pi(
+                    self._pi_path,
+                    self._os_env_spec,
+                    self._cwd,
+                    spawn_env_names=list(env),
+                    credential_rewrites=[sandbox_credential.rewrite],
+                    spawn_env=env,
+                )
+                if not sandboxed.sandboxed:
+                    raise _PiAuthError(
+                        "Configured Pi provider credentials require an active Pi sandbox"
+                    )
+                launch_path = sandboxed.launch_path
+                rpc._sandbox_launcher = sandboxed.launch_path
+                rpc._egress_handle = sandboxed.egress_handle
+                rpc._egress_tmpdir = sandboxed.egress_tmpdir
+            await rpc.start(
+                launch_path,
+                env=env,
+                cwd=self._cwd,
+                model=pi_model or None,
+                system_prompt=system_prompt or None,
+                system_prompt_mode=self._system_prompt_mode,
+                thinking=thinking,
+                extra_args=extra_args or None,
+            )
+        except Exception:
+            await rpc.close()
+            raise
         state.rpc = rpc
         state.system_prompt = system_prompt
         state.model = effective_model

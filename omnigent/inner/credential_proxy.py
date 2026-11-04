@@ -119,6 +119,13 @@ class CredentialRewriteRule:
         secret expires and must be refreshed for long sessions (e.g. a
         Databricks OAuth profile). Takes precedence over
         :attr:`real_secret` when set.
+    :param require_placeholder: When ``True``, do not inject the credential
+        into a request that omitted ``Authorization``. The caller must send
+        :attr:`synthetic`; this is useful when possession of the placeholder
+        is the capability being constrained.
+    :param https_only: When ``True``, refuse the placeholder on plain HTTP.
+    :param port: Optional exact upstream port binding. ``None`` accepts any
+        port for backward compatibility.
     """
 
     host: str
@@ -127,6 +134,9 @@ class CredentialRewriteRule:
     synthetic: str | None = None
     username: str | None = None
     secret_provider: Callable[[], str] | None = None
+    require_placeholder: bool = False
+    https_only: bool = False
+    port: int | None = None
 
     def resolve_secret(self) -> str:
         """
