@@ -174,3 +174,16 @@ isolated server + host + slow-checkout repository and checks: timeout →
 `session_reused`; a host-only SIGKILL mid-checkout → restart → `resumed` with
 no late writes from the orphaned git group; a pre-existing branch → `conflict`.
 It stops only the process groups it started.
+
+## Orphaned git groups and index locks
+
+Each git process group an attempt starts is recorded with its pid, pgid, start
+time, command line, resolved git executable and cwd. On the next attempt run
+the host re-proves all of these against the live group leader immediately
+before SIGTERM and again before SIGKILL; a record without executable and cwd
+proof is never signaled. SIGTERM lets git remove its own `index.lock`. If a
+lock remains (git needed SIGKILL, or the group could not be proven), the
+resume reports `worktree_needs_attention` and the lock is left in place:
+Omnigent never deletes a lock it cannot prove it created. Its own
+`index.lock` carries a unique token and is removed only while the path still
+has that token and inode.
