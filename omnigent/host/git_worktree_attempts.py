@@ -9,6 +9,7 @@ overwrites files. See designs/SESSION_GIT_WORKTREE.md.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -923,9 +924,11 @@ def _fill_missing_files(worktree: str) -> None:
 def _hold_index_lock(receipt: Receipt, git_dir: Path) -> Iterator[None]:
     """Own ``index.lock`` (O_EXCL) so no git process can write the index meanwhile.
 
-    The lock carries a unique token; on release it is removed only while the path
-    is still that same file with that token. A lock someone replaced is left alone
-    and reported, so a foreign git's lock is never deleted.
+    The lock carries a unique token and its inode is kept. Any failure after the
+    exclusive create removes it again (only while the path is still that inode),
+    and release removes it only after proving the file is ours, so a foreign
+    git's replacement lock is never deleted. See designs/SESSION_GIT_WORKTREE.md
+    for the residual windows.
     """
     lock = git_dir / "index.lock"
     token = f"omnigent-attempt {receipt.attempt_id} {secrets.token_hex(16)}\n".encode()
@@ -935,12 +938,26 @@ def _hold_index_lock(receipt: Receipt, git_dir: Path) -> Iterator[None]:
         raise _attention(
             receipt, "an index.lock is present, so a git process may still be writing"
         ) from exc
+    except OSError as exc:
+        raise gw.WorktreeError(f"could not create {lock}: {exc}") from exc
+    ours: os.stat_result | None = None
     try:
-        os.write(fd, token)
-        os.fsync(fd)
         ours = os.fstat(fd)
-    finally:
+        _write_all(fd, token)
+        os.fsync(fd)
+    except BaseException as exc:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        if ours is not None:
+            _release_index_lock(lock, ours, None)
+        if isinstance(exc, OSError):
+            raise gw.WorktreeError(f"could not set up {lock}: {exc}") from exc
+        raise
+    try:
         os.close(fd)
+    except OSError as exc:
+        _release_index_lock(lock, ours, None)
+        raise gw.WorktreeError(f"could not set up {lock}: {exc}") from exc
     body_error: BaseException | None = None
     try:
         yield
@@ -951,30 +968,65 @@ def _hold_index_lock(receipt: Receipt, git_dir: Path) -> Iterator[None]:
         if not _release_index_lock(lock, ours, token):
             replaced = _attention(
                 receipt,
-                "the index.lock was replaced by another process while the checkout was "
-                "being finished; it was left in place",
+                "the index.lock was replaced by another process, or could not be released, "
+                "while the checkout was being finished; it was left in place",
             )
             if body_error is None:
                 raise replaced
             gw._logger.warning("%s", replaced.message)
 
 
-def _release_index_lock(lock: Path, ours: os.stat_result, token: bytes) -> bool:
-    """Unlink ``lock`` only if it is still our file; ``False`` if it was replaced."""
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write to index.lock")
+        view = view[written:]
+
+
+def _is_our_lock(path: Path, ours: os.stat_result, token: bytes | None) -> bool:
+    """Whether ``path`` is the file we created (same inode, and token when given)."""
     try:
-        current = os.lstat(lock)
-    except FileNotFoundError:
-        return False
-    if (current.st_dev, current.st_ino) != (ours.st_dev, ours.st_ino):
-        return False
-    try:
-        with open(lock, "rb") as handle:
-            if handle.read(len(token) + 1) != token:
-                return False
+        current = os.lstat(path)
+        if (current.st_dev, current.st_ino) != (ours.st_dev, ours.st_ino):
+            return False
+        if token is None:
+            return True
+        with open(path, "rb") as handle:
+            return handle.read(len(token) + 1) == token
     except OSError:
         return False
-    lock.unlink()
-    return True
+
+
+def _release_index_lock(lock: Path, ours: os.stat_result, token: bytes | None) -> bool:
+    """Remove our lock; ``False`` (and nothing deleted) unless it is provably ours.
+
+    The lock is first renamed to a private name and re-verified there, so a lock
+    swapped in after the first check is never unlinked: it is moved back to
+    ``index.lock`` if that path is still free, else left under the private name.
+    Never raises.
+    """
+    if not _is_our_lock(lock, ours, token):
+        return False
+    private = lock.with_name(f"index.lock.omnigent-release-{secrets.token_hex(8)}")
+    try:
+        os.rename(lock, private)
+    except OSError:
+        return False
+    if _is_our_lock(private, ours, token):
+        with contextlib.suppress(OSError):
+            os.unlink(private)
+        return True
+    # A replacement slipped in between the check and the rename: give it back.
+    try:
+        os.link(private, lock)
+    except OSError:
+        gw._logger.warning("left a foreign index lock at %s (index.lock was retaken)", private)
+        return False
+    with contextlib.suppress(OSError):
+        os.unlink(private)
+    return False
 
 
 def _create_index(receipt: Receipt, git_dir: Path) -> None:

@@ -846,3 +846,87 @@ def test_live_unprovable_writer_blocks_resume_and_later_edit_survives(
     with contextlib.suppress(WorktreeAttemptError):
         _create(repo)
     assert (path / "f1.txt").read_text() == "user edit\n"
+
+
+def _fail_on_our_lock(monkeypatch, path: Path, name: str, error: Exception) -> None:
+    """Make ``os.<name>(fd, ...)`` fail only for our index.lock's descriptor."""
+    lock = _git_dir(path) / "index.lock"
+    real = getattr(gwa.os, name)
+
+    def fake(fd, *args):
+        try:
+            if os.fstat(fd).st_ino == os.lstat(lock).st_ino:
+                raise error
+        except FileNotFoundError:
+            pass
+        return real(fd, *args)
+
+    monkeypatch.setattr(gwa.os, name, fake)
+
+
+@pytest.mark.parametrize(
+    ("name", "error"),
+    [("fsync", OSError(5, "EIO")), ("write", OSError(28, "ENOSPC"))],
+    ids=["fsync-fails", "write-fails"],
+)
+def test_lock_setup_failure_removes_our_lock(repo: Path, monkeypatch, name, error) -> None:
+    path = _make_partial(repo, monkeypatch)
+    _fail_on_our_lock(monkeypatch, path, name, error)
+    with pytest.raises(WorktreeAttemptError) as exc:
+        _create(repo)
+    assert _code(exc) == INCOMPLETE and "could not set up" in exc.value.message
+    assert not (_git_dir(path) / "index.lock").exists()
+
+
+def test_zero_byte_write_is_a_setup_failure(repo: Path, monkeypatch) -> None:
+    path = _make_partial(repo, monkeypatch)
+    lock = _git_dir(path) / "index.lock"
+    real_write = gwa.os.write
+
+    def stalled(fd, data):
+        with contextlib.suppress(FileNotFoundError):
+            if os.fstat(fd).st_ino == os.lstat(lock).st_ino:
+                return 0
+        return real_write(fd, data)
+
+    monkeypatch.setattr(gwa.os, "write", stalled)
+    with pytest.raises(WorktreeAttemptError) as exc:
+        _create(repo)
+    assert "short write" in exc.value.message
+    assert not lock.exists()
+
+
+def test_release_io_error_never_raises_raw_and_reports(repo: Path, monkeypatch) -> None:
+    _make_partial(repo, monkeypatch)
+    real_rename = gwa.os.rename
+
+    def failing_rename(src, dst, *args, **kwargs):
+        if str(src).endswith("index.lock"):
+            raise OSError(16, "EBUSY")
+        return real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(gwa.os, "rename", failing_rename)
+    with pytest.raises(WorktreeAttemptError) as exc:
+        _create(repo)
+    assert _code(exc) == NEEDS_ATTENTION and "could not be released" in exc.value.message
+    assert store_for_repo(str(repo)).load(A1).phase != gwa.PHASE_READY
+
+
+def test_lock_swapped_in_the_final_window_is_restored_not_deleted(repo: Path, monkeypatch) -> None:
+    """A foreign lock replaces ours after the check but before the rename: it survives."""
+    path = _make_partial(repo, monkeypatch)
+    lock = _git_dir(path) / "index.lock"
+    real_rename = gwa.os.rename
+
+    def swap_then_rename(src, dst, *args, **kwargs):
+        if Path(src) == lock and ".omnigent-release-" in str(dst):
+            lock.unlink()
+            lock.write_text("foreign git lock\n")
+        return real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(gwa.os, "rename", swap_then_rename)
+    with pytest.raises(WorktreeAttemptError) as exc:
+        _create(repo)
+    assert _code(exc) == NEEDS_ATTENTION
+    assert lock.read_text() == "foreign git lock\n"
+    assert not list(lock.parent.glob("index.lock.omnigent-release-*"))
