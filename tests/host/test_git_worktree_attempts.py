@@ -602,7 +602,9 @@ def test_reaper_never_signals_an_unproven_group(repo: Path, monkeypatch, current
     assert stopped == [] and sent == []
 
 
-def test_reaper_treats_permission_error_as_not_ours(repo: Path, monkeypatch) -> None:
-    stopped, _ = _reap_with(monkeypatch, repo, dict(_RECORDED), kill_error=PermissionError)
+def test_reaper_treats_permission_error_as_not_ours(repo: Path, monkeypatch, caplog) -> None:
+    with caplog.at_level("WARNING", logger=gw._logger.name):
+        stopped, _ = _reap_with(monkeypatch, repo, dict(_RECORDED), kill_error=PermissionError)
     assert stopped == []
+    assert "not signaling process group 4242: permission denied" in caplog.text
     assert not store_for_repo(str(repo)).pgids_path(A1).exists()

@@ -296,6 +296,10 @@ def _signal_group(pgid: int, sig: int) -> bool:
         # macOS reports EPERM for a group of exited members; treat it as not ours.
         if sig != 0:
             gw._logger.warning("not signaling process group %s: permission denied", pgid)
+        else:
+            gw._logger.debug(
+                "process group %s no longer signalable (EPERM); treating as gone", pgid
+            )
         return False
     return True
 
