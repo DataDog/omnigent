@@ -156,14 +156,20 @@ class ReceiptStore:
 
     @contextmanager
     def track_git_groups(self, attempt_id: str) -> Iterator[None]:
-        """Record live git process groups for this attempt while the body runs."""
-        live: set[int] = set()
+        """Record the identity of each live git process group while the body runs."""
+        live: dict[int, dict[str, object]] = {}
         path = self.pgids_path(attempt_id)
 
         def record(pid: int, started: bool) -> None:
-            (live.add if started else live.discard)(pid)
+            if started:
+                identity = _probe_process(pid)
+                if identity is None or identity["pgid"] != pid:
+                    return  # already gone, or not a group leader we started
+                live[pid] = identity
+            elif live.pop(pid, None) is None:
+                return
             tmp = path.with_suffix(".pgids.tmp")
-            tmp.write_text(json.dumps(sorted(live)))
+            tmp.write_text(json.dumps(list(live.values())))
             os.replace(tmp, path)
 
         token = gw.git_spawn_hook.set(record)
@@ -175,17 +181,20 @@ class ReceiptStore:
     def reap_orphan_git_groups(self, attempt_id: str) -> list[int]:
         """Stop git process groups a crashed host left running for this attempt.
 
-        A group is stopped only when one of its members is still a ``git`` process,
-        so a recycled process-group id is never signaled.
+        A group is signaled only when its leader still has the exact pid, pgid,
+        start time and command line recorded at spawn, so a reused id is never hit.
         """
         path = self.pgids_path(attempt_id)
         try:
-            recorded = [int(pgid) for pgid in json.loads(path.read_text())]
+            recorded = json.loads(path.read_text())
         except (OSError, ValueError, TypeError):
             return []
-        stopped = [pgid for pgid in recorded if os.name == "posix" and _is_git_group(pgid)]
-        for pgid in stopped:
-            _stop_group(pgid)
+        stopped: list[int] = []
+        if os.name == "posix" and isinstance(recorded, list):
+            for identity in recorded:
+                if isinstance(identity, dict) and _is_recorded_group(identity):
+                    if _stop_group(int(identity["pgid"])):
+                        stopped.append(int(identity["pgid"]))
         path.unlink(missing_ok=True)
         return stopped
 
@@ -237,38 +246,75 @@ def _read_receipt(path: Path) -> Receipt | None:
         return None
 
 
-def _is_git_group(pgid: int) -> bool:
-    try:
-        os.killpg(pgid, 0)
-    except (ProcessLookupError, PermissionError):
-        return False
+def _probe_process(pid: int) -> dict[str, object] | None:
+    """Return ``{pid, pgid, started, command}`` for a live process, or ``None``."""
+    if os.name != "posix":
+        return None
     import subprocess
 
-    listing = subprocess.run(
-        ["ps", "-A", "-o", "pgid=,command="], capture_output=True, text=True, check=False
-    ).stdout
-    for line in listing.splitlines():
-        group, _, command = line.strip().partition(" ")
-        if group == str(pgid) and "git" in command.split(" ", 1)[0]:
-            return True
-    return False
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "pid=,pgid=,lstart=,command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
+        ).stdout.strip()
+    except OSError:
+        return None
+    parts = out.split()
+    # lstart is five fields, e.g. "Wed Nov  4 13:40:12 2026".
+    if len(parts) < 8 or not parts[0].isdigit() or not parts[1].isdigit():
+        return None
+    return {
+        "pid": int(parts[0]),
+        "pgid": int(parts[1]),
+        "started": " ".join(parts[2:7]),
+        "command": " ".join(parts[7:]),
+    }
 
 
-def _stop_group(pgid: int) -> None:
+def _is_recorded_group(identity: dict[str, object]) -> bool:
+    """Whether the recorded group leader is provably the same live process."""
+    try:
+        pid = int(identity["pid"])  # type: ignore[arg-type]
+    except (KeyError, TypeError, ValueError):
+        return False
+    current = _probe_process(pid)
+    return current is not None and all(
+        current[key] == identity.get(key) for key in ("pid", "pgid", "started", "command")
+    )
+
+
+def _signal_group(pgid: int, sig: int) -> bool:
+    """Signal a group; ``False`` when it is gone or not ours to signal."""
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # macOS reports EPERM for a group of exited members; treat it as not ours.
+        if sig != 0:
+            gw._logger.warning("not signaling process group %s: permission denied", pgid)
+        return False
+    return True
+
+
+def _stop_group(pgid: int) -> bool:
+    """SIGTERM, then SIGKILL after a grace period. Returns whether it was signaled."""
     import signal
 
+    signaled = False
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(pgid, sig)
-        except ProcessLookupError:
-            return
+        if not _signal_group(pgid, sig):
+            return signaled
+        signaled = True
         deadline = time.monotonic() + gw._GIT_TERM_GRACE_S
         while time.monotonic() < deadline:
-            try:
-                os.killpg(pgid, 0)
-            except ProcessLookupError:
-                return
+            if not _signal_group(pgid, 0):
+                return signaled
             time.sleep(0.05)
+    return signaled
 
 
 def _claim_attempt_for_repo(attempt_id: str, common_dir: Path) -> None:

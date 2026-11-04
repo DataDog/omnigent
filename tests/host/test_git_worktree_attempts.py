@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -551,3 +553,56 @@ def test_index_lock_appearing_after_fill_is_never_ready(repo: Path, monkeypatch)
     assert _code(exc) == NEEDS_ATTENTION and "index.lock" in str(exc.value)
     assert (_git_dir(path) / "index.lock").exists()
     assert store_for_repo(str(repo)).load(A1).phase != gwa.PHASE_READY
+
+
+_RECORDED = {
+    "pid": 4242,
+    "pgid": 4242,
+    "started": "Wed Nov  4 13:40:12 2026",
+    "command": "git checkout-index --all --quiet",
+}
+
+
+def _reap_with(monkeypatch, repo: Path, current: dict | None, kill_error: type | None = None):
+    """Run the reaper against a recorded identity with ps and signals faked (none sent)."""
+    store = store_for_repo(str(repo))
+    store.dir.mkdir(parents=True, exist_ok=True)
+    store.pgids_path(A1).write_text(json.dumps([_RECORDED]))
+    sent: list[tuple[int, int]] = []
+
+    def fake_killpg(pgid: int, sig: int) -> None:
+        if kill_error is not None:
+            raise kill_error()
+        sent.append((pgid, sig))
+        if sig == 0 and any(s != 0 for _, s in sent):
+            raise ProcessLookupError()
+
+    monkeypatch.setattr(gwa, "_probe_process", lambda pid: current)
+    monkeypatch.setattr(gwa.os, "killpg", fake_killpg)
+    return store.reap_orphan_git_groups(A1), sent
+
+
+def test_reaper_signals_only_the_recorded_group(repo: Path, monkeypatch) -> None:
+    stopped, sent = _reap_with(monkeypatch, repo, dict(_RECORDED))
+    assert stopped == [4242] and (4242, signal.SIGTERM) in sent
+
+
+@pytest.mark.parametrize(
+    "current",
+    [
+        {**_RECORDED, "started": "Thu Nov  5 09:00:00 2026", "command": "/usr/bin/git status"},
+        {**_RECORDED, "command": "/usr/local/bin/not-git-helper"},
+        {**_RECORDED, "pgid": 999},
+        None,
+    ],
+    ids=["reused-pgid-git-status", "not-git-helper", "left-group", "gone"],
+)
+def test_reaper_never_signals_an_unproven_group(repo: Path, monkeypatch, current) -> None:
+    stopped, sent = _reap_with(monkeypatch, repo, current)
+    assert stopped == [] and sent == []
+
+
+def test_reaper_treats_permission_error_as_not_ours(repo: Path, monkeypatch) -> None:
+    stopped, _ = _reap_with(monkeypatch, repo, dict(_RECORDED), kill_error=PermissionError)
+    assert stopped == []
+    assert not store_for_repo(str(repo)).pgids_path(A1).exists()
