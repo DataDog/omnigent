@@ -161,11 +161,16 @@ class ReceiptStore:
         live: dict[int, dict[str, object]] = {}
         path = self.pgids_path(attempt_id)
 
-        def record(pid: int, started: bool) -> None:
+        git_exe = _resolved_git_executable()
+
+        def record(pid: int, started: bool, cwd: str) -> None:
             if started:
-                identity = _probe_process(pid)
+                identity = _probe_process(pid, with_exe_and_cwd=False)
                 if identity is None or identity["pgid"] != pid:
                     return  # already gone, or not a group leader we started
+                # What we launched: proven against the live process only at reap time.
+                identity["exe"] = git_exe
+                identity["cwd"] = os.path.realpath(cwd)
                 live[pid] = identity
             elif live.pop(pid, None) is None:
                 return
@@ -182,8 +187,9 @@ class ReceiptStore:
     def reap_orphan_git_groups(self, attempt_id: str) -> list[int]:
         """Stop git process groups a crashed host left running for this attempt.
 
-        A group is signaled only when its leader still has the exact pid, pgid,
-        start time and command line recorded at spawn, so a reused id is never hit.
+        A group is signaled only while its leader still has the exact pid, pgid,
+        start time, command line, executable path and cwd recorded at spawn,
+        re-checked before every signal, so a reused id is never hit.
         """
         path = self.pgids_path(attempt_id)
         try:
@@ -194,7 +200,7 @@ class ReceiptStore:
         if os.name == "posix" and isinstance(recorded, list):
             for identity in recorded:
                 if isinstance(identity, dict) and _is_recorded_group(identity):
-                    if _stop_group(int(identity["pgid"])):
+                    if _stop_group(identity):
                         stopped.append(int(identity["pgid"]))
         path.unlink(missing_ok=True)
         return stopped
@@ -247,7 +253,15 @@ def _read_receipt(path: Path) -> Receipt | None:
         return None
 
 
-def _probe_process(pid: int) -> dict[str, object] | None:
+def _resolved_git_executable() -> str | None:
+    """Real path of the ``git`` binary this host launches, or ``None``."""
+    import shutil
+
+    found = shutil.which("git")
+    return os.path.realpath(found) if found else None
+
+
+def _probe_process(pid: int, *, with_exe_and_cwd: bool = True) -> dict[str, object] | None:
     """Return ``{pid, pgid, started, command}`` for a live process, or ``None``."""
     if os.name != "posix":
         return None
@@ -267,12 +281,52 @@ def _probe_process(pid: int) -> dict[str, object] | None:
     # lstart is five fields, e.g. "Wed Nov  4 13:40:12 2026".
     if len(parts) < 8 or not parts[0].isdigit() or not parts[1].isdigit():
         return None
+    exe, cwd = _process_exe_and_cwd(pid) if with_exe_and_cwd else (None, None)
     return {
         "pid": int(parts[0]),
         "pgid": int(parts[1]),
         "started": " ".join(parts[2:7]),
         "command": " ".join(parts[7:]),
+        "exe": exe,
+        "cwd": cwd,
     }
+
+
+def _process_exe_and_cwd(pid: int) -> tuple[str | None, str | None]:
+    """Resolved executable path and cwd of ``pid`` (``/proc`` on Linux, ``lsof`` elsewhere)."""
+    proc = Path(f"/proc/{pid}")
+    if proc.is_dir():
+        try:
+            return (
+                os.path.realpath(os.readlink(proc / "exe")),
+                os.path.realpath(os.readlink(proc / "cwd")),
+            )
+        except OSError:
+            return None, None
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["lsof", "-a", "-p", str(pid), "-d", "cwd,txt", "-Fn"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+    exe: str | None = None
+    cwd: str | None = None
+    fd: str | None = None
+    for line in out.splitlines():
+        if line.startswith("f"):
+            fd = line[1:]
+        elif line.startswith("n"):
+            if fd == "cwd" and cwd is None:
+                cwd = os.path.realpath(line[1:])
+            elif fd == "txt" and exe is None:
+                exe = os.path.realpath(line[1:])  # the first text mapping is the executable
+    return exe, cwd
 
 
 def _is_recorded_group(identity: dict[str, object]) -> bool:
@@ -282,9 +336,12 @@ def _is_recorded_group(identity: dict[str, object]) -> bool:
     except (KeyError, TypeError, ValueError):
         return False
     current = _probe_process(pid)
-    return current is not None and all(
-        current[key] == identity.get(key) for key in ("pid", "pgid", "started", "command")
-    )
+    if current is None:
+        return False
+    keys = ("pid", "pgid", "started", "command", "exe", "cwd")
+    if any(identity.get(key) is None for key in ("exe", "cwd")):
+        return False  # no executable/cwd proof was recorded: never signal
+    return all(current.get(key) == identity.get(key) for key in keys)
 
 
 def _signal_group(pgid: int, sig: int) -> bool:
@@ -305,12 +362,18 @@ def _signal_group(pgid: int, sig: int) -> bool:
     return True
 
 
-def _stop_group(pgid: int) -> bool:
-    """SIGTERM, then SIGKILL after a grace period. Returns whether it was signaled."""
+def _stop_group(identity: dict[str, object]) -> bool:
+    """SIGTERM, then SIGKILL after a grace period, re-proving identity before each signal.
+
+    Returns whether the group was signaled at all.
+    """
     import signal
 
+    pgid = int(identity["pgid"])  # type: ignore[arg-type]
     signaled = False
     for sig in (signal.SIGTERM, signal.SIGKILL):
+        if not _is_recorded_group(identity):
+            return signaled
         if not _signal_group(pgid, sig):
             return signaled
         signaled = True

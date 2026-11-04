@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -560,6 +561,8 @@ _RECORDED = {
     "pgid": 4242,
     "started": "Wed Nov  4 13:40:12 2026",
     "command": "git checkout-index --all --quiet",
+    "exe": "/usr/bin/git",
+    "cwd": "/repo-worktrees/vitrine-run-a",
 }
 
 
@@ -593,9 +596,18 @@ def test_reaper_signals_only_the_recorded_group(repo: Path, monkeypatch) -> None
         {**_RECORDED, "started": "Thu Nov  5 09:00:00 2026", "command": "/usr/bin/git status"},
         {**_RECORDED, "command": "/usr/local/bin/not-git-helper"},
         {**_RECORDED, "pgid": 999},
+        {**_RECORDED, "exe": "/usr/local/bin/other"},
+        {**_RECORDED, "cwd": "/unrelated"},
         None,
     ],
-    ids=["reused-pgid-git-status", "not-git-helper", "left-group", "gone"],
+    ids=[
+        "reused-pgid-git-status",
+        "not-git-helper",
+        "left-group",
+        "other-exe",
+        "other-cwd",
+        "gone",
+    ],
 )
 def test_reaper_never_signals_an_unproven_group(repo: Path, monkeypatch, current) -> None:
     stopped, sent = _reap_with(monkeypatch, repo, current)
@@ -669,3 +681,49 @@ def test_replaced_index_lock_is_left_for_the_foreign_git(repo: Path, monkeypatch
     _, stderr = foreign[0].communicate(timeout=20)
     assert foreign[0].returncode == 0, stderr
     assert store_for_repo(str(repo)).load(A1).phase != gwa.PHASE_READY
+
+
+def _signals_with_identity_sequence(monkeypatch, repo: Path, recorded: dict, probes: list):
+    """Reap with ``_probe_process`` answering ``probes`` in order; the group never exits."""
+    store = store_for_repo(str(repo))
+    store.dir.mkdir(parents=True, exist_ok=True)
+    store.pgids_path(A1).write_text(json.dumps([recorded]))
+    answers = iter(probes)
+    sent: list[int] = []
+    monkeypatch.setattr(gwa, "_probe_process", lambda pid: next(answers, probes[-1]))
+    monkeypatch.setattr(gwa.os, "killpg", lambda pgid, sig: sent.append(sig))
+    monkeypatch.setattr(gw, "_GIT_TERM_GRACE_S", 0.05)
+    store.reap_orphan_git_groups(A1)
+    return [sig for sig in sent if sig != 0]
+
+
+def test_reaper_rechecks_identity_before_kill(repo: Path, monkeypatch) -> None:
+    """Identity changes after SIGTERM (pid reused by an unrelated git): no SIGKILL."""
+    changed = {**_RECORDED, "command": "/unrelated/git status", "cwd": "/unrelated"}
+    sent = _signals_with_identity_sequence(
+        monkeypatch, repo, dict(_RECORDED), [dict(_RECORDED), dict(_RECORDED), changed]
+    )
+    assert sent == [signal.SIGTERM]
+
+
+def test_reaper_escalates_while_identity_holds(repo: Path, monkeypatch) -> None:
+    sent = _signals_with_identity_sequence(monkeypatch, repo, dict(_RECORDED), [dict(_RECORDED)])
+    assert sent == [signal.SIGTERM, signal.SIGKILL]
+
+
+def test_reaper_never_signals_without_exe_and_cwd_proof(repo: Path, monkeypatch) -> None:
+    weak = {key: value for key, value in _RECORDED.items() if key not in ("exe", "cwd")}
+    sent = _signals_with_identity_sequence(monkeypatch, repo, weak, [dict(_RECORDED)])
+    assert sent == []
+
+
+def test_probe_reports_exe_and_cwd_of_a_real_process(tmp_path: Path) -> None:
+    proc = subprocess.Popen(["sleep", "5"], cwd=tmp_path)
+    try:
+        identity = gwa._probe_process(proc.pid)
+        assert identity is not None
+        assert identity["exe"] == os.path.realpath(shutil.which("sleep") or "")
+        assert os.path.realpath(str(identity["cwd"])) == os.path.realpath(tmp_path)
+    finally:
+        proc.kill()
+        proc.wait()

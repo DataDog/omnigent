@@ -119,7 +119,7 @@ def _git_timeout_s() -> float:
 
 # Called with (pid, started) around each git process group; attempt mode records them so a
 # restarted host can stop groups a crashed host left running.
-git_spawn_hook: ContextVar[Callable[[int, bool], None] | None] = ContextVar(
+git_spawn_hook: ContextVar[Callable[[int, bool, str], None] | None] = ContextVar(
     "git_spawn_hook", default=None
 )
 
@@ -185,7 +185,7 @@ def _run_git(
         raise WorktreeError("git is not installed on the host") from exc
     hook = git_spawn_hook.get()
     if hook is not None:
-        hook(proc.pid, True)
+        hook(proc.pid, True, cwd)
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
@@ -198,7 +198,7 @@ def _run_git(
         raise
     finally:
         if hook is not None:
-            hook(proc.pid, False)
+            hook(proc.pid, False, cwd)
     return subprocess.CompletedProcess(argv, proc.returncode or 0, stdout, stderr)
 
 
