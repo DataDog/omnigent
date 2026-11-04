@@ -471,3 +471,23 @@ def test_label_lookup_is_not_truncated_by_archived_sessions(db_uri: str) -> None
         host_id=_HOST_ID, key="omnigent.git.worktree_attempt", value=ATTEMPT
     )
     assert found == [live.id]
+
+
+def test_label_lookup_is_not_hidden_by_other_hosts(db_uri: str) -> None:
+    """Same-label live sessions on another host never crowd out this host's match."""
+    store = SqlAlchemyConversationStore(db_uri)
+    other_host = "4d8753b34a61b09af35a01136d40fadf"
+    HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
+    HostStore(db_uri).upsert_on_connect(other_host, "other", RESERVED_USER_LOCAL)
+    label = {"omnigent.git.worktree_attempt": ATTEMPT}
+    for _ in range(40):
+        store.create_conversation(
+            agent_id=None, host_id=other_host, workspace="/w/run-a", labels=label
+        )
+    mine = store.create_conversation(
+        agent_id=None, host_id=_HOST_ID, workspace="/w/run-a", labels=label
+    )
+    found = store.find_live_sessions_with_label(
+        host_id=_HOST_ID, key="omnigent.git.worktree_attempt", value=ATTEMPT
+    )
+    assert found == [mine.id]
