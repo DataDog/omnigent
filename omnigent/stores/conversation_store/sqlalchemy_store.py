@@ -176,7 +176,9 @@ _WORKSPACE_SHARER_SCAN_LIMIT = 32
 # Upper bound on live sessions returned for one label (e.g. a worktree attempt id).
 _LABELED_SESSION_SCAN_LIMIT = 16
 # Hard stop for one label lookup (16 x 64 = 1024 matching label rows).
-_LABELED_SESSION_MAX_PAGES = 64
+# Label rows read per page, and the most a lookup may scan before it fails loudly.
+_LABELED_SESSION_PAGE_SIZE = 256
+_LABELED_SESSION_MAX_ROWS = 100_000
 
 
 class _RowCountResult(Protocol):
@@ -5069,7 +5071,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         found: list[str] = []
         last: str | None = None
-        for _ in range(_LABELED_SESSION_MAX_PAGES):
+        scanned = 0
+        while True:
             with self._conv_session("find_labeled_conversation_ids") as conv_sess:
                 query = select(SqlConversationLabel.conversation_id).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
@@ -5081,7 +5084,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 page = list(
                     conv_sess.scalars(
                         query.order_by(SqlConversationLabel.conversation_id).limit(
-                            _LABELED_SESSION_SCAN_LIMIT
+                            _LABELED_SESSION_PAGE_SIZE
                         )
                     )
                 )
@@ -5109,15 +5112,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                     )
                 found += [cid for cid in page if cid in on_host]
-            if (
-                len(found) >= _LABELED_SESSION_SCAN_LIMIT
-                or len(page) < _LABELED_SESSION_SCAN_LIMIT
-            ):
+            scanned += len(page)
+            if len(found) >= _LABELED_SESSION_SCAN_LIMIT or len(page) < _LABELED_SESSION_PAGE_SIZE:
                 break
-        else:
-            _logger.warning(
-                "label lookup %s=%s stopped after %d pages", key, value, _LABELED_SESSION_MAX_PAGES
-            )
+            if scanned >= _LABELED_SESSION_MAX_ROWS:
+                # Never answer "none" after giving up: a silent [] would hide a live session.
+                raise RuntimeError(
+                    f"label lookup {key}={value} matched more than "
+                    f"{_LABELED_SESSION_MAX_ROWS} sessions; refusing to return a partial answer"
+                )
         return found[:_LABELED_SESSION_SCAN_LIMIT]
 
     async def delete_conversation(self, conversation_id: str) -> bool:

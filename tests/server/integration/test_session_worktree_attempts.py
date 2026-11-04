@@ -536,3 +536,44 @@ def test_label_page_query_is_an_index_range(db_uri: str) -> None:
             )
             assert "ix_conversation_labels_key_value" in plan, plan
             assert "TEMP B-TREE" not in plan.upper(), plan
+
+
+def _label_off_host(db_uri: str, count: int) -> SqlAlchemyConversationStore:
+    store = SqlAlchemyConversationStore(db_uri)
+    other_host = "5e8753b34a61b09af35a01136d40fadf"
+    HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)
+    HostStore(db_uri).upsert_on_connect(other_host, "other", RESERVED_USER_LOCAL)
+    for _ in range(count):
+        store.create_conversation(
+            agent_id=None,
+            host_id=other_host,
+            workspace="/w/run-a",
+            labels={"omnigent.git.worktree_attempt": ATTEMPT},
+        )
+    return store
+
+
+def test_label_lookup_finds_target_past_1024_off_host_matches(db_uri: str) -> None:
+    store = _label_off_host(db_uri, 1100)
+    mine = store.create_conversation(
+        agent_id=None,
+        host_id=_HOST_ID,
+        workspace="/w/run-a",
+        labels={"omnigent.git.worktree_attempt": ATTEMPT},
+    )
+    found = store.find_live_sessions_with_label(
+        host_id=_HOST_ID, key="omnigent.git.worktree_attempt", value=ATTEMPT
+    )
+    assert found == [mine.id]
+
+
+def test_label_lookup_fails_loudly_past_its_hard_cap(db_uri: str, monkeypatch) -> None:
+    import omnigent.stores.conversation_store.sqlalchemy_store as sql_store
+
+    store = _label_off_host(db_uri, 40)
+    monkeypatch.setattr(sql_store, "_LABELED_SESSION_PAGE_SIZE", 8)
+    monkeypatch.setattr(sql_store, "_LABELED_SESSION_MAX_ROWS", 16)
+    with pytest.raises(RuntimeError, match="refusing to return a partial answer"):
+        store.find_live_sessions_with_label(
+            host_id=_HOST_ID, key="omnigent.git.worktree_attempt", value=ATTEMPT
+        )
