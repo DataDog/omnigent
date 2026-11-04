@@ -608,3 +608,25 @@ def test_reaper_treats_permission_error_as_not_ours(repo: Path, monkeypatch, cap
     assert stopped == []
     assert "not signaling process group 4242: permission denied" in caplog.text
     assert not store_for_repo(str(repo)).pgids_path(A1).exists()
+
+
+def test_reaper_probe_eperm_after_signal_is_logged_and_treated_as_gone(
+    repo: Path, monkeypatch, caplog
+) -> None:
+    """macOS reports EPERM polling a group whose members exited; that ends the wait."""
+    store = store_for_repo(str(repo))
+    store.dir.mkdir(parents=True, exist_ok=True)
+    store.pgids_path(A1).write_text(json.dumps([_RECORDED]))
+    sent: list[int] = []
+
+    def fake_killpg(pgid: int, sig: int) -> None:
+        if sig == 0:
+            raise PermissionError()
+        sent.append(sig)
+
+    monkeypatch.setattr(gwa, "_probe_process", lambda pid: dict(_RECORDED))
+    monkeypatch.setattr(gwa.os, "killpg", fake_killpg)
+    with caplog.at_level("DEBUG", logger=gw._logger.name):
+        assert store.reap_orphan_git_groups(A1) == [4242]
+    assert sent == [signal.SIGTERM]
+    assert "process group 4242 no longer signalable (EPERM)" in caplog.text
