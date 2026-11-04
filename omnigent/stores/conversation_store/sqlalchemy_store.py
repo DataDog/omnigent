@@ -105,6 +105,7 @@ from omnigent.stores.conversation_store import (
     ConversationStore,
     CreatedSession,
     DailyCostState,
+    LabelLookupExhaustedError,
     SessionConnectivity,
     pinned_label_key,
 )
@@ -5117,7 +5118,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 break
             if scanned >= _LABELED_SESSION_MAX_ROWS:
                 # Never answer "none" after giving up: a silent [] would hide a live session.
-                raise RuntimeError(
+                raise LabelLookupExhaustedError(
                     f"label lookup {key}={value} matched more than "
                     f"{_LABELED_SESSION_MAX_ROWS} sessions; refusing to return a partial answer"
                 )

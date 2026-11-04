@@ -509,13 +509,22 @@ async def find_attempt_session(
         another user's session owns it.
     """
     from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.stores.conversation_store import LabelLookupExhaustedError
 
-    ids = await asyncio.to_thread(
-        conversation_store.find_live_sessions_with_label,
-        host_id=host_id,
-        key=WORKTREE_ATTEMPT_LABEL_KEY,
-        value=attempt_id,
-    )
+    try:
+        ids = await asyncio.to_thread(
+            conversation_store.find_live_sessions_with_label,
+            host_id=host_id,
+            key=WORKTREE_ATTEMPT_LABEL_KEY,
+            value=attempt_id,
+        )
+    except LabelLookupExhaustedError as exc:
+        # Never guess "no session" here: refuse cleanly before anything is created.
+        raise WorktreeAttemptError(
+            "conflict",
+            f"too many sessions are labeled with attempt {attempt_id} to check safely; "
+            "nothing was created. Use a new attempt_id.",
+        ) from exc
     expected = worktree_root_fingerprint(source_repo)
     for conversation_id in ids:
         conv = await asyncio.to_thread(conversation_store.get_conversation, conversation_id)

@@ -315,6 +315,10 @@ class ConversationAlreadyExistsError(Exception):
     """Raised when a caller-supplied conversation id is already in use."""
 
 
+class LabelLookupExhaustedError(RuntimeError):
+    """A label lookup matched more rows than it may scan; no partial answer is given."""
+
+
 class NameAlreadyExistsError(Exception):
     """
     Raised by ``create_conversation`` when the requested

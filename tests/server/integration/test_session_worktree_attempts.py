@@ -577,7 +577,55 @@ def test_label_lookup_fails_loudly_past_its_hard_cap(db_uri: str, monkeypatch) -
     store = _label_off_host(db_uri, 40)
     monkeypatch.setattr(sql_store, "_LABELED_SESSION_PAGE_SIZE", 8)
     monkeypatch.setattr(sql_store, "_LABELED_SESSION_MAX_ROWS", 16)
-    with pytest.raises(RuntimeError, match="refusing to return a partial answer"):
+    from omnigent.stores.conversation_store import LabelLookupExhaustedError
+
+    with pytest.raises(LabelLookupExhaustedError, match="refusing to return a partial answer"):
         store.find_live_sessions_with_label(
             host_id=_HOST_ID, key="omnigent.git.worktree_attempt", value=ATTEMPT
         )
+
+
+def _exhaust_label_lookup(monkeypatch) -> None:
+    from omnigent.stores.conversation_store import LabelLookupExhaustedError
+
+    def exhausted(self, **kwargs):
+        raise LabelLookupExhaustedError("label lookup matched more than 100000 sessions")
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "find_live_sessions_with_label", exhausted)
+
+
+async def test_lookup_exhaustion_is_a_clean_409_on_sessions(
+    register_host, client, repo, monkeypatch
+) -> None:
+    frames = register_host()
+    agent = await create_test_agent(client, name="wt-attempt-exhaust")
+    before = (await client.get("/v1/sessions", params={"visibility": "all"})).json()
+    assert "data" in before, before
+    _exhaust_label_lookup(monkeypatch)
+    resp = await _post(client, agent["id"], repo)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "conflict"
+    assert _creates(frames) == []
+    after = (await client.get("/v1/sessions", params={"visibility": "all"})).json()
+    assert len(after.get("data", [])) == len(before.get("data", []))
+
+
+async def test_lookup_exhaustion_is_a_clean_409_on_runner_route(
+    register_host, client, repo, monkeypatch
+) -> None:
+    frames = register_host()
+    agent = await create_test_agent(client, name="wt-attempt-exhaust-runner")
+    session = (await client.post("/v1/sessions", json={"agent_id": agent["id"]})).json()
+    _exhaust_label_lookup(monkeypatch)
+    resp = await client.post(
+        f"/v1/hosts/{_HOST_ID}/runners",
+        json={
+            "session_id": session["id"],
+            "workspace": str(repo),
+            "git": {"branch_name": "vitrine/run-x", "attempt_id": ATTEMPT},
+        },
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "conflict"
+    assert _creates(frames) == []
+    assert not any(isinstance(f, HostLaunchRunnerFrame) for f in frames)
