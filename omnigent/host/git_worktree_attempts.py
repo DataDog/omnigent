@@ -476,6 +476,8 @@ def _advance_steps(
             raise _attention(
                 receipt, f"branch {receipt.branch!r} points at {tip}, not the reserved base"
             )
+        if tip is None:
+            raise gw.WorktreeError(f"branch {receipt.branch!r} does not exist")
         _validate_directory(repo, tip, receipt.relative_directory)
         receipt.start_commit = tip
         receipt.phase = PHASE_BRANCH_CREATED

@@ -11159,7 +11159,9 @@ async def _ensure_bind_target_ready(host_id: str, workspace: str, request: Reque
     )
 
     host_registry = getattr(request.app.state, "host_registry", None)
-    host_conn = host_registry.get(host_id) if host_registry is not None else None
+    if host_registry is None:
+        return
+    host_conn = host_registry.get(host_id)
     if host_conn is None:
         return
     try:

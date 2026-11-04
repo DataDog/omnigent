@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-
 import subprocess
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -32,17 +31,17 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.host.identity import HostIdentity
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.host_registry import HostConnection
 from omnigent.server.routes.host_tunnel import create_worktree_result_payload
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
-from omnigent.host.identity import HostIdentity
-from omnigent.server.auth import RESERVED_USER_LOCAL
-from omnigent.server.host_registry import HostConnection
 from omnigent.stores.host_store import HostStore
 from tests.server.helpers import create_test_agent
 

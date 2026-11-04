@@ -461,6 +461,7 @@ WORKTREE_ATTEMPT_LABEL_KEY = "omnigent.git.worktree_attempt"
 # Per-process only: concurrent same-attempt POSTs on one replica serialize here.
 # Across replicas the host receipt still prevents a duplicate worktree, but two
 # replicas racing the very first create can each create a session.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by globally unique host id
 _attempt_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )

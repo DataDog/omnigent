@@ -92,8 +92,17 @@ def _make_partial(repo: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     receipt = store_for_repo(str(repo)).load(A1)
     assert receipt is not None and receipt.phase == gwa.PHASE_BRANCH_CREATED
     path = Path(receipt.worktree_path)
-    _git(repo, "worktree", "add", "--no-checkout", "--lock", "--reason", "initializing",
-         str(path), "vitrine/run-a")
+    _git(
+        repo,
+        "worktree",
+        "add",
+        "--no-checkout",
+        "--lock",
+        "--reason",
+        "initializing",
+        str(path),
+        "vitrine/run-a",
+    )
     for i in range(5):
         (path / f"f{i}.txt").write_text(f"content {i}\n")
     return path
@@ -262,7 +271,9 @@ def test_restart_resumes_from_receipt_alone(repo: Path, monkeypatch) -> None:
         f"r=c(repo_path={str(repo)!r}, branch_name='vitrine/run-a', attempt_id={A1!r});"
         "print(r.outcome)"
     )
-    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True)
+    out = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+    )
     assert out.stdout.strip() == "resumed"
 
 
