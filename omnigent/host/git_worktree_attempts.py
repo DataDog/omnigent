@@ -695,6 +695,13 @@ def _finish(
     workspace = Path(receipt.worktree_path) / receipt.relative_directory
     if not workspace.is_dir():
         raise _attention(receipt, f"selected directory {receipt.relative_directory!r} is missing")
+    git_dir = gw._run_git(["rev-parse", "--absolute-git-dir"], cwd=receipt.worktree_path)
+    _check(git_dir, "could not resolve worktree git dir")
+    if (Path(git_dir.stdout.strip()) / "index.lock").exists():
+        # Never report ready while another git process may still be writing.
+        raise _attention(
+            receipt, "an index.lock is present, so a git process may still be writing"
+        )
     receipt.phase = PHASE_READY
     receipt.completed_at = int(time.time())
     store.write(receipt)
@@ -739,6 +746,54 @@ def _fill_missing_files(worktree: str) -> None:
         raise gw._git_error("git checkout-index failed", result)
 
 
+@contextmanager
+def _hold_index_lock(receipt: Receipt, git_dir: Path) -> Iterator[None]:
+    """Own ``index.lock`` (O_EXCL) so no git process can write the index meanwhile."""
+    lock = git_dir / "index.lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError as exc:
+        raise _attention(
+            receipt, "an index.lock is present, so a git process may still be writing"
+        ) from exc
+    try:
+        yield
+    finally:
+        os.close(fd)
+        lock.unlink(missing_ok=True)
+
+
+def _create_index(receipt: Receipt, git_dir: Path) -> None:
+    """Create the missing index without ever replacing one that appears concurrently.
+
+    The index is built in a temp file while we hold ``index.lock``, then installed
+    with a hard link, which fails instead of overwriting an existing index.
+    """
+    index = git_dir / "index"
+    tmp = git_dir / f"index.omnigent-{receipt.attempt_id}"
+    tmp.unlink(missing_ok=True)
+    with _hold_index_lock(receipt, git_dir):
+        if index.exists():
+            raise _attention(receipt, "an index appeared while the checkout was being finished")
+        try:
+            _check(
+                gw._run_git(
+                    ["read-tree", str(receipt.start_commit)],
+                    cwd=receipt.worktree_path,
+                    env={"GIT_INDEX_FILE": str(tmp)},
+                ),
+                "git read-tree failed",
+            )
+            try:
+                os.link(tmp, index)
+            except FileExistsError as exc:
+                raise _attention(
+                    receipt, "an index appeared while the checkout was being finished"
+                ) from exc
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
 def _complete_partial(store: ReceiptStore, receipt: Receipt, *, locked: str | None) -> None:
     """Finish a registered, partly checked-out worktree without overwriting anything."""
     worktree = receipt.worktree_path
@@ -757,10 +812,7 @@ def _complete_partial(store: ReceiptStore, receipt: Receipt, *, locked: str | No
         if staged:
             raise _attention(receipt, "the index has staged changes", staged)
     else:
-        _check(
-            gw._run_git(["read-tree", str(receipt.start_commit)], cwd=worktree),
-            "git read-tree failed",
-        )
+        _create_index(receipt, git_dir)
     changed, missing = _dirty_files(receipt)
     if changed:
         raise _attention(receipt, "files differ from the branch", changed)
@@ -773,6 +825,8 @@ def _complete_partial(store: ReceiptStore, receipt: Receipt, *, locked: str | No
             receipt, "files changed while the checkout was being finished", changed + missing
         )
     _verify_identity(store, receipt, check_commit=True)
+    if (git_dir / "index.lock").exists():
+        raise _attention(receipt, "an index.lock appeared while the checkout was being finished")
     if locked == "initializing":
         gw._run_git(["worktree", "unlock", worktree], cwd=receipt.repo_root)
 

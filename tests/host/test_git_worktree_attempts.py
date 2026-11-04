@@ -80,10 +80,10 @@ def _code(exc: pytest.ExceptionInfo[WorktreeAttemptError]) -> str:
 def _timeout_at(monkeypatch: pytest.MonkeyPatch, prefix: list[str]) -> None:
     real = gw._run_git
 
-    def fake(args: list[str], *, cwd: str):
+    def fake(args: list[str], *, cwd: str, **kw):
         if args[: len(prefix)] == prefix:
             raise gw.GitTimeoutError("git command timed out after 120s")
-        return real(args, cwd=cwd)
+        return real(args, cwd=cwd, **kw)
 
     monkeypatch.setattr(gw, "_run_git", fake)
 
@@ -496,3 +496,58 @@ def test_restart_stops_git_group_left_by_crashed_host(repo: Path, tmp_path: Path
     assert restart.stdout.strip() == "resumed"
     path = Path(store_for_repo(str(repo)).load(A1).worktree_path)
     assert (path / "f0.txt").read_text() == "content 0\n"
+
+
+def _git_dir(path: Path) -> Path:
+    return Path(_git(path, "rev-parse", "--absolute-git-dir").strip())
+
+
+def test_index_staged_after_inspection_is_never_replaced(repo: Path, monkeypatch) -> None:
+    """No index at inspection; the user stages before our read-tree: their snapshot wins."""
+    path = _make_partial(repo, monkeypatch)
+    real_lock = gwa._hold_index_lock
+
+    def user_stages_first(receipt, git_dir):
+        (path / "f2.txt").write_text("USER STAGED SNAPSHOT\n")
+        _git(path, "add", "f2.txt")
+        (path / "f2.txt").write_text("content 2\n")  # worktree text restored
+        return real_lock(receipt, git_dir)
+
+    monkeypatch.setattr(gwa, "_hold_index_lock", user_stages_first)
+    with pytest.raises(WorktreeAttemptError) as exc:
+        _create(repo)
+    assert _code(exc) == NEEDS_ATTENTION
+    assert _git(path, "show", ":f2.txt") == "USER STAGED SNAPSHOT\n"
+    assert store_for_repo(str(repo)).load(A1).phase != gwa.PHASE_READY
+
+
+def test_index_lock_held_by_another_git_blocks_index_creation(repo: Path, monkeypatch) -> None:
+    path = _make_partial(repo, monkeypatch)
+    real_lock = gwa._hold_index_lock
+
+    def foreign_lock_first(receipt, git_dir):
+        (git_dir / "index.lock").write_text("")
+        return real_lock(receipt, git_dir)
+
+    monkeypatch.setattr(gwa, "_hold_index_lock", foreign_lock_first)
+    with pytest.raises(WorktreeAttemptError) as exc:
+        _create(repo)
+    assert _code(exc) == NEEDS_ATTENTION
+    assert (_git_dir(path) / "index.lock").exists()
+    assert not (_git_dir(path) / "index").exists()
+
+
+def test_index_lock_appearing_after_fill_is_never_ready(repo: Path, monkeypatch) -> None:
+    path = _make_partial(repo, monkeypatch)
+    real_fill = gwa._fill_missing_files
+
+    def fill_then_lock(worktree: str) -> None:
+        real_fill(worktree)
+        (_git_dir(path) / "index.lock").write_text("")
+
+    monkeypatch.setattr(gwa, "_fill_missing_files", fill_then_lock)
+    with pytest.raises(WorktreeAttemptError) as exc:
+        _create(repo)
+    assert _code(exc) == NEEDS_ATTENTION and "index.lock" in str(exc.value)
+    assert (_git_dir(path) / "index.lock").exists()
+    assert store_for_repo(str(repo)).load(A1).phase != gwa.PHASE_READY

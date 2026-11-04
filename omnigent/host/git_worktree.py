@@ -150,6 +150,7 @@ def _run_git(
     args: list[str],
     *,
     cwd: str,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a git command, returning the completed process.
 
@@ -161,6 +162,7 @@ def _run_git(
         shell parsing occurs.
     :param cwd: Working directory to run git in, e.g.
         ``"/Users/alice/myrepo"``.
+    :param env: Extra environment variables, e.g. ``{"GIT_INDEX_FILE": ...}``.
     :returns: The completed process with captured text stdout/stderr.
     :raises WorktreeError: If git is not installed, or the command
         exceeds the git timeout (:class:`GitTimeoutError`).
@@ -172,7 +174,7 @@ def _run_git(
             argv,
             cwd=cwd,
             # Keep failure diagnostics stable for repository classification.
-            env={**os.environ, "LC_ALL": "C"},
+            env={**os.environ, **(env or {}), "LC_ALL": "C"},
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

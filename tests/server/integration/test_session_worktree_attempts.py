@@ -301,12 +301,12 @@ async def test_bind_rejects_partial_and_allows_plain_worktree(
     agent = await create_test_agent(client, name="wt-attempt-bind")
     real = gw._run_git
 
-    def timeout_on_add(args: list[str], *, cwd: str):
+    def timeout_on_add(args: list[str], *, cwd: str, **kw):
         if args[:2] == ["worktree", "add"]:
             # Leave a registered, unpopulated checkout like a killed host would.
-            real([*args[:2], "--no-checkout", *args[2:]], cwd=cwd)
+            real([*args[:2], "--no-checkout", *args[2:]], cwd=cwd, **kw)
             raise gw.GitTimeoutError("git command timed out after 120s")
-        return real(args, cwd=cwd)
+        return real(args, cwd=cwd, **kw)
 
     monkeypatch.setattr(gw, "_run_git", timeout_on_add)
     partial = await _post(client, agent["id"], repo)
