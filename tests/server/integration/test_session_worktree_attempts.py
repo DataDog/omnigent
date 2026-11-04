@@ -497,6 +497,9 @@ def test_label_page_query_is_an_index_range(db_uri: str) -> None:
     """Each label page seeks the label index in order: no temp sort, no OFFSET."""
     from sqlalchemy import event
 
+    if not db_uri.startswith("sqlite"):
+        pytest.skip("EXPLAIN QUERY PLAN is SQLite syntax")
+
     store = SqlAlchemyConversationStore(db_uri)
     other_host = "5e8753b34a61b09af35a01136d40fadf"
     HostStore(db_uri).upsert_on_connect(_HOST_ID, "wt-host", RESERVED_USER_LOCAL)

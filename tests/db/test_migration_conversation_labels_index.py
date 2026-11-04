@@ -33,7 +33,12 @@ def _label_indexes(engine: sa.Engine) -> dict[str, list[str]]:
 def test_index_at_head(tmp_path: Path) -> None:
     engine = get_or_create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     try:
-        assert _label_indexes(engine)[_INDEX] == ["workspace_id", "key", "value", "conversation_id"]
+        assert _label_indexes(engine)[_INDEX] == [
+            "workspace_id",
+            "key",
+            "value",
+            "conversation_id",
+        ]
     finally:
         clear_engine_cache()
 
