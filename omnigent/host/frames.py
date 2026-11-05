@@ -62,6 +62,8 @@ CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
+# ``host.create_worktree`` honors ``attempt_id`` (idempotent, resumable creation):
+CAP_GIT_WORKTREE_ATTEMPTS = "git_worktree_attempts"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
 CAP_MCP_REGISTRY = "mcp_registry"
 
@@ -75,6 +77,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_MCP_REGISTRY,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
+    CAP_GIT_WORKTREE_ATTEMPTS,
     CAP_REFRESH_HARNESSES,
 ]
 
@@ -594,6 +597,8 @@ class HostCreateWorktreeFrame:
     :param existing_branch: When ``True``, check out the pre-existing
         ``branch_name`` into a fresh worktree (the deleted-worktree
         recreate path) instead of creating a new branch.
+    :param attempt_id: Client attempt id for idempotent creation; ``None``
+        keeps legacy behavior. Older hosts ignore it (gate on the capability).
     """
 
     request_id: str
@@ -601,6 +606,7 @@ class HostCreateWorktreeFrame:
     branch_name: str
     base_branch: str | None = None
     existing_branch: bool = False
+    attempt_id: str | None = None
 
 
 @dataclass
@@ -618,6 +624,10 @@ class HostCreateWorktreeResultFrame:
     :param error: Error message when ``status`` is ``"failed"``,
         e.g. ``"not a git repository"``. ``None`` on success.
     :param workspace: Selected directory in the new worktree. Absent on older hosts.
+    :param error_code: Attempt-mode failure code, e.g.
+        ``"worktree_creation_incomplete"``. ``None`` for legacy failures.
+    :param creation: Attempt-mode receipt (attempt_id, state, outcome,
+        worktree_path, branch, workspace, resume_started).
     """
 
     request_id: str
@@ -626,6 +636,8 @@ class HostCreateWorktreeResultFrame:
     branch: str | None = None
     error: str | None = None
     workspace: str | None = None
+    error_code: str | None = None
+    creation: _JsonObject | None = None
 
 
 @dataclass
@@ -1544,6 +1556,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "branch_name": frame.branch_name,
                 "base_branch": frame.base_branch,
                 "existing_branch": frame.existing_branch,
+                "attempt_id": frame.attempt_id,
             }
         )
     if isinstance(frame, HostCreateWorktreeResultFrame):
@@ -1556,6 +1569,8 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "branch": frame.branch,
                 "error": frame.error,
                 "workspace": frame.workspace,
+                "error_code": frame.error_code,
+                "creation": frame.creation,
             }
         )
     if isinstance(frame, HostRemoveWorktreeFrame):
@@ -2544,6 +2559,7 @@ def _decode_create_worktree(msg: _JsonObject) -> HostCreateWorktreeFrame:
         branch_name=_required_str(msg, "branch_name"),
         base_branch=_optional_nullable_str(msg, "base_branch"),
         existing_branch=existing_branch is True,
+        attempt_id=_optional_nullable_str(msg, "attempt_id"),
     )
 
 
@@ -2555,6 +2571,7 @@ def _decode_create_worktree_result(
     :param msg: Decoded frame object.
     :returns: Typed host.create_worktree_result frame.
     """
+    creation = msg.get("creation")
     return HostCreateWorktreeResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
@@ -2562,6 +2579,8 @@ def _decode_create_worktree_result(
         branch=_optional_nullable_str(msg, "branch"),
         error=_optional_nullable_str(msg, "error"),
         workspace=_optional_nullable_str(msg, "workspace"),
+        error_code=_optional_nullable_str(msg, "error_code"),
+        creation=creation if isinstance(creation, dict) else None,
     )
 
 

@@ -1480,12 +1480,16 @@ class SessionGitOptions(BaseModel):
         branch. Create mode only; invalid with ``existing_worktree``
         and with ``base_branch`` (an existing branch has no base to
         fork).
+    :param attempt_id: Client-generated id for idempotent, resumable
+        creation (create mode only). Reuse it on every retry of the same
+        create; ``None`` keeps legacy behavior.
     """
 
     branch_name: str
     base_branch: str | None = None
     existing_worktree: bool = False
     existing_branch: bool = False
+    attempt_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{16,128}$")
 
     @model_validator(mode="after")
     def _check_existing_worktree(self) -> SessionGitOptions:
@@ -1505,6 +1509,8 @@ class SessionGitOptions(BaseModel):
             raise ValueError("base_branch cannot be set when existing_branch is true")
         if self.existing_branch and self.existing_worktree:
             raise ValueError("existing_branch and existing_worktree cannot both be true")
+        if self.existing_worktree and self.attempt_id is not None:
+            raise ValueError("attempt_id cannot be set when existing_worktree is true")
         return self
 
 
@@ -2130,6 +2136,30 @@ class BackgroundTaskInfo(BaseModel):
     command: str | None = None
 
 
+class SessionGitWorktreeReceipt(BaseModel):
+    """
+    Ownership/readiness receipt for an attempt-mode worktree create.
+
+    :param attempt_id: The request's ``git.attempt_id``.
+    :param state: Always ``"ready"`` on a successful create.
+    :param outcome: ``created`` (this request), ``resumed`` (finished a
+        partial from the same attempt) or ``existing`` (already done).
+    :param worktree_path: Worktree root on the host.
+    :param branch: Branch checked out in the worktree.
+    :param workspace: Session directory inside the worktree.
+    :param session_reused: ``True`` when an earlier request with this attempt
+        already created the session and it is returned instead of a new one.
+    """
+
+    attempt_id: str
+    state: Literal["ready", "partial"]
+    outcome: Literal["created", "resumed", "existing"]
+    worktree_path: str
+    branch: str
+    workspace: str
+    session_reused: bool = False
+
+
 class SessionResponse(BaseModel):
     """
     API representation of a session.
@@ -2400,6 +2430,8 @@ class SessionResponse(BaseModel):
         therefore resets the clock, so an orchestrator treating this as a pure
         item-append heartbeat should account for that. Can be compared across
         snapshots independently of lifecycle status.
+    :param git_worktree: Attempt-mode create receipt; ``None`` on reads and
+        legacy creates.
     """
 
     id: str
@@ -2419,6 +2451,7 @@ class SessionResponse(BaseModel):
     host_resumable: bool = False
     reasoning_effort: str | None = None
     items: list[ConversationItem] = Field(default_factory=list)
+    git_worktree: SessionGitWorktreeReceipt | None = None
     permission_level: int | None = None
     sub_agent_name: str | None = None
     kind: str = "default"

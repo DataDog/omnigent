@@ -346,6 +346,10 @@ class ConversationAlreadyExistsError(Exception):
     """Raised when a caller-supplied conversation id is already in use."""
 
 
+class LabelLookupExhaustedError(RuntimeError):
+    """A label lookup matched more rows than it may scan; no partial answer is given."""
+
+
 class NameAlreadyExistsError(Exception):
     """
     Raised by ``create_conversation`` when the requested
@@ -2111,6 +2115,20 @@ class ConversationStore(ABC):
         :param include_subdirectories: Also protect sessions inside this worktree root.
         :returns: ``True`` when at least one other live conversation
             references the pair, else ``False``.
+        """
+        ...
+
+    @abstractmethod
+    def find_live_sessions_with_label(self, *, host_id: str, key: str, value: str) -> list[str]:
+        """
+        Ids of non-archived conversations on ``host_id`` labeled ``key=value``.
+
+        Backed by the ``(workspace_id, key, value)`` label index; no truncation.
+
+        :param host_id: Host the session is bound to, e.g. ``"host_a1b2..."``.
+        :param key: Label key, e.g. ``"omnigent.git.worktree_attempt"``.
+        :param value: Label value, e.g. an attempt id.
+        :returns: Matching conversation ids, oldest first.
         """
         ...
 

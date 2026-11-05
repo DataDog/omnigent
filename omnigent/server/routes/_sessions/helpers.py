@@ -9777,6 +9777,7 @@ async def _create_session_worktree(
     """
     from omnigent.host.git_worktree import WorktreeError, validate_branch_name
     from omnigent.server.routes._host_worktree import (
+        WorktreeAttemptError,
         WorktreeHostUnavailableError,
         WorktreeProxyError,
         create_worktree_on_host,
@@ -9802,7 +9803,10 @@ async def _create_session_worktree(
             branch_name=git.branch_name,
             base_branch=git.base_branch,
             existing_branch=git.existing_branch,
+            attempt_id=git.attempt_id,
         )
+    except WorktreeAttemptError as exc:
+        raise OmnigentError(exc.message, code=exc.code) from exc
     except WorktreeHostUnavailableError as exc:
         # Host offline / unresponsive — infra, not user input.
         raise OmnigentError(exc.message, code=ErrorCode.CONFLICT) from exc

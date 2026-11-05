@@ -1695,6 +1695,32 @@ def test_create_worktree_result_frame_failure_round_trip() -> None:
     assert decoded.error == "branch 'x' already exists"
 
 
+def test_create_worktree_attempt_fields_round_trip_and_old_shapes() -> None:
+    """attempt_id / error_code / creation survive, and old-peer frames decode as None."""
+    import json
+
+    request = HostCreateWorktreeFrame(
+        request_id="r", repo_path="/repo", branch_name="b", attempt_id="a" * 16
+    )
+    assert decode_host_frame(encode_host_frame(request)) == request
+    result = HostCreateWorktreeResultFrame(
+        request_id="r",
+        status="failed",
+        error="timed out",
+        error_code="worktree_creation_incomplete",
+        creation={"attempt_id": "a" * 16, "state": "partial"},
+    )
+    assert decode_host_frame(encode_host_frame(result)) == result
+    old = json.loads(encode_host_frame(result))
+    old.pop("error_code")
+    old.pop("creation")
+    decoded = decode_host_frame(json.dumps(old))
+    assert decoded.error_code is None and decoded.creation is None
+    old_req = json.loads(encode_host_frame(request))
+    old_req.pop("attempt_id")
+    assert decode_host_frame(json.dumps(old_req)).attempt_id is None
+
+
 def test_remove_worktree_frame_round_trip() -> None:
     """Verify HostRemoveWorktreeFrame survives encode → decode.
 

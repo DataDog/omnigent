@@ -11,7 +11,7 @@ from __future__ import annotations
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -547,12 +547,14 @@ def test_list_worktrees_preserves_probe_failure(
         stdout="",
         stderr=stderr,
     )
-    with patch("omnigent.host.git_worktree.subprocess.run", return_value=failed) as run:
+    proc = MagicMock(returncode=failed.returncode, pid=0)
+    proc.communicate.return_value = (failed.stdout, failed.stderr)
+    with patch("omnigent.host.git_worktree.subprocess.Popen", return_value=proc) as popen:
         with pytest.raises(WorktreeError) as exc:
             list_worktrees(repo_path=str(git_repo))
     suffix = f": {stderr}" if stderr else ""
     assert exc.value.message == f"git worktree list failed (exit 128){suffix}"
-    assert run.call_args.kwargs["env"]["LC_ALL"] == "C"
+    assert popen.call_args.kwargs["env"]["LC_ALL"] == "C"
 
 
 @pytest.mark.parametrize(

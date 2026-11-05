@@ -8,10 +8,14 @@ designs/SESSION_GIT_WORKTREE.md.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
+import signal
 import subprocess
+from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,6 +51,10 @@ class WorktreeError(Exception):
         """
         super().__init__(message)
         self.message = message
+
+
+class GitTimeoutError(WorktreeError):
+    """A git call exceeded the host git timeout and its process group was stopped."""
 
 
 def validate_branch_name(name: str) -> None:
@@ -95,37 +103,103 @@ def _sanitize_dirname(branch_name: str) -> str:
     return branch_name.strip("/").replace("/", "-")
 
 
+def _git_timeout_s() -> float:
+    """Per-git-call timeout, overridable via ``OMNIGENT_HOST_GIT_TIMEOUT_S``."""
+    raw = os.environ.get("OMNIGENT_HOST_GIT_TIMEOUT_S")
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            _logger.warning("ignoring invalid OMNIGENT_HOST_GIT_TIMEOUT_S=%r", raw)
+        else:
+            if value > 0:
+                return value
+    return _GIT_TIMEOUT_S
+
+
+# Called with (pid, started) around each git process group; attempt mode records them so a
+# restarted host can stop groups a crashed host left running.
+git_spawn_hook: ContextVar[Callable[[int, bool, str], None] | None] = ContextVar(
+    "git_spawn_hook", default=None
+)
+
+# Grace between SIGTERM and SIGKILL for a timed-out git process group.
+_GIT_TERM_GRACE_S: float = 5.0
+
+
+def _terminate_group(proc: subprocess.Popen[str]) -> None:
+    """Stop a timed-out git and its children (checkout runs as a grandchild).
+
+    SIGTERM lets git's signal handlers drop their lockfiles; SIGKILL follows
+    after a grace period so nothing keeps writing once we report a timeout.
+    """
+    if os.name != "posix":
+        proc.kill()
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=_GIT_TERM_GRACE_S)
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGKILL)
+
+
 def _run_git(
     args: list[str],
     *,
     cwd: str,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a git command, returning the completed process.
+
+    On POSIX git runs in its own process group so a timeout stops the whole
+    group, including checkout grandchildren.
 
     :param args: Git argv *after* ``git``, e.g.
         ``["rev-parse", "--show-toplevel"]``. Passed as a list so no
         shell parsing occurs.
     :param cwd: Working directory to run git in, e.g.
         ``"/Users/alice/myrepo"``.
+    :param env: Extra environment variables, e.g. ``{"GIT_INDEX_FILE": ...}``.
     :returns: The completed process with captured text stdout/stderr.
     :raises WorktreeError: If git is not installed, or the command
-        exceeds :data:`_GIT_TIMEOUT_S`.
+        exceeds the git timeout (:class:`GitTimeoutError`).
     """
+    timeout = _git_timeout_s()
+    argv = ["git", *args]
     try:
-        return subprocess.run(
-            ["git", *args],
+        proc = subprocess.Popen(
+            argv,
             cwd=cwd,
             # Keep failure diagnostics stable for repository classification.
-            env={**os.environ, "LC_ALL": "C"},
-            capture_output=True,
+            env={**os.environ, **(env or {}), "LC_ALL": "C"},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=_GIT_TIMEOUT_S,
-            check=False,
+            start_new_session=os.name == "posix",
         )
     except FileNotFoundError as exc:
         raise WorktreeError("git is not installed on the host") from exc
+    hook = git_spawn_hook.get()
+    if hook is not None:
+        hook(proc.pid, True, cwd)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        raise WorktreeError(f"git command timed out after {_GIT_TIMEOUT_S:.0f}s") from exc
+        _terminate_group(proc)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.communicate(timeout=_GIT_TERM_GRACE_S)
+        raise GitTimeoutError(f"git command timed out after {timeout:.0f}s") from exc
+    except BaseException:
+        _terminate_group(proc)
+        raise
+    finally:
+        if hook is not None:
+            hook(proc.pid, False, cwd)
+    return subprocess.CompletedProcess(argv, proc.returncode or 0, stdout, stderr)
 
 
 def _git_error(label: str, result: subprocess.CompletedProcess[str]) -> WorktreeError:
@@ -197,6 +271,8 @@ class WorktreeInfo:
         (no branch checked out).
     :param updated_at: Unix epoch seconds of the checked-out HEAD commit, or
         ``None`` when the commit timestamp cannot be resolved.
+    :param locked: Lock reason (``""`` when locked without one), ``None`` if unlocked.
+    :param creation: Attempt receipt summary, ``None`` when no receipt owns the path.
     """
 
     path: str
@@ -204,6 +280,8 @@ class WorktreeInfo:
     is_main: bool
     detached: bool
     updated_at: int | None = None
+    locked: str | None = None
+    creation: dict[str, object] | None = None
 
 
 def _commit_updated_ats(repo_root: str, heads: list[str | None]) -> dict[str, int]:
@@ -226,7 +304,9 @@ def _commit_updated_ats(repo_root: str, heads: list[str | None]) -> dict[str, in
     return timestamps
 
 
-def list_worktrees(*, repo_path: str, for_cleanup: bool = False) -> list[WorktreeInfo]:
+def list_worktrees(
+    *, repo_path: str, for_cleanup: bool = False, attach_creation: bool = True
+) -> list[WorktreeInfo]:
     """List the git worktrees of the repository containing ``repo_path``.
 
     Resolves the main work tree first (so a linked worktree resolves the
@@ -239,6 +319,7 @@ def list_worktrees(*, repo_path: str, for_cleanup: bool = False) -> list[Worktre
         If removed or replaced by a file, resolve from a surviving parent.
     :param for_cleanup: Recover a stored canonical workspace without following
         replacement symlinks. The caller must verify the recorded cleanup root.
+    :param attach_creation: Attach attempt receipts as ``creation``.
     :returns: One :class:`WorktreeInfo` per worktree, main first.
     :raises WorktreeError: If ``repo_path`` is not a directory or not
         inside a git work tree, or if ``git worktree list`` fails.
@@ -257,17 +338,21 @@ def list_worktrees(*, repo_path: str, for_cleanup: bool = False) -> list[Worktre
     if result.returncode != 0:
         raise _git_error("git worktree list failed", result)
 
-    records: list[tuple[str, str | None, bool, str | None]] = []
+    records: list[tuple[str, str | None, bool, str | None, str | None]] = []
     path: str | None = None
     branch: str | None = None
     head: str | None = None
+    locked: str | None = None
     detached = False
     for line in result.stdout.splitlines():
         if line.startswith("worktree "):
             path = line[len("worktree ") :].strip()
             branch = None
             head = None
+            locked = None
             detached = False
+        elif line == "locked" or line.startswith("locked "):
+            locked = line[len("locked ") :].strip() if line != "locked" else ""
         elif line.startswith("HEAD "):
             head = line[len("HEAD ") :].strip()
         elif line.startswith("branch "):
@@ -277,24 +362,28 @@ def list_worktrees(*, repo_path: str, for_cleanup: bool = False) -> list[Worktre
             detached = True
         elif line == "" and path is not None:
             # Blank line terminates a record.
-            records.append((path, branch, detached, head))
+            records.append((path, branch, detached, head, locked))
             path = None
     # The porcelain output may omit a trailing blank line for the last record.
     if path is not None:
-        records.append((path, branch, detached, head))
+        records.append((path, branch, detached, head, locked))
     updated_ats = _commit_updated_ats(repo_root, [record[3] for record in records])
-    return [
+    infos = [
         WorktreeInfo(
-            path=worktree_path,
-            branch=worktree_branch,
+            path=wt_path,
+            branch=wt_branch,
             is_main=index == 0,
-            detached=worktree_detached,
-            updated_at=updated_ats.get(worktree_head) if worktree_head is not None else None,
+            detached=wt_detached,
+            updated_at=updated_ats.get(wt_head) if wt_head is not None else None,
+            locked=wt_locked,
         )
-        for index, (worktree_path, worktree_branch, worktree_detached, worktree_head) in enumerate(
-            records
-        )
+        for index, (wt_path, wt_branch, wt_detached, wt_head, wt_locked) in enumerate(records)
     ]
+    if attach_creation:
+        from omnigent.host.git_worktree_attempts import attach_creation as _attach
+
+        _attach(repo_root, infos)
+    return infos
 
 
 def _local_branch_exists(repo_root: str, branch_name: str) -> bool:

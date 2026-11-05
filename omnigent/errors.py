@@ -261,6 +261,15 @@ class ErrorCode:
     STALE_CURSOR = "stale_cursor"
     PROVIDER_IDENTITY_NOT_SUPPORTED = "provider_identity_not_supported"
     REAUTHENTICATION_REQUIRED = "reauthentication_required"
+    # Attempt-mode git worktree creation (designs/SESSION_GIT_WORKTREE.md).
+    WORKTREE_CREATION_IN_PROGRESS = "worktree_creation_in_progress"
+    WORKTREE_CREATION_INCOMPLETE = "worktree_creation_incomplete"
+    WORKTREE_ATTEMPT_CONFLICT = "worktree_attempt_conflict"
+    WORKTREE_ATTEMPT_MISMATCH = "worktree_attempt_mismatch"
+    WORKTREE_NEEDS_ATTENTION = "worktree_needs_attention"
+    WORKTREE_ATTEMPT_REMOVED = "worktree_attempt_removed"
+    WORKTREE_NOT_READY = "worktree_not_ready"
+    WORKTREE_ATTEMPTS_UNSUPPORTED = "worktree_attempts_unsupported"
 
 
 # Client-facing text for ``SESSION_AGENT_MISSING``: the session's agent was
@@ -322,6 +331,14 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     ErrorCode.STALE_CURSOR: 400,
     ErrorCode.PROVIDER_IDENTITY_NOT_SUPPORTED: 400,
     ErrorCode.REAUTHENTICATION_REQUIRED: 401,
+    ErrorCode.WORKTREE_CREATION_IN_PROGRESS: 409,
+    ErrorCode.WORKTREE_CREATION_INCOMPLETE: 409,
+    ErrorCode.WORKTREE_ATTEMPT_CONFLICT: 409,
+    ErrorCode.WORKTREE_ATTEMPT_MISMATCH: 409,
+    ErrorCode.WORKTREE_NEEDS_ATTENTION: 409,
+    ErrorCode.WORKTREE_ATTEMPT_REMOVED: 410,
+    ErrorCode.WORKTREE_NOT_READY: 409,
+    ErrorCode.WORKTREE_ATTEMPTS_UNSUPPORTED: 412,
 }
 
 
@@ -369,6 +386,15 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # A stale reference: the cursor row was deleted (often by the same user
     # in another client) between two page fetches.
     ErrorCode.STALE_CURSOR: ErrorCategory.USER,
+    # Worktree attempt outcomes reflect repository state on the user's host.
+    ErrorCode.WORKTREE_CREATION_IN_PROGRESS: ErrorCategory.USER,
+    ErrorCode.WORKTREE_CREATION_INCOMPLETE: ErrorCategory.USER,
+    ErrorCode.WORKTREE_ATTEMPT_CONFLICT: ErrorCategory.USER,
+    ErrorCode.WORKTREE_ATTEMPT_MISMATCH: ErrorCategory.USER,
+    ErrorCode.WORKTREE_NEEDS_ATTENTION: ErrorCategory.USER,
+    ErrorCode.WORKTREE_ATTEMPT_REMOVED: ErrorCategory.USER,
+    ErrorCode.WORKTREE_NOT_READY: ErrorCategory.USER,
+    ErrorCode.WORKTREE_ATTEMPTS_UNSUPPORTED: ErrorCategory.CONFIG,
 }
 
 
@@ -416,6 +442,14 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.CONFLICT: ErrorImpact.BENIGN,
     ErrorCode.REFRESH_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.STALE_CURSOR: ErrorImpact.BENIGN,
+    ErrorCode.WORKTREE_CREATION_IN_PROGRESS: ErrorImpact.TRANSIENT,
+    ErrorCode.WORKTREE_CREATION_INCOMPLETE: ErrorImpact.TRANSIENT,
+    ErrorCode.WORKTREE_ATTEMPT_CONFLICT: ErrorImpact.BENIGN,
+    ErrorCode.WORKTREE_ATTEMPT_MISMATCH: ErrorImpact.BENIGN,
+    ErrorCode.WORKTREE_NEEDS_ATTENTION: ErrorImpact.BLOCKING,
+    ErrorCode.WORKTREE_ATTEMPT_REMOVED: ErrorImpact.BENIGN,
+    ErrorCode.WORKTREE_NOT_READY: ErrorImpact.BENIGN,
+    ErrorCode.WORKTREE_ATTEMPTS_UNSUPPORTED: ErrorImpact.BLOCKING,
 }
 
 
@@ -459,6 +493,14 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.UPSTREAM_CANCELLED: ErrorPhase.UNKNOWN,
     ErrorCode.UPSTREAM_PERMISSION_DENIED: ErrorPhase.UNKNOWN,
     ErrorCode.STALE_CURSOR: ErrorPhase.REQUEST,
+    ErrorCode.WORKTREE_CREATION_IN_PROGRESS: ErrorPhase.REQUEST,
+    ErrorCode.WORKTREE_CREATION_INCOMPLETE: ErrorPhase.REQUEST,
+    ErrorCode.WORKTREE_ATTEMPT_CONFLICT: ErrorPhase.REQUEST,
+    ErrorCode.WORKTREE_ATTEMPT_MISMATCH: ErrorPhase.REQUEST,
+    ErrorCode.WORKTREE_NEEDS_ATTENTION: ErrorPhase.REQUEST,
+    ErrorCode.WORKTREE_ATTEMPT_REMOVED: ErrorPhase.REQUEST,
+    ErrorCode.WORKTREE_NOT_READY: ErrorPhase.REQUEST,
+    ErrorCode.WORKTREE_ATTEMPTS_UNSUPPORTED: ErrorPhase.REQUEST,
 }
 
 

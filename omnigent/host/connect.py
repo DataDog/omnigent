@@ -130,6 +130,7 @@ from omnigent.host.git_worktree import (
     list_worktrees,
     remove_worktree,
 )
+from omnigent.host.git_worktree_attempts import WorktreeAttemptError, create_worktree_attempt
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
@@ -3849,18 +3850,32 @@ class HostProcess:
             # but not tracked runners — the reaper must not wait() them out
             # from under subprocess (#1782).
             with self._host_subprocess_op():
-                created = await asyncio.to_thread(
-                    create_worktree,
-                    repo_path=frame.repo_path,
-                    branch_name=frame.branch_name,
-                    base_branch=frame.base_branch,
-                    existing_branch=frame.existing_branch,
-                )
+                if frame.attempt_id is not None:
+                    attempt = await asyncio.to_thread(
+                        create_worktree_attempt,
+                        repo_path=frame.repo_path,
+                        branch_name=frame.branch_name,
+                        attempt_id=frame.attempt_id,
+                        base_branch=frame.base_branch,
+                        existing_branch=frame.existing_branch,
+                    )
+                    created = attempt.worktree
+                    creation: dict[str, object] | None = attempt.creation()
+                else:
+                    created = await asyncio.to_thread(
+                        create_worktree,
+                        repo_path=frame.repo_path,
+                        branch_name=frame.branch_name,
+                        base_branch=frame.base_branch,
+                        existing_branch=frame.existing_branch,
+                    )
+                    creation = None
         except WorktreeError as exc:
             return HostCreateWorktreeResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=exc.message,
+                error_code=exc.code if isinstance(exc, WorktreeAttemptError) else None,
             )
         _logger.info(
             "Created worktree %s (branch %s) from %s",
@@ -3874,6 +3889,7 @@ class HostProcess:
             worktree_path=created.worktree_path,
             branch=created.branch,
             workspace=created.workspace,
+            creation=creation,
         )
 
     async def _handle_remove_worktree(
@@ -3953,6 +3969,7 @@ class HostProcess:
                     "is_main": wt.is_main,
                     "detached": wt.detached,
                     "updated_at": wt.updated_at,
+                    **({"creation": wt.creation} if wt.creation is not None else {}),
                 }
                 for wt in worktrees
             ],

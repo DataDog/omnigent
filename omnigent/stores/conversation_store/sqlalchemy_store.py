@@ -108,6 +108,7 @@ from omnigent.stores.conversation_store import (
     ConversationUpdateResult,
     CreatedSession,
     DailyCostState,
+    LabelLookupExhaustedError,
     SessionConnectivity,
     pinned_label_key,
 )
@@ -176,6 +177,12 @@ _LIST_ITEMS_MAX_ROWS_PER_STATEMENT = 200
 # bound keeps the archived-filter query's ``IN`` list small and caps the work a
 # pathological directory can impose on a delete. Hitting it answers "in use".
 _WORKSPACE_SHARER_SCAN_LIMIT = 32
+# Upper bound on live sessions returned for one label (e.g. a worktree attempt id).
+_LABELED_SESSION_SCAN_LIMIT = 16
+# Hard stop for one label lookup (16 x 64 = 1024 matching label rows).
+# Label rows read per page, and the most a lookup may scan before it fails loudly.
+_LABELED_SESSION_PAGE_SIZE = 256
+_LABELED_SESSION_MAX_ROWS = 100_000
 
 
 class _RowCountResult(Protocol):
@@ -5416,6 +5423,69 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 is not None
             )
+
+    def find_live_sessions_with_label(self, *, host_id: str, key: str, value: str) -> list[str]:
+        """
+        Ids of non-archived conversations on ``host_id`` labeled ``key=value``.
+        See the protocol docstring.
+
+        Keyset-paginates ``ix_conversation_labels_key_value`` by ``conversation_id``
+        so each page is a bounded index range; the archived and host filters run
+        per page by primary key (metadata may live on another engine).
+        """
+        found: list[str] = []
+        last: str | None = None
+        scanned = 0
+        while True:
+            with self._conv_session("find_labeled_conversation_ids") as conv_sess:
+                query = select(SqlConversationLabel.conversation_id).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.key == key,
+                    SqlConversationLabel.value == value,
+                )
+                if last is not None:
+                    query = query.where(SqlConversationLabel.conversation_id > last)
+                page = list(
+                    conv_sess.scalars(
+                        query.order_by(SqlConversationLabel.conversation_id).limit(
+                            _LABELED_SESSION_PAGE_SIZE
+                        )
+                    )
+                )
+                if not page:
+                    break
+                last = page[-1]
+                live = set(
+                    conv_sess.scalars(
+                        select(SqlConversation.id).where(
+                            SqlConversation.workspace_id == current_workspace_id(),
+                            SqlConversation.id.in_(page),
+                            SqlConversation.archived.is_(False),
+                        )
+                    )
+                )
+            if live:
+                with self._session("filter_labeled_sessions_by_host") as meta_sess:
+                    on_host = set(
+                        meta_sess.scalars(
+                            select(SqlConversationMetadata.id).where(
+                                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                                SqlConversationMetadata.host_id == host_id,
+                                SqlConversationMetadata.id.in_(live),
+                            )
+                        )
+                    )
+                found += [cid for cid in page if cid in on_host]
+            scanned += len(page)
+            if len(found) >= _LABELED_SESSION_SCAN_LIMIT or len(page) < _LABELED_SESSION_PAGE_SIZE:
+                break
+            if scanned >= _LABELED_SESSION_MAX_ROWS:
+                # Never answer "none" after giving up: a silent [] would hide a live session.
+                raise LabelLookupExhaustedError(
+                    f"label lookup {key}={value} matched more than "
+                    f"{_LABELED_SESSION_MAX_ROWS} sessions; refusing to return a partial answer"
+                )
+        return found[:_LABELED_SESSION_SCAN_LIMIT]
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         """

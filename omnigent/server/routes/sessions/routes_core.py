@@ -1041,6 +1041,17 @@ def register_core_routes(
         if body.requested_host_id is not None:
             await _check_requested_host_id(request, body.requested_host_id, user_id)
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
+        attempt_id = body.git.attempt_id if body.git is not None else None
+        if attempt_id is not None and body.host_id is not None:
+            from omnigent.server.routes._host_worktree import attempt_create_lock
+
+            # Serialize same-attempt retries so a dropped reply returns one session.
+            async with attempt_create_lock(body.host_id, attempt_id):
+                return await _create_json_session(request, body, user_id)
+        return await _create_json_session(request, body, user_id)
+
+    async def _create_json_session(request: Request, body: Any, user_id: str | None) -> Any:
+        """Create, notify, grant and launch a JSON-body session."""
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
@@ -1056,6 +1067,12 @@ def register_core_routes(
             background_title_coordinator=background_title_coordinator,
             project_store=project_store,
         )
+        if resp.git_worktree is not None and resp.git_worktree.session_reused:
+            # An earlier request with this attempt already created and launched it.
+            if permission_store is not None and user_id is not None:
+                resp.permission_level = LEVEL_OWNER
+            add_audit_attrs(session_id=resp.id, agent=resp.agent_id)
+            return resp
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
         # Without this, the runner doesn't know this session exists
