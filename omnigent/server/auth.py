@@ -478,6 +478,11 @@ class _OidcIdentityTokenProvider:
         """Opaque OIDC credential-session reference; never a credential."""
         return self._session_id
 
+    def get_habitat_session_credential(self) -> str:
+        return self._token_manager.get_habitat_session_credential(
+            self._session_id, self._expected_user_id
+        )
+
     def get_identity_token(self) -> IdentityToken:
         result = self._token_manager.get_current_id_token(
             self._session_id,

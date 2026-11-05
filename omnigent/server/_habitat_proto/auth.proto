@@ -1,0 +1,60 @@
+syntax = "proto3";
+package hab.v1;
+option go_package = "github.com/ddoghq/habitat/habkit/gen/go/hab/v1;habv1";
+
+// AuthService is the client-facing facade. Provider refresh tokens never leave the broker.
+service AuthService {
+  rpc StartLogin(StartLoginRequest) returns (StartLoginResponse);
+  rpc CompleteLogin(CompleteLoginRequest) returns (CompleteLoginResponse);
+  rpc GetClientToken(GetClientTokenRequest) returns (GetClientTokenResponse);
+  rpc GetSessionStatus(GetSessionStatusRequest) returns (GetSessionStatusResponse);
+  rpc Logout(LogoutRequest) returns (LogoutResponse);
+}
+message UserIdentity {
+  string issuer = 1;
+  string subject = 2;
+  string email = 3;
+}
+message StartLoginRequest {
+  string profile = 1;
+  string callback_uri = 2;
+  // Require a new provider authentication and a fresh signed auth_time claim.
+  bool force_reauthentication = 3;
+}
+message StartLoginResponse {
+  string authorization_url = 1;
+  string transaction_credential = 2;
+  string state = 3;
+  int64 expires_at_unix = 4;
+}
+message CompleteLoginRequest {
+  string profile = 1;
+  string transaction_credential = 2;
+  string callback_uri = 3;
+  string state = 4;
+  string authorization_code = 5;
+}
+message CompleteLoginResponse {
+  string session_credential = 1;
+  UserIdentity identity = 2;
+  // CLI: API bearer (approved audience hab). Omnigent: user ID token for its existing external OBO exchange.
+  string client_token = 3;
+  int64 token_expires_at_unix = 4;
+  int64 session_expires_at_unix = 5;
+}
+message GetClientTokenRequest { string profile = 1; string session_credential = 2; }
+message GetClientTokenResponse {
+  // Output follows the registered profile; an Omnigent ID token is not a HabService bearer.
+  string client_token = 1;
+  UserIdentity identity = 2;
+  int64 token_expires_at_unix = 3;
+  int64 session_expires_at_unix = 4;
+}
+message GetSessionStatusRequest { string profile = 1; string session_credential = 2; }
+message GetSessionStatusResponse {
+  UserIdentity identity = 1;
+  int64 session_expires_at_unix = 2;
+  bool login_required = 3;
+}
+message LogoutRequest { string profile = 1; string session_credential = 2; }
+message LogoutResponse {}

@@ -53,6 +53,7 @@ class OidcSessionCredentials:
     provider_client_id: str | None
     credential_version: int
     refresh_lease_expires_at: int | None
+    broker_session_credential: str | None = None
 
 
 def _generate_handle() -> tuple[str, str]:
@@ -127,9 +128,14 @@ class OidcSessionStore:
         user_id: str,
         id_token: str,
         refresh_token: str | None,
+        broker_session_credential: str | None = None,
     ) -> bytes:
         plaintext = json.dumps(
-            {"id_token": id_token, "refresh_token": refresh_token},
+            {
+                "id_token": id_token,
+                "refresh_token": refresh_token,
+                "broker_session_credential": broker_session_credential,
+            },
             separators=(",", ":"),
         )
         return self._cipher.encrypt(
@@ -138,7 +144,7 @@ class OidcSessionStore:
 
     def _decrypt_credentials(
         self, session_id: str, user_id: str, blob: bytes
-    ) -> tuple[str, str | None] | None:
+    ) -> tuple[str, str | None, str | None] | None:
         try:
             ciphertext = blob.decode("ascii")
         except UnicodeDecodeError:
@@ -159,7 +165,10 @@ class OidcSessionStore:
             return None
         if not isinstance(id_token, str) or not isinstance(refresh_token, (str, type(None))):
             return None
-        return id_token, refresh_token
+        broker = data.get("broker_session_credential")
+        if broker is not None and not isinstance(broker, str):
+            return None
+        return id_token, refresh_token, broker
 
     def create(
         self,
@@ -199,6 +208,7 @@ class OidcSessionStore:
         *,
         provider_issuer: str,
         provider_client_id: str,
+        broker_session_credential: str | None = None,
     ) -> CreatedOidcSession:
         """Create a session and return its opaque handle plus internal ID.
 
@@ -208,7 +218,9 @@ class OidcSessionStore:
         session_id = uuid.uuid4().hex
         handle, handle_digest = _generate_handle()
         now = int(time.time())
-        ciphertext = self._encrypt_credentials(session_id, user_id, id_token, refresh_token)
+        ciphertext = self._encrypt_credentials(
+            session_id, user_id, id_token, refresh_token, broker_session_credential
+        )
         with (
             query_name_scope("omnigent.oidc_session_store.create_oidc_session"),
             self._session_factory() as session,
@@ -320,10 +332,11 @@ class OidcSessionStore:
             result = self._decrypt_credentials(session_id, user_id, row.credential_ciphertext)
             if result is None:
                 return None
-            id_token, refresh_token = result
+            id_token, refresh_token, broker = result
             return OidcSessionCredentials(
                 id_token=id_token,
                 refresh_token=refresh_token,
+                broker_session_credential=broker,
                 id_token_expiry=row.id_token_expiry or 0,
                 absolute_expiry=row.absolute_expiry,
                 provider_subject=row.provider_subject,
