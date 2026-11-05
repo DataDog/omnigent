@@ -713,7 +713,8 @@ def test_refresh_survives_store_reconstruction(session_factory, keys, monkeypatc
     assert result.id_token == refreshed_token
 
 
-def test_broker_session_refresh_stays_in_habitat(session_factory, keys, monkeypatch):
+@pytest.mark.parametrize("email", ["alice@example.com", "Alice@Example.com"])
+def test_broker_session_refresh_stays_in_habitat(session_factory, keys, monkeypatch, email):
     """Only an encrypted broker handle persists; the provider resolves fresh tokens."""
     from types import SimpleNamespace
 
@@ -734,7 +735,7 @@ def test_broker_session_refresh_stays_in_habitat(session_factory, keys, monkeypa
         broker_session_credential="opaque-broker-secret",
     )
     requests = []
-    token = keys.sign_id_token({})
+    token = keys.sign_id_token({"email": email})
 
     def get_token(session):
         requests.append(session)
@@ -789,4 +790,41 @@ def test_broker_rejects_changed_identity(session_factory, keys, monkeypatch):
     )
     manager = OidcTokenManager(store, _make_config())
     with pytest.raises(ReauthenticationError, match="identity changed"):
+        manager.get_current_id_token(created.session_id, "alice@example.com")
+
+
+@pytest.mark.parametrize("invalidation", ["revoked", "expired"])
+def test_broker_reply_cannot_outlive_local_session(
+    session_factory, keys, monkeypatch, invalidation
+):
+    from types import SimpleNamespace
+
+    from omnigent.server.habitat_broker import HabitatBroker
+
+    store = OidcSessionStore(session_factory, credential_key=_TEST_KEY)
+    now = int(time.time())
+    clock = [now]
+    created = store.create_with_id(
+        user_id="alice@example.com",
+        provider_subject="idp-subject-123",
+        id_token="",
+        refresh_token=None,
+        id_token_expiry=0,
+        absolute_expiry=now + 120,
+        provider_issuer=_ISSUER,
+        provider_client_id=_CLIENT_ID,
+        broker_session_credential="opaque-broker-secret",
+    )
+    token = keys.sign_id_token({})
+
+    def get_token(_session):
+        if invalidation == "revoked":
+            assert store.revoke(created.session_id)
+        else:
+            clock[0] = now + 121
+        return SimpleNamespace(client_token=token, token_expires_at_unix=now + 300)
+
+    monkeypatch.setattr(HabitatBroker, "from_env", lambda: SimpleNamespace(get_token=get_token))
+    manager = OidcTokenManager(store, _make_config(), clock=lambda: clock[0])
+    with pytest.raises(ReauthenticationError):
         manager.get_current_id_token(created.session_id, "alice@example.com")
