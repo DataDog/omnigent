@@ -15,7 +15,9 @@ Omnigent stores only an encrypted broker session credential in its existing OIDC
 Omnigent retrieves a current ID token for each delegated operation.
 The existing external OBO exchange still produces the Habitat API bearer.
 The plugin sends the broker session credential only on `CreateHab` as `x-hab-credential-session`.
-Logout revokes the broker session before it revokes the local session.
+Logout attempts broker revocation before it revokes the local session.
+A broker outage does not prevent local session revocation or cookie deletion.
+Remote credentials retain their broker expiry if remote revocation fails.
 
 Deploy Habitat support and the compatible plugin wheel before this application change.
 The source image must pin both the application commit and the dd-source plugin commit.

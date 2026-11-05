@@ -874,11 +874,18 @@ def create_auth_router(
                     credentials = await asyncio.to_thread(
                         oidc_session_store.get_refresh_credentials, resolved[1], resolved[0]
                     )
-                    if credentials is not None and credentials.broker_session_credential:
-                        await asyncio.to_thread(
-                            HabitatBroker.from_env().logout, credentials.broker_session_credential
+                    try:
+                        if credentials is not None and credentials.broker_session_credential:
+                            await asyncio.to_thread(
+                                HabitatBroker.from_env().logout,
+                                credentials.broker_session_credential,
+                            )
+                    except (RuntimeError, ValueError):
+                        _logger.warning(
+                            "Habitat remote logout failed; local session will be revoked"
                         )
-                    await asyncio.to_thread(oidc_session_store.revoke, resolved[1])
+                    finally:
+                        await asyncio.to_thread(oidc_session_store.revoke, resolved[1])
         base_path = getattr(request.app.state, "base_path", "")
         redirect_url = config.logout_redirect_uri or f"{base_path}/"
         response = RedirectResponse(url=redirect_url, status_code=302)
