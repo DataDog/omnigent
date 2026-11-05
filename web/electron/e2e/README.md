@@ -126,6 +126,14 @@ instruction to chat. No instruction bar should appear below the browser URL.
 
 ## Authoring a desktop reproduction
 
+For macOS titlebar clearance, build the SPA and run
+`OMNIGENT_PYTHON="$PWD/.venv/bin/python" node --test web/electron/e2e/desktop_titlebar_zoom.e2e.js`
+from the repository root. This checks real Electron zoom from 50% to 150%,
+14px/16px roots, sidebar toggling, and reloading at 80%. Set
+`OMNIGENT_DESKTOP_RECORD_DIR` outside the checkout to retain the recording.
+Native traffic lights require a human visual check: use View → Zoom Out and
+Actual Size, then collapse/reopen the sidebar and open Settings.
+
 1. Copy `desktop_connect.e2e.js` to `e2e/desktop_<slug>.e2e.js`.
 2. If the bug's failure is **past** connect, pass `serverUrl` to
    `launchDesktop` so the app boots straight into the shell; if the bug is in
@@ -141,3 +149,35 @@ instruction to chat. No instruction bar should appear below the browser URL.
    footage. Use `saveRecording(RECORD_DIR, "before-<facet>")` (or
    `fixed-<facet>`), then write the journey `caption` for the handoff exactly as
    the other lanes do (see `dev/repro-agent/AGENTS.md`, Step 4).
+
+## Navigation policy runtime boundary
+
+`desktop_navigation_policy.e2e.js` uses the production partition hooks in a real
+Electron process. It checks public HTTPS navigation twice, an HSTS HTTP-to-HTTPS
+upgrade after learning a real server policy, a refused loopback
+alias, and a trusted localhost preview twice. The public and preview response
+assertions check connected addresses and view IDs; the HSTS assertions check
+Chromium’s HTTP-to-HTTPS redirect metadata and final URL. Internal-resolving
+iframe and object destinations must be classified as `subFrame` and `object`,
+attributed to the preview view, and cancelled through production request hooks.
+A main-frame redirect and page-created `window.open` to that alias must also
+retain the owning view ID and be cancelled. A main-only
+fixture bypasses preflight for one local request to isolate response cancellation;
+its real network metadata must trigger the production response guard. Preview
+eligibility is supplied by the main-only fixture rather than live Arca enrollment.
+The test requires outbound HTTPS access to `example.com` and `hsts.badssl.com`,
+and public DNS resolution of `lvh.me` to loopback. Repeated local-fixture loads must report HTTP 200 because
+the document guard skips cache reads.
+
+Run with the prerequisites above:
+
+```sh
+OMNIGENT_DESKTOP_RECORD_DIR=/absolute/path/outside/repo \
+  OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_navigation_policy.e2e.js
+```
+
+The recording and `network-evidence.json` are retained together, including partial
+network evidence when an assertion fails. Temporary server fixtures and the desktop
+profile are removed separately from the recording directory. Renderer
+URL-bar navigation also passes through the policy; it has no local-network
+opt-out.

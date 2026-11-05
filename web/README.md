@@ -149,7 +149,10 @@ alone.
 
 - Vite + React 19 + TypeScript
 - Tailwind v4 (`@import "tailwindcss"`, no config file)
-- shadcn/ui (`radix-nova` preset, neutral base, CSS variables)
+- shadcn/ui (`radix-nova` preset, neutral base, CSS variables). Its framework CSS
+  is preserved in `src/shadcn-tailwind.css`; the component-generator CLI is not
+  a runtime dependency. To add components, run `pnpm dlx shadcn@0.0.0-beta.9d3f70e54 add <component>`
+  from `web/`.
 - TanStack Query, Zustand, React Router v7
 - streamdown (+ `@streamdown/code`, `@streamdown/math`, `@streamdown/mermaid`),
   shiki, framer-motion, cmdk, react-hotkeys-hook, use-stick-to-bottom,

@@ -642,6 +642,41 @@ async def test_coded_executor_error_is_raised_with_its_code() -> None:
     assert raised.value.undelivered is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", [None, "databricks_sign_in_pending"])
+@pytest.mark.parametrize("undelivered", [False, True])
+async def test_executor_delivery_evidence_survives_without_an_error_code(
+    code: str | None, undelivered: bool
+) -> None:
+    """The relay needs delivery evidence independently of error classification."""
+    import asyncio
+
+    from omnigent.inner.executor import ExecutorError, MockExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [ExecutorError(message="Terminal is not ready", code=code, undelivered=undelivered)]
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = TurnContext(
+        response_id="resp_not_ready", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hello"), ctx)
+        detail = adapter._build_error_detail(raised.value)
+        assert detail.undelivered is (True if undelivered else None)
+        assert detail.code == (code or "RuntimeError")
+        assert detail.message == (
+            "Terminal is not ready" if code else "inner executor error: Terminal is not ready"
+        )
+    finally:
+        await adapter.on_shutdown()
+
+
 def test_build_error_detail_uses_omnigent_error_code() -> None:
     """
     :class:`OmnigentError` (and its
@@ -680,6 +715,132 @@ def test_build_error_detail_uses_omnigent_error_code() -> None:
     # this assertion would fail.
     base_detail = HarnessApp._build_error_detail(adapter, RuntimeError("oops"))
     assert base_detail.code == "RuntimeError"
+
+
+# Claude Code's result text when its version predates the selected model.
+_OLD_CLI_REFUSAL = (
+    'API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; '
+    "version 2.1.280 or newer is required. Run 'claude update', or update the Claude "
+    'desktop app, then try again."}'
+)
+
+
+@pytest.mark.parametrize("undelivered", [False, True])
+def test_build_error_detail_codes_old_cli_model_refusal(undelivered: bool) -> None:
+    """
+    A claude-sdk turn ending on Claude Code's "version N or newer is required"
+    refusal reaches the adapter as a bare ``RuntimeError``; the detail is coded
+    ``client_update_required`` and names both versions and the update command,
+    with the raw text kept as the message.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    message = f"inner executor error: {_OLD_CLI_REFUSAL}"
+    error = (
+        InnerExecutorError(message, code=None, undelivered=True)
+        if undelivered
+        else RuntimeError(message)
+    )
+
+    detail = adapter._build_error_detail(error)
+
+    assert detail.code == "client_update_required"
+    assert detail.undelivered is (True if undelivered else None)
+    assert detail.message == str(error)
+    assert detail.title == "Claude Code needs an update"
+    assert detail.cause is not None
+    assert "2.1.217" in detail.cause
+    assert "2.1.280" in detail.cause
+    assert detail.remediation is not None
+    assert "`claude update`" in detail.remediation
+
+
+def test_old_cli_refusal_text_does_not_override_other_classifications() -> None:
+    """
+    The text check is a last resort: an executor-named code and an SDK-typed
+    failure keep their code, and an unrelated ``RuntimeError`` stays generic.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        ExecutorAdapter,
+        InnerExecutorError,
+    )
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+
+    named = adapter._build_error_detail(
+        InnerExecutorError(_OLD_CLI_REFUSAL, code="databricks_sign_in_pending")
+    )
+    assert named.code == "databricks_sign_in_pending"
+    assert named.cause is None
+
+    typed = adapter._build_error_detail(httpx.ConnectError(_OLD_CLI_REFUSAL))
+    assert typed.code == "connection_error"
+    assert typed.cause is None
+
+    unrelated = adapter._build_error_detail(RuntimeError("inner executor error: boom"))
+    assert unrelated.code == "RuntimeError"
+    assert unrelated.title is None
+    assert unrelated.cause is None
+    assert unrelated.remediation is None
+
+
+# The provider's model-not-found text as it reaches the adapter from the SDK.
+_MODEL_NOT_FOUND = (
+    "There's an issue with the selected model (anthropic/claude-opus-4-8). "
+    "It may not exist or you may not have access to it."
+)
+
+
+@pytest.mark.parametrize("undelivered", [False, True])
+def test_build_error_detail_adds_model_unavailable_recovery_hint(undelivered: bool) -> None:
+    """
+    A claude-sdk turn ending on a model-not-found refusal reaches the adapter as
+    a bare ``RuntimeError``; the detail gains a recovery hint while keeping the
+    generic ``RuntimeError`` code (so the web shows the agent-turn-error
+    headline) and the original message with its model id.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    message = f"inner executor error: {_MODEL_NOT_FOUND}"
+    error = (
+        InnerExecutorError(message, code=None, undelivered=True)
+        if undelivered
+        else RuntimeError(message)
+    )
+
+    detail = adapter._build_error_detail(error)
+
+    assert detail.code == "RuntimeError"
+    assert detail.undelivered is (True if undelivered else None)
+    assert detail.message == str(error)
+    # No title/cause so the web keeps the agent-named turn-error headline and the
+    # original provider message, matching the already-covered native card.
+    assert detail.title is None
+    assert detail.cause is None
+    assert "anthropic/claude-opus-4-8" in detail.message
+    assert detail.remediation is not None
+    assert "model picker" in detail.remediation
+    assert "/model" in detail.remediation
+
+
+def test_model_unavailable_hint_does_not_override_other_classifications() -> None:
+    """The hint is a last-resort text check: a coded or SDK-typed failure keeps
+    its code and gains no spurious remediation."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+
+    named = adapter._build_error_detail(
+        InnerExecutorError(_MODEL_NOT_FOUND, code="databricks_sign_in_pending")
+    )
+    assert named.code == "databricks_sign_in_pending"
+    assert named.remediation is None
+
+    typed = adapter._build_error_detail(httpx.ConnectError(_MODEL_NOT_FOUND))
+    assert typed.code == "connection_error"
+    assert typed.remediation is None
 
 
 def test_classify_openai_exception_maps_known_types() -> None:
@@ -1652,6 +1813,90 @@ def test_run_turn_clears_mcp_queue_at_turn_start() -> None:
     )
 
 
+async def test_stable_tool_executor_holds_idle_watchdog_only_for_a_request_declared_tool() -> None:
+    """
+    ``_stable_tool_executor`` classifies client-owned waits from ``request.tools``,
+    not a name prefix.
+
+    Reproduces the second watchdog defect: an ordinary runner/server-side
+    tool (an MCP tool, a spec-local tool, a runner builtin — anything not
+    starting with ``sys_os_``) must NOT hold the idle watchdog open merely
+    because its name doesn't match a prefix heuristic. The only
+    authoritative signal is whether the turn's own request actually
+    declared the tool (``_current_client_tool_names``, built from
+    ``request.tools`` — the same kind of per-run ownership record the
+    runner's own ``TurnDispatch.client_side_tool_names`` is for the
+    native-harness/subprocess model). Drives the real
+    :class:`TurnContext` and the real ``_stable_tool_executor`` /
+    ``_bridge_one_dispatch`` chain — no hand-rolled ctx fake.
+    """
+    import asyncio
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext("resp_classification", queue, asyncio.Event())
+    adapter._current_ctx = ctx
+    adapter._current_agent = "test-agent"
+    # This turn's request declared exactly one client tool.
+    adapter._current_client_tool_names = frozenset({"lookup_secret_token"})
+
+    # An ordinary server-side tool the request never declared — an MCP tool,
+    # a spec-local tool, or a runner builtin. Not a sys_os_* name either, so
+    # the old prefix heuristic would have wrongly held the watchdog open.
+    server_task = asyncio.create_task(
+        adapter._stable_tool_executor("search_docs", {}, call_id="call_server")
+    )
+    await queue.get()  # the action_required emit
+    assert ctx._pending_human_waits == 0, (
+        "a tool the request never declared must not count as a human wait — "
+        "a wedge here must still trip the idle watchdog"
+    )
+    ctx._pending_tool_calls["call_server"].set_result("{}")
+    assert await server_task == {}
+    assert ctx._pending_human_waits == 0
+
+
+async def test_stable_tool_executor_holds_idle_watchdog_for_a_request_declared_client_tool() -> (
+    None
+):
+    """
+    An explicitly-offered client tool DOES hold the idle watchdog open while parked.
+
+    The companion case to the test above: a tool the turn's own request
+    actually declared in ``request.tools`` is the one case that may
+    legitimately wait on a person far longer than an idle window, so it
+    must still hold the watchdog open — the fix for the first defect must
+    not have been lost while fixing the classification source for the
+    second.
+    """
+    import asyncio
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext("resp_classification_client", queue, asyncio.Event())
+    adapter._current_ctx = ctx
+    adapter._current_agent = "test-agent"
+    adapter._current_client_tool_names = frozenset({"lookup_secret_token"})
+
+    client_task = asyncio.create_task(
+        adapter._stable_tool_executor("lookup_secret_token", {}, call_id="call_client")
+    )
+    await queue.get()
+    assert ctx._pending_human_waits == 1, (
+        "a request-declared client tool must hold the idle watchdog open "
+        "while parked, same as before this fix"
+    )
+    ctx._pending_tool_calls["call_client"].set_result("{}")
+    assert await client_task == {}
+    assert ctx._pending_human_waits == 0
+
+
 async def test_stable_tool_executor_pops_queue_for_bare_tool_name() -> None:
     """
     ``_stable_tool_executor`` pops the queued tool_use_id even
@@ -1707,6 +1952,7 @@ async def test_stable_tool_executor_pops_queue_for_bare_tool_name() -> None:
             name: str,
             arguments: str,
             agent: str,
+            client_owned: bool = True,
         ) -> str:
             """Record the call_id then return a benign payload.
 
@@ -1714,10 +1960,12 @@ async def test_stable_tool_executor_pops_queue_for_bare_tool_name() -> None:
             :param name: Tool name (ignored).
             :param arguments: JSON-encoded args (ignored).
             :param agent: Agent name (ignored).
+            :param client_owned: Watchdog-hold flag (ignored here;
+                pinned separately in test_scaffold.py).
             :returns: Empty JSON object so
                 ``_bridge_one_dispatch`` can decode.
             """
-            del name, arguments, agent
+            del name, arguments, agent, client_owned
             captured_call_ids.append(call_id)
             return "{}"
 
@@ -1831,6 +2079,7 @@ async def test_observed_and_dispatched_call_ids_match_for_openai_agents() -> Non
             name: str,
             arguments: str,
             agent: str,
+            client_owned: bool = True,
         ) -> str:
             """
             Record the call_id and return a benign payload.
@@ -1843,10 +2092,12 @@ async def test_observed_and_dispatched_call_ids_match_for_openai_agents() -> Non
             :param name: Tool name (ignored for this test).
             :param arguments: JSON-encoded args (ignored).
             :param agent: Agent name (ignored).
+            :param client_owned: Watchdog-hold flag (ignored here;
+                pinned separately in test_scaffold.py).
             :returns: ``"{}"`` so the inner SDK can decode it as
                 JSON without errors.
             """
-            del name, arguments, agent
+            del name, arguments, agent, client_owned
             captured_dispatched_call_ids.append(call_id)
             return "{}"
 
@@ -1905,6 +2156,117 @@ async def test_executor_adapter_builds_config_from_request() -> None:
     await adapter.run_turn(request, ctx)
     assert captured["extra"] == {"reasoning_effort": "medium", "max_tokens": 65536}
     assert captured["model"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_turn_prefers_request_client_side_tool_names_over_tools_derivation() -> None:
+    """
+    ``_current_client_tool_names`` comes from ``request.client_side_tool_names`` when present.
+
+    Reproduces the production-boundary defect: ``request.tools`` is the
+    runner's MERGED spec + client tool list once a real turn reaches the
+    harness, so deriving ownership from ``tools`` directly would wrongly
+    treat a spec-owned tool merged into the same request as client-owned
+    whenever ``client_side_tool_names`` isn't read. With the authoritative
+    field present, only its names — not every name in ``tools`` — become
+    the turn's client-owned set.
+    """
+    import asyncio
+
+    from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    captured: dict[str, object] = {}
+
+    class _CaptureClientToolNamesExecutor(Executor):
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ):
+            captured["client_tool_names"] = adapter._current_client_tool_names
+            yield TurnComplete(response="ok")
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _CaptureClientToolNamesExecutor())
+    ctx = TurnContext(
+        response_id="resp_authoritative_ownership",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+    request = CreateResponseRequest(
+        model="test-agent",
+        input="hi",
+        tools=[
+            {"type": "function", "function": {"name": "github__get_issue"}},
+            {"type": "function", "function": {"name": "report_done"}},
+        ],
+        # The authoritative set excludes the spec-owned github__get_issue,
+        # even though it is also present in ``tools`` above.
+        client_side_tool_names=["report_done"],
+    )
+    await adapter.run_turn(request, ctx)
+    assert captured["client_tool_names"] == frozenset({"report_done"}), (
+        "github__get_issue must not leak into the client-owned set merely "
+        "because it is also present in request.tools"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_turn_fails_closed_when_client_side_tool_names_absent() -> None:
+    """
+    Without the authoritative field, NOTHING is treated as client-owned.
+
+    An absent ``client_side_tool_names`` (an older runner, or a direct or
+    synthetic caller that can't compute it) must fail CLOSED, not fall
+    back to treating every name in ``tools`` as a candidate: that fallback
+    would re-admit the exact spec/client ambiguity the field exists to
+    resolve (a spec tool sharing the request with a client tool would
+    again be wrongly exempted from the idle watchdog). The cost of failing
+    closed is only that a genuine client wait isn't specially recognized
+    until the sender is updated; it still parks and resolves normally.
+    """
+    import asyncio
+
+    from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    captured: dict[str, object] = {}
+
+    class _CaptureClientToolNamesExecutor(Executor):
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ):
+            captured["client_tool_names"] = adapter._current_client_tool_names
+            yield TurnComplete(response="ok")
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _CaptureClientToolNamesExecutor())
+    ctx = TurnContext(
+        response_id="resp_fail_closed_ownership",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+    request = CreateResponseRequest(
+        model="test-agent",
+        input="hi",
+        tools=[{"type": "function", "function": {"name": "report_done"}}],
+        client_side_tool_names=None,
+    )
+    await adapter.run_turn(request, ctx)
+    expected_failure_message = (
+        "an absent ownership signal must never be treated as "
+        f"'everything in tools is client-owned'; got {captured['client_tool_names']!r}"
+    )
+    assert captured["client_tool_names"] == frozenset(), expected_failure_message
 
 
 @pytest.mark.asyncio
@@ -1991,6 +2353,8 @@ class _OneInjectionCtx:
 
         self._injection: Any = injection
         self.emitted: list[Any] = []
+        self.response_id = "resp_injection"
+        self.session_id = "session_injection"
         # Mirror TurnContext: the watcher skips delivery once cancelled.
         self.cancelled = asyncio.Event()
 

@@ -59,6 +59,7 @@ from omnigent.models.claude_model_vocabulary import (
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 
@@ -97,12 +98,12 @@ logger = logging.getLogger(__name__)
 # Default auth-token refresh cadence (ms) for the vendor-neutral gateway
 # transport when ``HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS`` is
 # unset. Not Databricks-specific: the same fallback applies to any gateway
-# producer (Databricks AI gateway or a generic key/gateway provider).
+# producer (Databricks Unity Gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 
 # Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
-# request headers. The Databricks AI gateway only serves Claude requests
+# request headers. The Databricks Unity Gateway only serves Claude requests
 # in coding-agent mode when this header is present, so the Databricks
 # gateway env (not the generic-provider gateway env) must carry it.
 _ANTHROPIC_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
@@ -834,6 +835,7 @@ class _ClaudeClientState:
     model: str | None
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
+    effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -849,10 +851,16 @@ class PreparedClaudeCli:
         Edit, …).  ``False`` when the sandbox cannot be applied (e.g. network
         denied, unsupported platform) — the caller should then leave native
         tools disabled.
+    :param managed_api_key_helper: The machine-managed ``apiKeyHelper`` command
+        when the supervisor must stay outside the sandbox to reach host
+        credentials.  The caller uses this to launch Claude in a hardened host
+        mode that ignores user/project customizations and exposes only
+        Omnigent MCP tools.
     """
 
     cli_path: str | None
     enable_native_tools: bool
+    managed_api_key_helper: str | None = None
 
 
 def _ensure_sdk() -> ModuleType:
@@ -899,7 +907,7 @@ def _build_mcp_tools(
                         "content": [
                             {
                                 "type": "text",
-                                "text": json.dumps(
+                                "text": json_dumps_transport_safe(
                                     {"error": f"No tool executor for '{tool_name}'"}
                                 ),
                             }
@@ -919,7 +927,7 @@ def _build_mcp_tools(
                         response["is_error"] = image_result.is_error
                         return response
                     response = {
-                        "content": [{"type": "text", "text": json.dumps(result)}],
+                        "content": [{"type": "text", "text": json_dumps_transport_safe(result)}],
                     }
                     if result.get("blocked") is True or (
                         "error" in result and result.get("error")
@@ -928,7 +936,12 @@ def _build_mcp_tools(
                     return response
                 except Exception as exc:  # noqa: BLE001 — tool handler converts any error to MCP error response
                     return {
-                        "content": [{"type": "text", "text": json.dumps({"error": str(exc)})}],
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json_dumps_transport_safe({"error": str(exc)}),
+                            }
+                        ],
                         "isError": True,
                     }
 
@@ -1249,7 +1262,7 @@ def _resolve_gateway_env(
     # already fixed this by negotiating betas with the gateway instead
     # (`claude_native.py` CLAUDE_CODE_USE_GATEWAY=1); claude-sdk — the harness
     # behind Polly and Debby — never got that change. Scope it to a real
-    # Databricks AI Gateway base URL so a generic gateway (or a mock server)
+    # Databricks Unity Gateway base URL so a generic gateway (or a mock server)
     # that cannot negotiate betas keeps the original workaround.
     if is_databricks_ai_gateway_url(base_url):
         gateway_env["CLAUDE_CODE_USE_GATEWAY"] = "1"
@@ -1316,6 +1329,39 @@ def _claude_internal_write_files() -> list[pathlib.Path]:
     return [path for path in candidates if path.exists()]
 
 
+def _managed_api_key_helper_command() -> str | None:
+    """Read the machine-managed Claude ``apiKeyHelper`` command, if present.
+
+    A managed ``apiKeyHelper`` commonly depends on private host credential
+    stores (Vault, GPG, keychains) that must not be bind-mounted into an agent
+    sandbox.  The caller passes the command back to Claude through explicit
+    invocation-local settings, allowing ``--bare`` mode to skip every other
+    managed, user, and project customization.
+    """
+
+    candidates = [
+        pathlib.Path("/etc/claude-code/managed-settings.json"),
+        pathlib.Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+    ]
+    for settings_path in candidates:
+        if not settings_path.is_file():
+            continue
+        try:
+            payload = json.loads(settings_path.read_text())
+        except (OSError, ValueError):
+            continue
+        helper = payload.get("apiKeyHelper") if isinstance(payload, dict) else None
+        if isinstance(helper, str) and helper.strip():
+            return helper.strip()
+    return None
+
+
+def _has_managed_api_key_helper() -> bool:
+    """Whether machine-managed Claude settings provide host-side auth."""
+
+    return _managed_api_key_helper_command() is not None
+
+
 def _resolve_sandbox_cwd(spec_cwd: str | None) -> pathlib.Path:
     """Resolve the sandbox root, rooting relative paths at the session
     working folder rather than the runner daemon's process cwd.
@@ -1373,6 +1419,19 @@ def prepare_claude_cli_path(
     sandbox_spec = spec.sandbox or OSEnvSandboxSpec()
     if sandbox_spec.type == "none":
         return PreparedClaudeCli(cli_path=real_cli_path, enable_native_tools=True)
+
+    managed_api_key_helper = _managed_api_key_helper_command()
+    if managed_api_key_helper is not None:
+        logger.info(
+            "Managed Claude apiKeyHelper detected; running the Claude supervisor "
+            "outside the sandbox in hardened bare/restricted mode with native "
+            "tools disabled so host credentials remain outside the agent sandbox"
+        )
+        return PreparedClaudeCli(
+            cli_path=real_cli_path,
+            enable_native_tools=False,
+            managed_api_key_helper=managed_api_key_helper,
+        )
 
     cwd = _resolve_sandbox_cwd(spec.cwd)
     try:
@@ -1433,6 +1492,9 @@ def prepare_tight_cli_process_path(
         return None
 
     if _sandbox_disabled_by_env():
+        return real_cli_path
+
+    if _has_managed_api_key_helper():
         return real_cli_path
 
     # Skip silently on non-Linux: the implicit default sandbox here is
@@ -1608,7 +1670,7 @@ class ClaudeSDKExecutor(Executor):
             gateway: If True, route through a vendor-neutral gateway
                 (base URL + bearer-token command + model). Enables the
                 gateway path regardless of which producer fed it (the
-                Databricks AI gateway or a generic provider).
+                Databricks Unity Gateway or a generic provider).
             databricks_profile: Databricks-specific config profile from
                 ~/.databrickscfg, e.g. ``"<your-profile>"``.  Only used by the
                 Databricks producer path (deriving base URL / auth command
@@ -1694,7 +1756,7 @@ class ClaudeSDKExecutor(Executor):
         # ``--plugin-dir <bundle>`` produces clean
         # ``<agent-name>:<skill-name>`` labels in Claude's skill
         # listing instead of the auto-derived tmpdir basename.
-        if self._bundle_dir is not None:
+        if self._bundle_dir is not None and (self._bundle_dir / "skills").is_dir():
             try:
                 ensure_bundle_plugin_manifest(self._bundle_dir, self._agent_name)
             except OSError as exc:
@@ -1723,6 +1785,12 @@ class ClaudeSDKExecutor(Executor):
         # The bundled CLI may be older and send beta flags that the
         # Databricks gateway doesn't support.
         self._cli_wrapper_path: str | None = None
+        # Set only when a configured sandbox must be bypassed because the
+        # machine-managed apiKeyHelper depends on host credential stores.  In
+        # this mode run_turn strips every non-explicit Claude customization.
+        # An explicit ``sandbox.type: none`` remains the operator-requested
+        # unsandboxed behavior and does not activate this compatibility mode.
+        self._managed_api_key_helper: str | None = None
         self._cli_path: str | None = _find_system_claude()
         if self._cli_path:
             if self._os_env_spec is not None:
@@ -1731,14 +1799,20 @@ class ClaudeSDKExecutor(Executor):
                     self._os_env_spec,
                 )
                 self._os_env = prepared.enable_native_tools
+                self._managed_api_key_helper = prepared.managed_api_key_helper
                 if prepared.cli_path != self._cli_path:
                     self._cli_wrapper_path = prepared.cli_path
                     self._cli_path = prepared.cli_path
             else:
+                managed_api_key_helper = (
+                    None if _sandbox_disabled_by_env() else _managed_api_key_helper_command()
+                )
                 wrapped_cli = prepare_tight_cli_process_path(
                     self._cli_path,
                     cwd=self._cwd,
                 )
+                if managed_api_key_helper is not None and wrapped_cli == self._cli_path:
+                    self._managed_api_key_helper = managed_api_key_helper
                 if wrapped_cli != self._cli_path:
                     self._cli_wrapper_path = wrapped_cli
                     self._cli_path = wrapped_cli
@@ -1789,6 +1863,8 @@ class ClaudeSDKExecutor(Executor):
                 )
             self._extra_env.update(gateway_env)
         self._extra_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
+        if entrypoint := os.environ.get("OMNIGENT_CLAUDE_CODE_ENTRYPOINT"):
+            self._extra_env["CLAUDE_CODE_ENTRYPOINT"] = entrypoint
 
         # Retry policy → Anthropic SDK env vars passed to the Claude
         # CLI subprocess. ``ANTHROPIC_MAX_RETRIES`` and
@@ -1945,6 +2021,7 @@ class ClaudeSDKExecutor(Executor):
                 model=model,
                 loop=asyncio.get_running_loop(),
                 task=current_task,
+                effort=getattr(options, "effort", None),
             )
             self._clients[session_key] = state
             return client
@@ -2499,6 +2576,13 @@ class ClaudeSDKExecutor(Executor):
         from claude_agent_sdk.types import StreamEvent as _StreamEvent
 
         cfg = config or ExecutorConfig()
+        try:
+            reasoning_effort = validate_effort(
+                cfg.extra.get("reasoning_effort"), "Claude Agent SDK", CLAUDE_EFFORTS
+            )
+        except ValueError as exc:
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
+            return
 
         session_key = self._session_key(messages)
         crashed_reason = self._crashed_sessions.get(session_key)
@@ -2521,6 +2605,14 @@ class ClaudeSDKExecutor(Executor):
             # completion with no assistant text instead of an empty string.
             yield TurnComplete(response=None)
             return
+
+        state = self._clients.get(session_key)
+        if state is not None and state.effort != reasoning_effort and prompt != "/compact":
+            # Effort is a launch option. Rebuild with history for conversational
+            # turns, but let /compact operate on the existing client's context.
+            await self._close_live_client(session_key)
+            resume_session = False
+            prompt = self._build_prompt(messages, resume_session=False)
 
         # Build MCP tools from Omnigent tool schemas
         mcp_tools = _build_mcp_tools(tools, self._tool_executor) if tools else []
@@ -2595,7 +2687,8 @@ class ClaudeSDKExecutor(Executor):
         # for the canonical ids the CLI names itself (the refusal-fallback).
         # No-op off the gateway transport.
         model_overrides = await self._apply_gateway_model_vocabulary(env, api_key_helper)
-        settings_payload = _claude_settings_payload(api_key_helper, model_overrides)
+        effective_api_key_helper = api_key_helper or self._managed_api_key_helper
+        settings_payload = _claude_settings_payload(effective_api_key_helper, model_overrides)
 
         # Capture stderr from the CLI subprocess for diagnostics
         stderr_lines: list[str] = []
@@ -2635,13 +2728,19 @@ class ClaudeSDKExecutor(Executor):
         # MCP tools (declared via ``os_env`` in the spec), not the
         # SDK's native Bash/Read/Edit/Write. Keep Skill and ToolSearch in
         # the base set so MCP definitions can be discovered on demand.
-        base_tools: list[str] = ["Skill", "ToolSearch"]
+        hardened_managed_auth = self._managed_api_key_helper is not None
+        base_tools: list[str] = (
+            ["ToolSearch"] if hardened_managed_auth else ["Skill", "ToolSearch"]
+        )
         # Translate the spec's host-skill filter into the SDK
         # options. Falls back to ``"all"`` semantics when the
         # field is malformed (the parser already validates, so
         # this is belt-and-suspenders).
-        resolved = _resolve_skills_option(self._skills_filter) or _ResolvedSkills(
-            skills="all", setting_sources=None
+        resolved = (
+            _ResolvedSkills(skills=[], setting_sources=[])
+            if hardened_managed_auth
+            else _resolve_skills_option(self._skills_filter)
+            or _ResolvedSkills(skills="all", setting_sources=None)
         )
         # Bundle skills are exposed via the SDK's plugin mechanism.
         # The bundle's ``<bundle>/skills/<dir>/SKILL.md`` files are
@@ -2651,14 +2750,33 @@ class ClaudeSDKExecutor(Executor):
         # ``name`` (and thus the skill-listing prefix) comes from
         # the manifest written at construction time.
         bundle_plugins: list[Any] = []  # type: ignore[explicit-any]  # SdkPluginConfig is a TypedDict — typed Any here to keep the import lazy
-        if self._bundle_dir is not None:
+        if (
+            not hardened_managed_auth
+            and self._bundle_dir is not None
+            and (self._bundle_dir / "skills").is_dir()
+        ):
             bundle_plugins.append({"type": "local", "path": str(self._bundle_dir)})
+        extra_args = {"no-session-persistence": None}
+        permission_mode = self._permission_mode
+        if hardened_managed_auth:
+            # The supervisor must stay on the host so its managed helper can
+            # reach private credentials.  ``bare`` prevents loading hooks,
+            # plugins, CLAUDE.md, auto-memory, keychain state, or any other
+            # user/project customization; ``restricted`` removes implicit
+            # code-running and web tools.  Only the explicit Omnigent MCP
+            # server, system prompt, and managed apiKeyHelper remain.
+            extra_args.update({"bare": None, "restricted": None})
+            if permission_mode == "bypassPermissions":
+                # Claude rejects --restricted with bypassPermissions. MCP tools
+                # are already pre-approved above, so auto preserves unattended
+                # execution without weakening restricted mode.
+                permission_mode = "auto"
         options_kwargs: dict[str, Any] = {  # type: ignore[explicit-any]  # ClaudeAgentOptions accepts mixed-typed kwargs (str / list / dict / callable / etc.)
             "tools": base_tools,
             "system_prompt": system_prompt or None,
             "mcp_servers": mcp_servers if mcp_servers else {},
             "allowed_tools": allowed_tools,
-            "permission_mode": self._permission_mode,
+            "permission_mode": permission_mode,
             "max_turns": cfg.extra.get("max_turns"),
             "env": env,
             "settings": settings_payload,
@@ -2667,7 +2785,7 @@ class ClaudeSDKExecutor(Executor):
             "include_hook_events": True,
             "skills": resolved.skills,
             "plugins": bundle_plugins,
-            "extra_args": {"no-session-persistence": None},
+            "extra_args": extra_args,
             "max_buffer_size": 10 * 1024 * 1024,
         }
         # Only forward ``setting_sources`` when explicitly set.
@@ -2681,13 +2799,6 @@ class ClaudeSDKExecutor(Executor):
         # branch).
         if resolved.setting_sources is not None:
             options_kwargs["setting_sources"] = resolved.setting_sources
-        try:
-            reasoning_effort = validate_effort(
-                cfg.extra.get("reasoning_effort"), "Claude Agent SDK", CLAUDE_EFFORTS
-            )
-        except ValueError as exc:
-            yield ExecutorError(message=describe_exception(exc), retryable=False)
-            return
         if reasoning_effort is not None:
             options_kwargs["effort"] = reasoning_effort
         # Databricks opus/fable endpoints reject thinking.type="enabled"
@@ -3161,6 +3272,10 @@ class ClaudeSDKExecutor(Executor):
                     elif isinstance(message, sdk.ResultMessage):
                         result_msg = cast(_ResultMessageObj, message)
                         claude_session_id = getattr(result_msg, "session_id", None)
+                        logger.info(
+                            "Claude CLI result received (is_error=%s)",
+                            getattr(result_msg, "is_error", None),
+                        )
                         if getattr(result_msg, "is_error", None):
                             # Harness-level failure (e.g. expired login). Surface
                             # as an executor error rather than assistant content.
@@ -3398,6 +3513,7 @@ class ClaudeSDKExecutor(Executor):
             if compaction_event is not None:
                 yield compaction_event
 
+        logger.info("ClaudeSDKExecutor: turn complete")
         yield TurnComplete(response=response_text, usage=turn_usage)
 
     @staticmethod

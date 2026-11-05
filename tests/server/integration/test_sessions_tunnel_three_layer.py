@@ -926,9 +926,9 @@ async def test_on_runner_connect_restarts_relay_via_router(
         async def post(self, *args: Any, **kwargs: Any) -> _StubResponse:
             return _StubResponse()
 
-    def _spy_resolver(conv_id: str):  # type: ignore[no-untyped-def]
+    def _spy_resolver(conv_id: str, **kwargs: Any):  # type: ignore[no-untyped-def]
         routed_calls.append(conv_id)
-        real_routed = real_resolver(conv_id)
+        real_routed = real_resolver(conv_id, **kwargs)
         fake = RoutedRunner(runner_id=real_routed.runner_id, client=_StubClient())  # type: ignore[arg-type]
         routed_clients[conv_id] = fake.client
         return fake
@@ -1059,6 +1059,7 @@ async def _reconnect_fires_connect_hook(
     *,
     wait_for_recover: str,
     runner_client: httpx.AsyncClient | None = None,
+    expect_recovered: bool = True,
 ) -> AsyncIterator[list[str]]:
     """Drive a real tunnel disconnect/reconnect so ``_on_runner_connect`` fires.
 
@@ -1069,7 +1070,7 @@ async def _reconnect_fires_connect_hook(
     ``_publish_runner_recovered_status`` with a spy that records
     completion (the closure re-imports it from the module on each call,
     so the patch is picked up). Waits until the recovery helper has run
-    to completion for ``wait_for_recover`` before yielding, so callers
+    to completion for the whole connection before yielding, so callers
     can assert on the post-recovery state.
 
     With ``runner_client``, keep the real relay and replace only its transport.
@@ -1095,8 +1096,8 @@ async def _reconnect_fires_connect_hook(
         async def post(self, *args: Any, **kwargs: Any) -> _StubResponse:
             return _StubResponse()
 
-    def _spy_resolver(conv_id: str):  # type: ignore[no-untyped-def]
-        real_routed = real_resolver(conv_id)
+    def _spy_resolver(conv_id: str, **kwargs: Any):  # type: ignore[no-untyped-def]
+        real_routed = real_resolver(conv_id, **kwargs)
         return RoutedRunner(
             runner_id=real_routed.runner_id,
             client=runner_client if runner_client is not None else _StubClient(),  # type: ignore[arg-type]
@@ -1129,6 +1130,17 @@ async def _reconnect_fires_connect_hook(
 
     sessions_routes._publish_runner_recovered_status = _spy_recover  # type: ignore[assignment]
 
+    from omnigent.server.routes import runner_tunnel
+
+    recovery_finished = asyncio.Event()
+    real_hook = runner_tunnel._run_connect_hook
+
+    async def _spy_hook(hook: Any, connection: Any) -> None:
+        await real_hook(hook, connection)
+        if ap_app.state.tunnel_registry.get(_RUNNER_ID) is connection:
+            recovery_finished.set()
+
+    runner_tunnel._run_connect_hook = _spy_hook
     communicator: ApplicationCommunicator | None = None
     forwarder_task: asyncio.Task[None] | None = None
     try:
@@ -1155,21 +1167,19 @@ async def _reconnect_fires_connect_hook(
             name="tunnel-recover-reconnect-forwarder",
         )
 
-        async def _recovered() -> None:
-            while wait_for_recover not in recovered_calls:
-                await asyncio.sleep(0.02)
-
         try:
-            await asyncio.wait_for(_recovered(), timeout=budget(5.0))
+            await asyncio.wait_for(recovery_finished.wait(), timeout=budget(5.0))
         except asyncio.TimeoutError:
             raise AssertionError(
-                "Reconnect did not drive _on_runner_connect to call "
-                f"_publish_runner_recovered_status for {wait_for_recover!r} "
+                "Reconnect did not finish recovery of the connection containing "
+                f"{wait_for_recover!r} "
                 f"within 5s. recovered_calls={recovered_calls}"
             ) from None
 
+        assert (wait_for_recover in recovered_calls) is expect_recovered, recovered_calls
         yield recovered_calls
     finally:
+        runner_tunnel._run_connect_hook = real_hook
         router.client_for_session_resources = real_resolver  # type: ignore[method-assign]
         sessions_routes._ensure_runner_relay = real_ensure  # type: ignore[assignment]
         sessions_routes._ensure_runner_relay_ready = real_ensure_ready  # type: ignore[assignment]
@@ -1560,8 +1570,8 @@ def _stub_connect_hook_for_pumpless_ws(ap_app: FastAPI, monkeypatch: pytest.Monk
     router = ap_app.state.runner_router
     real_resolver = router.client_for_session_resources
 
-    def _stub_resolver(conv_id: str):  # type: ignore[no-untyped-def]
-        real_routed = real_resolver(conv_id)
+    def _stub_resolver(conv_id: str, **kwargs: Any):  # type: ignore[no-untyped-def]
+        real_routed = real_resolver(conv_id, **kwargs)
         return RoutedRunner(runner_id=real_routed.runner_id, client=_StubClient())  # type: ignore[arg-type]
 
     monkeypatch.setattr(router, "client_for_session_resources", _stub_resolver)
@@ -1749,6 +1759,119 @@ async def test_runner_disconnect_rechecks_tunnel_after_session_lookup(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("idle_shutdown", [True, False])
+async def test_runner_idle_shutdown_settles_stale_running_session(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    idle_shutdown: bool,
+) -> None:
+    """A runner that closes for its idle watchdog settles a stale turn to idle.
+
+    The idle watchdog exits only after the runner found no active work, so a
+    session still cached ``running`` was not interrupted. A plain clean close
+    carries no such attestation and still fails the turn.
+    """
+    from omnigent.runner.transports.ws_tunnel.frames import RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_app = tunnel_three_layer_stack.ap_app
+    monkeypatch.setattr(sessions_module, "RUNNER_DISCONNECT_GRACE_S", 0.01)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+    response = await tunnel_three_layer_stack.ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={"bundle": ("agent.tar.gz", _build_harness_agent_bundle(), "application/gzip")},
+    )
+    assert response.status_code == 201, response.text
+    session_id = response.json()["session_id"]
+    runner_id = "runner-idle-shutdown"
+    store = get_conversation_store()
+    store.replace_runner_id(session_id, runner_id)
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+    store.set_session_live_status(session_id, "running")
+    try:
+        await communicator.send_input(
+            {
+                "type": "websocket.disconnect",
+                "code": 1000,
+                "reason": RUNNER_IDLE_SHUTDOWN_CLOSE_REASON if idle_shutdown else "",
+            }
+        )
+        await communicator.wait(timeout=budget(2.0))
+        grace_task = next(
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == f"runner-disconnect-grace-{runner_id}"
+        )
+        await asyncio.wait_for(asyncio.shield(grace_task), timeout=budget(5.0))
+        conv = store.get_conversation(session_id)
+        assert conv is not None
+        error = sessions_module._last_task_error_from_labels(conv.labels)
+        if idle_shutdown:
+            assert sessions_module._session_status_cache[session_id] == "idle"
+            assert conv.live_status == "idle"
+            assert error is None
+            assert session_id not in sessions_module._intentional_stop_sessions
+        else:
+            assert sessions_module._session_status_cache[session_id] == "failed"
+            assert error is not None and error["code"] == "runner_disconnected"
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._intentional_stop_sessions.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("idle_shutdown", [True, False])
+async def test_runner_idle_shutdown_marks_relay_bound_sessions_before_the_grace(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    idle_shutdown: bool,
+) -> None:
+    """A relay decides at the same deadline as the grace timer, so it is marked at disconnect."""
+    from types import SimpleNamespace
+
+    from omnigent.runner.transports.ws_tunnel.frames import RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_app = tunnel_three_layer_stack.ap_app
+    # Long enough that only the disconnect hook, not the grace sweep, can mark.
+    monkeypatch.setattr(sessions_module, "RUNNER_DISCONNECT_GRACE_S", 60.0)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+    runner_id = "runner-idle-shutdown-relay"
+    session_id = "relay-bound-idle-shutdown"
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._runner_relay_tasks[session_id] = SimpleNamespace(  # type: ignore[assignment]
+        runner_id=runner_id
+    )
+    sessions_module._session_status_cache[session_id] = "running"
+    try:
+        await communicator.send_input(
+            {
+                "type": "websocket.disconnect",
+                "code": 1000,
+                "reason": RUNNER_IDLE_SHUTDOWN_CLOSE_REASON if idle_shutdown else "",
+            }
+        )
+        await communicator.wait(timeout=budget(2.0))
+
+        marked = sessions_module._intentional_stop_sessions.get(session_id)
+        assert marked == (runner_id if idle_shutdown else None)
+    finally:
+        for task in asyncio.all_tasks():
+            if task.get_name() == f"runner-disconnect-grace-{runner_id}":
+                task.cancel()
+        sessions_module._runner_relay_tasks.pop(session_id, None)
+        sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._intentional_stop_sessions.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
 @pytest.mark.parametrize("foreign_write", [True, False])
 async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
     tunnel_three_layer_stack: _TunnelStack,
@@ -1892,6 +2015,96 @@ async def test_server_initiated_close_never_fails_the_turn(
         assert sessions_module._last_task_error_from_labels(conv.labels) is None
     finally:
         shutdown_state.reset_for_tests()
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_server_retired_tunnel_never_fails_the_turn(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel THIS server retired for the runner to reconnect leaves the turn alone.
+
+    Retiring through the registry closes the socket with 1001 while the server
+    stays up, so no shutdown mark is set. The runner usually re-tunnels to
+    another replica, which then owns the turn: this replica must record the
+    handoff, keep the liveness stamp, and skip the offline-marking once the
+    grace runs out. The mark clears when the runner tunnels back here.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server import session_live_state, shutdown_state
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+
+    grace = 0.4
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": (
+                "agent.tar.gz",
+                _build_harness_agent_bundle(),
+                "application/gzip",
+            ),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    runner_id = "runner-server-retired"
+    store = get_conversation_store()
+    store.replace_runner_id(session_id, runner_id)
+    cleared_runners: list[str] = []
+    monkeypatch.setattr(session_live_state, "clear_runner_liveness", cleared_runners.append)
+    touched_runners: list[str] = []
+    monkeypatch.setattr(session_live_state, "touch_runner_liveness", touched_runners.extend)
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+    touched_runners.clear()
+    reconnect_communicator: ApplicationCommunicator | None = None
+    try:
+        assert ap_app.state.tunnel_registry.deregister(runner_id) is not None
+
+        async def _disconnect_hook_ran() -> None:
+            while runner_id not in touched_runners and runner_id not in cleared_runners:
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(_disconnect_hook_ran(), timeout=budget(2.0))
+        assert shutdown_state.runner_handoff_reason(runner_id) == "tunnel_retired"
+        assert not shutdown_state.server_shutting_down()
+        assert runner_id not in cleared_runners
+        assert runner_id in touched_runners
+
+        # Well past the grace: the timer has fired and must have skipped the marking.
+        await asyncio.sleep(grace * 3)
+        assert sessions_module._session_status_cache.get(session_id) == "running"
+        conv = store.get_conversation(session_id)
+        assert conv is not None
+        assert sessions_module._last_task_error_from_labels(conv.labels) is None
+
+        reconnect_communicator = await _connect_runner_tunnel(ap_app, runner_id)
+        await _send_hello_and_wait(
+            reconnect_communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
+        )
+        assert shutdown_state.runner_handoff_reason(runner_id) is None
+    finally:
+        shutdown_state.reset_for_tests()
+        with contextlib.suppress(asyncio.TimeoutError, Exception):
+            await communicator.wait(timeout=budget(2.0))
+        if reconnect_communicator is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reconnect_communicator.send_input(
+                    {"type": "websocket.disconnect", "code": 1000},
+                )
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                await reconnect_communicator.wait(timeout=budget(2.0))
         sessions_module._session_status_cache.pop(session_id, None)
 
 
@@ -2195,7 +2408,10 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
 
     monkeypatch.setattr(initializer, "initialize", record_init)
     async with _reconnect_fires_connect_hook(
-        ap_app, fake_pm, wait_for_recover=parent_id
+        ap_app,
+        fake_pm,
+        wait_for_recover=parent_id,
+        expect_recovered=fail_first != "parent",
     ) as recovered:
         if fail_first:
             assert failed_once

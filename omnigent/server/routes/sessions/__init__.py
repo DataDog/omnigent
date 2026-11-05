@@ -281,6 +281,8 @@ from omnigent.server.routes._sessions.common import (
     _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE as _OPENCODE_NATIVE_WRAPPER_LABEL_VALUE,
     _PI_NATIVE_WRAPPER_LABEL_VALUE as _PI_NATIVE_WRAPPER_LABEL_VALUE,
     _RACE_TASK_REAP_TIMEOUT_S as _RACE_TASK_REAP_TIMEOUT_S,
+    _RUNNER_CLIENT_RESOLVE_ATTEMPTS as _RUNNER_CLIENT_RESOLVE_ATTEMPTS,
+    _RUNNER_CLIENT_RESOLVE_RETRY_S as _RUNNER_CLIENT_RESOLVE_RETRY_S,
     _RUNNER_CONVICTION_POLL_S as _RUNNER_CONVICTION_POLL_S,
     _RUNNER_FORWARD_TIMEOUT as _RUNNER_FORWARD_TIMEOUT,
     _RUNNER_RELAY_READY_TIMEOUT_S as _RUNNER_RELAY_READY_TIMEOUT_S,
@@ -636,6 +638,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _maybe_wake_stale_resumable_managed_sandbox as _maybe_wake_stale_resumable_managed_sandbox,
     _native_subagent_wrapper_labels as _native_subagent_wrapper_labels,
     _native_terminal_runtime as _native_terminal_runtime,
+    _note_runner_idle_shutdown as _note_runner_idle_shutdown,
     _persist_external_codex_subagent_start as _persist_external_codex_subagent_start,
     _persist_external_conversation_item as _persist_external_conversation_item,
     _persist_external_devin_subagent_start as _persist_external_devin_subagent_start,
@@ -806,6 +809,8 @@ def create_sessions_router(
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     register_runner_ingest: Callable[..., None] | None = None,
+    register_startup_dispatch: Callable[..., None] | None = None,
+    register_initial_file_upload: Callable[..., None] | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -935,6 +940,7 @@ def create_sessions_router(
         auth_provider=auth_provider,
         permission_store=permission_store,
         host_registry=host_registry,
+        register_initial_file_upload=register_initial_file_upload,
     )
 
     register_browser_routes(
@@ -969,6 +975,7 @@ def create_sessions_router(
         background_title_coordinator=background_title_coordinator,
         runner_tunnel_tokens=runner_tunnel_tokens,
         register_runner_ingest=register_runner_ingest,
+        register_startup_dispatch=register_startup_dispatch,
     )
 
     register_permissions_routes(

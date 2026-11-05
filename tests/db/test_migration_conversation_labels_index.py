@@ -53,7 +53,7 @@ def test_downgrade_drops_index(tmp_path: Path) -> None:
             command.upgrade(cfg, "nn1a2b3c4d5e")
         with engine.begin() as conn:
             cfg.attributes["connection"] = conn
-            command.downgrade(cfg, "m017dd1006a")
+            command.downgrade(cfg, "m019dd1021a")
         assert _INDEX not in _label_indexes(engine)
     finally:
         engine.dispose()
@@ -97,7 +97,7 @@ def test_postgres_retry_rebuilds_only_its_own_invalid_index() -> None:
         with setup.connect() as conn:
             conn.execute(sa.text(invalidate), {"i": f"public.{_INDEX}"})
             # Retry only this migration.
-            conn.execute(sa.text("UPDATE alembic_version SET version_num = 'm017dd1006a'"))
+            conn.execute(sa.text("UPDATE alembic_version SET version_num = 'm019dd1021a'"))
         _run_migrations(sa.create_engine(uri), uri)
         with setup.connect() as conn:
             assert _pg_index_valid(conn, "public") is True

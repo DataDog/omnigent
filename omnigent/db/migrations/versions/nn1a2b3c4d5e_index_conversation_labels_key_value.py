@@ -1,7 +1,7 @@
 """index conversation labels by key and value
 
 Revision ID: nn1a2b3c4d5e
-Revises: m017dd1006a
+Revises: m019dd1021a
 Create Date: 2026-11-04 00:00:00.000000
 
 Adds ``ix_conversation_labels_key_value`` on ``(workspace_id, key, value,
@@ -22,7 +22,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "nn1a2b3c4d5e"
-down_revision: str | None = "m017dd1006a"
+down_revision: str | None = "m019dd1021a"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

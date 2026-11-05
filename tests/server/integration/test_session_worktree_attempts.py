@@ -126,7 +126,7 @@ async def register_host(app: FastAPI, db_uri: str) -> AsyncIterator[Register]:
                 text = await conn.outbound_queue.get()
                 if text is None:
                     return
-                frame = decode_host_frame(text)
+                frame = decode_host_frame(text.data)
                 frames.append(frame)
                 if isinstance(frame, HostStatFrame):
                     fut = conn.pending_stats.pop(frame.request_id, None)
@@ -272,7 +272,7 @@ async def test_old_host_gets_412(register_host, client, repo) -> None:
     frames = register_host(capabilities=[])
     agent = await create_test_agent(client, name="wt-attempt-old")
     resp = await _post(client, agent["id"], repo)
-    assert resp.status_code == 412
+    assert resp.status_code == 412, resp.text
     assert resp.json()["error"]["code"] == "worktree_attempts_unsupported"
     assert _creates(frames) == []
 

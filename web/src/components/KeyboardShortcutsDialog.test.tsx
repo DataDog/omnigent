@@ -46,11 +46,12 @@ function keysFor(label: string): string[] {
 }
 
 describe("KeyboardShortcutsList composer rows", () => {
-  it("shows Enter to send and Shift+Enter for a new line by default", () => {
+  it("shows Enter to send and Shift+Enter or Alt+Enter for a new line by default", () => {
     render(<KeyboardShortcutsList />);
 
     expect(keysFor("Send message")).toEqual(["↵"]);
-    expect(keysFor("New line in message")).toEqual(["⇧", "↵"]);
+    expect(keysFor("New line in message")).toEqual(["⇧", "↵", "Alt", "↵"]);
+    expect(screen.getByText("New line in message").closest("li")).toHaveTextContent("⇧↵orAlt↵");
   });
 
   it("shows Ctrl+Enter to send and Enter for a new line in alternate mode", () => {
@@ -91,6 +92,14 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Find a session by name")).toEqual(["Ctrl", "Alt", "S"]);
   });
 
+  it("keeps native new-session keys and updates the Settings reference", () => {
+    const { rerender } = render(<KeyboardShortcutsList variant="settings" />);
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Shift", "O"]);
+    isNativeShell.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList variant="settings" />);
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Alt", "N"]);
+  });
+
   it("renders nothing until opened", () => {
     render(<KeyboardShortcutsDialog />);
     expect(screen.queryByText("Send message")).toBeNull();
@@ -103,7 +112,7 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Keyboard shortcuts")).toBeTruthy();
     // General / In chats / Navigation / View / Slash commands — one each.
     expect(screen.getByText("Start a new session")).toBeTruthy();
-    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Alt", "N"]);
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Shift", "O"]);
     expect(screen.getByText("Open command palette")).toBeTruthy();
     expect(keysFor("Open Settings")).toEqual(["Ctrl", "Alt", ","]);
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();

@@ -20,6 +20,7 @@ import {
   ENTER_KEY,
   Kbd,
   MOD_KEY,
+  newSessionShortcutKeys,
   SHIFT_KEY,
   VIEW_MODE_TOGGLE_KEYS,
 } from "@/components/KeyboardShortcut";
@@ -58,6 +59,8 @@ interface Shortcut {
    *  arrow-pairs, the two interchangeable keys for that action. */
   keys: string[];
   lastKeySeparator?: string;
+  /** Another chord for the same action, shown after "or". */
+  alternateKeys?: string[];
 }
 
 interface ShortcutGroup {
@@ -73,7 +76,6 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "General",
     items: [
-      { label: "Start a new session", keys: [MOD_KEY, ALT_KEY, "N"] },
       { label: "Open command palette", keys: [MOD_KEY, "K"] },
       { label: "Find a session by name", keys: [MOD_KEY, ALT_KEY, "S"] },
       { label: "Open Settings", keys: [MOD_KEY, ALT_KEY, ","] },
@@ -145,6 +147,15 @@ function shortcutGroupsFor(
   preventsKeyboardSubmit: boolean,
 ): ShortcutGroup[] {
   return SHORTCUT_GROUPS.map((group) => {
+    if (group.title === "General") {
+      return {
+        ...group,
+        items: [
+          { label: "Start a new session", keys: newSessionShortcutKeys(native) },
+          ...group.items,
+        ],
+      };
+    }
     if (group.title === "In chats" && !preventsKeyboardSubmit) {
       return {
         ...group,
@@ -157,6 +168,8 @@ function shortcutGroupsFor(
           {
             label: "New line in message",
             keys: composerNewLineShortcutKeys(submitWithModEnter),
+            // Alt+Enter is a newline in both modes; plain Enter already is in alternate mode.
+            alternateKeys: submitWithModEnter ? undefined : [ALT_KEY, ENTER_KEY],
           },
           ...group.items,
         ],
@@ -242,6 +255,14 @@ export function KeyboardShortcutsList({
                       <Kbd>{key}</Kbd>
                     </Fragment>
                   ))}
+                  {item.alternateKeys ? (
+                    <>
+                      <span className="px-0.5 text-sm text-muted-foreground/70">or</span>
+                      {item.alternateKeys.map((key) => (
+                        <Kbd key={`${item.label}-alternate-${key}`}>{key}</Kbd>
+                      ))}
+                    </>
+                  ) : null}
                 </span>
               </li>
             ))}

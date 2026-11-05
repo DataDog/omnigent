@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import hmac
 import logging
 import os
@@ -102,6 +103,12 @@ _SHUTDOWN_GRACE_S = 4.5
 # (DENY), advisory LLM/TOOL_RESULT phases fail OPEN (ALLOW).
 _POLICY_EVAL_TIMEOUT_S = 86400.0
 
+# Only these phases can park server-side on a human ASK (see the
+# ``policies/evaluate`` route). The others answer in seconds, so a verdict
+# lost in delivery must not stall the turn for the full human-wait budget.
+_HUMAN_GATED_POLICY_PHASES = frozenset({"PHASE_TOOL_CALL", "PHASE_LLM_REQUEST", "PHASE_REQUEST"})
+_UNGATED_POLICY_EVAL_TIMEOUT_S = 120.0
+
 # Stable, client-visible error code for a turn-context desync (the inner SDK
 # generation outlived its turn — an orphaned tool/policy callback, or a turn
 # torn down on a dead harness channel). Deliberately ABSENT from AP's
@@ -141,6 +148,41 @@ _TURN_ABSOLUTE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_ABSOLUTE_TIMEOUT_S
 # Retry only pre-output wedges after confirmed teardown. Replaying a turn
 # with progress can duplicate tool effects; retries never extend the hard cap.
 _WEDGED_TURN_RECOVERY_RETRIES = 1
+
+# Set by the harness subprocess entrypoint. Executors import their SDKs lazily
+# on the first turn, so that graph is only static once a turn has completed.
+_freeze_gc_after_first_turn = False
+
+
+def arm_gc_freeze_after_first_turn() -> None:
+    """Collect and freeze GC-tracked objects once, after this process's first completed turn.
+
+    Only the harness subprocess arms this; an embedding process keeps normal
+    GC. A failed or cancelled turn leaves the freeze armed, so a later turn
+    still freezes the lazily imported SDK.
+    """
+    global _freeze_gc_after_first_turn
+    _freeze_gc_after_first_turn = True
+
+
+def _freeze_gc_if_armed(run_task: asyncio.Task[None], ctx: TurnContext) -> None:
+    """Run the armed freeze once *run_task* has completed without error.
+
+    Called after the turn's terminal event is sent and its state torn down, so
+    the one-time collection (~25 ms) is off the turn's path and frees the
+    turn's cycles instead of pinning them. A harness that observes
+    ``ctx.cancelled`` and returns normally ended a cancelled turn, not a completed one.
+    """
+    global _freeze_gc_after_first_turn
+    if not _freeze_gc_after_first_turn or not run_task.done() or run_task.cancelled():
+        return
+    if ctx.cancelled.is_set():
+        return
+    if run_task.exception() is not None:
+        return
+    _freeze_gc_after_first_turn = False
+    gc.collect()
+    gc.freeze()
 
 
 @dataclass(frozen=True)
@@ -432,9 +474,9 @@ class TurnContext:
         # resolved by the ``approval`` /events handler.
         self._pending_elicitations: dict[str, asyncio.Future[ElicitationResult]] = {}
         # Human-approval waits in flight (elicitation replies, policy
-        # verdicts). While > 0 heartbeats hold the idle window open so an
-        # unanswered approval isn't failed as a wedged turn; the absolute
-        # ceiling still applies.
+        # verdicts, client-tool call results). While > 0 heartbeats hold
+        # the idle window open so an unanswered wait isn't failed as a
+        # wedged turn; the absolute ceiling still applies.
         self._pending_human_waits = 0
         # Layer 3 per-policy-evaluation state:
         # ``evaluation_id`` → Future[PolicyVerdictPayload].
@@ -502,7 +544,15 @@ class TurnContext:
             self._hold_idle_watchdog()
         self._event_queue.put_nowait(event)
 
-    async def dispatch_tool(self, call_id: str, name: str, arguments: str, agent: str) -> str:
+    async def dispatch_tool(
+        self,
+        call_id: str,
+        name: str,
+        arguments: str,
+        agent: str,
+        *,
+        client_owned: bool = True,
+    ) -> str:
         """
         Emit a server-dispatched tool call and park until the result.
 
@@ -512,6 +562,17 @@ class TurnContext:
         the parked Future when Omnigent delivers an event carrying the
         matching ``call_id``. See §How Omnigent resolves action_required
         tool calls in the design doc.
+
+        ``client_owned`` gates whether the wait counts toward the idle
+        watchdog's human-approval hold (see ``_pending_human_waits``): a
+        genuine client-side tool can legitimately wait on a person far
+        longer than any in-turn LLM step, so heartbeats hold the idle
+        window open for as long as it is outstanding. A server-executed
+        call (e.g. the ``sys_os_*`` host-tool bridge) is answered by
+        Omnigent's own machinery, not a person, so a wedge there must
+        still trip the idle watchdog like any other stalled tool call;
+        callers pass ``client_owned=False`` for those. The absolute
+        ceiling bounds the turn either way.
 
         :param call_id: Unique identifier for this tool call,
             e.g. ``"call_abc123"``. Omnigent echoes it back in the
@@ -524,6 +585,13 @@ class TurnContext:
         :param agent: Agent name that invoked the tool — required
             on the function_call item per
             :class:`omnigent.entities.conversation.FunctionCallData`.
+        :param client_owned: ``True`` when a real connected client (a
+            human or an external system standing in for one) must
+            answer this call, so the idle watchdog should not fire
+            merely because the answer is slow. ``False`` for a call
+            Omnigent's own server-side machinery executes and answers,
+            which must still be treated as a normal tool step for
+            watchdog purposes.
         :returns: The tool's output string from
             :class:`omnigent.server.schemas.ToolResult`.
         :raises asyncio.CancelledError: If the turn is cancelled
@@ -544,8 +612,25 @@ class TurnContext:
             "arguments": arguments,
             "call_id": call_id,
             "agent": agent,
+            # Additive marker, not part of the OpenAI function_call shape:
+            # lets omnigent.runtime.pending_client_tool_calls exclude a
+            # server-executed dispatch from the reconnect snapshot —
+            # a reconnecting client has nothing to answer for a call it
+            # never owned. Pydantic ignores unknown keys by default, so
+            # this is safe even if the item is later parsed as
+            # FunctionCallData.
+            "client_owned": client_owned,
         }
         self.emit(OutputItemDoneEvent(type="response.output_item.done", item=item))
+        # A genuinely client-owned tool parks on a human (or external system)
+        # to answer, same as an elicitation reply — hold the idle window open
+        # on heartbeats while it waits so an unanswered call doesn't trip the
+        # idle watchdog mid-wait. The absolute ceiling still bounds the turn.
+        # A server-executed call (``client_owned=False``) gets no such hold:
+        # nothing is waiting on a person, so a wedge there must still fail
+        # the turn like any other stalled tool call.
+        if client_owned:
+            self._pending_human_waits += 1
         try:
             result = await future
             item["status"] = "completed"
@@ -567,8 +652,12 @@ class TurnContext:
         finally:
             # Always remove — whether the Future resolved cleanly
             # or was cancelled, holding it in the dict would
-            # leak memory across turns.
+            # leak memory across turns. The hold decrement mirrors
+            # whichever branch incremented it above, on every exit path
+            # (answer, cancel, or an unexpected exception from ``future``).
             self._pending_tool_calls.pop(call_id, None)
+            if client_owned:
+                self._pending_human_waits -= 1
 
     async def elicit(
         self, elicitation_id: str, params: ElicitationRequestParams
@@ -691,9 +780,18 @@ class TurnContext:
         """
         future: asyncio.Future[PolicyVerdictPayload] = asyncio.get_running_loop().create_future()
         self._pending_policy_evaluations[evaluation_id] = future
+        human_gated = phase in _HUMAN_GATED_POLICY_PHASES
+        timeout_s = (
+            _POLICY_EVAL_TIMEOUT_S
+            if human_gated
+            else min(_POLICY_EVAL_TIMEOUT_S, _UNGATED_POLICY_EVAL_TIMEOUT_S)
+        )
         # Unlike elicit's unbounded park, this wait is already bounded by
-        # the wait_for below; the counter only holds the idle window open.
-        self._pending_human_waits += 1
+        # the wait_for below; the counter only holds the idle window open,
+        # and only for phases that can actually wait on a human.
+        if human_gated:
+            self._pending_human_waits += 1
+        _logger.info("Policy evaluation %s requested (phase=%s)", evaluation_id, phase)
         self.emit(
             PolicyEvaluationRequestEvent(
                 type="policy_evaluation.requested",
@@ -703,7 +801,9 @@ class TurnContext:
             )
         )
         try:
-            return await asyncio.wait_for(future, timeout=_POLICY_EVAL_TIMEOUT_S)
+            verdict = await asyncio.wait_for(future, timeout=timeout_s)
+            _logger.info("Policy evaluation %s resolved: %s", evaluation_id, verdict.action)
+            return verdict
         except asyncio.TimeoutError:
             # Phase-aware default: advisory LLM phases and TOOL_RESULT (the
             # tool already ran) fail OPEN so a missing verdict never hangs the
@@ -714,7 +814,7 @@ class TurnContext:
             _logger.warning(
                 "Policy evaluation %s timed out after %ds; defaulting to %s",
                 evaluation_id,
-                _POLICY_EVAL_TIMEOUT_S,
+                timeout_s,
                 _action,
             )
             return PolicyVerdictPayload(
@@ -727,7 +827,8 @@ class TurnContext:
             )
         finally:
             self._pending_policy_evaluations.pop(evaluation_id, None)
-            self._pending_human_waits -= 1
+            if human_gated:
+                self._pending_human_waits -= 1
 
     def _complete_policy_evaluation(
         self, evaluation_id: str, verdict: PolicyVerdictPayload
@@ -1267,6 +1368,13 @@ class HarnessApp:
         for ctx in self._in_flight.values():
             if ctx._complete_policy_evaluation(body.evaluation_id, verdict):
                 break
+        else:
+            # A dropped verdict leaves its turn parked until the eval timeout.
+            _logger.warning(
+                "Policy verdict %s matched no pending evaluation (%d in-flight turns)",
+                body.evaluation_id,
+                len(self._in_flight),
+            )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     async def _start_or_inject_turn(
@@ -1281,8 +1389,11 @@ class HarnessApp:
         1. ``previous_response_id`` matches an in-flight turn →
            in-band injection: enqueue the request body on that
            turn's injection queue, return 204.
-        2. Scaffold is shutting down → refuse with 503.
-        3. Otherwise → start a new turn: allocate ``response_id``,
+        2. A runner steer (``injection_id`` set) with no live turn to
+           inject into → refuse with 409; the runner replays it as its
+           continuation turn.
+        3. Scaffold is shutting down → refuse with 503.
+        4. Otherwise → start a new turn: allocate ``response_id``,
            build a :class:`TurnContext`, register it in
            ``_in_flight``, and return a streaming SSE response
            that runs ``run_turn`` to completion.
@@ -1291,7 +1402,8 @@ class HarnessApp:
         :returns: Either a :class:`StreamingResponse` for the new
             turn or a 204 :class:`Response` for an in-band
             injection.
-        :raises OmnigentError: 503 on shutdown.
+        :raises OmnigentError: 409 for a steer with no live turn; 503 on
+            shutdown.
         """
         if (
             request.previous_response_id is not None
@@ -1315,6 +1427,15 @@ class HarnessApp:
             ):
                 self._active_turn_ctx._push_injection(request)
                 return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+            if request.injection_id is not None:
+                # The steered turn already ended or was interrupted. The runner
+                # keeps the message buffered for its continuation turn, so a turn
+                # started here would run unseen and make that continuation a 204.
+                raise OmnigentError(
+                    "no active turn to inject into",
+                    code=ErrorCode.CONFLICT,
+                )
 
             if self._shutting_down.is_set():
                 raise OmnigentError(
@@ -1426,6 +1547,7 @@ class HarnessApp:
             yield _format_sse_event(terminal)
         finally:
             await self._teardown_turn(ctx, run_task, heartbeat_task)
+            _freeze_gc_if_armed(run_task, ctx)
 
     def _initial_envelope_events(
         self, ctx: TurnContext, model: str, start_seq: int

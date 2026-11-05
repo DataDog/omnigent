@@ -281,6 +281,14 @@ class Conversation:
 # ── Conversation item data types ───────────────────────
 
 
+class StartupInputOptions(BaseModel):
+    """Request options retained only while a startup input awaits delivery."""
+
+    model_override: str | None = None
+    tools: list[dict[str, Any]] | None = None
+    background_titles_enabled: bool = False
+
+
 class MessageData(BaseModel):
     """
     Data for a message item (user or assistant).
@@ -316,6 +324,9 @@ class MessageData(BaseModel):
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
+    startup_options: StartupInputOptions | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @field_validator("content")
     @classmethod
@@ -385,12 +396,16 @@ class FunctionCallData(BaseModel):
     :param arguments: JSON-encoded arguments string.
     :param call_id: Unique call identifier from the LLM,
         e.g. ``"call_abc123"``.
+    :param namespace: Tool namespace the model emitted the call under,
+        e.g. ``"container"``. ``None`` for the default namespace. Harnesses
+        that replay history must round-trip it with the call.
     """
 
     agent: str = Field(serialization_alias="model")
     name: str
     arguments: str
     call_id: str
+    namespace: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class FunctionCallOutputData(BaseModel):
@@ -749,6 +764,9 @@ class SlashCommandData(BaseModel):
     name: str
     arguments: str
     output: str | None = None
+    startup_options: StartupInputOptions | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 ItemData = (
@@ -858,6 +876,8 @@ class NewConversationItem(BaseModel):
     # know whether a timed-out POST committed). Same 32-hex shape the store
     # mints itself; ``None`` keeps the store-assigned random id.
     stable_id: str | None = None
+    status: Literal["completed", "in_progress", "incomplete", "failed"] = "completed"
+    replaces_pending_id: str | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> NewConversationItem:

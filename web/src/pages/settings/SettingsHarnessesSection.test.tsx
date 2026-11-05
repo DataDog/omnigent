@@ -6,6 +6,8 @@
 
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { SkillContent } from "@/hooks/useSkillContent";
@@ -19,7 +21,7 @@ const CONTENT: SkillContent = {
   name: "review",
   description: "Review diffs.",
   content:
-    "## Instructions\nRead the diff.\n![private image](https://example.test/pixel)\n<script>secret()</script>",
+    "## Instructions\nRead the diff.\n[guide](./GUIDE.md) [docs](https://example.test/docs)\n![private image](https://example.test/pixel)\n<script>secret()</script>",
   truncated: false,
 };
 let contentQuery: { data?: SkillContent; error?: unknown; isPending: boolean } = {
@@ -75,17 +77,28 @@ const STARTUP: HarnessStartup = {
   command: "claude",
   resolved_path: "/opt/bin/claude",
   command_source: "config",
-  arg_count: 2,
+  arg_count: 4,
+  args: ["--model", "opus", "--api-key", "synthetic-secret"],
+  configured_command: "claude",
+  configured_args: ["--model", "opus", "--api-key", "synthetic-secret"],
+  environment: { inherit: true, variables: {}, unset: [] },
 };
+let startupData = STARTUP;
 let startupError: ApiError | null = null;
 const startupCalls = vi.fn();
 let hosts: Host[] = [];
 vi.mock("@/hooks/useHosts", async (importActual) => ({
   ...(await importActual()),
-  useHosts: () => ({ data: hosts }),
+  useHosts: () => {
+    return useQuery({
+      queryKey: ["hosts", { includeSandbox: false }],
+      queryFn: async () => hosts,
+      initialData: hosts,
+    });
+  },
   useHarnessStartup: (hostId: string, harness: string) => {
     startupCalls(hostId, harness);
-    return { data: startupError ? undefined : STARTUP, error: startupError, isPending: false };
+    return { data: startupError ? undefined : startupData, error: startupError, isPending: false };
   },
 }));
 
@@ -132,7 +145,14 @@ vi.mock("@/hooks/useHarnessInventory", async (importActual) => ({
 let harnessInstall = true;
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
-    features: { harness_install: harnessInstall, harness_settings_ui: true },
+    features: { harness_install: harnessInstall },
+    installable_harnesses: [
+      "claude-native",
+      "codex-native",
+      "opencode-native",
+      "pi-native",
+      "qwen-native",
+    ],
   }),
 }));
 
@@ -141,28 +161,56 @@ vi.mock("@/shell/NewChatDialog", () => ({
   ComposerAgentIcon: () => <span data-testid="agent-icon" />,
 }));
 
-// Assert the setup dialog is opened with the right harness/host, without
-// rendering its full install/auth flow.
-const setupDialogProps = vi.fn();
-vi.mock("@/shell/HarnessSetupDialog", () => ({
-  HarnessSetupDialog: (props: { open: boolean; harness: string | null; host: Host | null }) => {
-    setupDialogProps(props);
+const fixDialogProps = vi.fn();
+vi.mock("./HarnessFixDialog", () => ({
+  HarnessFixDialog: (props: {
+    open: boolean;
+    mode: "reconfigure" | "update" | "install";
+    harness: string;
+    host: Host;
+    onFixed: (result: {
+      configuredHarnesses: Record<string, boolean | string>;
+      credentialKind?: "isaac" | "personal";
+      gatewayInference?: Record<string, boolean> | null;
+    }) => void;
+  }) => {
+    fixDialogProps(props);
     return props.open ? (
       <div
-        data-testid="setup-dialog"
+        data-testid="fix-dialog"
         data-harness={props.harness}
-        data-host={props.host?.host_id ?? ""}
-      />
+        data-host={props.host.host_id}
+        data-mode={props.mode}
+      >
+        <button
+          type="button"
+          onClick={() =>
+            props.onFixed({
+              configuredHarnesses: { [props.harness]: true },
+              credentialKind: "isaac",
+              gatewayInference: { [props.harness]: true },
+            })
+          }
+        >
+          Complete fix
+        </button>
+      </div>
     ) : null;
   },
 }));
 
 function renderHarnesses(harness?: string) {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
-    <MemoryRouter initialEntries={[`/settings/harnesses${harness ? `/${harness}` : ""}`]}>
-      <SettingsHarnessesSection />
-    </MemoryRouter>,
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <MemoryRouter initialEntries={[`/settings/harnesses${harness ? `/${harness}` : ""}`]}>
+          <SettingsHarnessesSection />
+        </MemoryRouter>
+      </TooltipProvider>
+    </QueryClientProvider>,
   );
+  return queryClient;
 }
 
 // Radix Tabs activate on focus; jsdom's synthetic click doesn't move focus.
@@ -200,36 +248,58 @@ afterEach(() => {
   hosts = [];
   inventory = INVENTORY;
   harnessInstall = true;
-  setupDialogProps.mockReset();
+  fixDialogProps.mockReset();
   startupCalls.mockClear();
+  startupData = STARTUP;
   startupError = null;
 });
 
 describe("Harnesses grid", () => {
-  it("shows Installed (no Set-up) for a ready harness and a badge + Set-up for a not-ready one", () => {
+  it("shows the configured credential and a reconfiguration warning with its reason", async () => {
     hosts = [ONLINE];
     renderHarnesses();
 
-    // claude-native is ready → "Installed", no action button.
     expect(within(card("claude-native")).getByText("Configured")).toBeTruthy();
+    expect(within(card("claude-native")).getByText("· Signed in")).toBeTruthy();
     expect(screen.queryByTestId("harness-action-claude-native")).toBeNull();
 
-    // codex-native reports needs-auth → warning badge + a Set-up button.
-    expect(screen.getByText("needs auth")).toBeTruthy();
-    expect(screen.getByTestId("harness-action-codex-native")).toBeTruthy();
+    const warning = within(card("codex-native")).getByLabelText(
+      "Needs reconfiguration: Missing credentials",
+    );
+    expect(warning.textContent).toContain("Needs reconfiguration");
+    expect(screen.getByTestId("harness-settings-codex-native")).toBeTruthy();
+    fireEvent.focus(warning);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Missing credentials");
   });
 
-  it("opens the setup dialog for the clicked harness", () => {
-    hosts = [ONLINE];
+  it("opens install for a not-installed harness on the selected host", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
     renderHarnesses();
 
     fireEvent.click(screen.getByTestId("harness-action-codex-native"));
 
-    const dialog = screen.getByTestId("setup-dialog");
+    const dialog = screen.getByTestId("fix-dialog");
     expect(dialog.getAttribute("data-harness")).toBe("codex-native");
-    // The dialog is bound to the host chosen when setup opened, not the live
-    // selection — a later host switch can't redirect the credential/install.
     expect(dialog.getAttribute("data-host")).toBe("h1");
+    expect(dialog.getAttribute("data-mode")).toBe("install");
+    expect(within(card("codex-native")).queryByText("Needs reconfiguration")).toBeNull();
+    expect(within(card("codex-native")).getByText("Not installed")).toBeTruthy();
+  });
+
+  it("does not offer one-click install for a not-installed Cursor harness", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "cursor-native": "binary-missing" } }];
+    renderHarnesses();
+
+    expect(screen.queryByTestId("harness-action-cursor-native")).toBeNull();
+    expect(screen.getByTestId("harness-settings-cursor-native")).toBeTruthy();
+  });
+
+  it("uses the existing inventory label instead of guessing a personal subscription", () => {
+    hosts = [{ ...ONLINE, gateway_inference: { "claude-native": false } }];
+    renderHarnesses();
+
+    expect(within(card("claude-native")).getByText("· Signed in")).toBeTruthy();
+    expect(within(card("claude-native")).queryByText(/Personal subscription/)).toBeNull();
   });
 
   it("treats unknown readiness (host reports nothing) as neutral, not needs-setup", () => {
@@ -241,7 +311,7 @@ describe("Harnesses grid", () => {
     expect(screen.queryByTestId("harness-action-codex-native")).toBeNull();
     expect(screen.queryByTestId("harness-action-claude-native")).toBeNull();
     expect(within(card("claude-native")).queryByText("Installed")).toBeNull();
-    expect(screen.queryByText("needs setup")).toBeNull();
+    expect(screen.queryByText("Needs reconfiguration")).toBeNull();
   });
 
   it("hides Set-up (keeps the badge) when harness_install is disabled", () => {
@@ -251,8 +321,11 @@ describe("Harnesses grid", () => {
     hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
     renderHarnesses();
 
-    expect(screen.getByText("binary missing")).toBeTruthy();
+    expect(within(card("codex-native")).getByText("Binary missing")).toBeTruthy();
+    expect(within(card("codex-native")).queryByText("Not installed")).toBeNull();
+    expect(within(card("codex-native")).queryByLabelText(/Needs reconfiguration/)).toBeNull();
     expect(screen.queryByTestId("harness-action-codex-native")).toBeNull();
+    expect(screen.queryByTestId("harness-settings-codex-native")).toBeNull();
   });
 
   it("shows the no-host notice and no Set-up buttons when no host is online", () => {
@@ -284,12 +357,14 @@ describe("Harnesses grid", () => {
     expect(screen.queryByTestId("harness-card-codex-native")).toBeNull();
   });
 
-  it("links an installed harness's card to its details page, but not a not-ready one", () => {
+  it("links ready and broken harness cards to details while the feature is enabled", () => {
     hosts = [ONLINE];
     renderHarnesses();
 
     expect(card("claude-native").getAttribute("href")).toBe("/settings/harnesses/claude-native");
-    expect(card("codex-native").getAttribute("href")).toBeNull();
+    expect(card("codex-native").getAttribute("href")).toBe(
+      "/settings/harnesses/codex-native?tab=settings",
+    );
   });
 });
 
@@ -312,6 +387,15 @@ describe("Harness card navigation", () => {
     fireEvent.click(screen.getByTestId("harness-settings-claude-native"));
     expect(selected("Settings")).toBe("true");
   });
+
+  it("opens a broken harness on Settings from its gear", () => {
+    hosts = [ONLINE];
+    renderHarnesses();
+
+    fireEvent.click(screen.getByTestId("harness-settings-codex-native"));
+    expect(selected("Settings")).toBe("true");
+    expect(screen.getByText(/Codex can’t sign in on my-laptop/)).toBeTruthy();
+  });
 });
 
 describe("Harness details", () => {
@@ -329,11 +413,12 @@ describe("Harness details", () => {
 
     // The credential lives under the Settings tab.
     selectTab("Settings");
-    expect(screen.getByText("AI Gateway")).toBeTruthy();
+    expect(screen.getByText("Isaac")).toBeTruthy();
+    expect(screen.getByText("Databricks-managed credential via the Unity Gateway")).toBeTruthy();
     expect(screen.getByText("/opt/bin/claude")).toBeTruthy();
-    expect(screen.getByText("2 configured arguments (values hidden)")).toBeTruthy();
-    expect(screen.getByText(/harness.claude-native.command/)).toBeTruthy();
-    expect(screen.getByText(/workspace's .omnigent/)).toBeTruthy();
+    for (const arg of STARTUP.args ?? []) expect(screen.getAllByText(arg)).toHaveLength(1);
+    expect(screen.getByText(/Sessions and workspaces may override/)).toBeTruthy();
+    expect(screen.getByText(/harness.claude-native in ~\/.omnigent\/config.yaml/)).toBeTruthy();
   });
 
   it("keeps tool discovery lazy and shows host-reported details", () => {
@@ -398,13 +483,130 @@ describe("Harness details", () => {
     expect(screen.queryByRole("tab", { name: /MCP servers/ })).toBeNull();
   });
 
-  it("offers Set up instead of the catalog for a harness that isn't ready", () => {
+  it("shows tabs, a warning, and reconfiguration controls for a broken harness", () => {
+    hosts = [ONLINE];
+    renderHarnesses("codex-native");
+
+    expect(screen.getByText(/Codex can’t sign in on my-laptop/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reconfigure" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Reconfigure credential" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: /MCP servers/ })).toBeTruthy();
+  });
+
+  it("opens reconfiguration from the credential card", () => {
+    hosts = [ONLINE];
+    renderHarnesses("codex-native");
+
+    fireEvent.click(screen.getByRole("button", { name: "Reconfigure credential" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "reconfigure");
+  });
+
+  it("uses Update for an outdated harness", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "version-too-low" } }];
+    renderHarnesses("codex-native");
+
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "update");
+  });
+
+  it("uses Set up for a not-installed Cursor harness", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "cursor-native": "binary-missing" } }];
+    renderHarnesses("cursor-native");
+
+    expect(screen.queryByRole("button", { name: "Install" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Set up" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "install");
+  });
+
+  it("uses Set up instead of Update for an outdated Cursor harness", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "cursor-native": "version-too-low" } }];
+    renderHarnesses("cursor-native");
+
+    expect(screen.queryByRole("button", { name: "Update" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Set up" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "update");
+  });
+
+  it("uses Set up instead of Reconfigure for a non-installable Cursor harness", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "cursor-native": "needs-auth" } }];
+    renderHarnesses("cursor-native");
+
+    expect(screen.queryByRole("button", { name: "Reconfigure" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Set up" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "reconfigure");
+  });
+
+  it.each([
+    ["binary-missing", "Not installed"],
+    [false, "Not configured"],
+  ])("never calls an install state %s reconfiguration", (reason, label) => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": reason } }];
+    renderHarnesses("codex-native");
+
+    expect(screen.getAllByText(label)).toHaveLength(2);
+    expect(screen.queryByText("Needs reconfiguration")).toBeNull();
+  });
+
+  it("uses dedicated recovery copy for a readiness error", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "readiness-error" } }];
+    renderHarnesses("codex-native");
+
+    expect(
+      screen.getByText("Codex isn’t working on my-laptop. Run setup again to fix it."),
+    ).toBeTruthy();
+    expect(screen.queryByText(/credential is missing/)).toBeNull();
+  });
+
+  it("applies the fixed readiness immediately and shows the ready notice", () => {
+    hosts = [ONLINE];
+    const queryClient = renderHarnesses("codex-native");
+    const hostsKey = ["hosts", { includeSandbox: false }];
+    queryClient.setQueryData(hostsKey, [ONLINE]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Reconfigure" }));
+    fireEvent.click(screen.getByRole("button", { name: "Complete fix" }));
+
+    expect(screen.getByText("Codex is ready on my-laptop. Checked just now.")).toBeTruthy();
+    expect(screen.getByText("· Isaac")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Reconfigure" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reconfigure credential" })).toBeNull();
+    expect(queryClient.getQueryData<Host[]>(hostsKey)?.[0].configured_harnesses).toEqual({
+      "codex-native": true,
+    });
+    expect(queryClient.getQueryData<Host[]>(hostsKey)?.[0].gateway_inference).toEqual({
+      "codex-native": true,
+    });
+  });
+
+  it("keeps the original broken detail when harness_install is disabled", () => {
+    harnessInstall = false;
     hosts = [ONLINE];
     renderHarnesses("codex-native");
 
     expect(screen.getByText(/Set up Codex on my-laptop/)).toBeTruthy();
-    expect(screen.getByTestId("harness-action-codex-native")).toBeTruthy();
+    expect(screen.queryByText("Machine")).toBeNull();
     expect(screen.queryByRole("tab", { name: /MCP servers/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reconfigure" })).toBeNull();
+  });
+
+  it("keeps the working detail unchanged when harness_install is disabled", () => {
+    harnessInstall = false;
+    hosts = [{ ...ONLINE, gateway_inference: { "claude-native": true } }];
+    renderHarnesses("claude-native");
+
+    selectTab("Settings");
+    expect(screen.getByText("Unity Gateway")).toBeTruthy();
+    expect(screen.queryByText("Isaac")).toBeNull();
+    expect(screen.queryByText("Machine")).toBeNull();
+  });
+
+  it("hides fix actions for a managed sandbox host", () => {
+    hosts = [{ ...ONLINE, sandbox_provider: "modal" }];
+    renderHarnesses("codex-native");
+
+    expect(screen.queryByRole("button", { name: "Reconfigure" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reconfigure credential" })).toBeNull();
+    expect(screen.queryByTestId("fix-dialog")).toBeNull();
   });
 
   it("falls back to the grid for an unknown harness slug", () => {
@@ -416,13 +618,120 @@ describe("Harness details", () => {
 });
 
 describe("Launch settings compatibility", () => {
+  it.each(["claude-native", "codex-native"])(
+    "shows one startup configuration with separate env values and arguments for %s",
+    (harness) => {
+      hosts = [{ ...ONLINE, configured_harnesses: { [harness]: true } }];
+      startupData = {
+        ...STARTUP,
+        command: "isaac",
+        resolved_path: "/opt/bin/isaac",
+        args: ["codex", "--", ""],
+        configured_command: "/usr/bin/env",
+        configured_args: [
+          "-i",
+          "-u",
+          "REMOVED",
+          "TOKEN=synthetic-secret=with spaces",
+          "EMPTY=",
+          "isaac",
+          "codex",
+          "--",
+          "",
+        ],
+        environment: {
+          inherit: false,
+          variables: { TOKEN: "synthetic-secret=with spaces", EMPTY: "" },
+          unset: ["REMOVED"],
+        },
+      };
+      renderHarnesses(harness);
+      selectTab("Settings");
+      const startupSection = screen
+        .getByRole("heading", { name: "Startup configuration" })
+        .closest("section")!;
+      expect(
+        within(startupSection)
+          .getAllByRole("heading", { level: 3 })
+          .map((heading) => heading.textContent),
+      ).toEqual(["Command", "Environment", "Arguments"]);
+      expect(within(startupSection).getByText("/opt/bin/isaac")).toBeTruthy();
+      const envSection = within(startupSection)
+        .getByRole("heading", { name: "Environment" })
+        .closest("div")!;
+      expect(within(envSection).getByText("TOKEN")).toBeTruthy();
+      expect(within(envSection).getByText("synthetic-secret=with spaces")).toBeTruthy();
+      expect(within(envSection).getByText("EMPTY")).toBeTruthy();
+      expect(within(envSection).getByText('""')).toBeTruthy();
+      expect(within(envSection).getByText("Inherited environment cleared.")).toBeTruthy();
+      expect(within(envSection).getByText("REMOVED")).toBeTruthy();
+      const argsSection = within(startupSection)
+        .getByRole("heading", { name: "Arguments" })
+        .closest("div")!;
+      expect(
+        within(argsSection)
+          .getAllByRole("listitem")
+          .map((item) => item.textContent),
+      ).toEqual(["codex", "--", '""']);
+      expect(screen.queryByText("Configured invocation")).toBeNull();
+      expect(screen.queryByText("Environment overrides")).toBeNull();
+      expect(screen.queryByText("Startup arguments")).toBeNull();
+      expect(screen.queryByText("/usr/bin/env")).toBeNull();
+      expect(screen.queryByText("TOKEN=synthetic-secret=with spaces")).toBeNull();
+      expect(screen.getAllByText("synthetic-secret=with spaces")).toHaveLength(1);
+      expect(screen.getByText(/not a running session's full command or environment/)).toBeTruthy();
+    },
+  );
+
+  it("does not invent env settings for an opaque env wrapper", () => {
+    hosts = [ONLINE];
+    startupData = {
+      ...STARTUP,
+      command: "/usr/bin/env",
+      resolved_path: "/usr/bin/env",
+      args: ["-S", "TOKEN=synthetic-secret isaac codex --"],
+      configured_command: "/usr/bin/env",
+      configured_args: ["-S", "TOKEN=synthetic-secret isaac codex --"],
+      environment: null,
+    };
+    renderHarnesses("claude-native");
+    selectTab("Settings");
+    expect(screen.getByText(/Cannot separate environment values/)).toBeTruthy();
+    expect(screen.getByText("/usr/bin/env")).toBeTruthy();
+    expect(screen.getAllByRole("listitem").map((item) => item.textContent)).toEqual([
+      "-S",
+      "TOKEN=synthetic-secret isaac codex --",
+    ]);
+    expect(screen.queryByText("Inherited values are not listed.")).toBeNull();
+    expect(screen.queryByText("Configured invocation")).toBeNull();
+  });
+
+  it("requests an update when the host reports args without env metadata", () => {
+    hosts = [ONLINE];
+    startupData = { ...STARTUP, configured_args: undefined, environment: undefined };
+    renderHarnesses("claude-native");
+    selectTab("Settings");
+    expect(screen.getByText("Update my-laptop to see environment settings.")).toBeTruthy();
+    expect(screen.queryByText("Configured invocation")).toBeNull();
+  });
+
+  it("asks for a host update when an older host reports only the argument count", () => {
+    hosts = [ONLINE];
+    startupData = { ...STARTUP, args: null, configured_args: null, environment: null };
+    renderHarnesses("claude-native");
+    selectTab("Settings");
+    expect(
+      screen.getByText("4 configured arguments. Update my-laptop to view values."),
+    ).toBeTruthy();
+  });
+
   it.each([404, 501, 502])("keeps the credential when startup returns %s", (status) => {
     hosts = [ONLINE];
     startupError = new ApiError("unavailable", status, null);
     renderHarnesses("claude-native");
     selectTab("Settings");
     expect(screen.getByText("Signed in")).toBeTruthy();
-    expect(screen.queryByText("Path to binary")).toBeNull();
+    expect(screen.queryByText("Startup configuration")).toBeNull();
     if (status === 501)
       expect(screen.getByText("Update my-laptop to see launch settings.")).toBeTruthy();
     if (status === 502)
@@ -499,6 +808,10 @@ it("opens skill markdown only on demand and returns to Skills", () => {
   expect(screen.getByRole("heading", { name: "Instructions" })).toBeTruthy();
   expect(document.querySelector("img")).toBeNull();
   expect(document.querySelector("script")).toBeNull();
+  expect(screen.queryByRole("link", { name: "guide" })).toBeNull();
+  expect(screen.getByRole("link", { name: "docs" }).getAttribute("href")).toBe(
+    "https://example.test/docs",
+  );
   fireEvent.click(screen.getByRole("button", { name: "Skills" }));
   expect(screen.getByRole("tab", { name: "Skills · 1" }).getAttribute("aria-selected")).toBe(
     "true",
@@ -598,13 +911,19 @@ it("probes only the expanded server, showing its tools, count and status", () =>
   hosts = [ONLINE];
   renderHarnesses("claude-native");
   expect(mcpLookups.every((lookup) => !lookup[4])).toBe(true);
-  expect(screen.queryByRole("img", { name: "Connected" })).toBeNull();
+  expect(screen.queryByRole("status")).toBeNull();
   fireEvent.click(screen.getByTestId("catalog-row-linear"));
   expect(mcpLookups).toContainEqual([ONLINE.host_id, "claude", "linear", "toolkit", true]);
   expect(mcpLookups.some((lookup) => lookup[2] === "github" && lookup[4])).toBe(false);
   expect(screen.getByText("read_docs")).toBeTruthy();
+  const toolDetails = screen.getByText("Read documentation").closest("details")!;
+  expect(toolDetails.open).toBe(false);
+  fireEvent.click(screen.getByText("read_docs"));
+  expect(toolDetails.open).toBe(true);
   expect(screen.getByText("· 1 tool")).toBeTruthy();
-  expect(screen.getByRole("img", { name: "Connected" })).toBeTruthy();
+  expect(screen.getByRole("status").textContent).toBe("Connected");
+  expect(screen.getByRole("status").firstElementChild).toHaveClass("bg-success");
+  expect(screen.queryByText(/Tools reported when probed/)).toBeNull();
   fireEvent.click(screen.getByTestId("catalog-row-linear"));
   expect(screen.queryByText("read_docs")).toBeNull();
 });
@@ -648,18 +967,27 @@ it("hides MCP expansion on old-server 404", () => {
 it.each([
   [
     "needs_auth",
+    "Needs auth",
+    "bg-warning",
     "Authentication required. Harness sign-in credentials cannot be reused for this probe.",
   ],
-  ["timeout", "MCP probe timed out."],
-  ["unreachable", "Couldn't reach this MCP server."],
-  ["unsupported", "This MCP configuration cannot be probed from the host."],
-])("reports probe status %s without a tool count", (connection, label) => {
+  ["timeout", "Failed to connect", "bg-destructive", "MCP probe timed out."],
+  ["unreachable", "Failed to connect", "bg-destructive", "Couldn't reach this MCP server."],
+  [
+    "unsupported",
+    "Failed to connect",
+    "bg-destructive",
+    "This MCP configuration cannot be probed from the host.",
+  ],
+])("reports probe status %s without a tool count", (connection, statusLabel, color, detail) => {
   hosts = [ONLINE];
   mcpResult = { data: { tools: [], connection, truncated: false }, isPending: false };
   renderHarnesses("claude-native");
   fireEvent.click(screen.getByTestId("catalog-row-github"));
-  expect(screen.getByRole("img", { name: label })).toBeTruthy();
-  expect(screen.getByText(label)).toBeTruthy();
+  const status = screen.getByRole("status");
+  expect(status.textContent).toBe(statusLabel);
+  expect(status.firstElementChild).toHaveClass(color);
+  expect(screen.getByText(detail)).toBeTruthy();
   expect(screen.queryByText(/· 0 tools/)).toBeNull();
 });
 

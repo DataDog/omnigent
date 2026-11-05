@@ -68,6 +68,7 @@ import {
   getSessionSlim,
   getSessionUsage,
   fetchSessionItemsPage,
+  HOST_OFFLINE_CODE,
   INITIAL_WINDOW_ITEMS,
   interrupt as interruptSession,
   openSessionStream,
@@ -109,6 +110,7 @@ import {
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import { forgetUnsentSend, peekUnsentSend, rememberUnsentSend } from "@/lib/unsentSends";
 import { isSideChatCommand, usesNativeSideChatFork } from "@/lib/sideChat";
 // Re-exported below so existing `@/store/chatStore` importers keep working; the
 // pure helpers live in a leaf module so low-level session hooks can gate on temp
@@ -130,11 +132,17 @@ import { uploadFile } from "@/lib/filesApi";
 import { attachmentKey } from "@/lib/attachments";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
-import { getCurrentAuthorId, resolveSessionHost } from "@/lib/identity";
-import { getOmnigentHostConfig } from "@/lib/host";
+import {
+  getCurrentAuthorId,
+  getCurrentUserId,
+  resolveSessionHost,
+  subscribeIdentity,
+} from "@/lib/identity";
+import { getOmnigentHostConfig, isDatabricksWorkspace } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
 import { emitInteractionPhase, startTimedInteraction } from "@/lib/analyticsEmit";
@@ -144,13 +152,16 @@ import {
   onResponseEnd,
   onResponseStart,
 } from "./interactionTelemetry";
-import { getSessionHost } from "@/lib/sessionHost";
+import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
 import {
   isClaudeAgentMessageContent,
   isSystemUserContent,
   taskNotificationMarkerContent,
 } from "@/lib/systemMessage";
-import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
+import {
+  isNativeTerminalSession as isNativeTerminalSessionFn,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
 import type { StoredReplyDraft } from "@/lib/replyDraft";
 import { toast } from "sonner";
 
@@ -395,20 +406,30 @@ export function beginLocalConversation(
 
 /** Whether a temporary conversation still owns its unsent first message. */
 export function hasPendingLocalMessage(tempConvId: string): boolean {
-  return (
-    conversationRegistry
-      .peek(tempConvId)
-      ?.getState()
-      .pendingUserMessages.some((message) => message.initialDraft !== undefined) ?? false
-  );
+  const state = conversationRegistry.peek(tempConvId)?.getState();
+  return state !== undefined && holdsInitialDraft(state);
+}
+
+/** Whether a first message is still held for startup; nothing queued may overtake it. */
+export function holdsInitialDraft(state: Pick<ConversationState, "pendingUserMessages">): boolean {
+  return state.pendingUserMessages.some((message) => message.initialDraft !== undefined);
+}
+
+/** Keep a conversation's queued messages from sending until the user retries each one. */
+function suspendQueuedMessages(conversationId: string): void {
+  setActive((s) => ({
+    queuedMessages: s.queuedMessages.map((m) =>
+      m.conversationId === conversationId ? { ...m, requiresRetry: true } : m,
+    ),
+  }));
 }
 
 /**
  * Hydrate a client-only conversation onto its real server id once
  * `createSession` returns: rekey the registry entry (carrying the optimistic
  * bubble), the send chain, and the sidebar row from `tempConvId` to `realId`;
- * flip the store + URL when still viewing it; then POST the first message via
- * `send` (reusing the already-shown bubble), which binds the real stream.
+ * flip the store + URL when still viewing it; then bind the stream and send
+ * the first message unless the create already accepted it durably.
  *
  * Navigate-away safe: the registry/chain/sidebar rekey is id-addressed and
  * always runs. The store flip + `navigate` run ONLY when still on `tempConvId`,
@@ -425,8 +446,9 @@ export function hydrateLocalConversation(
   navigate: (to: string, opts?: { replace?: boolean }) => void,
   isStillViewing: () => boolean = () => true,
   project?: LocalConversationProject,
+  initialInputAccepted = false,
 ): void {
-  const shouldSend = hasPendingLocalMessage(tempConvId);
+  const shouldSend = !initialInputAccepted && hasPendingLocalMessage(tempConvId);
   const restoredDraft = conversationRegistry.peek(tempConvId)?.getState().failedSendDraft;
   // Registry entry (carrying the optimistic bubble) + the sidebar row, both
   // id-addressed. Rekey the row BEFORE the caller's refetch so a lagging index
@@ -448,10 +470,33 @@ export function hydrateLocalConversation(
   }
 
   if (!shouldSend) {
-    // Creation can finish after Interrupt; bind the empty session without sending.
-    void ensureBoundSession(agentId, useChatStore.getState, undefined, realId).catch(() => {
-      // bindStream records load failures on the conversation.
-    });
+    if (initialInputAccepted) {
+      setterFor(realId)((state) => ({
+        startupPending: true,
+        pendingUserMessages: state.pendingUserMessages.map((message) =>
+          message.tempId === pendingMsgTempId
+            ? { ...message, posted: true, initialDraft: undefined }
+            : message,
+        ),
+      }));
+    }
+    // Stop may have restored the draft while the create request was in flight.
+    const cancel =
+      initialInputAccepted && restoredDraft ? interruptSession(realId) : Promise.resolve();
+    void cancel
+      .catch((err) => {
+        const { code } = describeSendFailure(err);
+        setterFor(realId)((state) => ({
+          blocks: [
+            ...state.blocks,
+            makeClientErrorBlock("Couldn't cancel the saved first message. Try Stop again.", code),
+          ],
+        }));
+      })
+      .then(() => ensureBoundSession(agentId, useChatStore.getState, undefined, realId))
+      .catch(() => {
+        // bindStream records load failures on the conversation.
+      });
     return;
   }
 
@@ -536,6 +581,19 @@ export interface PendingUserMessage {
    * on snapshot-replayed entries (they're already server-owned).
    */
   posted?: boolean;
+  /**
+   * The server's pending-input id from the accepted POST. The bubble keeps
+   * `tempId` as its React key, so this is its only link to the entry a
+   * receipt names. Snapshot-replayed entries carry that id as `tempId`.
+   */
+  pendingId?: string;
+  /**
+   * Sent to a native-terminal session while its turn was running. The vendor
+   * agent reads such a message only after its current step (e.g. a running
+   * tool call), so the bubble says so until `session.input.consumed` promotes
+   * it. Unset on snapshot-replayed entries.
+   */
+  sentMidTurn?: boolean;
 }
 
 /**
@@ -576,6 +634,8 @@ export interface QueuedMessage {
   stableId?: string;
   /** A failed send stays queued until the user explicitly retries or edits it. */
   requiresRetry?: boolean;
+  /** The session's host was offline; held until it reconnects, then sent. */
+  waitingForHost?: boolean;
 }
 
 /**
@@ -626,6 +686,16 @@ export interface ConversationState {
   blocks: AnyBlock[];
   /** User messages POSTed but not yet acked via session.input.consumed. */
   pendingUserMessages: PendingUserMessage[];
+  /**
+   * Recent shell mirrors and the bubbles they settled. Retaining both client
+   * and server ids protects later inputs from duplicate or legacy receipts.
+   */
+  settledShellInputs: {
+    itemId: string;
+    tempId?: string;
+    pendingId?: string;
+    contentKey?: string;
+  }[];
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
   activeResponse: ActiveResponse | null;
   /**
@@ -958,7 +1028,8 @@ export interface ConversationState {
    * is in flight, so it would otherwise read as idle `runner_asleep` and
    * show nothing at all. Feeds `useSessionLiveness` as a `starting` nudge
    * and self-expires after `STARTING_GRACE_S`. `null` when no such launch
-   * is outstanding.
+   * is outstanding. Also stamped when the session's managed sandbox reports
+   * `ready`: its runner is up, but its terminal is not created yet.
    */
   runnerLaunchedAt: number | null;
   /**
@@ -979,6 +1050,8 @@ export interface ConversationState {
    * launch.
    */
   sandboxStatus: SandboxStatus | null;
+  /** Managed startup accepts sends durably before its first harness dispatch. */
+  startupPending: boolean;
   /**
    * Native MCP startup progress, cleared when startup settles or live
    * assistant text arrives. Failures/cancellations stay in host diagnostics,
@@ -1017,6 +1090,18 @@ export interface ConversationState {
  * screen, what its composer is holding). They stay on the root store when
  * per-conversation state moves out.
  */
+/** One side chat's unsent composer contents. */
+export interface SideChatComposerDraft {
+  starting?: boolean;
+  quotes?: string[];
+  text: string;
+  files: File[];
+}
+
+/** The empty composer, shared so an absent entry keeps a stable identity (a
+ *  fresh object per render would re-render every subscriber). */
+export const EMPTY_SIDE_CHAT_COMPOSER: SideChatComposerDraft = { text: "", files: [] };
+
 export interface AppChatState {
   /** The conversation currently on screen. `null` on `/`. */
   conversationId: string | null;
@@ -1045,6 +1130,8 @@ export interface AppChatState {
    * tabs.
    */
   sideChatToOpen: { childId: string; parentId: string } | null;
+  /** Visible, writable side chat that receives selections from its parent. */
+  sideChatSelectionTarget: { childId: string; parentId: string } | null;
   /**
    * Initial composer text for a freshly-opened side chat, keyed by its child
    * conversation id. Set when a generic `/side <question>` opens an empty side
@@ -1055,6 +1142,12 @@ export interface AppChatState {
    * instead the "Ask in side chat" selection that tab's composer quotes.
    */
   sideChatDrafts: Record<string, string>;
+  /**
+   * Unsent composer state per side-chat child id, retained across the pane's
+   * unmounts (rail tab switch, breakpoint cross, drawer teardown). In-memory
+   * only: `File` values aren't serializable.
+   */
+  sideChatComposers: Record<string, SideChatComposerDraft>;
   /**
    * Messages submitted while the agent is busy, held client-side (not yet
    * POSTed) and shown in the composer's queue strip. The head is flushed
@@ -1101,12 +1194,21 @@ export interface ChatActions {
   openSideChatWithDraft: (childSessionId: string, draft: string, parentId: string) => void;
   /** Clear a side chat's seeded composer draft (called after it's consumed). */
   clearSideChatDraft: (childSessionId: string) => void;
+  /** Update one side chat's unsent composer state (text + attachments). */
+  updateSideChatComposer: (
+    childSessionId: string,
+    mutate: (current: SideChatComposerDraft) => SideChatComposerDraft,
+  ) => void;
+  /** Drop a side chat's unsent composer state (sent, or the tab was closed). */
+  clearSideChatComposer: (childSessionId: string) => void;
   /**
    * Queue a message client-side instead of POSTing it now, for a send made
    * while the agent is busy. The head is flushed automatically (FIFO, one per
    * turn) when the session next goes idle — see the `session_status` handler.
    */
   enqueueMessage: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
+  /** Let a conversation's messages held for an offline host flush again. */
+  releaseHostHeldMessages: (conversationId: string) => void;
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
@@ -1350,15 +1452,52 @@ function modelSelectionPending(state: ConversationState): boolean {
   );
 }
 
-/** Keep the draft local while native model startup or a model switch is pending. */
-function waitForModelSelection(conversationId: string, tempId: string): Promise<boolean> {
+// A native CLI can't take input until its sandbox is up, and a launch can take
+// minutes; the server holds a message for less than that.
+function nativeSandboxLaunching(state: ConversationState): boolean {
+  return (
+    state.isNativeTerminalSession &&
+    state.sandboxStatus !== null &&
+    state.sandboxStatus.stage !== "failed"
+  );
+}
+
+// Restores a draft held through a launch whose end never reaches this tab; well
+// past the time any launch is allowed to take.
+const SANDBOX_LAUNCH_MAX_WAIT_MS = 20 * 60_000;
+
+/** Whether a message sent now is held locally for startup rather than posted. */
+function wouldHoldSend(state: ConversationState): boolean {
+  // The server saves startup messages itself, so it needs no local hold.
+  return (
+    !state.startupPending &&
+    (modelSelectionPending(state) ||
+      nativeSandboxLaunching(state) ||
+      (state.sessionModelSeeded && state.sessionHarness === null))
+  );
+}
+
+/**
+ * Keep the draft local while native model startup or a model switch is pending,
+ * or while a native session's sandbox launches.
+ */
+function waitForInitialDispatch(conversationId: string, tempId: string): Promise<boolean> {
   return new Promise((resolve, reject) => {
+    // One deadline at a time: the launch's while the sandbox starts, then the model's.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let deadline: "launch" | "model" | undefined;
     const finish = (ready: boolean, error?: Error) => {
       clearTimeout(timer);
       unsubscribe();
       unsubscribeDisposed();
       if (error) reject(error);
       else resolve(ready);
+    };
+    const expireAfter = (phase: "launch" | "model", ms: number, message: string) => {
+      if (deadline === phase) return;
+      clearTimeout(timer);
+      deadline = phase;
+      timer = setTimeout(() => finish(false, new Error(message)), ms);
     };
     const check = () => {
       const entry = conversationRegistry.peek(conversationId);
@@ -1374,8 +1513,29 @@ function waitForModelSelection(conversationId: string, tempId: string): Promise<
           false,
           state.conversationLoadError ?? new Error("Session failed before the message was sent."),
         );
-      } else if (!modelSelectionPending(state)) {
+      } else if (state.isNativeTerminalSession && state.sandboxStatus?.stage === "failed") {
+        const reason = state.sandboxStatus.error;
+        finish(
+          false,
+          new Error(
+            `The session's managed sandbox failed to launch${reason ? `: ${reason}` : "."}`,
+          ),
+        );
+      } else if (!modelSelectionPending(state) && !nativeSandboxLaunching(state)) {
         finish(true);
+      } else if (nativeSandboxLaunching(state)) {
+        // The model can only start once the sandbox is up.
+        expireAfter(
+          "launch",
+          SANDBOX_LAUNCH_MAX_WAIT_MS,
+          "The sandbox did not finish launching. Please retry the message.",
+        );
+      } else {
+        expireAfter(
+          "model",
+          SEND_CHAIN_MAX_WAIT_MS,
+          "The model did not finish starting. Please retry the message.",
+        );
       }
     };
     const unsubscribe = conversationRegistry.subscribe((id) => {
@@ -1384,11 +1544,6 @@ function waitForModelSelection(conversationId: string, tempId: string): Promise<
     const unsubscribeDisposed = conversationRegistry.subscribeDisposed((id) => {
       if (id === conversationId) finish(false);
     });
-    const timer = setTimeout(
-      () =>
-        finish(false, new Error("The model did not finish starting. Please retry the message.")),
-      SEND_CHAIN_MAX_WAIT_MS,
-    );
     check();
   });
 }
@@ -1816,11 +1971,59 @@ export function consumePendingInitialPrompt(conversationId: string): PendingInit
   return prompt;
 }
 
+const HARNESS_CATALOG_QUERY = {
+  queryKey: ["harness-labels"] as const,
+  queryFn: fetchHarnessCatalog,
+  staleTime: 30_000,
+};
+
+/**
+ * Resolve the SDK harness's declared family from the same catalog as the picker.
+ * Use cached data immediately and refresh stale entries in the background.
+ * Native harnesses keep their wrapper-label gate; no cache still awaits discovery.
+ */
+async function effortFamilyForSession(
+  session: { harness?: string | null } | null | undefined,
+): Promise<string | null> {
+  if (queryClient === null || !session?.harness) return null;
+  if (nativeCodingAgentForHarness(session.harness)) return null;
+  let catalog: HarnessCatalog | undefined;
+  try {
+    catalog = await queryClient.ensureQueryData({
+      ...HARNESS_CATALOG_QUERY,
+      revalidateIfStale: true,
+    });
+  } catch {
+    catalog = queryClient.getQueryData<HarnessCatalog>(HARNESS_CATALOG_QUERY.queryKey);
+  }
+  return catalog?.effortFamilies[session.harness] ?? null;
+}
+
+/**
+ * Synchronous variant for the hydration path: the declared family from the
+ * catalog already in cache, or ``undefined`` when no catalog has loaded yet.
+ * Never awaits — the transcript must not wait on ``/v1/harnesses``. When the
+ * catalog is absent it is prefetched in the background for the next lookup.
+ */
+function cachedEffortFamilyForSession(
+  session: { harness?: string | null } | null | undefined,
+): string | null | undefined {
+  if (queryClient === null || !session?.harness) return null;
+  if (nativeCodingAgentForHarness(session.harness)) return null;
+  const catalog = queryClient.getQueryData<HarnessCatalog>(HARNESS_CATALOG_QUERY.queryKey);
+  if (catalog === undefined) {
+    void queryClient.prefetchQuery(HARNESS_CATALOG_QUERY);
+    return undefined;
+  }
+  return catalog.effortFamilies[session.harness] ?? null;
+}
+
 export const useChatStore = create<ChatState>((_rootSet, get) => ({
   conversationId: null,
   redirectToConversationId: null,
   blocks: [],
   pendingUserMessages: [],
+  settledShellInputs: [],
   btwSidechat: null,
   queuedMessages: [],
   activeResponse: null,
@@ -1861,7 +2064,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sessionHarness: null,
   awaitingSideChatFor: null,
   sideChatToOpen: null,
+  sideChatSelectionTarget: null,
   sideChatDrafts: {},
+  sideChatComposers: {},
   subAgentName: null,
   contextWindow: null,
   tokensUsed: null,
@@ -1874,14 +2079,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   runnerLaunchedAt: null,
   viewers: [],
   sandboxStatus: null,
+  startupPending: false,
   mcpStartup: null,
   mcpStartupLaunch: { pending: false, dismissed: false },
   abortController: null,
   historyGeneration: 0,
 
   enqueueMessage: (text, files, replyDraft) => {
-    const { conversationId, boundAgentId, sessionHarness } = get();
+    const { conversationId, boundAgentId, sessionHarness, startupPending } = get();
     if (conversationId === null) return;
+    if (startupPending && boundAgentId && !isCompactControl(sessionHarness, text, files)) {
+      void get().send(text, boundAgentId, files, {
+        replyDraft,
+        pinnedConversationId: conversationId,
+      });
+      return;
+    }
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
     const stableId = randomUUID().replace(/-/g, "");
@@ -1916,6 +2129,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     setActive((s) => ({
       queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId),
     }));
+  },
+
+  releaseHostHeldMessages: (conversationId) => {
+    setActive((s) => {
+      if (!s.queuedMessages.some((m) => m.conversationId === conversationId && m.waitingForHost)) {
+        return {};
+      }
+      return {
+        queuedMessages: s.queuedMessages.map((m) =>
+          m.conversationId === conversationId && m.waitingForHost
+            ? { ...m, waitingForHost: false }
+            : m,
+        ),
+      };
+    });
   },
 
   reorderQueuedMessage: (queueId, beforeQueueId) => {
@@ -1953,6 +2181,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const agentId = target?.agentId ?? s.boundAgentId;
     if (target === undefined || agentId === null) return;
     if (target.command === "compact" && rejectBusyCompact(target.conversationId)) return;
+    // Nothing can be steered past a first message still held for startup; it stays queued.
+    const targetState = setterForState(target.conversationId);
+    if (targetState !== null && holdsInitialDraft(targetState)) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
     void s.send(target.text, agentId, target.files, queuedSendOptions(target));
@@ -1962,6 +2193,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const s = get();
     const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
     if (own.length === 0) return;
+    const state = setterForState(conversationId);
+    if (state !== null && holdsInitialDraft(state)) return;
+    // When the first one will be held for startup, the rest stay queued behind it.
+    if (state !== null && wouldHoldSend(state)) {
+      s.steerMessage(own[0]!.queueId);
+      return;
+    }
     // SDK buffers compact; Pi interrupts and Codex requires idle.
     // Drain their prefix first so compaction cannot interrupt those messages.
     const compactIndex =
@@ -2002,7 +2240,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // sub-agents) outlives it, so the server accepts a new turn immediately —
     // mirror `shouldQueueSend`. Only the local send lifecycle (`streaming`) and
     // an actively `running` turn gate the flush. No agent → nothing to send to.
-    if (s.conversationId === null || s.boundAgentId === null || s.sessionStatus === "running") {
+    if (
+      s.conversationId === null ||
+      s.boundAgentId === null ||
+      s.sessionStatus === "running" ||
+      holdsInitialDraft(s)
+    ) {
       return;
     }
     if (s.status === "streaming") {
@@ -2027,7 +2270,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // so an undrained message from another conversation can sit at index 0; a
     // head-only guard would let it block this conversation's messages forever.
     const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
-    if (head === undefined || head.requiresRetry) return;
+    if (head === undefined || head.requiresRetry || head.waitingForHost) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
     void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, queuedSendOptions(head));
@@ -2069,6 +2312,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (statusById.get(conversationId) !== "idle") continue;
       // The sidebar can still say idle while a compact control starts.
       const local = setterForState(conversationId);
+      if (local !== null && holdsInitialDraft(local)) continue;
       if (
         local?.sessionHarness === "codex-native" ||
         local?.sessionHarness === "claude-sdk" ||
@@ -2089,7 +2333,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const cooldownUntil = backgroundFlushCooldownUntil.get(conversationId);
       if (cooldownUntil !== undefined && cooldownUntil > now) continue;
       const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
-      if (head === undefined || head.requiresRetry) continue;
+      if (head === undefined || head.requiresRetry || head.waitingForHost) continue;
       const compactAgentId = head.agentId ?? local?.boundAgentId;
       if (head.command === "compact" && !compactAgentId) continue;
 
@@ -2174,6 +2418,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       sideChatDrafts: draft ? { ...s.sideChatDrafts, [childSessionId]: draft } : s.sideChatDrafts,
     }));
   },
+  updateSideChatComposer: (childSessionId, mutate) => {
+    useChatStore.setState((s) => ({
+      sideChatComposers: {
+        ...s.sideChatComposers,
+        [childSessionId]: mutate(s.sideChatComposers[childSessionId] ?? EMPTY_SIDE_CHAT_COMPOSER),
+      },
+    }));
+  },
+  clearSideChatComposer: (childSessionId) => {
+    useChatStore.setState((s) => {
+      if (!(childSessionId in s.sideChatComposers)) return {};
+      return {
+        sideChatComposers: Object.fromEntries(
+          Object.entries(s.sideChatComposers).filter(([key]) => key !== childSessionId),
+        ),
+      };
+    });
+  },
   clearSideChatDraft: (childSessionId) => {
     useChatStore.setState((s) => {
       if (!(childSessionId in s.sideChatDrafts)) return {};
@@ -2240,9 +2502,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // their `/side` text never reaches `send`.
     const opensSideChat =
       usesNativeSideChatFork(get().sessionHarness) && isSideChatCommand(text.trim());
-    if (opensSideChat) {
-      useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
-    }
     const targetState = pinnedId === null ? get() : setterForState(pinnedId);
     const compacts =
       opts?.command === "compact" || isCompactControl(targetState?.sessionHarness, text, files);
@@ -2250,17 +2509,54 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       opts?.onError?.("Compact is disabled while a chat is in progress");
       return;
     }
+    // Nothing may overtake a first message still held for startup: queue behind it.
+    if (
+      !compacts &&
+      !opts?.reusePendingTempId &&
+      targetState !== null &&
+      holdsInitialDraft(targetState)
+    ) {
+      const target = pinnedId ?? get().conversationId;
+      if (opts?.onError !== undefined) {
+        // Callers with their own failure handling take the message back, e.g. the queue.
+        opts.onError("This session is still starting. Try again once it has started.");
+      } else if (target !== null) {
+        // Queue it behind the held message, in the session it was meant for.
+        queueSeq += 1;
+        const queuedFor = target === get().conversationId ? get() : setterForState(target);
+        const queuedAgentId = queuedFor?.boundAgentId ?? agentId;
+        setActive((s) => ({
+          queuedMessages: [
+            ...s.queuedMessages,
+            {
+              queueId: `q_${queueSeq}`,
+              text,
+              stableId,
+              conversationId: target,
+              agentId: queuedAgentId,
+              ...(files && files.length > 0 ? { files } : {}),
+              ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+            },
+          ],
+        }));
+      }
+      return;
+    }
+    if (opensSideChat) {
+      useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
+    }
     const skipPendingBubble = opensSideChat || compacts;
     const initialDraft =
       opts?.reusePendingTempId != null
         ? targetState?.pendingUserMessages.find((p) => p.tempId === opts.reusePendingTempId)
             ?.initialDraft
-        : !skipPendingBubble &&
-            targetState &&
-            (modelSelectionPending(targetState) ||
-              (targetState.sessionModelSeeded && targetState.sessionHarness === null))
+        : !skipPendingBubble && targetState && wouldHoldSend(targetState)
           ? { text, files: files ?? [] }
           : undefined;
+    // Non-native sends persist at POST time, so only a native session leaves
+    // the bubble pending until the agent actually reads it.
+    const sentMidTurn =
+      targetState?.isNativeTerminalSession === true && targetState.sessionStatus === "running";
     const alreadyStreaming =
       opts?.reusePendingTempId != null
         ? false
@@ -2319,6 +2615,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 ...(initialDraft ? { initialDraft } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+                ...(sentMidTurn ? { sentMidTurn } : {}),
               },
             ],
         // A new turn does NOT supersede the background-shell tally: shells
@@ -2337,6 +2634,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // target afterward would leak the message into the now-active session.
     // An explicit pin (navigate-first background POST) wins over the visible id.
     const submitConversationId = pinnedId ?? get().conversationId;
+    // Only the composer on screen takes back a send cut off by a reload (see
+    // `unsentSendToRestore`); a side chat posts to its child beside the parent.
+    const sentOnScreen = pinnedId === null || pinnedId === get().conversationId;
 
     // Take our place in THIS conversation's send chain: wait for its prior
     // send's network work, then hand off to the next via `releaseSend` in the
@@ -2364,7 +2664,20 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // otherwise resolve that id, find an empty chain, and overtake this POST.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
-      if (initialDraft && !(await waitForModelSelection(sessionId, tempId))) return;
+      // Until this send settles, the server may hold the message without persisting
+      // it, so keep its text where a reload can find it (see `unsentSendToRestore`).
+      // Only once identity names the sender: unlike `getCurrentAuthorId`, this id
+      // tells the single-user `local` viewer apart from one not yet resolved.
+      const senderId = getCurrentUserId();
+      if (!compacts && sentOnScreen && senderId !== null && text.trim()) {
+        rememberUnsentSend(sessionId, {
+          stableId,
+          text,
+          authorId: senderId,
+          ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+        });
+      }
+      if (initialDraft && !(await waitForInitialDispatch(sessionId, tempId))) return;
 
       if (compacts) {
         // Compact controls emit turn status edges, but no user
@@ -2414,14 +2727,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
         initialDispatched = true;
       }
-      const postResult = await postEvent(sessionId, {
-        type: "message",
-        data: {
-          role: "user",
-          content: serverContent,
-          stable_id: stableId,
+      const postResult = await postEvent(
+        sessionId,
+        {
+          type: "message",
+          data: {
+            role: "user",
+            content: serverContent,
+            stable_id: stableId,
+          },
         },
-      });
+        { holdWhenHostOffline: true },
+      );
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic
@@ -2452,7 +2769,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // consumed event pops it.
         setterFor(sessionId)((s) => ({
           pendingUserMessages: s.pendingUserMessages.map((p) =>
-            p.tempId === tempId ? { ...p, posted: true } : p,
+            p.tempId === tempId
+              ? {
+                  ...p,
+                  posted: true,
+                  ...(postResult.pendingId ? { pendingId: postResult.pendingId } : {}),
+                }
+              : p,
+          ),
+          settledShellInputs: s.settledShellInputs.map((entry) =>
+            entry.tempId === tempId && postResult.pendingId
+              ? { ...entry, pendingId: postResult.pendingId }
+              : entry,
           ),
         }));
       }
@@ -2460,9 +2788,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // optimistic bubble deliberately keeps its client temp id as its
       // stable React key — swapping it to the server id mid-send forces
       // a bubble remount (a visible flink). The eventual
-      // `session.input.consumed` clears this bubble by FIFO order (its
-      // `clearedPendingId` matches only snapshot-hydrated bubbles, which
-      // already carry the server id); see the consumed handler.
+      // `pendingId` links it to a later receipt without changing the React key.
       // Refresh the sidebar without waiting for the 4 s `useConversations`
       // poll — picks up server-side title auto-gen and any runner_id /
       // status transitions that happen during the turn.
@@ -2483,8 +2809,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // suppresses the default surfacing below — no restored draft, no error
       // block in the parent transcript. The bubble rollback + status settle still
       // run so the parent isn't left mid-send.
-      const callerHandlesError = opts?.onError !== undefined;
-      opts?.onError?.(message);
+      // The host is offline and the server recorded nothing: queue the message
+      // ahead of this conversation's others and send it once the host is back.
+      const holdTarget = postedSessionId ?? submitConversationId;
+      const heldForHost =
+        err instanceof ApiError && err.code === HOST_OFFLINE_CODE && holdTarget !== null;
+      if (heldForHost) {
+        holdSendForHost(holdTarget, message, {
+          text,
+          stableId,
+          ...(agentId ? { agentId } : {}),
+          ...(files && files.length > 0 ? { files } : {}),
+          ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+        });
+      }
+      const callerHandlesError = heldForHost || opts?.onError !== undefined;
+      if (!heldForHost) opts?.onError?.(message);
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -2492,6 +2832,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // (`failedSendDraft` is conversation-scoped); the composer reads whichever
       // conversation is active and guards on the id before restoring.
       const draftSessionId = postedSessionId ?? submitConversationId;
+      // A first message that never left the browser goes back to the composer;
+      // what was queued behind it waits for an explicit retry rather than going first.
+      if (initialDraft && !initialDispatched && draftSessionId !== null) {
+        suspendQueuedMessages(draftSessionId);
+      }
       // A coded error confirms refusal; a transport failure leaves delivery
       // unknown unless this retries a previously refused send.
       const answeredWithRefusal = err instanceof ApiError && err.code !== null;
@@ -2587,6 +2932,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
     } finally {
       inFlightSends.delete(stableId);
+      if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
       releaseSend();
@@ -2654,7 +3000,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // message, and forwards the meta to the runner.
       const postResult = await postEvent(sessionId, {
         type: "slash_command",
-        data: { kind: "skill", name, arguments: args },
+        data: {
+          kind: "skill",
+          name,
+          arguments: args,
+          ...(setterForState(sessionId)?.startupPending
+            ? { stable_id: randomUUID().replace(/-/g, "") }
+            : {}),
+        },
       });
       if (postResult.denied) {
         // Denied commands publish no receipt, so nothing will pop the
@@ -2730,6 +3083,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         sendLatchedAt: null,
         failedSendDraft: { ...draft, conversationId: sessionId },
       });
+      // What was queued behind it must not go first; it waits for an explicit retry.
+      suspendQueuedMessages(sessionId);
       // A local follow-up must not prevent Interrupt from stopping earlier work.
       if (
         state.activeResponse?.state !== "streaming" &&
@@ -3022,31 +3377,46 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   setEffort: async (effort) => {
+    const { conversationId, sessionReasoningEffort: previous } = get();
     setActive({ sessionReasoningEffort: effort });
-    const { conversationId } = get();
     if (conversationId) {
       if (queryClient === null) {
         throw new Error("chatStore.setEffort: queryClient not initialized");
       }
-      const session = await queryClient.fetchQuery({
-        queryKey: ["session", conversationId],
-        queryFn: () => getSessionSlim(conversationId),
-        staleTime: Infinity,
-        retry: false,
-      });
-      // Harness has no effort control: undo the optimistic session-scoped write
-      // so this conversation doesn't claim an effort the server will never hold.
-      if (!supportsEffortControl(session)) {
-        setterFor(conversationId)({ sessionReasoningEffort: null });
-        return;
+      const pick = trackLiveSettingPick(conversationId, "reasoningEffort", previous);
+      try {
+        const session = await queryClient.fetchQuery({
+          queryKey: ["session", conversationId],
+          queryFn: () => getSessionSlim(conversationId),
+          staleTime: Infinity,
+          retry: false,
+        });
+        // Harness has no effort control: undo the optimistic session-scoped write
+        // so this conversation doesn't claim an effort the server will never hold.
+        // SDK harnesses carry no wrapper label, so resolve their declared effort
+        // family to recognize that they do take a ``reasoning_effort`` override.
+        if (!supportsEffortControl(session, await effortFamilyForSession(session))) {
+          setterFor(conversationId)({ sessionReasoningEffort: null });
+          return;
+        }
+        await updateSession(conversationId, { reasoningEffort: effort });
+        pick.confirm(effort);
+      } catch (err) {
+        // Adopt the server's settled effort, not an earlier unconfirmed pick; keep a newer pick.
+        const settled = await settledSessionSetting(conversationId, "reasoningEffort", pick);
+        setterFor(conversationId)((s) =>
+          s.sessionReasoningEffort === effort ? { sessionReasoningEffort: settled } : {},
+        );
+        throw err;
+      } finally {
+        pick.done();
       }
-      await updateSession(conversationId, { reasoningEffort: effort });
     }
   },
 
   setModel: async (model, opts) => {
+    const { conversationId, sessionModelOverride: previous } = get();
     setActive({ sessionModelOverride: model });
-    const { conversationId } = get();
     if (conversationId) {
       const expectConfirmation = opts?.expectConfirmation === true && model !== null;
       if (expectConfirmation) {
@@ -3067,17 +3437,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           );
         }, 30_000);
       }
+      const pick = trackLiveSettingPick(conversationId, "modelOverride", previous);
       let session;
       try {
         session = await updateSession(conversationId, { modelOverride: model });
+        pick.confirm(session.modelOverride ?? null);
       } catch (err) {
-        // The ask never reached the server — nothing will confirm it.
-        if (expectConfirmation) {
-          setterFor(conversationId)((s) =>
-            s.pendingModelChange === model ? { pendingModelChange: null } : {},
-          );
-        }
+        // Nothing will confirm a refused ask; adopt the server's settled model unless
+        // a newer pick replaced it.
+        const settled = await settledSessionSetting(conversationId, "modelOverride", pick);
+        setterFor(conversationId)((s) => ({
+          ...(expectConfirmation && s.pendingModelChange === model
+            ? { pendingModelChange: null }
+            : {}),
+          ...(s.sessionModelOverride === model ? { sessionModelOverride: settled } : {}),
+        }));
         throw err;
+      } finally {
+        pick.done();
       }
       // Server-canonical may differ from the optimistic write (e.g.
       // when a clear alias was sent) — refresh local state to match.
@@ -3333,6 +3710,39 @@ function rejectBusyCompact(conversationId: string | null): boolean {
   return true;
 }
 
+/**
+ * Queue a send the server refused because the session's host is offline. It
+ * waits ahead of the conversation's other queued messages until
+ * `releaseHostHeldMessages` runs, then flushes like any queued message.
+ */
+function holdSendForHost(
+  conversationId: string,
+  notice: string,
+  message: Omit<QueuedMessage, "queueId" | "conversationId">,
+): void {
+  queueSeq += 1;
+  const held: QueuedMessage = {
+    ...message,
+    queueId: `q_${queueSeq}`,
+    conversationId,
+    waitingForHost: true,
+  };
+  setActive((s) => {
+    const at = s.queuedMessages.findIndex(
+      (m) => m.conversationId === conversationId && !m.waitingForHost,
+    );
+    const index = at === -1 ? s.queuedMessages.length : at;
+    return {
+      queuedMessages: [...s.queuedMessages.slice(0, index), held, ...s.queuedMessages.slice(index)],
+    };
+  });
+  setterFor(conversationId)((s) => {
+    const last = s.blocks[s.blocks.length - 1];
+    if (last?.type === "error" && last.code === HOST_OFFLINE_CODE) return {};
+    return { blocks: [...s.blocks, makeClientErrorBlock(notice, HOST_OFFLINE_CODE)] };
+  });
+}
+
 function queuedSendOptions(
   message: QueuedMessage,
   batchOrder?: ReadonlyMap<string, number>,
@@ -3508,6 +3918,69 @@ function abortConversationStream(entry: ConversationEntry): void {
 function setterForState(conversationId: string): ChatState | null {
   const entry = conversationRegistry.peek(conversationId);
   return entry === undefined ? null : entryGetter(entry)();
+}
+
+type LiveSettingField = "reasoningEffort" | "modelOverride";
+
+/** One live pick of a session setting, sharing the confirmed value with overlapping picks. */
+interface LiveSettingPick {
+  confirm: (value: string | null) => void;
+  confirmed: () => string | null;
+  done: () => void;
+}
+
+/** Last server-confirmed value of each session setting that has picks in flight. */
+const confirmedLiveSettings = new Map<string, { value: string | null; picks: number }>();
+
+/**
+ * Track a live pick of *field*, starting from *current* when no other pick is in flight.
+ *
+ * An overlapping pick's optimistic value may never apply, so it is not a fallback.
+ */
+function trackLiveSettingPick(
+  conversationId: string,
+  field: LiveSettingField,
+  current: string | null,
+): LiveSettingPick {
+  const key = `${conversationId}:${field}`;
+  let entry = confirmedLiveSettings.get(key);
+  if (entry === undefined) {
+    entry = { value: current, picks: 0 };
+    confirmedLiveSettings.set(key, entry);
+  }
+  entry.picks += 1;
+  const tracked = entry;
+  return {
+    confirm: (value) => {
+      tracked.value = value;
+    },
+    confirmed: () => tracked.value,
+    done: () => {
+      tracked.picks -= 1;
+      if (tracked.picks === 0) confirmedLiveSettings.delete(key);
+    },
+  };
+}
+
+/**
+ * Read a session setting after a refused change.
+ *
+ * The server orders and rolls back live settings changes, so its value is the
+ * settled one; an earlier optimistic pick may never have applied. If the lookup
+ * fails, fall back to the last value the server confirmed.
+ */
+async function settledSessionSetting(
+  conversationId: string,
+  field: LiveSettingField,
+  pick: LiveSettingPick,
+): Promise<string | null> {
+  try {
+    const value = (await getSessionSlim(conversationId))[field] ?? null;
+    pick.confirm(value);
+    return value;
+  } catch {
+    return pick.confirmed();
+  }
 }
 
 /**
@@ -3994,6 +4467,7 @@ function sessionBindingPatch(
   | "codexModelOptions"
   | "terminalPending"
   | "sandboxStatus"
+  | "startupPending"
   | "mcpStartup"
   | "mcpStartupLaunch"
 > {
@@ -4029,6 +4503,12 @@ function sessionBindingPatch(
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
+    // "ready" with saved inputs left: a native first input awaits its transcript
+    // receipt, and the server still saves new messages behind it.
+    startupPending:
+      session.labels?.["omnigent.startup"] === "pending" ||
+      (session.labels?.["omnigent.startup"] === "ready" &&
+        (session.pendingInputs ?? []).length > 0),
     ...mcpStartupSnapshotPatch(session, state, launchBeforeFetch),
   };
 }
@@ -4189,7 +4669,13 @@ async function bindStream(
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
 
-    const canApplyEffort = supportsEffortControl(session);
+    // The session row's reasoning_effort is the server's truth; the harness
+    // catalog only gates whether a control is shown. Read the family from cache
+    // so hydration never waits on /v1/harnesses, and keep the server's value
+    // when no catalog has loaded yet rather than blanking a real setting.
+    const cachedFamily = cachedEffortFamilyForSession(session);
+    const canApplyEffort =
+      cachedFamily === undefined ? true : supportsEffortControl(session, cachedFamily);
     const effectiveEffort = canApplyEffort ? (session.reasoningEffort ?? null) : null;
 
     const snapshotBlocks = itemsToBlocks(items);
@@ -4198,6 +4684,7 @@ async function bindStream(
     // before this chat was opened wouldn't render otherwise.
     const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
     const oldestItemId = items[0]?.id ?? null;
+    const unsentDraft = hydratePending ? unsentSendToRestore(id, items) : null;
     set((state) => {
       const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
       const bindingPatch = sessionBindingPatch(session, state, launchBeforeFetch);
@@ -4328,6 +4815,9 @@ async function bindStream(
         ...effectiveBindingPatch,
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
         pendingUserMessages: snapshotPending,
+        ...(unsentDraft !== null && state.failedSendDraft === null
+          ? { failedSendDraft: unsentDraft }
+          : {}),
         loadingConversation: false,
         hasMoreHistory: page.hasMore,
         oldestItemId,
@@ -4569,6 +5059,21 @@ function dropEphemeralInFlightBlocks(
 const RECONNECT_BACKFILL_MAX_PAGES = 4;
 
 /**
+ * Launch stages are not replayed, so a launch last seen in flight takes a snapshot's
+ * stage; one that settled unseen starts the runner grace a live `ready` would.
+ */
+function launchSnapshotPatch(
+  session: Session,
+  state: Pick<ConversationState, "sandboxStatus">,
+): Partial<Pick<ConversationState, "sandboxStatus" | "runnerLaunchedAt">> {
+  if (state.sandboxStatus === null || state.sandboxStatus.stage === "failed") return {};
+  const sandboxStatus = session.sandboxStatus ?? null;
+  return sandboxStatus === null
+    ? { sandboxStatus, runnerLaunchedAt: Date.now() }
+    : { sandboxStatus };
+}
+
+/**
  * Session-snapshot state every reconnect path recovers: `sessionStatus`,
  * token/context/cost counters, the MCP startup band, and — when the turn
  * ended during the gap —
@@ -4591,6 +5096,7 @@ function reconnectStatusPatch(
   const patch: Partial<ChatState> = {
     sessionStatus: session.status,
     ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
+    ...launchSnapshotPatch(session, s),
   };
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.
@@ -4647,6 +5153,22 @@ function reconnectStatusPatch(
     patch.status = "streaming";
   }
   return patch;
+}
+
+/**
+ * Re-read only a launch's stage, on screen or not. Live events that leave the launch
+ * alone can't void the read; a launch update that lands during it wins instead.
+ */
+async function reconcileLaunchStatus(id: string, set: Setter, get: Getter): Promise<void> {
+  const before = get().sandboxStatus;
+  let session: Session;
+  try {
+    session = await getSessionSlim(id);
+  } catch {
+    return;
+  }
+  if (isConversationDisposed(id)) return;
+  set((s) => (s.sandboxStatus === before ? launchSnapshotPatch(session, s) : {}));
 }
 
 /**
@@ -4710,7 +5232,11 @@ async function reconcileActiveSessionStatus(
   ) {
     return;
   }
-  set((s) => reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch));
+  set((s) => {
+    const patch = reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch);
+    const blocks = snapshotCompactionSpinners(s.blocks, s.activeResponse, patch.activeResponse);
+    return blocks === null ? patch : { ...patch, blocks };
+  });
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
   const ignored = nativePreviewTombstonesByController.get(controller);
   if (
@@ -4950,18 +5476,21 @@ async function rehydrateWindowOnReconnect(
       windowBlocks,
       withoutRebuiltUserInputCards(tail, windowBlocks),
     );
+    const statusPatch = reconnectStatusPatch(session, s, launchBeforeFetch);
+    const blocks =
+      reconcileElicitationBlocks(
+        merged,
+        snapshotPending,
+        preGapElicitations.pending,
+        preGapElicitations.autoResolved,
+      ) ?? merged;
     return {
-      ...reconnectStatusPatch(session, s, launchBeforeFetch),
+      ...statusPatch,
       // Same persisted-item evidence as the reconnect path: a rehydrated item
       // can be a send whose POST died in the gap.
       ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
       blocks:
-        reconcileElicitationBlocks(
-          merged,
-          snapshotPending,
-          preGapElicitations.pending,
-          preGapElicitations.autoResolved,
-        ) ?? merged,
+        snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks,
       hasMoreHistory: fresh.hasMore,
       oldestItemId: fresh.items[0]?.id ?? null,
       loadingMoreHistory: false,
@@ -5148,6 +5677,8 @@ async function reconcileOnReconnect(
       preGapElicitations.autoResolved,
     );
     if (reconciled !== null) nextBlocks = reconciled;
+    nextBlocks =
+      snapshotCompactionSpinners(nextBlocks, s.activeResponse, patch.activeResponse) ?? nextBlocks;
     if (nextBlocks !== s.blocks) patch.blocks = nextBlocks;
     return patch;
   });
@@ -5270,17 +5801,44 @@ export async function startStreamPump(
     for (const timer of catchupTimers) window.clearTimeout(timer);
     catchupTimers = [];
   };
+  // Re-read at each catch-up delay, replacing any prior burst: the full status if asked
+  // (on screen only) and, while a launch shows, its stage on screen or not.
+  const scheduleStatusCatchup = (withStatus: boolean): void => {
+    if (typeof window === "undefined") return;
+    clearCatchupTimers();
+    catchupTimers = RECONNECT_STATUS_CATCHUP_DELAYS_MS.map((delayMs) =>
+      window.setTimeout(() => {
+        if (controller.signal.aborted || isConversationDisposed(id)) return;
+        if (withStatus) runGuardedStatusReconcile();
+        const launch = get().sandboxStatus;
+        if (launch !== null && launch.stage !== "failed") void reconcileLaunchStatus(id, set, get);
+      }, delayMs),
+    );
+  };
   // Consecutive 404s only — reset on any non-404 outcome (success or a
   // different-status failure), so a 404 has to persist across attempts to
   // count toward the cap below.
   let consecutive404s = 0;
-  // True once we've had at least one SUCCESSFUL open. Drives reconnect-only
-  // behavior (drop in-flight + reconcile), which must NOT run on the first
-  // established stream — failed opens leave it false so a recovered first
-  // connect is still treated as initial, not a reconnect.
+  // Ordinary failed opens still use bindStream's initial snapshot; successful
+  // connections and host readdresses need reconnect reconciliation.
   let hasConnected = false;
   let previousStreamEpoch: string | null = null;
   const nativePreviewBaselines = new Map<string, string>();
+  // A host can be learned while an open is pending or backing off; the bind
+  // snapshot may predate that gap even without a successful open.
+  let hostReaddressed = false;
+  // The host the latest open was addressed to, and that open while it is live.
+  let openedHost = getSessionHost(id);
+  let liveAttempt: AbortController | null = null;
+  const unsubscribeHost = isDatabricksWorkspace()
+    ? subscribeSessionHostChanges(() => {
+        const host = getSessionHost(id);
+        if (host !== null && host !== openedHost) {
+          hostReaddressed = true;
+          liveAttempt?.abort();
+        }
+      })
+    : undefined;
   // A reconnect loop is inherently sequential — open → pump → reconnect —
   // so its awaits cannot be parallelized; no-await-in-loop doesn't apply.
   /* eslint-disable no-await-in-loop */
@@ -5302,10 +5860,8 @@ export async function startStreamPump(
         if (controller.signal.aborted || isConversationDisposed(id)) break;
       }
 
-      // Per-attempt controller: a presence idle flip recycles just this
-      // connection (the `idle` query param is the entire presence uplink,
-      // so the flip must arrive as a reconnect). Outer aborts (switchTo /
-      // unmount) forward in so teardown still cancels the live fetch.
+      // Presence and host-routing changes recycle only this connection.
+      // Outer aborts still cancel the live fetch and the whole binding.
       const attempt = new AbortController();
       const onOuterAbort = () => attempt.abort();
       controller.signal.addEventListener("abort", onOuterAbort);
@@ -5313,6 +5869,8 @@ export async function startStreamPump(
       // Stamped from attempt start so the wake fast-path can also recycle
       // an open that has hung past the stale window, not just a dead body.
       streamAttemptActivity.set(attempt, Date.now());
+      openedHost = getSessionHost(id);
+      liveAttempt = attempt;
       try {
         const idle = presenceIdle.idleNow();
         let streamRes: Response;
@@ -5321,8 +5879,8 @@ export async function startStreamPump(
         } catch (err) {
           if (err instanceof Error && err.name === "AbortError") {
             if (controller.signal.aborted || isConversationDisposed(id)) break;
-            // Only the attempt was aborted (presence flip mid-open) —
-            // reopen immediately with the recomputed idle flag.
+            // Only the attempt was aborted; reopen with current presence
+            // and host routing without discarding the stream binding.
             continue;
           }
           if (isConversationDisposed(id)) break;
@@ -5388,9 +5946,11 @@ export async function startStreamPump(
           continue;
         }
 
-        const reconnecting = hasConnected;
+        const reconnecting = hasConnected || hostReaddressed;
         const streamEpoch = streamRes.headers.get("x-omnigent-stream-epoch");
+        if (!hasConnected) clearSseLog(id);
         hasConnected = true;
+        hostReaddressed = false;
         failedOpens = 0;
         consecutive404s = 0;
         presenceIdle.noteReported(idle);
@@ -5419,10 +5979,6 @@ export async function startStreamPump(
             set,
             nativePreviewBaselines.size > 0 ? nativePreviewBaselines : null,
           );
-        } else {
-          // Fresh connection (not a reconnect) — clear any stale SSE log from
-          // a previous stream bind so the debug panel starts clean.
-          clearSseLog(id);
         }
         previousStreamEpoch = streamEpoch;
         // Guard the byte stream with a silence watchdog: the server
@@ -5461,23 +6017,16 @@ export async function startStreamPump(
           // settles shortly after reconnect clears in seconds. Guarded +
           // idempotent, and scoped to the active conversation by
           // reconcileActiveSessionStatus itself.
-          if (typeof window !== "undefined") {
-            // Cancel any prior burst so recurring reconnects don't accumulate
-            // timers on the long-lived controller.
-            clearCatchupTimers();
-            catchupTimers = RECONNECT_STATUS_CATCHUP_DELAYS_MS.map((delayMs) =>
-              window.setTimeout(() => {
-                if (controller.signal.aborted || isConversationDisposed(id)) return;
-                runGuardedStatusReconcile();
-              }, delayMs),
-            );
-          }
+          scheduleStatusCatchup(true);
+        } else {
+          // A launch's `ready` sent before this first open subscribed is in no snapshot
+          // read yet, so re-read its stage over the next ~20 s while it still shows.
+          scheduleStatusCatchup(false);
         }
         let reason = await pumpPromise;
 
-        // A presence flip aborts only the attempt; the pump reads that as
-        // "aborted" but the outer controller is still live — reconnect so
-        // the new idle flag reaches the server.
+        // Presence or host changes abort only the attempt; a live outer
+        // controller means the pump must reconnect and reconcile the gap.
         if (reason === "aborted" && !controller.signal.aborted) {
           reason = "dropped";
         }
@@ -5487,12 +6036,14 @@ export async function startStreamPump(
           markLivePreviewsInterrupted(id, set);
         }
       } finally {
+        liveAttempt = null;
         controller.signal.removeEventListener("abort", onOuterAbort);
         presenceAttemptControllers.delete(attempt);
         streamAttemptActivity.delete(attempt);
       }
     }
   } finally {
+    unsubscribeHost?.();
     if (statusReconcileTimer !== null) window.clearInterval(statusReconcileTimer);
     clearCatchupTimers();
     if (get().abortController === controller) {
@@ -5888,6 +6439,60 @@ export function adoptTrailingUnattributedBlocks(
   return next;
 }
 
+/**
+ * Assign visible "Compacting…" spinners to the starting turn, because
+ * compaction progress can arrive before the turn that compacts is dispatched.
+ *
+ * @returns the rewritten blocks, or `null` when nothing needed adopting.
+ */
+export function adoptCompactionSpinners(blocks: AnyBlock[], responseId: string): AnyBlock[] | null {
+  const foreign = (b: AnyBlock) =>
+    b.type === "compaction_loading" && b.ctx.responseId !== responseId;
+  if (!blocks.some(foreign)) return null;
+  return blocks.map((b) => (foreign(b) ? { ...b, ctx: { ...b.ctx, responseId } } : b));
+}
+
+/**
+ * Remove "Compacting…" spinners owned by the just-settled turn; a lost
+ * compaction terminal is not replayed.
+ *
+ * @returns the remaining blocks, or `null` when the turn owned no spinner.
+ */
+export function withoutSettledCompactionSpinners(
+  blocks: AnyBlock[],
+  responseId: string,
+): AnyBlock[] | null {
+  const owned = (b: AnyBlock) => b.type === "compaction_loading" && b.ctx.responseId === responseId;
+  if (!blocks.some(owned)) return null;
+  return blocks.filter((b) => !owned(b));
+}
+
+/**
+ * Apply the turn transition a status snapshot makes to the "Compacting…"
+ * spinners, as the live edge it stands in for would: settling the open turn
+ * retires its spinners, and revealing a newly running turn hands them to it.
+ *
+ * @param before The conversation's `activeResponse` before the snapshot.
+ * @param after The snapshot patch's `activeResponse`; `undefined` when the
+ *   snapshot left it unchanged.
+ * @returns the rewritten blocks, or `null` when nothing changes.
+ */
+function snapshotCompactionSpinners(
+  blocks: AnyBlock[],
+  before: ActiveResponse | null,
+  after: ActiveResponse | null | undefined,
+): AnyBlock[] | null {
+  if (after == null) return null;
+  if (after.state === "streaming") {
+    return after.responseId !== before?.responseId
+      ? adoptCompactionSpinners(blocks, after.responseId)
+      : null;
+  }
+  return before?.state === "streaming"
+    ? withoutSettledCompactionSpinners(blocks, before.responseId)
+    : null;
+}
+
 // How long after a terminal edge a delta still belongs to the finished
 // turn. A scheduled wake (cron / wakeup fires at 60s minimum) streams
 // its FIRST deltas ahead of the transcript batch that names the new
@@ -5963,25 +6568,34 @@ export async function pumpStreamEvents(
   // Ignore the rest of messages whose previews are stale or already replaced
   // by authoritative items, so late transport delivery cannot recreate them.
   const events = tapLiveDeltas(
-    tapSessionEvents(rawEvents, id, (elicitationId) => {
-      // A fast native approval can resolve in the few milliseconds between
-      // the reducer yielding its card and the next animation-frame flush.
-      // `handleSessionEvent` can only update committed blocks, so settle the
-      // buffered copy here instead of dropping that resolved edge.
-      const at = buffer.findIndex(
-        (block) =>
-          block.type === "elicitation" &&
-          block.elicitationId === elicitationId &&
-          block.status === "pending",
-      );
-      if (at === -1) return;
-      const target = buffer[at] as ElicitationBlock;
-      buffer[at] = {
-        ...target,
-        status: "responded",
-        response: { action: "auto_resolved" },
-      };
-    }),
+    tapSessionEvents(
+      rawEvents,
+      id,
+      (elicitationId) => {
+        // A fast native approval can resolve in the few milliseconds between
+        // the reducer yielding its card and the next animation-frame flush.
+        // `handleSessionEvent` can only update committed blocks, so settle the
+        // buffered copy here instead of dropping that resolved edge.
+        const at = buffer.findIndex(
+          (block) =>
+            block.type === "elicitation" &&
+            block.elicitationId === elicitationId &&
+            block.status === "pending",
+        );
+        if (at === -1) return;
+        const target = buffer[at] as ElicitationBlock;
+        buffer[at] = {
+          ...target,
+          status: "responded",
+          response: { action: "auto_resolved" },
+        };
+      },
+      () => {
+        // Commit what the stream emitted before a turn edge applies, so the
+        // edge's adoption and cleanup (e.g. of a "Compacting…" spinner) see it.
+        flush();
+      },
+    ),
     id,
     ignoredMessages,
     set,
@@ -6067,6 +6681,8 @@ export async function pumpStreamEvents(
           activeResponse: { responseId: block.responseId, state: "streaming", error: null },
           status: "streaming",
         });
+        const adopted = adoptCompactionSpinners(get().blocks, block.responseId);
+        if (adopted !== null) set({ blocks: adopted });
         continue;
       }
 
@@ -6225,6 +6841,9 @@ export async function pumpStreamEvents(
         if (active !== null && active.responseId !== endedId) {
           continue;
         }
+        // A terminal for an already-settled (or stopped) turn must not take a
+        // spinner published after it (an idle `/compact` is stamped with it).
+        const settlesTurn = endedId !== "" && (active === null || active.state === "streaming");
         // If the active response was already marked cancelled by an
         // earlier `session.interrupted`, keep that. Session events
         // are the authoritative source for user-initiated terminals.
@@ -6241,12 +6860,16 @@ export async function pumpStreamEvents(
         // had their preview replaced when their `text_done` committed, so
         // this is usually a no-op.
         get().blocks.forEach((candidate) => ignoreLivePreview(candidate, ignoredMessages));
-        set((s) => ({
-          status: "idle",
-          blocks: s.blocks.some(isLiveProvisionalBlock)
+        set((s) => {
+          const blocks = s.blocks.some(isLiveProvisionalBlock)
             ? s.blocks.filter((b) => !isLiveProvisionalBlock(b))
-            : s.blocks,
-        }));
+            : s.blocks;
+          return {
+            status: "idle",
+            blocks:
+              (settlesTurn ? withoutSettledCompactionSpinners(blocks, endedId) : null) ?? blocks,
+          };
+        });
         const convId = get().conversationId;
         if (convId) {
           queryClient?.invalidateQueries({ queryKey: sessionItemsQueryKey(convId) });
@@ -6488,6 +7111,73 @@ async function sendVerdictFromServer(
 }
 
 /**
+ * The send a previous page of this tab left unanswered, as a failed-send draft.
+ *
+ * `send` records each message's text before its POST and drops it once the
+ * POST settles. A record found on a cold bind therefore comes from a page that
+ * reloaded or closed mid-send, e.g. while the server held the POST for a
+ * sandbox wake, which persists nothing until the wake ends. Only the sender
+ * gets the text back, and only if the snapshot holds no item under its stable
+ * id. Matching text is no proof: `pending_inputs` entries and native mirrors
+ * carry no stable id, and another message can say the same thing.
+ *
+ * @param conversationId - The session being bound.
+ * @param items - The snapshot's committed items.
+ * @returns The draft to restore, or `null`.
+ */
+function unsentSendToRestore(
+  conversationId: string,
+  items: readonly { id: string }[],
+): ConversationState["failedSendDraft"] {
+  const unsent = peekUnsentSend(conversationId);
+  // A send still open in this tab settles on its own.
+  if (unsent === null || inFlightSends.has(unsent.stableId)) return null;
+  const viewerId = getCurrentUserId();
+  // The viewer can't be checked before identity resolves; try again once it does.
+  if (viewerId === null) {
+    restoreUnsentSendOnceIdentified(conversationId, items);
+    return null;
+  }
+  forgetUnsentSend(conversationId, unsent.stableId);
+  // Another account has signed in to this tab since.
+  if (unsent.authorId !== viewerId) return null;
+  if (items.some((item) => item.id === unsent.stableId)) return null;
+  return {
+    conversationId,
+    text: unsent.text,
+    files: [],
+    stableId: unsent.stableId,
+    ...(unsent.replyDraft ? { replyDraft: unsent.replyDraft } : {}),
+    serverRefused: false,
+  };
+}
+
+/**
+ * Finish a restore `unsentSendToRestore` put off until `/v1/me` names the viewer.
+ * The bind has already painted, so the draft goes straight onto the session's
+ * entry. Subscribing keeps a failed probe retrying.
+ *
+ * @param conversationId - The session whose bind put the restore off.
+ * @param items - That bind's snapshot items.
+ */
+function restoreUnsentSendOnceIdentified(
+  conversationId: string,
+  items: readonly { id: string }[],
+): void {
+  const unsubscribe = subscribeIdentity(() => {
+    if (getCurrentUserId() === null) return;
+    unsubscribe();
+    // An evicted session keeps the record for its next bind.
+    if (isConversationDisposed(conversationId)) return;
+    const draft = unsentSendToRestore(conversationId, items);
+    if (draft === null) return;
+    setterFor(conversationId)((state) =>
+      state.failedSendDraft === null ? { failedSendDraft: draft } : {},
+    );
+  });
+}
+
+/**
  * Reconcile a failed-send draft against a reconnect snapshot.
  *
  * A snapshot item under the draft's stable id proves delivery (see
@@ -6702,6 +7392,23 @@ function messageContentText(content: MessageContentBlock[]): string {
 }
 
 /**
+ * Match a sent `!cmd` using the server's whitespace normalization.
+ * Unsent drafts and empty commands cannot acknowledge a submission.
+ *
+ * @param bubble - A queued optimistic bubble.
+ * @param command - The mirrored command, without its leading `!`.
+ */
+function isShellCommandBubble(bubble: PendingUserMessage, command: string): boolean {
+  const wanted = command.replace(/\s+/g, " ").trim();
+  if (bubble.initialDraft || wanted === "") return false;
+  const text = messageContentText(bubble.content);
+  return text.startsWith("!") && text.slice(1).trimStart() === wanted;
+}
+
+/** Bound replay protection to the server's maximum pending queue size. */
+const MAX_SETTLED_SHELL_INPUTS = 64;
+
+/**
  * Normalized texts of the committed user-message blocks in `blocks`,
  * dropping empties (image-only messages). The dedup baseline for the
  * the snapshot replay in `bindStream`.
@@ -6854,13 +7561,40 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       }));
       return;
     case "session_sandbox_status":
-      // Advance the managed-sandbox provisioning indicator. `ready`
-      // clears it — from then on the session looks like any
-      // host-bound session; `failed` retains the reason so the page
-      // explains why the sandbox never came up.
-      applyToConversation({
-        sandboxStatus: event.stage === "ready" ? null : { stage: event.stage, error: event.error },
-      });
+      // `ready` clears the launch indicator and starts the launch grace (the runner is
+      // up, its terminal not yet); `failed` keeps the reason so the page can explain
+      // why the sandbox never came up.
+      applyToConversation(
+        event.stage === "ready"
+          ? { sandboxStatus: null, runnerLaunchedAt: Date.now() }
+          : { sandboxStatus: { stage: event.stage, error: event.error, provider: event.provider } },
+      );
+      // The sandbox host is bound before its runner starts; refetch the binding and a
+      // host list cached before that host registered, so the composer can name it.
+      if (event.stage === "connecting" || event.stage === "ready") {
+        void queryClient?.invalidateQueries({
+          queryKey: ["session", event.conversationId],
+          exact: true,
+        });
+        void queryClient?.invalidateQueries({ queryKey: ["hosts"] });
+        // Cancel pre-binding requests too: invalidation alone reuses an initial fetch.
+        void queryClient?.cancelQueries({
+          queryKey: ["session-agent", event.conversationId],
+          exact: true,
+        });
+        void queryClient?.invalidateQueries({
+          queryKey: ["session-agent", event.conversationId],
+          exact: true,
+        });
+        // The host binding is now durable. Learning it readdresses a stream
+        // opened before provisioning, without depending on a browser send.
+        void getSessionSlim(event.conversationId)
+          .then((session) => {
+            queryClient?.setQueryData(["session", event.conversationId], session);
+            applyToConversation({ sessionHostId: session.hostId ?? null });
+          })
+          .catch(() => {});
+      }
       return;
     case "session_mcp_startup": {
       // Mirror the harness's per-MCP-server startup map while the round
@@ -7134,10 +7868,15 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // Blocks the reducer emitted before this edge named the turn
           // (codex opens reasoning ~2s earlier) carry no response id, so
           // they'd group into their own bubble beside the turn's own.
-          // Attribute them to the turn they belong to.
-          const adopted = adoptTrailingUnattributedBlocks(s.blocks, event.responseId);
-          if (adopted !== null) patch.blocks = adopted;
+          // Attribute them to the turn they belong to. The turn also takes
+          // over any "Compacting…" spinner still on screen.
+          const attributed =
+            adoptTrailingUnattributedBlocks(s.blocks, event.responseId) ?? s.blocks;
+          const adopted = adoptCompactionSpinners(attributed, event.responseId) ?? attributed;
+          if (adopted !== s.blocks) patch.blocks = adopted;
         }
+        // The open turn this edge settles, whose spinner goes with it.
+        let settledResponseId: string | null = null;
         // `waiting` is a TURN-END edge (the turn already finished; only
         // background work — background shells / sub-agents — outlives it). It
         // must finalize the local send lifecycle exactly like `idle`, NOT keep
@@ -7151,6 +7890,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         if (event.status === "idle" || event.status === "failed" || event.status === "waiting") {
           if (event.responseId !== undefined && s.activeResponse?.responseId === event.responseId) {
             patch.status = "idle";
+            if (s.activeResponse.state === "streaming") settledResponseId = event.responseId;
             if (s.activeResponse.state !== "cancelled") {
               patch.activeResponse = {
                 responseId: event.responseId,
@@ -7171,6 +7911,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             // no longer publish status. A `cancelled` turn is preserved as-is.
             patch.status = "idle";
             if (s.activeResponse?.state === "streaming") {
+              settledResponseId = s.activeResponse.responseId;
               patch.activeResponse = {
                 ...s.activeResponse,
                 state: event.status === "failed" ? "failed" : "completed",
@@ -7254,6 +7995,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             } satisfies ErrorBlock,
           ];
         }
+        if (settledResponseId !== null) {
+          const settled = withoutSettledCompactionSpinners(
+            patch.blocks ?? s.blocks,
+            settledResponseId,
+          );
+          if (settled !== null) patch.blocks = settled;
+        }
         // A `runner_disconnected` card is an observation ("can't reach the
         // runner"), not a turn result: any live status edge from the runner
         // proves it is reachable again, so the stale card goes.
@@ -7321,6 +8069,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       return;
     }
     case "session_input_consumed":
+      applyToConversation({ startupPending: false });
       // This committed item may be a send whose POST failed client-side —
       // its arrival proves that send was delivered, so retract the draft
       // before it (re)populates the composer with an already-sent prompt.
@@ -7360,6 +8109,19 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           eventContent !== null &&
           isClaudeAgentMessageContent(eventContent) &&
           (!pendingHead || contentKeyOf(pendingHead.content) !== contentKeyOf(eventContent));
+        // An older server's skip receipt names a `!cmd` bubble its shell input already
+        // cleared: it owns no bubble, and the FIFO head belongs to a later message.
+        const named = event.clearedPendingId;
+        const settledShell =
+          !!named &&
+          s.settledShellInputs.some(
+            (entry) =>
+              entry.pendingId === named ||
+              entry.tempId === named ||
+              (!entry.pendingId &&
+                eventContent !== null &&
+                entry.contentKey === contentKeyOf(eventContent)),
+          );
         if (hasCommittedItem(s.blocks, event.itemId)) {
           // The committed copy is already in `blocks` — the forwarder-mirrored
           // item beat this event through the stream, or a snapshot merge
@@ -7368,7 +8130,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // Same precision order as below (named entry, then FIFO head), minus
           // the append.
           const cleared = event.clearedPendingId;
-          const at = cleared ? s.pendingUserMessages.findIndex((p) => p.tempId === cleared) : -1;
+          const at = cleared
+            ? s.pendingUserMessages.findIndex(
+                (p) => p.tempId === cleared || p.pendingId === cleared,
+              )
+            : -1;
           if (at >= 0) {
             return {
               pendingUserMessages: [
@@ -7377,6 +8143,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               ],
             };
           }
+          if (settledShell) return {};
           // FIFO-head fallback — same marker guard as the promote path below. A
           // mirrored system marker (the vendor CLI's own `[Request interrupted
           // by user]` record) is synthesized by the CLI, owns no pending entry,
@@ -7393,7 +8160,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // 1. Drop by id when the server names the drained entry.
         const cleared = event.clearedPendingId;
         if (cleared) {
-          const idx = s.pendingUserMessages.findIndex((p) => p.tempId === cleared);
+          const idx = s.pendingUserMessages.findIndex(
+            (p) => p.tempId === cleared || p.pendingId === cleared,
+          );
           if (idx >= 0) {
             const matched = s.pendingUserMessages[idx]!;
             const content = committedContentFor(event, matched.content);
@@ -7428,6 +8197,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    drains it and names it via `clearedPendingId`, so it lands on
         //    branch 1 and never reaches this fallback.
         const head =
+          settledShell ||
           unmatchedEnvelope ||
           (eventContent !== null && isSystemUserContent(eventContent)) ||
           s.pendingUserMessages[0]?.initialDraft
@@ -7481,6 +8251,31 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         return { pendingUserMessages: rest };
       });
       return;
+    case "terminal_command": {
+      // Shell inputs have no consumed receipt; remove only the matching sent bubble.
+      const command = event.kind === "input" ? event.input : null;
+      if (command === null) return;
+      applyToConversation((s) => {
+        if (s.settledShellInputs.some((entry) => entry.itemId === event.itemId)) return {};
+        const at = s.pendingUserMessages.findIndex((p) => isShellCommandBubble(p, command));
+        const popped = s.pendingUserMessages[at];
+        return {
+          pendingUserMessages: popped
+            ? [...s.pendingUserMessages.slice(0, at), ...s.pendingUserMessages.slice(at + 1)]
+            : s.pendingUserMessages,
+          settledShellInputs: [
+            ...s.settledShellInputs,
+            {
+              itemId: event.itemId,
+              tempId: popped?.tempId,
+              pendingId: popped?.pendingId,
+              contentKey: popped ? contentKeyOf(popped.content) : undefined,
+            },
+          ].slice(-MAX_SETTLED_SHELL_INPUTS),
+        };
+      });
+      return;
+    }
     case "session_interrupted":
       // Explicit user-cancel signal. Distinguishes "interrupted by
       // user action" from the generic `response.incomplete` that
@@ -7497,6 +8292,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         });
       }
       finalizeCurrentActive("cancelled", event.responseId, sourceConversationId);
+      // Stopping the turn stops its compaction, and the idle that follows a
+      // native stop may name no turn, so the stop itself retires the spinner.
+      applyToConversation((s) => {
+        const stopped = s.activeResponse?.responseId;
+        const blocks = stopped ? withoutSettledCompactionSpinners(s.blocks, stopped) : null;
+        return blocks === null ? {} : { blocks };
+      });
       return;
     case "session_created":
       // A side chat the user asked for (via `/side`, the `+` tray, or the rail's
@@ -7831,10 +8633,14 @@ async function* tapSessionEvents(
   events: AsyncIterable<StreamEvent>,
   conversationId: string,
   onElicitationResolved?: (elicitationId: string) => void,
+  beforeTurnEdge?: () => void,
 ): AsyncIterable<StreamEvent> {
   for await (const event of events) {
     if (!isConversationDisposed(conversationId)) {
       streamEventRevisions.set(conversationId, (streamEventRevisions.get(conversationId) ?? 0) + 1);
+    }
+    if (event.type === "session_status" || event.type === "session_interrupted") {
+      beforeTurnEdge?.();
     }
     handleSessionEvent(event, conversationId);
     if (event.type === "elicitation_resolved") {

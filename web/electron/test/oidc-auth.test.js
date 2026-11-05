@@ -103,7 +103,7 @@ function harness({ refresh, signIn, accepted = new Set(["valid"]) } = {}) {
     credentials,
     getOrigin: (win) => origins.get(win) ?? null,
     onAuthRequired: (win, serverUrl, error) => authRequired.push({ win, serverUrl, error }),
-    onSignedOut: (win, serverUrl) => signedOut.push({ win, serverUrl }),
+    onSignedOut: (win, serverUrl, details) => signedOut.push({ win, serverUrl, ...details }),
     fetchFn,
     setTimeoutFn: (fn, delay) => {
       const timer = { fn, delay };
@@ -162,6 +162,10 @@ describe("ensureSession", () => {
   });
 
   it("signs in through the browser on Connect and installs the session cookie", async () => {
+    const recorded = [];
+    mock.method(require("../src/diagnostics").diagnostics, "record", (...args) =>
+      recorded.push(args),
+    );
     const noGrant = Object.assign(new Error("none"), { code: "NO_STORED_TOKEN" });
     const h = harness({ refresh: async () => Promise.reject(noGrant) });
     let announced = 0;
@@ -179,6 +183,10 @@ describe("ensureSession", () => {
     assert.equal(details.secure, true);
     assert.equal(details.path, "/");
     assert.ok(details.expirationDate > Date.now() / 1000 + 28000);
+    assert.deepEqual(recorded, [
+      ["oidc_session", { origin: SERVER, outcome: "browser" }],
+      ["oidc_session", { origin: SERVER, outcome: "signed_in" }],
+    ]);
   });
 
   it("does not open the browser when the server is unreachable", async () => {
@@ -247,10 +255,9 @@ describe("sign-out robustness", () => {
     });
     const win = h.connect();
     await h.session.cookies.set({ url: SERVER, name: COOKIE, value: "valid" });
-    navigate(win, "will-navigate", `${SERVER}/auth/logout`);
-    await tick();
-    await tick();
+    assert.equal(await h.auth.signOutWindow(win), false);
     assert.equal(h.signedOut.length, 1);
+    assert.equal(h.signedOut[0].complete, false, "the connect screen must not claim success");
     assert.equal(h.session.cookies.jar.has(COOKIE), false);
   });
 });
@@ -408,6 +415,17 @@ describe("window lifecycle", () => {
     assert.equal(h.session.cookies.jar.has(COOKIE), false);
     assert.equal(h.signedOut.length, 1);
     assert.equal(h.authRequired.length, 0);
+  });
+
+  it("signs out on request, like the app's own sign-out", async () => {
+    const h = harness();
+    await h.session.cookies.set({ url: SERVER, name: COOKIE, value: "valid" });
+    const win = h.connect();
+    assert.equal(await h.auth.signOutWindow(win), true);
+    assert.equal(h.credentials.signOut.mock.callCount(), 1);
+    assert.equal(h.session.cookies.jar.has(COOKIE), false);
+    assert.equal(h.signedOut.length, 1);
+    assert.equal(await h.auth.signOutWindow(win), false, "a signed-out window has nothing left");
   });
 
   it("ignores a window that moved to another server", async () => {

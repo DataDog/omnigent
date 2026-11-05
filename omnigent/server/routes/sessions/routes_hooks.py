@@ -49,6 +49,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     AuthProvider,
 )
+from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
@@ -207,7 +208,7 @@ def register_hooks_routes(
 
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -659,7 +660,24 @@ def register_hooks_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        is_read_only = access.level is not None and access.level < LEVEL_EDIT
+        is_read_only = permission_store is not None and (
+            access.level is None or access.level < LEVEL_EDIT
+        )
+        if (
+            permission_store is not None
+            and access.conversation is not None
+            and access.conversation.parent_conversation_id is not None
+        ):
+            # Child display levels do not describe the parent's mutation authority.
+            is_read_only = not await asyncio.to_thread(
+                check_session_access,
+                user_id,
+                session_id,
+                LEVEL_EDIT,
+                permission_store,
+                conversation_store,
+                access.conversation,
+            )
         try:
             payload = await request.json()
         except json.JSONDecodeError as exc:
@@ -821,7 +839,7 @@ def register_hooks_routes(
             )
 
         loaded = _sf.get_agent_cache().load(
-            agent.id, agent.bundle_location, expand_env=agent.session_id is None
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
 
         _caps = _sf.get_caps()
@@ -1125,7 +1143,7 @@ def register_hooks_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -1217,7 +1235,7 @@ def register_hooks_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -1317,7 +1335,7 @@ def register_hooks_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -1435,7 +1453,7 @@ def register_hooks_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -1646,7 +1664,7 @@ def register_hooks_routes(
         # Claude Code session never gets a Codex suggestion.
         cross_harness = auto_harness_session(conv, parent)
         # Which families the spawn may land on decides which router can serve it:
-        # off the AI Gateway the built-in judge answers, from the live catalog
+        # off the Unity Gateway the built-in judge answers, from the live catalog
         # alone (the static table's databricks-* ids are unreachable there).
         gateway_backed = await _spawn_gateway_backed(
             request,
@@ -1764,7 +1782,7 @@ def register_hooks_routes(
                 )
 
         # This pane's own family decides which router can serve its first turn.
-        # A create off the AI Gateway now succeeds (the built-in judge answers),
+        # A create off the Unity Gateway now succeeds (the built-in judge answers),
         # so this hook must make the same choice the composer path does.
         turn_gateway_backed = (
             await _spawn_gateway_backed(request, conv, (route_request.harness,))

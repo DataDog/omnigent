@@ -57,7 +57,14 @@ export interface Branding {
 }
 
 /** Release features understood by this frontend build. */
-export type FeatureKey = "usage_page" | "harness_install" | "canvas" | "harness_settings_ui";
+export type FeatureKey =
+  | "usage_page"
+  | "harness_install"
+  | "canvas"
+  | "arca_shutdown_warnings"
+  | "import_review"
+  | "custom_agents_settings_ui"
+  | "sidebar_grouping_ui";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -98,6 +105,8 @@ export interface ServerInfo {
    * the new-session host picker.
    */
   managed_sandboxes_enabled: boolean;
+  /** The create request durably accepts managed sessions' first input. */
+  durable_initial_input?: boolean;
   /**
    * Short name of the backing sandbox provider (e.g. ``"modal"``,
    * ``"lakebox"``) used to label the new-session sandbox option per
@@ -122,7 +131,7 @@ export interface ServerInfo {
    */
   sandbox_provider_capabilities?: Record<
     string,
-    { multi_repo?: boolean; inference_models?: boolean }
+    { multi_repo?: boolean; inference_models?: boolean; default_models?: boolean }
   >;
   /**
    * Connection providers this deploy has wired (config + store present),
@@ -144,6 +153,8 @@ export interface ServerInfo {
    * the "Public access" toggle. Fails open to ``true``.
    */
   public_sharing_enabled: boolean;
+  /** Public permission ceiling; older servers support Read only. */
+  public_sharing_max_level?: "read" | "edit";
   /**
    * Installed omnigent server version (same value as ``/api/version``),
    * e.g. ``"0.3.0.dev0"``. Shown in the session info popover's version
@@ -202,6 +213,22 @@ export interface ServerInfo {
    * hidden there. Fails to ``false``.
    */
   archive_worktree_cleanup?: boolean;
+  /**
+   * True when a managed create accepts ``host_id`` naming its new sandbox
+   * host. Older servers reject it, so the create omits it there. Fails to
+   * ``false``.
+   */
+  request_managed_sandbox_host_id?: boolean;
+  /**
+   * True when the server stores user agents (``omnigent agent add``,
+   * ``GET /v1/agents?scope=user``). Gates the picker's "my agents" source
+   * and the Import bundle button. Absent on older servers (off).
+   */
+  agent_install?: boolean;
+  /** True when GET /v1/agents/{id} is available; absent on older servers (off). */
+  agent_detail?: boolean;
+  /** Owner-only configuration reads and conditional PATCH updates. */
+  agent_config_edit?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
 }
@@ -253,6 +280,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   // not silently disable sharing, so the sentinel is the permissive "on".
   sharing_mode: "on",
   public_sharing_enabled: true,
+  public_sharing_max_level: "read",
   server_version: null,
   smart_routing_enabled: false,
   smart_routing_sources: { external: false, oss: false },
@@ -261,6 +289,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   installable_harnesses: [],
   dictation_available: false,
   archive_worktree_cleanup: false,
+  request_managed_sandbox_host_id: false,
   branding: null,
 };
 
@@ -298,6 +327,14 @@ export function isFeatureEnabled(info: ServerInfo | "loading", feature: FeatureK
   return info !== "loading" && info.features?.[feature] === true;
 }
 
+export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boolean {
+  return (
+    isFeatureEnabled(info, "custom_agents_settings_ui") &&
+    info !== "loading" &&
+    info.agent_install === true
+  );
+}
+
 let cachedServerInfo: ServerInfo | null = null;
 let pendingServerInfo: Promise<ServerInfo> | null = null;
 
@@ -329,6 +366,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           needs_setup: data.needs_setup === true,
           databricks_features: data.databricks_features === true,
           managed_sandboxes_enabled: data.managed_sandboxes_enabled === true,
+          durable_initial_input: data.durable_initial_input === true,
           sandbox_provider:
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
           sandbox_providers: Array.isArray(data.sandbox_providers)
@@ -350,6 +388,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : "on",
           // Fail open: only an explicit false disables the public toggle.
           public_sharing_enabled: data.public_sharing_enabled !== false,
+          public_sharing_max_level: data.public_sharing_max_level === "edit" ? "edit" : "read",
           server_version: typeof data.server_version === "string" ? data.server_version : null,
           smart_routing_enabled: smartRoutingEnabled,
           smart_routing_sources: parseSmartRoutingSources(
@@ -363,6 +402,10 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : [],
           dictation_available: data.dictation_available === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
+          request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
+          agent_install: data.agent_install === true,
+          agent_detail: data.agent_detail === true,
+          agent_config_edit: data.agent_config_edit === true,
           branding: parseBranding(data.branding),
         };
         return cachedServerInfo;

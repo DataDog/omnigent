@@ -1,6 +1,8 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
+import * as sessionsApi from "@/lib/sessionsApi";
+import { useChatStore } from "@/store/chatStore";
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
@@ -10,7 +12,11 @@ import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
-import { writeDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
+import {
+  type DefaultWorkspaceTab,
+  writeDefaultWorkspaceTab,
+  writePinnedWorkspaceTabs,
+} from "@/lib/workspaceTabPreferences";
 import { WorkspacePanel } from "./WorkspacePanel";
 
 // The rail's content children are exercised by their own suites; stub them so
@@ -20,7 +26,19 @@ import { WorkspacePanel } from "./WorkspacePanel";
 // show) so we can prove which child mounted without dragging in Monaco / hook
 // stacks / xterm.
 vi.mock("./FileViewer", () => ({
-  FileViewer: ({ path }: { path: string }) => <div data-testid="file-viewer-stub">{path}</div>,
+  FileViewer: ({
+    path,
+    open,
+    mediaActive,
+  }: {
+    path: string;
+    open: boolean;
+    mediaActive: boolean;
+  }) => (
+    <div data-testid="file-viewer-stub" data-open={open} data-media-active={mediaActive}>
+      {path}
+    </div>
+  ),
 }));
 vi.mock("./FilesPanel", () => ({
   // Echo the fixed scope so tests can prove the Files tab renders the tree
@@ -57,6 +75,14 @@ vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
 }));
 vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
+// A side chat's pane is covered by its own suite; the stub just names its child.
+vi.mock("@/components/chat/SideChatPane", () => ({
+  SideChatPane: ({ childId }: { childId: string }) => (
+    <div data-testid="side-chat-pane-stub">{childId}</div>
+  ),
+}));
+const isMobileMock = vi.hoisted(() => vi.fn(() => false));
+vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => isMobileMock() }));
 
 const useTerminalsMock = vi.mocked(useTerminals);
 const useCreateTerminalMock = vi.mocked(useCreateTerminal);
@@ -66,6 +92,7 @@ afterEach(() => {
   cleanup();
   localStorage.clear();
   vi.clearAllMocks();
+  isMobileMock.mockReturnValue(false);
   Reflect.deleteProperty(window, "omnigentDesktop");
   useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
   useCreateTerminalMock.mockReturnValue({
@@ -85,7 +112,9 @@ afterEach(() => {
  */
 function renderWorkspace(
   overrides: {
-    rightRailTab?: RightRailTab;
+    rightRailTab?: RightRailTab | null;
+    openPanels?: DefaultWorkspaceTab[];
+    showFilesPanel?: boolean;
     selectedFilePath?: string | null;
     openFiles?: string[];
     changedCount?: number;
@@ -100,15 +129,18 @@ function renderWorkspace(
     animateVisibility?: boolean;
     resizing?: boolean;
     inert?: boolean;
+    mobileSideChatsOpen?: boolean;
   } = {},
 ) {
   const openFileViewer = vi.fn();
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
+  const onClosePanel = vi.fn();
   const onBrowserTabOpened = vi.fn();
   const openTerminalTab = vi.fn();
   const onCloseTerminal = vi.fn();
   const onToggleMaximized = vi.fn();
+  const onMobileSideChatsOpenChange = vi.fn();
   const view = render(
     <TooltipProvider delayDuration={0}>
       <WorkspacePanel
@@ -125,9 +157,11 @@ function renderWorkspace(
           onMouseDown: vi.fn(),
           onKeyDown: vi.fn(),
         }}
-        rightRailTab={overrides.rightRailTab ?? "files"}
+        rightRailTab={overrides.rightRailTab === undefined ? "files" : overrides.rightRailTab}
         onRightRailTabChange={onRightRailTabChange}
-        showFilesPanel
+        openPanels={overrides.openPanels ?? []}
+        onClosePanel={onClosePanel}
+        showFilesPanel={overrides.showFilesPanel ?? true}
         showGithubTab={overrides.showGithubTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
         onBrowserTabOpened={onBrowserTabOpened}
@@ -154,6 +188,8 @@ function renderWorkspace(
         onShowHiddenChange={vi.fn()}
         liveness={overrides.liveness}
         pending={overrides.pending}
+        mobileSideChatsOpen={overrides.mobileSideChatsOpen}
+        onMobileSideChatsOpenChange={onMobileSideChatsOpenChange}
       />
     </TooltipProvider>,
   );
@@ -161,15 +197,60 @@ function renderWorkspace(
     openFileViewer,
     onCloseFile,
     onRightRailTabChange,
+    onClosePanel,
     onBrowserTabOpened,
     openTerminalTab,
     onCloseTerminal,
     onToggleMaximized,
+    onMobileSideChatsOpenChange,
     view,
   };
 }
 
 describe("WorkspacePanel surface presentation", () => {
+  it("offers unpinned pages in + without requiring shell or browser support", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { onRightRailTabChange } = renderWorkspace({ showGithubTab: true });
+
+    expect(screen.queryByRole("tab", { name: "Changes" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "Agents 1" })).toHaveAttribute("aria-keyshortcuts", "2");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Pull Requests" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Files" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Changes" }));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("changes");
+  });
+
+  it("renders opened unpinned pages as closable tabs alongside files", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { onClosePanel } = renderWorkspace({
+      rightRailTab: "changes",
+      openPanels: ["changes"],
+      openFiles: ["README.md"],
+    });
+
+    expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-flat-view", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Close Changes" }));
+    expect(onClosePanel).toHaveBeenCalledWith("changes");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Changes" })).toBeInTheDocument();
+  });
+
+  it("keeps + available with no pinned pages and hides unavailable pages", () => {
+    writePinnedWorkspaceTabs([]);
+    renderWorkspace({ rightRailTab: null, showFilesPanel: false });
+
+    expect(screen.queryByRole("tab")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Select panel" })).toBeNull();
+    expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+    expect(screen.getByText("Open a Workspace tab from the + menu.")).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Agents" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Files" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Pull Requests" })).toBeNull();
+  });
+
   it("sits flush to the window edge with a left divider, no floating card frame", () => {
     renderWorkspace();
 
@@ -207,10 +288,10 @@ describe("WorkspacePanel surface presentation", () => {
   });
 
   it.each([
-    ["files", ["Files", "Changes", "GitHub", "Agents 1"]],
-    ["changes", ["Changes", "Files", "GitHub", "Agents 1"]],
-    ["github", ["GitHub", "Files", "Changes", "Agents 1"]],
-    ["subagents", ["Agents 1", "Files", "Changes", "GitHub"]],
+    ["files", ["Files", "Changes", "Pull Requests", "Agents 1"]],
+    ["changes", ["Changes", "Files", "Pull Requests", "Agents 1"]],
+    ["github", ["Pull Requests", "Files", "Changes", "Agents 1"]],
+    ["subagents", ["Agents 1", "Files", "Changes", "Pull Requests"]],
   ] as const)("places the %s default first without reordering the remaining tabs", (tab, order) => {
     writeDefaultWorkspaceTab(tab);
     renderWorkspace({ showGithubTab: true, showBrowserTab: true, rightRailTab: "files" });
@@ -293,7 +374,7 @@ describe("WorkspacePanel surface presentation", () => {
   it("shows inert workspace chrome while a temporary session is pending", () => {
     renderWorkspace({ pending: true });
 
-    for (const name of ["Files", "Changes", "GitHub", "Agents"]) {
+    for (const name of ["Files", "Changes", "Pull Requests", "Agents"]) {
       expect(screen.getByRole("tab", { name: new RegExp(name) })).toBeDisabled();
     }
     expect(screen.getByText("Starting workspace…")).toBeInTheDocument();
@@ -425,6 +506,12 @@ describe("WorkspacePanel open-file tabs", () => {
 });
 
 describe("WorkspacePanel content area", () => {
+  it("keeps the file editor open while disabling media in the collapsed rail", () => {
+    renderWorkspace({ open: false, selectedFilePath: "notes.md" });
+    expect(screen.getByTestId("file-viewer-stub")).toHaveAttribute("data-open", "true");
+    expect(screen.getByTestId("file-viewer-stub")).toHaveAttribute("data-media-active", "false");
+  });
+
   it("renders the FileViewer for the active path (not the scope panel)", () => {
     renderWorkspace({
       openFiles: ["src/App.tsx"],
@@ -627,6 +714,19 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(tabsRegion).not.toContainElement(plus);
   });
 
+  it.each([false, true])(
+    "excludes the scrolling tabs from window dragging without excluding the whole toolbar (maximized=%s)",
+    (maximized) => {
+      renderWorkspace({ openFiles: ["src/App.tsx", "docs/README.md"], maximized });
+      const toolbar = screen.getByRole("toolbar", { name: "Workspace tabs" });
+      const viewport = toolbar.querySelector(".overflow-x-auto");
+      expect(viewport).not.toBeNull();
+      expect(viewport).toHaveClass("no-drag");
+      expect(viewport).toContainElement(screen.getByRole("button", { name: "Close App.tsx" }));
+      expect(toolbar).not.toHaveClass("no-drag");
+    },
+  );
+
   it("offers Shell (gated on declared terminals), creating one and opening it as a tab", async () => {
     // Agent declares a shell; creating it resolves to a terminal whose tab key
     // is handed to openTerminalTab.
@@ -781,18 +881,27 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
   });
 
-  it("shows 'Reconnecting…' while a create is in flight on a wakeable session", async () => {
+  it("keeps unpinned pages accessible while a shell reconnects", async () => {
     declaresShell();
+    writePinnedWorkspaceTabs([]);
+    const mutate = vi.fn();
     useCreateTerminalMock.mockReturnValue({
-      mutate: vi.fn(),
+      mutate,
       isPending: true,
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
 
-    renderWorkspace({ liveness: { kind: "host_asleep" } });
+    const { onRightRailTabChange } = renderWorkspace({ liveness: { kind: "host_asleep" } });
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    expect(await screen.findByRole("menuitem", { name: /reconnecting/i })).toBeInTheDocument();
+    const plus = screen.getByRole("button", { name: "Open new" });
+    expect(plus).toBeEnabled();
+    fireEvent.pointerDown(plus, { button: 0 });
+    const shell = await screen.findByRole("menuitem", { name: /reconnecting/i });
+    expect(shell).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(shell);
+    expect(mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Changes" }));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("changes");
   });
 
   it("disables Shell and labels it Offline when the session can't be reconnected from the web", async () => {
@@ -852,31 +961,31 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
   // The row containing the fixed nav tabs — the tab strip.
   const strip = () => screen.getByRole("tab", { name: /files/i }).closest("div.border-b")!;
 
-  it("keeps exactly one ml-auto in the strip with no open tabs (maximize pins right)", () => {
+  it("keeps exactly one ml-auto in the strip with no open tabs (picker pins trailing controls right)", () => {
     // Two ml-auto siblings split the free space and strand the nav group
-    // mid-strip. With no open tabs the single ml-auto lives on the maximize
-    // button; the nav group must NOT also carry one.
+    // mid-strip. With no open tabs the single ml-auto lives on the panel picker
+    // wrapper; the nav group must NOT also carry one.
     renderWorkspace({ openFiles: [], showBrowserTab: true });
 
     expect(strip().querySelectorAll(".ml-auto")).toHaveLength(1);
-    // It's the maximize button's wrapper (pins the button right).
-    const fullScreen = screen.getByRole("button", { name: "Full screen" });
-    expect(fullScreen.parentElement).toHaveClass("ml-auto");
+    // The picker pins the trailing controls right.
+    const picker = screen.getByRole("button", { name: "Select panel" });
+    expect(picker.parentElement).toHaveClass("ml-auto");
     // The nav tablist stays left — no ml-auto.
     expect(screen.getByRole("tablist")).not.toHaveClass("ml-auto");
   });
 
-  it("keeps exactly one ml-auto in the strip with open tabs (nav tabs stay left, maximize pins right)", () => {
+  it("keeps exactly one ml-auto in the strip with open tabs (picker pins trailing controls right)", () => {
     // The nav tabs stay anchored on the LEFT with open tabs — the open-tabs
-    // region renders to their right and the maximize button keeps the row's
+    // region renders to their right and the panel picker keeps the row's
     // single ml-auto. Two ml-auto siblings would split the free space.
     renderWorkspace({ openFiles: ["src/App.tsx"], showBrowserTab: true });
 
     expect(strip().querySelectorAll(".ml-auto")).toHaveLength(1);
     // The nav tablist stays left — no ml-auto of its own.
     expect(screen.getByRole("tablist")).not.toHaveClass("ml-auto");
-    // The maximize button owns the single ml-auto, pinning it right.
-    expect(screen.getByRole("button", { name: "Full screen" }).parentElement).toHaveClass(
+    // The panel picker owns the single ml-auto, pinning the controls right.
+    expect(screen.getByRole("button", { name: "Select panel" }).parentElement).toHaveClass(
       "ml-auto",
     );
     // The divider is present (separating the nav tabs from the open tabs) and
@@ -886,7 +995,7 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
     expect(divider).not.toHaveClass("ml-auto");
   });
 
-  it("does not leave a phantom gap: empty tab strips render nothing, so the '+' hugs the last tab", () => {
+  it("renders only populated tab strips in the scroll viewport", () => {
     // FileTabsStrip / TerminalTabsStrip must return null when empty — an empty
     // wrapper would still occupy a slot in the scroller's gap and offset the
     // trailing "+". With a file open (and no shells) the scroller should hold
@@ -998,5 +1107,219 @@ describe("WorkspacePanel browser tab", () => {
     await waitFor(() =>
       expect(toast.error).toHaveBeenCalledWith("Couldn't close browser tab. Try again."),
     );
+  });
+});
+
+describe("WorkspacePanel mobile side chats", () => {
+  const openTabs = () =>
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["conv_side_a", "conv_side_b"],
+      selectedSideChatId: "conv_side_b",
+    });
+
+  it.each([false, true])(
+    "keeps a side chat and draft when close fails (mobile=%s)",
+    async (mobile) => {
+      isMobileMock.mockReturnValue(mobile);
+      openTabs();
+      const stop = vi.spyOn(sessionsApi, "stopSession").mockRejectedValueOnce(new Error("offline"));
+      useChatStore.setState({ sideChatDrafts: { conv_side_b: "Keep this question" } });
+      renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true });
+      const surface = mobile
+        ? screen.getByTestId("side-chats-panel-drawer")
+        : screen.getByRole("complementary", { name: "Workspace" });
+      fireEvent.click(within(surface).getByRole("button", { name: "Close Side chat 2" }));
+
+      await waitFor(() =>
+        expect(toast.error).toHaveBeenCalledWith("Couldn't close side chat. Try again."),
+      );
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
+      expect(useChatStore.getState().sideChatDrafts.conv_side_b).toBe("Keep this question");
+
+      stop.mockResolvedValueOnce({ queued: false });
+      fireEvent.click(within(surface).getByRole("button", { name: "Close Side chat 2" }));
+      await waitFor(() =>
+        expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a"),
+      );
+      expect(stop.mock.calls).toEqual([["conv_side_b"], ["conv_side_b"]]);
+      expect(useChatStore.getState().sideChatDrafts.conv_side_b).toBeUndefined();
+      stop.mockRestore();
+    },
+  );
+
+  it("shows the selected side chat in the drawer, not the hidden rail", () => {
+    isMobileMock.mockReturnValue(true);
+    openTabs();
+    const { onMobileSideChatsOpenChange } = renderWorkspace({
+      rightRailTab: "sidechat",
+      mobileSideChatsOpen: true,
+    });
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(screen.getAllByTestId("side-chat-pane-stub").map((el) => el.textContent)).toEqual([
+      "conv_side_b",
+    ]);
+    expect(drawer).toContainElement(screen.getByTestId("side-chat-pane-stub"));
+
+    fireEvent.click(within(drawer).getByRole("tab", { name: "Side chat 1" }));
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a");
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+    expect(onMobileSideChatsOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("renders the drawer inside the app subtree, beside the hidden rail", () => {
+    // The embed scopes its stylesheet to its own root, and native shells scope
+    // safe-area insets to the app shell, so a drawer portaled to the body
+    // would render unstyled there.
+    isMobileMock.mockReturnValue(true);
+    openTabs();
+    const { view } = renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true });
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(view.container).toContainElement(drawer);
+    expect(
+      screen.getByRole("complementary", { name: "Workspace", hidden: true }),
+    ).not.toContainElement(drawer);
+  });
+
+  it("keeps the side chat mounted while the drawer is closed", () => {
+    // Dismissing the drawer must not unmount the pane: a seeded `/side`
+    // question still waiting on the child's agent binding has to go out, and
+    // unsent composer text has to survive — as behind a collapsed desktop rail.
+    isMobileMock.mockReturnValue(true);
+    openTabs();
+    renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: false });
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "closed");
+    expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
+  });
+
+  it("keeps the side chat in the rail on desktop", () => {
+    openTabs();
+    renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true });
+
+    expect(screen.queryByTestId("side-chats-panel-drawer")).toBeNull();
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
+  });
+});
+
+describe("WorkspacePanel panel picker", () => {
+  it("selects a file by full path, distinguishing duplicate basenames", () => {
+    const { openFileViewer } = renderWorkspace({
+      openFiles: ["src/index.ts", "tests/index.ts"],
+      selectedFilePath: "src/index.ts",
+    });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "src/index.ts" })).toHaveAttribute(
+      "aria-current",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "tests/index.ts" }));
+    expect(openFileViewer).toHaveBeenCalledWith("tests/index.ts");
+  });
+
+  it("lists available permanent panels and switches to them", () => {
+    const { onRightRailTabChange } = renderWorkspace({ showGithubTab: true });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    for (const name of ["Changes", "Pull Requests", "Agents"]) {
+      expect(screen.getByRole("menuitem", { name })).toBeInTheDocument();
+    }
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pull Requests" }));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("github");
+  });
+
+  // A real mouse press also releases; Radix's tooltip ignores focus while it
+  // still believes the pointer is down on its trigger.
+  function openPickerWithMouse() {
+    const trigger = screen.getByRole("button", { name: "Select panel" });
+    fireEvent.pointerDown(trigger, { button: 0 });
+    fireEvent.pointerUp(trigger, { button: 0 });
+    return trigger;
+  }
+
+  // Radix hands focus back from a timer queued when the menu unmounts; give it
+  // a short, bounded window before asserting that nothing refocused.
+  async function settleMenuClose() {
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
+    });
+  }
+
+  it("keeps the Select panel tooltip closed after a mouse pick", async () => {
+    renderWorkspace({ openFiles: ["src/App.tsx", "docs/README.md"] });
+    const trigger = openPickerWithMouse();
+    const item = await screen.findByRole("menuitem", { name: "docs/README.md" });
+    fireEvent.pointerDown(item, { button: 0 });
+    fireEvent.click(item);
+    await settleMenuClose();
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    expect(trigger).not.toHaveFocus();
+    // Hovering the button afterwards still shows its tooltip.
+    fireEvent.pointerMove(trigger.parentElement!, { pointerType: "mouse" });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Select panel");
+  });
+
+  it("keeps the tooltip closed when the pick releases a press that began on the trigger", async () => {
+    renderWorkspace({ openFiles: ["src/App.tsx"] });
+    const trigger = screen.getByRole("button", { name: "Select panel" });
+    fireEvent.pointerDown(trigger, { button: 0 });
+    const item = await screen.findByRole("menuitem", { name: "src/App.tsx" });
+    // Releasing on an item that was never pressed is how Radix selects on drag.
+    fireEvent.pointerUp(item, { button: 0 });
+    await settleMenuClose();
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    expect(trigger).not.toHaveFocus();
+  });
+
+  it("keeps the tooltip closed after a mouse click outside the open picker", async () => {
+    renderWorkspace({ openFiles: ["src/App.tsx"] });
+    const trigger = openPickerWithMouse();
+    await screen.findByRole("menu");
+    // The outside-press listener attaches a tick after the menu opens.
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    fireEvent.pointerDown(document.body, { button: 0 });
+    await settleMenuClose();
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    expect(trigger).not.toHaveFocus();
+  });
+
+  it("returns focus to the trigger after a keyboard pick, even after a press in the menu", async () => {
+    renderWorkspace({ openFiles: ["src/App.tsx"] });
+    const trigger = screen.getByRole("button", { name: "Select panel" });
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    const item = await screen.findByRole("menuitem", { name: "src/App.tsx" });
+    // A press inside the open menu switches the picker to pointer input; the
+    // Enter that follows must switch it back so focus still returns.
+    fireEvent.pointerDown(item, { button: 0 });
+    fireEvent.keyDown(item, { key: "Enter" });
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
+  it("selects an open terminal", () => {
+    const { openTerminalTab } = renderWorkspace({ openTerminals: ["terminal:zsh"] });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "zsh" }));
+    expect(openTerminalTab).toHaveBeenCalledWith("terminal:zsh");
+  });
+
+  it("selects browser and side-chat tabs", () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["browser-one"],
+      openSideChats: ["pending:one"],
+    });
+    const { onRightRailTabChange } = renderWorkspace({ showBrowserTab: true });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Browser 1" }));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Side chat 1" }));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
   });
 });
