@@ -1181,9 +1181,11 @@ def test_cli_poll_without_grant_store_keeps_legacy_shape(
         assert "refresh_token" not in r.json()
 
 
-@pytest.mark.parametrize("admitted, cleanup_error", [(True, False), (False, False), (False, True)])
+@pytest.mark.parametrize(
+    "admitted, cleanup_error", [(True, False), (True, True), (False, False), (False, True)]
+)
 def test_habitat_broker_callback_keeps_only_session_handle(
-    tmp_path, monkeypatch, admitted, cleanup_error
+    tmp_path, monkeypatch, admitted, cleanup_error, caplog
 ):
     """Broker login retains existing token validation and cleans up rejected sessions."""
     from types import SimpleNamespace
@@ -1218,7 +1220,7 @@ def test_habitat_broker_callback_keeps_only_session_handle(
         def logout(self, credential):
             calls.append(("logout", credential))
             if cleanup_error:
-                raise RuntimeError("safe broker failure")
+                raise RuntimeError("broker-session-secret")
 
     monkeypatch.setattr(HabitatBroker, "from_env", lambda: Broker())
     engine = create_engine(
@@ -1254,7 +1256,9 @@ def test_habitat_broker_callback_keeps_only_session_handle(
             logout = client.get("/auth/logout", follow_redirects=False)
             assert logout.status_code == 302
             assert store.resolve(handle) is None
+            assert client.cookies.get(_oidc_config().session_cookie_name) is None
         else:
             assert response.status_code == 400
         assert calls[-1] == ("logout", "broker-session-secret")
+        assert "broker-session-secret" not in caplog.text
     engine.dispose()
