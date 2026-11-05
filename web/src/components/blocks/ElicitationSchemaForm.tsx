@@ -287,10 +287,7 @@ export function ElicitationSchemaForm({ fields, onSubmit, onReject }: Elicitatio
                 {options.map((option, index) => {
                   const selected = Array.isArray(value) && value.includes(option);
                   return (
-                    <label
-                      key={option}
-                      className="flex items-center gap-2 text-ui text-foreground"
-                    >
+                    <label key={option} className="flex items-center gap-2 text-ui text-foreground">
                       <input
                         id={`${controlId}-${index}`}
                         type="checkbox"

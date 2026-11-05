@@ -2385,14 +2385,12 @@ async def _resolve_elicitation(
         and elicitation_id
         and action in {"accept", "decline", "cancel"}
     ):
-        outcome, record, error = await asyncio.to_thread(
+        outcome, _record, error = await asyncio.to_thread(
             resolve_durable_question,
             elicitation_id=elicitation_id,
             session_id=session_id,
             action=action,
-            content=(
-                data.get("content") if isinstance(data.get("content"), dict) else None
-            ),
+            content=(data.get("content") if isinstance(data.get("content"), dict) else None),
         )
         if outcome == "invalid":
             _logger.warning(
@@ -2407,22 +2405,18 @@ async def _resolve_elicitation(
         else:
             if outcome == CONFLICT:
                 _logger.info(
-                    "Durable elicitation %s conflicting answer ignored; "
-                    "first answer stands",
+                    "Durable elicitation %s conflicting answer ignored; first answer stands",
                     elicitation_id,
                 )
             elif outcome == FORBIDDEN:
                 _logger.warning(
-                    "Durable elicitation %s resolution from non-owner "
-                    "session %s rejected",
+                    "Durable elicitation %s resolution from non-owner session %s rejected",
                     elicitation_id,
                     session_id,
                 )
                 return
             if outcome in {RESOLVED, IDEMPOTENT}:
-                _publish_elicitation_resolved(
-                    session_id, elicitation_id, action=action
-                )
+                _publish_elicitation_resolved(session_id, elicitation_id, action=action)
                 if conversation_store is not None:
                     await asyncio.to_thread(
                         _publish_elicitation_resolved_to_ancestors,

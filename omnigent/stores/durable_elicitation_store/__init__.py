@@ -12,18 +12,18 @@ from __future__ import annotations
 
 from omnigent.stores.durable_elicitation_store._model import (
     AnswerConflictError,
+    DuplicateRegistrationError,
     DurableElicitation,
     DurableElicitationError,
-    DuplicateRegistrationError,
 )
 from omnigent.stores.durable_elicitation_store.sqlalchemy_store import (
     SqlAlchemyDurableElicitationStore,
 )
 
 __all__ = [
+    "AnswerConflictError",
+    "DuplicateRegistrationError",
     "DurableElicitation",
     "DurableElicitationError",
-    "DuplicateRegistrationError",
-    "AnswerConflictError",
     "SqlAlchemyDurableElicitationStore",
 ]

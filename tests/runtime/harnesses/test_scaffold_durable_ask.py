@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time as _time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
@@ -18,8 +19,6 @@ from typing import Any
 import pytest
 
 from omnigent.runtime.harnesses._scaffold import DurableAskEvent, HarnessApp, TurnContext
-import time as _time
-
 from omnigent.server.schemas import (
     CompletedEvent,
     CreatedEvent,
@@ -74,9 +73,7 @@ class _DurableWaitHarness(HarnessApp):
             ctx.emit(
                 HeartbeatEvent(
                     type="response.heartbeat",
-                    server_time=_time.strftime(
-                        "%Y-%m-%dT%H:%M:%SZ", _time.gmtime()
-                    ),
+                    server_time=_time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
                     last_event_seq=0,
                 )
             )
@@ -87,9 +84,7 @@ class _DurableWaitHarness(HarnessApp):
             self._handle_durable_ask_event(
                 DurableAskEvent(type="durable_ask_resolved", call_id="call_1")
             )
-        ctx.emit(
-            CompletedEvent(type="response.completed", response=_response())
-        )
+        ctx.emit(CompletedEvent(type="response.completed", response=_response()))
 
     def _build_terminal_event(self, ctx: TurnContext) -> dict[str, Any]:
         return {
@@ -128,7 +123,7 @@ async def test_durable_wait_survives_idle_and_absolute_ceilings(_tiny_budgets) -
     """A pending durable ask keeps the turn alive well past both ceilings."""
     release = asyncio.Event()
     app = _DurableWaitHarness(release, durable=True)
-    task, queue = await _run_turn(app, _request())
+    task, _queue = await _run_turn(app, _request())
     # Wait several times past both ceilings (0.05s idle / 0.15s absolute).
     await asyncio.sleep(0.5)
     assert not task.done(), (
@@ -172,13 +167,9 @@ async def test_durable_ask_events_bracket_the_counter(_tiny_budgets) -> None:
     ctx = TurnContext("resp_test", asyncio.Queue(), asyncio.Event())
     app._in_flight["resp_test"] = ctx
     ctx._pending_tool_calls["call_1"] = asyncio.get_running_loop().create_future()
-    app._handle_durable_ask_event(
-        DurableAskEvent(type="durable_ask_pending", call_id="call_1")
-    )
+    app._handle_durable_ask_event(DurableAskEvent(type="durable_ask_pending", call_id="call_1"))
     assert ctx._durable_human_waits == 1
-    app._handle_durable_ask_event(
-        DurableAskEvent(type="durable_ask_resolved", call_id="call_1")
-    )
+    app._handle_durable_ask_event(DurableAskEvent(type="durable_ask_resolved", call_id="call_1"))
     assert ctx._durable_human_waits == 0
     # Stale call_id on resolve: no negative counter, no crash.
     app._handle_durable_ask_event(
@@ -189,9 +180,9 @@ async def test_durable_ask_events_bracket_the_counter(_tiny_budgets) -> None:
 
 @pytest.mark.asyncio
 async def test_durable_ask_event_parses_on_the_inbound_union() -> None:
-    from omnigent.runtime.harnesses._scaffold import InboundEventRequest
-
     import pydantic
+
+    from omnigent.runtime.harnesses._scaffold import InboundEventRequest
 
     class _Envelope(pydantic.BaseModel):
         ev: InboundEventRequest

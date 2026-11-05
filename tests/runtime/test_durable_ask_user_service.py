@@ -45,9 +45,7 @@ def _register(invocation_id: str = "call_1", **kwargs) -> tuple[str, bool]:
     record, created = register_durable_question(
         conversation_id=kwargs.pop("conversation_id", OWNER),
         invocation_id=invocation_id,
-        arguments=kwargs.pop(
-            "arguments", {"question": "Env?", "options": ["staging", "prod"]}
-        ),
+        arguments=kwargs.pop("arguments", {"question": "Env?", "options": ["staging", "prod"]}),
         **kwargs,
     )
     return record, created
@@ -79,9 +77,7 @@ class TestRegistration:
             )
 
     def test_child_question_carries_target(self) -> None:
-        record, _ = _register(
-            conversation_id=hexid("f"), target_conversation_id=PARENT
-        )
+        record, _ = _register(conversation_id=hexid("f"), target_conversation_id=PARENT)
         assert record.target_conversation_id == PARENT
 
     def test_unwired_store_raises(self) -> None:
@@ -238,7 +234,7 @@ class TestSnapshot:
 
     def test_child_snapshot_routes_to_parent(self) -> None:
         child = hexid("f")
-        record, _ = _register(conversation_id=child, target_conversation_id=PARENT)
+        _child_record, _ = _register(conversation_id=child, target_conversation_id=PARENT)
         parent_events = snapshot_for_session(PARENT)
         assert len(parent_events) == 1
         params = parent_events[0]["params"]

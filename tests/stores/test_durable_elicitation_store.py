@@ -70,7 +70,9 @@ def _register(
 
 
 class TestCreateOrGet:
-    def test_register_creates_pending_question(self, store: SqlAlchemyDurableElicitationStore) -> None:
+    def test_register_creates_pending_question(
+        self, store: SqlAlchemyDurableElicitationStore
+    ) -> None:
         record, created = _register(store)
         assert created
         assert record.state == "pending"

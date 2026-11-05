@@ -208,15 +208,12 @@ def register_elicitations_routes(
             # Blocking SQLite/DB access stays off the event loop: a locked
             # database must not wedge the request loop.
             durable_record = (
-                await asyncio.to_thread(store.get, elicitation_id)
-                if store is not None
-                else None
+                await asyncio.to_thread(store.get, elicitation_id) if store is not None else None
             )
-            if (
-                durable_record is None
-                or session_id
-                not in {durable_record.conversation_id, durable_record.target_conversation_id}
-            ):
+            if durable_record is None or session_id not in {
+                durable_record.conversation_id,
+                durable_record.target_conversation_id,
+            }:
                 return {"status": "resolved"}
             if durable_record.state == "pending":
                 event = pending_event_for_record(
@@ -252,9 +249,7 @@ def register_elicitations_routes(
         }
         # A durable sys_ask_user card additionally exposes its schema so a
         # client can answer choice questions from the standalone page.
-        if params.get("durable") and isinstance(
-            params.get("requestedSchema"), dict
-        ):
+        if params.get("durable") and isinstance(params.get("requestedSchema"), dict):
             payload["durable"] = True
             payload["requestedSchema"] = params["requestedSchema"]
         return payload

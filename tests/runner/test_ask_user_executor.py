@@ -43,10 +43,14 @@ class _FakeServer:
                     return httpx.Response(503)
                 args = data.get("arguments") or {}
                 if not isinstance(args.get("question"), str) or not args["question"].strip():
-                    return httpx.Response(200, json={"error": "question must be a non-empty string"})
+                    return httpx.Response(
+                        200, json={"error": "question must be a non-empty string"}
+                    )
                 elicitation_id = hexid("e") + str(len(self.questions))
                 self.questions[elicitation_id] = data
-                return httpx.Response(202, json={"queued": False, "elicitation_id": elicitation_id})
+                return httpx.Response(
+                    202, json={"queued": False, "elicitation_id": elicitation_id}
+                )
             if event_type == "approval":
                 self.canceled.append(data.get("elicitation_id"))
                 self.durable_state[data["elicitation_id"]] = {
@@ -87,7 +91,7 @@ def _clients(fake_server: _FakeServer) -> tuple[httpx.AsyncClient, httpx.AsyncCl
         transport=httpx.MockTransport(fake_server.handler), base_url="https://server.test"
     )
     harness_client = httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda req: httpx.Response(204)),
+        transport=httpx.MockTransport(lambda _req: httpx.Response(204)),
         base_url="https://harness.test",
     )
     return server_client, harness_client
@@ -111,9 +115,7 @@ async def test_register_park_and_verdict(fake_server: _FakeServer) -> None:
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     (elicitation_id,) = fake_server.questions.keys()
-    assert pending_approvals.resolve(
-        elicitation_id, approved=True, content={"answer": "staging"}
-    )
+    assert pending_approvals.resolve(elicitation_id, approved=True, content={"answer": "staging"})
     output = json.loads(await asyncio.wait_for(task, timeout=5))
     assert output == {"action": "accept", "answer": "staging"}
     # The invocation id is the call id: replay-dedup is stable.
@@ -183,16 +185,14 @@ async def test_interrupt_cancels_the_pending_question(
 async def test_consumption_bookkeeping_after_delivery(
     fake_server: _FakeServer,
 ) -> None:
-    task = asyncio.create_task(
-        _run(fake_server, {"question": "Env?", "options": ["a", "b"]})
-    )
+    task = asyncio.create_task(_run(fake_server, {"question": "Env?", "options": ["a", "b"]}))
     await asyncio.sleep(0.02)
     (elicitation_id,) = fake_server.questions.keys()
     pending_approvals.resolve(elicitation_id, approved=True, content={"answer": "a"})
     await asyncio.wait_for(task, timeout=5)
     # The id is still tracked for the delivery-confirm step; marking consumed
     # posts the durable_ask_consumed event and clears the entry.
-    server_client, harness_client = _clients(fake_server)
+    server_client, _harness_client = _clients(fake_server)
     await ask_user.mark_consumed_if_ask(
         tool_name="sys_ask_user",
         call_id="call_1",

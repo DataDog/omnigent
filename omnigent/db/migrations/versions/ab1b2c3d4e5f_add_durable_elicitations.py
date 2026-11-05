@@ -61,9 +61,7 @@ def upgrade() -> None:
         sa.Column("created_at", sa.Integer(), nullable=False),
         sa.Column("updated_at", sa.Integer(), nullable=True),
         sa.CheckConstraint("state IN (1, 2, 3, 4, 5)", name="ck_durable_elicitations_state"),
-        sa.CheckConstraint(
-            "answer_action IN (1, 2, 3)", name="ck_durable_elicitations_action"
-        ),
+        sa.CheckConstraint("answer_action IN (1, 2, 3)", name="ck_durable_elicitations_action"),
         sa.PrimaryKeyConstraint("workspace_id", "id"),
         sa.UniqueConstraint(
             "workspace_id",

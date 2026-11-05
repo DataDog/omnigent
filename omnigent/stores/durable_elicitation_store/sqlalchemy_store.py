@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 
 from sqlalchemy import and_, select
 from sqlalchemy.exc import IntegrityError
@@ -22,8 +21,8 @@ from omnigent.db.utils import (
 )
 from omnigent.stores.durable_elicitation_store._model import (
     AnswerConflictError,
-    DurableElicitation,
     DuplicateRegistrationError,
+    DurableElicitation,
 )
 
 _TERMINAL_STATES = frozenset({"answered", "declined", "canceled"})
@@ -183,11 +182,9 @@ class SqlAlchemyDurableElicitationStore:
             return None
         try:
             with self._session("durable_elicitation.get") as session:
-                row = session.get(
-                    SqlDurableElicitation, (current_workspace_id(), elicitation_id)
-                )
+                row = session.get(SqlDurableElicitation, (current_workspace_id(), elicitation_id))
                 return _to_entity(row) if row is not None else None
-        except (InvalidUuidError, ValueError):
+        except ValueError:
             # A non-hex id can never name a durable question — report it as
             # unknown instead of surfacing a driver error to the caller.
             return None
@@ -309,9 +306,8 @@ class SqlAlchemyDurableElicitationStore:
                 raise KeyError(elicitation_id)
             if row.state != 1:
                 record = _to_entity(row)
-                if (
-                    record.answer_action == action
-                    and record.answer_content == (content if action == "accept" else None)
+                if record.answer_action == action and record.answer_content == (
+                    content if action == "accept" else None
                 ):
                     return record, False
                 raise AnswerConflictError(existing=record)
@@ -409,9 +405,7 @@ class SqlAlchemyDurableElicitationStore:
                 conditions.append(SqlDurableElicitation.invocation_id == invocation_id)
             if elicitation_id is not None:
                 conditions.append(SqlDurableElicitation.id == elicitation_id)
-            rows = session.scalars(
-                select(SqlDurableElicitation).where(and_(*conditions))
-            ).all()
+            rows = session.scalars(select(SqlDurableElicitation).where(and_(*conditions))).all()
             now = now_epoch()
             for row in rows:
                 row.state = 4

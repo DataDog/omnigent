@@ -129,6 +129,8 @@ from omnigent.server.routes._sessions.common import (
     _APPROVAL_TYPE,
     _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
     _COMPACT_TYPE,
+    _DURABLE_ASK_CONSUMED_TYPE,
+    _DURABLE_ASK_TYPE,
     _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
@@ -160,8 +162,6 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_SUBAGENT_START_TYPE,
     _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
     _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
-    _DURABLE_ASK_CONSUMED_TYPE,
-    _DURABLE_ASK_TYPE,
     _INTERRUPT_TYPE,
     _MCP_ELICITATION_TYPE,
     _RETRY_SESSION_TYPE,
@@ -1795,9 +1795,11 @@ def register_events_routes(
             # and commits atomically before forwarding to the runner.
             from omnigent.runtime.durable_ask_user import (
                 DurableAskUserUnavailable,
-                DuplicateRegistrationError,
                 pending_event_for_record,
                 register_durable_question,
+            )
+            from omnigent.stores.durable_elicitation_store import (
+                DuplicateRegistrationError,
             )
 
             ask_data = body.data or {}
@@ -1829,7 +1831,7 @@ def register_events_routes(
                 return {
                     "queued": False,
                     "error": "invocation_id already registered with a different question",
-                    "elicitation_id": exc.existing.id if exc.existing else None,
+                    "elicitation_id": exc.existing.id if exc.existing else "",
                 }
             ask_payload = pending_event_for_record(record)
             from omnigent.server.routes import sessions as _sessions_facade

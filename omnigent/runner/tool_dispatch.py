@@ -6971,9 +6971,7 @@ async def dispatch_tool_locally(
         if parsed_args is None:
             output = json.dumps({"error": "malformed JSON arguments"})
         elif server_client is None or harness_client is None:
-            output = json.dumps(
-                {"error": "sys_ask_user requires server and harness clients"}
-            )
+            output = json.dumps({"error": "sys_ask_user requires server and harness clients"})
         else:
             output = await _ask_user.execute_ask_user(
                 args=parsed_args,
@@ -6985,26 +6983,26 @@ async def dispatch_tool_locally(
             )
     else:
         output = await execute_tool(
-        tool_name=tool_name,
-        arguments=arguments,
-        server_client=server_client,
-        terminal_registry=terminal_registry,
-        resource_registry=resource_registry,
-        agent_spec=agent_spec,
-        conversation_id=conversation_id,
-        task_id=task_id,
-        agent_id=agent_id,
-        agent_name=agent_name,
-        runner_workspace=runner_workspace,
-        local_tool_workdir=local_tool_workdir,
-        mcp_manager=mcp_manager,
-        session_inbox=session_inbox,
-        session_async_tasks=session_async_tasks,
-        harness_client=harness_client,
-        filesystem_registry=filesystem_registry,
-        publish_event=publish_event,
-        effective_harness=effective_harness,
-    )
+            tool_name=tool_name,
+            arguments=arguments,
+            server_client=server_client,
+            terminal_registry=terminal_registry,
+            resource_registry=resource_registry,
+            agent_spec=agent_spec,
+            conversation_id=conversation_id,
+            task_id=task_id,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            runner_workspace=runner_workspace,
+            local_tool_workdir=local_tool_workdir,
+            mcp_manager=mcp_manager,
+            session_inbox=session_inbox,
+            session_async_tasks=session_async_tasks,
+            harness_client=harness_client,
+            filesystem_registry=filesystem_registry,
+            publish_event=publish_event,
+            effective_harness=effective_harness,
+        )
 
     # A file-mutating tool just ran — nudge the web to refetch the
     # changed-files list (throttled, coalesced client-side).

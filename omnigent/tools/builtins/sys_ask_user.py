@@ -261,8 +261,8 @@ class SysAskUserTool(Tool):
             "several selections. Without options the user answers in free "
             "text. Blocks until the user responds — they may take a long "
             "time or respond after reconnecting. Returns "
-            '{\"action\": \"accept\", \"answer\": ...} on an answer, or '
-            '{\"action\": \"decline\"} / {\"action\": \"cancel\"} when the '
+            '{"action": "accept", "answer": ...} on an answer, or '
+            '{"action": "decline"} / {"action": "cancel"} when the '
             "user declines or the question is cancelled."
         )
 

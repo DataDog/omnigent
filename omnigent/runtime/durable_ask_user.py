@@ -28,7 +28,6 @@ from omnigent.stores.durable_elicitation_store import (
     AnswerConflictError,
     DurableElicitation,
     DurableElicitationError,
-    DuplicateRegistrationError,
     SqlAlchemyDurableElicitationStore,
 )
 from omnigent.tools.builtins.sys_ask_user import (

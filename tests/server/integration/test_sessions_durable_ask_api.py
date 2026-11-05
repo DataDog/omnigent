@@ -9,13 +9,10 @@ conflicting, and malformed answers behave per the durable contract.
 
 from __future__ import annotations
 
-import asyncio
-
 import httpx
 import pytest
 
 from omnigent.runtime.durable_ask_user import configure_durable_elicitation_store
-
 from tests.server.helpers import create_test_agent
 from tests.server.integration.test_sessions_elicitation_resolve_url import (
     _create_session,
@@ -37,8 +34,7 @@ async def _register_durable(
             "type": "durable_ask",
             "data": {
                 "invocation_id": invocation_id,
-                "arguments": arguments
-                or {"question": "Env?", "options": ["staging", "prod"]},
+                "arguments": arguments or {"question": "Env?", "options": ["staging", "prod"]},
             },
         },
     )
@@ -87,9 +83,7 @@ async def test_register_invalid_arguments_fail_cleanly(
 ) -> None:
     agent = await create_test_agent(client, "durable-invalid")
     session_id = await _create_session(client, agent["id"])
-    result = await _register_durable(
-        client, session_id, arguments={"question": "   "}
-    )
+    result = await _register_durable(client, session_id, arguments={"question": "   "})
     assert result.get("error")
     assert "elicitation_id" not in result
 
@@ -102,9 +96,7 @@ async def test_get_elicitation_returns_pending_with_options(
     registered = await _register_durable(client, session_id)
     elicitation_id = registered["elicitation_id"]
 
-    resp = await client.get(
-        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}"
-    )
+    resp = await client.get(f"/v1/sessions/{session_id}/elicitations/{elicitation_id}")
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert data["status"] == "pending"
@@ -115,9 +107,7 @@ async def test_get_elicitation_returns_pending_with_options(
     ]
 
 
-async def test_snapshot_includes_pending_question(
-    client: httpx.AsyncClient, _wired_store
-) -> None:
+async def test_snapshot_includes_pending_question(client: httpx.AsyncClient, _wired_store) -> None:
     """The session snapshot replays the durable card (cold-load restore)."""
     agent = await create_test_agent(client, "durable-snapshot")
     session_id = await _create_session(client, agent["id"])
@@ -146,9 +136,7 @@ async def test_resolve_accepts_answer_and_clears_pending(
     assert resp.status_code == 202, resp.text
 
     # GET now reports the committed answer (delivery still outstanding).
-    data = (
-        await client.get(f"/v1/sessions/{session_id}/elicitations/{elicitation_id}")
-    ).json()
+    data = (await client.get(f"/v1/sessions/{session_id}/elicitations/{elicitation_id}")).json()
     assert data["status"] == "resolved"
     assert data["action"] == "accept"
     assert data["content"] == {"answer": "staging"}
@@ -167,15 +155,11 @@ async def test_resolve_malformed_answer_leaves_question_pending(
         json={"action": "accept", "content": {"answer": "not-an-option"}},
     )
     assert resp.status_code in {200, 202}, resp.text
-    data = (
-        await client.get(f"/v1/sessions/{session_id}/elicitations/{elicitation_id}")
-    ).json()
+    data = (await client.get(f"/v1/sessions/{session_id}/elicitations/{elicitation_id}")).json()
     assert data["status"] == "pending", "malformed answer must not resolve the question"
 
 
-async def test_resolve_duplicate_and_conflict(
-    client: httpx.AsyncClient, _wired_store
-) -> None:
+async def test_resolve_duplicate_and_conflict(client: httpx.AsyncClient, _wired_store) -> None:
     agent = await create_test_agent(client, "durable-dup")
     session_id = await _create_session(client, agent["id"])
     registered = await _register_durable(client, session_id)
@@ -198,9 +182,7 @@ async def test_resolve_duplicate_and_conflict(
         json={"action": "accept", "content": {"answer": "prod"}},
     )
     assert conflict.status_code in {200, 202, 409}
-    data = (
-        await client.get(f"/v1/sessions/{session_id}/elicitations/{elicitation_id}")
-    ).json()
+    data = (await client.get(f"/v1/sessions/{session_id}/elicitations/{elicitation_id}")).json()
     assert data["content"] == {"answer": "staging"}, "first answer must stand"
 
 
@@ -217,6 +199,7 @@ async def test_resolve_unknown_durable_id_falls_through_to_legacy_404_shape(
     # Legacy path behavior for an unknown id: accepted for forwarding
     # (the runner rejects on its own terms) — the key assertion is that the
     # durable store has no row for it, checked indirectly by GET.
+    _ = resp
     get_resp = await client.get(
         f"/v1/sessions/{session_id}/elicitations/deadbeefdeadbeefdeadbeefdeadbeef"
     )
@@ -224,9 +207,7 @@ async def test_resolve_unknown_durable_id_falls_through_to_legacy_404_shape(
     assert get_resp.json()["status"] == "resolved"
 
 
-async def test_consume_event_marks_exactly_once(
-    client: httpx.AsyncClient, _wired_store
-) -> None:
+async def test_consume_event_marks_exactly_once(client: httpx.AsyncClient, _wired_store) -> None:
     from omnigent.runtime.durable_ask_user import durable_store
 
     agent = await create_test_agent(client, "durable-consume")

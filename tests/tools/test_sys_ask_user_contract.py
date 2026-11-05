@@ -34,9 +34,7 @@ class TestValidateArgs:
         assert result.is_free_form
 
     def test_single_choice(self) -> None:
-        result = validate_ask_user_args(
-            {"question": "Ship?", "options": ["yes", "no"]}
-        )
+        result = validate_ask_user_args({"question": "Ship?", "options": ["yes", "no"]})
         assert isinstance(result, AskUserQuestion)
         assert result.options == ("yes", "no")
         assert result.multiple is False
@@ -69,9 +67,7 @@ class TestValidateArgs:
         assert isinstance(result, str), f"expected error for {args}, got {result!r}"
 
     def test_option_order_is_preserved(self) -> None:
-        result = validate_ask_user_args(
-            {"question": "q", "options": ["z", "a", "m"]}
-        )
+        result = validate_ask_user_args({"question": "q", "options": ["z", "a", "m"]})
         assert isinstance(result, AskUserQuestion)
         assert result.options == ("z", "a", "m")
 
@@ -86,9 +82,7 @@ class TestRequestedSchema:
         assert answer == {"type": "string", "minLength": 1}
 
     def test_single_choice_schema_is_string_enum(self) -> None:
-        question = validate_ask_user_args(
-            {"question": "Env?", "options": ["staging", "prod"]}
-        )
+        question = validate_ask_user_args({"question": "Env?", "options": ["staging", "prod"]})
         assert isinstance(question, AskUserQuestion)
         schema = build_requested_schema(question)
         answer = schema["properties"][ANSWER_FIELD]
@@ -119,9 +113,7 @@ class TestValidateAnswerContent:
     def test_free_form_accepts_text(self) -> None:
         question = validate_ask_user_args({"question": "q"})
         assert isinstance(question, AskUserQuestion)
-        assert validate_answer_content({"answer": "hello"}, question) == {
-            "answer": "hello"
-        }
+        assert validate_answer_content({"answer": "hello"}, question) == {"answer": "hello"}
 
     def test_free_form_rejects_blank(self) -> None:
         question = validate_ask_user_args({"question": "q"})
@@ -138,16 +130,12 @@ class TestValidateAnswerContent:
 
     def test_multiple_rejects_duplicates(self) -> None:
         assert isinstance(
-            validate_answer_content(
-                {"answer": ["a", "a"]}, self._question(multiple=True)
-            ),
+            validate_answer_content({"answer": ["a", "a"]}, self._question(multiple=True)),
             str,
         )
 
     def test_multiple_accepts_distinct_options(self) -> None:
-        content = validate_answer_content(
-            {"answer": ["b", "a"]}, self._question(multiple=True)
-        )
+        content = validate_answer_content({"answer": ["b", "a"]}, self._question(multiple=True))
         assert content == {"answer": ["b", "a"]}
 
     def test_none_content_is_invalid(self) -> None:
@@ -178,9 +166,10 @@ class TestFingerprintAndResult:
         }
         assert json.loads(format_tool_result(action="decline")) == {"action": "decline"}
         assert json.loads(format_tool_result(action="accept")) == {"action": "accept"}
-        assert json.loads(
-            format_tool_result(action="accept", answer=["a", "b"])
-        ) == {"action": "accept", "answer": ["a", "b"]}
+        assert json.loads(format_tool_result(action="accept", answer=["a", "b"])) == {
+            "action": "accept",
+            "answer": ["a", "b"],
+        }
 
 
 class TestBuiltinSurface:

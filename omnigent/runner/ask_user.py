@@ -36,7 +36,6 @@ import httpx
 
 from omnigent.runner import pending_approvals
 from omnigent.tools.builtins.sys_ask_user import (
-    AskUserQuestion,
     format_tool_result,
     validate_ask_user_args,
 )
@@ -102,9 +101,7 @@ async def _post_server_event(
         data = resp.json()
         return data if isinstance(data, dict) else {}
     except Exception as exc:  # noqa: BLE001 — surfaced by callers as tool errors
-        _logger.warning(
-            "sys_ask_user server event failed (%s): %s", payload.get("type"), exc
-        )
+        _logger.warning("sys_ask_user server event failed (%s): %s", payload.get("type"), exc)
         return None
 
 
@@ -156,9 +153,7 @@ async def _fetch_durable_state(
         data = resp.json()
         return data if isinstance(data, dict) else None
     except Exception as exc:  # noqa: BLE001 — callers retry on the next poll
-        _logger.warning(
-            "sys_ask_user state fetch failed for %s: %s", elicitation_id, exc
-        )
+        _logger.warning("sys_ask_user state fetch failed for %s: %s", elicitation_id, exc)
         return None
 
 
@@ -176,6 +171,8 @@ def _answer_from_state(state: dict[str, Any]) -> str | None:
         return None
     content = state.get("content") if isinstance(state.get("content"), dict) else None
     answer = content.get("answer") if content else None
+    if not isinstance(answer, (str, list)):
+        answer = None
     return format_tool_result(
         action=action,
         answer=answer if action == "accept" else None,
@@ -218,8 +215,6 @@ async def execute_ask_user(
     validated = validate_ask_user_args(args)
     if isinstance(validated, str):
         return json.dumps({"error": validated})
-    question: AskUserQuestion = validated
-
     registered = await _post_server_event(
         server_client,
         conversation_id,
@@ -292,11 +287,8 @@ async def execute_ask_user(
                     break
         assert verdict is not None
         if verdict.approved:
-            answer = (
-                verdict.content.get("answer")
-                if isinstance(verdict.content, dict)
-                else None
-            )
+            raw = verdict.content.get("answer") if isinstance(verdict.content, dict) else None
+            answer = raw if isinstance(raw, (str, list)) else None
             output = format_tool_result(action="accept", answer=answer)
         else:
             output = format_tool_result(action="decline")

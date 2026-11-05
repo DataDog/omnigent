@@ -1807,16 +1807,12 @@ class SqlDurableElicitation(OmnigentBase):
     tool_name: Mapped[str] = mapped_column(String(64), nullable=False)
     message: Mapped[str] = mapped_column(CompressedText, nullable=False)
     requested_schema: Mapped[str] = mapped_column(CompressedText, nullable=False)
-    state: Mapped[int] = mapped_column(
-        SmallInteger, nullable=False, server_default="1"
-    )
+    state: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     answer_action: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     answer_content: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     delivered_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     consumed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    delivery_attempts: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default="0"
-    )
+    delivery_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
