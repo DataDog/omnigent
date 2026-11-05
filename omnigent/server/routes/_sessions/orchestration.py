@@ -2363,6 +2363,78 @@ async def _resolve_elicitation(
         and bool(elicitation_id)
         and (pending_elicitations.lookup(elicitation_id) or (None,))[0] == session_id
     )
+    # Durable sys_ask_user questions resolve through the persisted store
+    # FIRST (commit-before-publish): the terminal state commits before any
+    # event is announced, and the answer is validated against the
+    # persisted schema so a malformed body leaves the question pending.
+    # Legacy policy/MCP elicitations never match a durable row and fall
+    # through to the in-memory paths unchanged.
+    from omnigent.runtime.durable_ask_user import (
+        CONFLICT,
+        FORBIDDEN,
+        IDEMPOTENT,
+        NOT_FOUND,
+        RESOLVED,
+        durable_store,
+        resolve_durable_question,
+    )
+
+    if (
+        durable_store() is not None
+        and isinstance(elicitation_id, str)
+        and elicitation_id
+        and action in {"accept", "decline", "cancel"}
+    ):
+        outcome, record, error = resolve_durable_question(
+            elicitation_id=elicitation_id,
+            session_id=session_id,
+            action=action,
+            content=(
+                data.get("content") if isinstance(data.get("content"), dict) else None
+            ),
+        )
+        if outcome == "invalid":
+            _logger.warning(
+                "Durable elicitation %s answer rejected: %s",
+                elicitation_id,
+                error,
+            )
+            # Malformed answers fail cleanly; the question stays pending.
+            return
+        if outcome == NOT_FOUND:
+            pass  # Not durable — fall through to the legacy paths.
+        else:
+            if outcome == CONFLICT:
+                _logger.info(
+                    "Durable elicitation %s conflicting answer ignored; "
+                    "first answer stands",
+                    elicitation_id,
+                )
+            elif outcome == FORBIDDEN:
+                _logger.warning(
+                    "Durable elicitation %s resolution from non-owner "
+                    "session %s rejected",
+                    elicitation_id,
+                    session_id,
+                )
+                return
+            if outcome in {RESOLVED, IDEMPOTENT}:
+                _publish_elicitation_resolved(
+                    session_id, elicitation_id, action=action
+                )
+                if conversation_store is not None:
+                    await asyncio.to_thread(
+                        _publish_elicitation_resolved_to_ancestors,
+                        conversation_store,
+                        session_id,
+                        elicitation_id,
+                        action,
+                    )
+                # Forward the verdict to the runner (commit already
+                # happened). Delivery is retryable via the store's
+                # unconsumed reconcile when the runner is offline here.
+                await _forward_approval_to_runner(session_id, data, runner_router)
+            return
     harness_future = _harness_elicitation_registry.get(elicitation_id)
     if harness_future is not None and not harness_future.done():
         # Only the session that owns this elicitation

@@ -2053,6 +2053,27 @@ def create_app(
     # run-completion hook (persist_scheduled_run_completion) fired from
     # _publish_status when a fired conversation's turn reaches terminal.
     session_live_state.configure(conversation_store, scheduled_task_store)
+    # Durable sys_ask_user questions: wire the store from the permission
+    # store's database (same physical DB every store-backed deployment
+    # uses). None (no permission_store — tests / minimal servers) keeps
+    # the durable surface off and every sys_ask_user call fails clean.
+    from omnigent.runtime.durable_ask_user import configure_durable_elicitation_store
+
+    if permission_store is not None:
+        try:
+            from omnigent.stores.durable_elicitation_store import (
+                SqlAlchemyDurableElicitationStore,
+            )
+
+            configure_durable_elicitation_store(
+                SqlAlchemyDurableElicitationStore(permission_store.storage_location)
+            )
+        except Exception:  # noqa: BLE001 — durable surface is additive
+            _logger.warning(
+                "durable elicitation store unavailable; sys_ask_user is disabled",
+                exc_info=True,
+            )
+            configure_durable_elicitation_store(None)
     # Extend a managed sandbox while its runner tunnel is live (the managed-path
     # caller for SandboxHostLauncher.keep_alive); no-op without a sandbox config.
     managed_host_keepalive.configure(conversation_store, host_store, sandbox_config)

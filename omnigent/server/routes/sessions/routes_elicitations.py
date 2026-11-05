@@ -197,7 +197,42 @@ def register_elicitations_routes(
 
         found = pending_elicitations.lookup(elicitation_id)
         if found is None or found[0] != session_id:
-            return {"status": "resolved"}
+            # Durable sys_ask_user questions live in the database, so they
+            # answer here even after a cold server start.
+            from omnigent.runtime.durable_ask_user import (
+                durable_store,
+                pending_event_for_record,
+            )
+
+            store = durable_store()
+            durable_record = store.get(elicitation_id) if store is not None else None
+            if (
+                durable_record is None
+                or session_id
+                not in {durable_record.conversation_id, durable_record.target_conversation_id}
+            ):
+                return {"status": "resolved"}
+            if durable_record.state == "pending":
+                event = pending_event_for_record(
+                    durable_record,
+                    mirror_on=session_id,
+                )
+                params = event.get("params", {})
+                return {
+                    "status": "pending",
+                    "message": params.get("message", "Question"),
+                    "phase": "",
+                    "policy_name": "",
+                    "content_preview": "",
+                    "requestedSchema": params.get("requestedSchema"),
+                    "durable": True,
+                }
+            return {
+                "status": "resolved",
+                "action": durable_record.answer_action,
+                "content": durable_record.answer_content,
+                "durable": True,
+            }
 
         _conv_id, event = found
         params_value = event.get("params")

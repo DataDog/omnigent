@@ -72,6 +72,19 @@ _APPROVAL_TYPE: str = "approval"
 _MCP_ELICITATION_TYPE: str = "mcp_elicitation"
 
 
+# Durable ``sys_ask_user`` registration event: same runner→server surface
+# as ``mcp_elicitation``, but the question persists before the card is
+# published so it survives server restarts (see
+# :mod:`omnigent.runtime.durable_ask_user`).
+_DURABLE_ASK_TYPE: str = "durable_ask"
+
+
+# Runner → server consumption acknowledgment for a durable ask: fired only
+# after the harness acknowledged the tool_result, so the server's
+# exactly-once consumption gate never outruns delivery.
+_DURABLE_ASK_CONSUMED_TYPE: str = "durable_ask_consumed"
+
+
 _COMPACT_TYPE: str = "compact"
 
 
@@ -1162,6 +1175,8 @@ __all__ = [
     "_HOST_RECONNECT_GRACE_S",
     "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S",
     "_HOST_RUNNER_STATUS_TIMEOUT_S",
+    "_DURABLE_ASK_CONSUMED_TYPE",
+    "_DURABLE_ASK_TYPE",
     "_INTERRUPT_TYPE",
     "_KIMI_NATIVE_HARNESS",
     "_KIRO_NATIVE_WRAPPER_LABEL_VALUE",
