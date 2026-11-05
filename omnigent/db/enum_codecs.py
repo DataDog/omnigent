@@ -119,6 +119,20 @@ SCHEDULED_TASK_EXECUTION_TARGET: dict[str, int] = {
     "managed_sandbox": 2,
 }
 
+DURABLE_ELICITATION_STATE: dict[str, int] = {
+    "pending": 1,
+    "answered": 2,
+    "declined": 3,
+    "canceled": 4,
+    "consumed": 5,
+}
+
+DURABLE_ELICITATION_ACTION: dict[str, int] = {
+    "accept": 1,
+    "decline": 2,
+    "cancel": 3,
+}
+
 SCHEDULED_TASK_RUN_STATUS: dict[str, int] = {
     "scheduled": 1,
     "running": 2,
@@ -338,3 +352,23 @@ def encode_scheduled_task_run_status(name: str) -> int:
 def decode_scheduled_task_run_status(code: int) -> str:
     """Decode a ``scheduled_task_runs.status`` int code to its name."""
     return _decode(SCHEDULED_TASK_RUN_STATUS, code, field="scheduled_task_runs.status")
+
+
+def encode_durable_elicitation_state(name: str) -> int:
+    """Encode a ``durable_elicitations.state`` name to its int code."""
+    return _encode(DURABLE_ELICITATION_STATE, name, field="durable_elicitations.state")
+
+
+def decode_durable_elicitation_state(code: int) -> str:
+    """Decode a ``durable_elicitations.state`` int code to its name."""
+    return _decode(DURABLE_ELICITATION_STATE, code, field="durable_elicitations.state")
+
+
+def encode_durable_elicitation_action(name: str) -> int:
+    """Encode a ``durable_elicitations.answer_action`` name to its int code."""
+    return _encode(DURABLE_ELICITATION_ACTION, name, field="durable_elicitations.answer_action")
+
+
+def decode_durable_elicitation_action(code: int) -> str:
+    """Decode a ``durable_elicitations.answer_action`` int code to its name."""
+    return _decode(DURABLE_ELICITATION_ACTION, code, field="durable_elicitations.answer_action")
