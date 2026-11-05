@@ -114,10 +114,18 @@ class OidcTokenManager:
                 email = _extract_verified_email(claims, self._config) if claims else None
                 if (
                     not claims
-                    or email != expected_user_id.lower()
+                    or email is None
+                    or email.lower() != expected_user_id.lower()
                     or claims.get("sub") != credentials.provider_subject
                 ):
                     raise ReauthenticationError("Habitat broker identity changed")
+                current = self._store.get_refresh_credentials(
+                    oidc_session_id, expected_user_id, now_epoch_seconds=int(self._clock())
+                )
+                if current is None:
+                    raise ReauthenticationError(
+                        "Session expired or was revoked during broker request"
+                    )
                 return IdTokenResult(result.client_token, result.token_expires_at_unix)
             credentials = self._ensure_stable_provider_binding(
                 oidc_session_id,
