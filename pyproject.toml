@@ -566,6 +566,8 @@ extend-exclude = [
     "assistant-ui",
     # Protobuf-generated code (DO NOT EDIT); not ours to restyle.
     "omnigent/api/**/*_pb2.py",
+    "omnigent/server/_habitat_proto/*_pb2.py",
+    "omnigent/server/_habitat_proto/*_pb2.pyi",
     "omnigent/api/**/*_pb2.pyi",
 ]
 
