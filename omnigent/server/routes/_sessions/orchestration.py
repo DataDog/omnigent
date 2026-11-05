@@ -2385,7 +2385,8 @@ async def _resolve_elicitation(
         and elicitation_id
         and action in {"accept", "decline", "cancel"}
     ):
-        outcome, record, error = resolve_durable_question(
+        outcome, record, error = await asyncio.to_thread(
+            resolve_durable_question,
             elicitation_id=elicitation_id,
             session_id=session_id,
             action=action,

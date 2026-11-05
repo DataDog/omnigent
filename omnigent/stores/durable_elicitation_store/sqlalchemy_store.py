@@ -169,15 +169,28 @@ class SqlAlchemyDurableElicitationStore:
 
     def get(self, elicitation_id: str) -> DurableElicitation | None:
         """
-        Return one question by id, or ``None`` when unknown or
+        Return one question by id, or ``None`` when unknown, malformed, or
         out-of-workspace.
 
         :param elicitation_id: The correlation id.
         :returns: The record, or ``None``.
         """
-        with self._session("durable_elicitation.get") as session:
-            row = session.get(SqlDurableElicitation, (current_workspace_id(), elicitation_id))
-            return _to_entity(row) if row is not None else None
+        import re as _re
+
+        if not _re.fullmatch(r"[0-9a-f]{32}", elicitation_id):
+            # A non-hex id can never name a durable question — report it as
+            # unknown instead of surfacing a driver error to the caller.
+            return None
+        try:
+            with self._session("durable_elicitation.get") as session:
+                row = session.get(
+                    SqlDurableElicitation, (current_workspace_id(), elicitation_id)
+                )
+                return _to_entity(row) if row is not None else None
+        except (InvalidUuidError, ValueError):
+            # A non-hex id can never name a durable question — report it as
+            # unknown instead of surfacing a driver error to the caller.
+            return None
 
     def list_for_conversation(
         self,

@@ -81,6 +81,14 @@ class DurableAskUserUnavailable(RuntimeError):
     """The durable-elicitation store is not wired into this process."""
 
 
+_ELICITATION_ID_RE = __import__("re").compile(r"^[0-9a-f]{32}$")
+
+
+def _is_elicitation_id(elicitation_id: str) -> bool:
+    """Whether an id is shaped like a durable elicitation id (bare hex UUID)."""
+    return bool(_ELICITATION_ID_RE.match(elicitation_id))
+
+
 def _require_store() -> SqlAlchemyDurableElicitationStore:
     store = _store
     if store is None:
@@ -182,6 +190,8 @@ def resolve_durable_question(
         human-readable validation message for malformed answers (the
         question stays pending).
     """
+    if not _is_elicitation_id(elicitation_id):
+        return NOT_FOUND, None, None
     store = _require_store()
     try:
         record = store.get(elicitation_id)

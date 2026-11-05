@@ -205,7 +205,13 @@ def register_elicitations_routes(
             )
 
             store = durable_store()
-            durable_record = store.get(elicitation_id) if store is not None else None
+            # Blocking SQLite/DB access stays off the event loop: a locked
+            # database must not wedge the request loop.
+            durable_record = (
+                await asyncio.to_thread(store.get, elicitation_id)
+                if store is not None
+                else None
+            )
             if (
                 durable_record is None
                 or session_id
