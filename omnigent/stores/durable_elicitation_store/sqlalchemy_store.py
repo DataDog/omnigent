@@ -303,9 +303,10 @@ class SqlAlchemyDurableElicitationStore:
                     return record, False
                 raise AnswerConflictError(existing=record)
             now = now_epoch()
-            row.state = encode_durable_elicitation_state(
-                "answered" if action == "accept" else action
-            )
+            state_name = {"accept": "answered", "decline": "declined", "cancel": "canceled"}[
+                action
+            ]
+            row.state = encode_durable_elicitation_state(state_name)
             row.answer_action = encode_durable_elicitation_action(action)
             row.answer_content = (
                 json.dumps(content, sort_keys=True) if action == "accept" else None

@@ -567,6 +567,8 @@ _RUNNER_FORWARD_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool
 _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) | {
     _INTERRUPT_TYPE,
     _APPROVAL_TYPE,
+    _DURABLE_ASK_TYPE,
+    _DURABLE_ASK_CONSUMED_TYPE,
     _MCP_ELICITATION_TYPE,
     _COMPACT_TYPE,
     _STOP_SESSION_TYPE,

@@ -227,3 +227,40 @@ describe("shapes the form must not claim", () => {
     expect(schemaFields(withReason).map((f) => f.name)).toEqual(["answer", "reason"]);
   });
 });
+
+describe("multiple-choice (array enum) questions", () => {
+  const MULTIPLE_SCHEMA: Record<string, unknown> = {
+    type: "object",
+    properties: {
+      answer: {
+        type: "array",
+        items: { type: "string", enum: ["tests", "docs", "chore"] },
+        minItems: 1,
+        uniqueItems: true,
+      },
+    },
+    required: ["answer"],
+  };
+  const fields = schemaFields(MULTIPLE_SCHEMA);
+
+  it("reads the option set from items.enum", () => {
+    expect(fields).toHaveLength(1);
+    expect(fields[0].required).toBe(true);
+  });
+
+  it("is incomplete with no selection and complete with one", () => {
+    expect(isComplete(fields, { answer: [] })).toBe(false);
+    expect(isComplete(fields, { answer: ["tests"] })).toBe(true);
+    expect(isComplete(fields, { answer: ["tests", "docs"] })).toBe(true);
+  });
+
+  it("sends the selections as a string array", () => {
+    expect(toContent(fields, { answer: ["tests", "docs"] })).toEqual({
+      answer: ["tests", "docs"],
+    });
+  });
+
+  it("sends nothing for an untouched multiple-choice field", () => {
+    expect(toContent(fields, {})).toEqual({});
+  });
+});

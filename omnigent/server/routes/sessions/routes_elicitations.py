@@ -237,10 +237,18 @@ def register_elicitations_routes(
         _conv_id, event = found
         params_value = event.get("params")
         params = params_value if isinstance(params_value, dict) else {}
-        return {
+        payload = {
             "status": "pending",
             "message": params.get("message", "Approval required"),
             "phase": params.get("phase", ""),
             "policy_name": params.get("policy_name", ""),
             "content_preview": params.get("content_preview", ""),
         }
+        # A durable sys_ask_user card additionally exposes its schema so a
+        # client can answer choice questions from the standalone page.
+        if params.get("durable") and isinstance(
+            params.get("requestedSchema"), dict
+        ):
+            payload["durable"] = True
+            payload["requestedSchema"] = params["requestedSchema"]
+        return payload
