@@ -189,7 +189,7 @@ def register_elicitations_routes(
             return {"unconsumed": []}
         try:
             rows = await asyncio.to_thread(store.list_for_conversation, session_id)
-        except Exception:  # noqa: BLE001 — recovery listing is best-effort
+        except Exception:
             rows = []
         return {
             "unconsumed": [

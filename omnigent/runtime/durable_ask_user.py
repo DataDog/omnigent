@@ -27,7 +27,6 @@ from typing import Any
 from omnigent.stores.durable_elicitation_store import (
     AnswerConflictError,
     DurableElicitation,
-    DurableElicitationError,
     SqlAlchemyDurableElicitationStore,
 )
 from omnigent.tools.builtins.sys_ask_user import (
@@ -198,7 +197,7 @@ def resolve_durable_question(
     store = _require_store()
     try:
         record = store.get(elicitation_id)
-    except Exception:  # noqa: BLE001 — a broken store must not 500 the resolve
+    except Exception:
         record = None
     if record is None:
         return NOT_FOUND, None, None
@@ -324,7 +323,7 @@ def snapshot_for_session(conversation_id: str) -> list[dict[str, Any]]:
     try:
         owned = store.list_for_conversation(conversation_id)
         presented = store.list_pending_for_target(conversation_id)
-    except Exception:  # noqa: BLE001 — a stale/broken store must not 500 the snapshot
+    except Exception:
         _logger.warning(
             "Durable ask snapshot read failed; rendering without durable questions",
             exc_info=True,
