@@ -246,3 +246,28 @@ class TestSnapshot:
         event = pending_event_for_record(record)
         assert event["elicitation_id"] == record.id
         assert event["params"]["mode"] == "form"
+
+
+class TestContinuationWake:
+    """The continuation wake must be answerable without replaying history."""
+
+    def test_wake_names_the_answer_and_tool_output(self) -> None:
+        from omnigent.runtime.durable_ask_user import continuation_wake_text
+        from omnigent.tools.builtins.sys_ask_user import format_tool_result
+
+        text = continuation_wake_text(
+            action="accept",
+            content={"answer": "staging"},
+            tool_output=format_tool_result(action="accept", answer="staging"),
+        )
+        assert "answered: 'staging'" in text
+        assert "sys_ask_user" in text
+        assert "Do not repeat any earlier work" in text
+
+    def test_decline_wake_is_terminal(self) -> None:
+        from omnigent.runtime.durable_ask_user import continuation_wake_text
+
+        text = continuation_wake_text(
+            action="decline", content=None, tool_output='{"action": "decline"}'
+        )
+        assert "decline" in text

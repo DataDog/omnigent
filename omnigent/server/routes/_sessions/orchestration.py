@@ -2385,7 +2385,7 @@ async def _resolve_elicitation(
         and elicitation_id
         and action in {"accept", "decline", "cancel"}
     ):
-        outcome, _record, error = await asyncio.to_thread(
+        outcome, resolved_record, error = await asyncio.to_thread(
             resolve_durable_question,
             elicitation_id=elicitation_id,
             session_id=session_id,
@@ -2432,7 +2432,16 @@ async def _resolve_elicitation(
                 # instead of dropping it. Delivery is retryable via the
                 # store's unconsumed reconcile when the runner is offline.
                 await _forward_approval_to_runner(
-                    session_id, {**data, "durable": True}, runner_router
+                    session_id,
+                    {
+                        **data,
+                        "durable": True,
+                        # Paused-call checkpoint: a runner with no live
+                        # waiter rebuilds the dangling tool call's output
+                        # item from this instead of guessing.
+                        "paused_call": (resolved_record.paused_call if resolved_record else None),
+                    },
+                    runner_router,
                 )
             return
     harness_future = _harness_elicitation_registry.get(elicitation_id)

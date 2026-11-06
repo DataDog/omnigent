@@ -198,7 +198,7 @@ def resolve_durable_question(
     store = _require_store()
     try:
         record = store.get(elicitation_id)
-    except DurableElicitationError:
+    except Exception:  # noqa: BLE001 — a broken store must not 500 the resolve
         record = None
     if record is None:
         return NOT_FOUND, None, None
@@ -321,12 +321,21 @@ def snapshot_for_session(conversation_id: str) -> list[dict[str, Any]]:
         return []
     events: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for record in store.list_for_conversation(conversation_id):
+    try:
+        owned = store.list_for_conversation(conversation_id)
+        presented = store.list_pending_for_target(conversation_id)
+    except Exception:  # noqa: BLE001 — a stale/broken store must not 500 the snapshot
+        _logger.warning(
+            "Durable ask snapshot read failed; rendering without durable questions",
+            exc_info=True,
+        )
+        return []
+    for record in owned:
         if record.state == "consumed":
             continue
         seen.add(record.id)
         events.append(pending_event_for_record(record))
-    for record in store.list_pending_for_target(conversation_id):
+    for record in presented:
         if record.id in seen:
             continue
         seen.add(record.id)

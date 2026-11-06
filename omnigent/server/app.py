@@ -3728,6 +3728,35 @@ def create_app(
                 wake_text = continuation_wake_text(
                     action=action, content=row.answer_content, tool_output=tool_output
                 )
+                paused_call = row.paused_call
+                if paused_call and isinstance(paused_call.get("call_id"), str):
+                    # Persist the tool result against the dangling call so
+                    # the committed history is structurally complete (call +
+                    # output) before the continuation turn starts.
+                    try:
+                        await ingest(
+                            app=app,
+                            runner_id=runner_id,
+                            owner=owner,
+                            session_id=conversation_id,
+                            payload={
+                                "type": "external_conversation_item",
+                                "data": {
+                                    "item_type": "function_call_output",
+                                    "item_data": {
+                                        "call_id": paused_call["call_id"],
+                                        "output": tool_output,
+                                    },
+                                    "response_id": paused_call.get("response_id")
+                                    or f"resp_durable_{row.id[:12]}",
+                                },
+                            },
+                        )
+                    except Exception:
+                        _logger.exception(
+                            "Durable ask tool-result persistence failed",
+                            extra={"session_id": conversation_id, "elicitation_id": row.id},
+                        )
                 try:
                     await ingest(
                         app=app,

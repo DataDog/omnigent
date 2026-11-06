@@ -30,6 +30,7 @@ class _FakeServer:
         self.durable_state: dict[str, dict] = {}
         self.consumed: list[str] = []
         self.canceled: list[str] = []
+        self.wakes: list[str] = []
         self.server_down = False
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -60,8 +61,14 @@ class _FakeServer:
                 }
                 return httpx.Response(202, json={"queued": False})
             if event_type == "durable_ask_consumed":
+                # Model the store's exactly-once gate: only the FIRST claim
+                # of a given ask transitions it; later claims ack consumed=False.
+                first_claim = data["elicitation_id"] not in self.consumed
                 self.consumed.append(data["elicitation_id"])
-                return httpx.Response(202, json={"queued": False, "consumed": True})
+                return httpx.Response(202, json={"queued": False, "consumed": first_claim})
+            if event_type == "message":
+                self.wakes.append(data["content"][0]["text"])
+                return httpx.Response(202, json={"queued": False})
             return httpx.Response(400, json={"error": f"unexpected {event_type}"})
         if request.method == "GET" and "/elicitations/" in path:
             elicitation_id = path.rsplit("/", 1)[-1]
@@ -213,3 +220,56 @@ async def test_consumption_bookkeeping_after_delivery(
 
 def test_result_format_never_invents_an_answer() -> None:
     assert format_tool_result(action="decline") == json.dumps({"action": "decline"})
+
+
+class TestRecovery:
+    """Runner-restart recovery claims exactly-once, then wakes once."""
+
+    async def test_recovery_claims_then_wakes(self, fake_server: _FakeServer) -> None:
+        server_client, _ = _clients(fake_server)
+        fake_server.durable_state[hexid("a")] = {
+            "status": "resolved",
+            "action": "accept",
+            "content": {"answer": "staging"},
+        }
+        # Unconsumed: the consume event succeeds.
+        recovered = await ask_user.recover_answered_ask(
+            elicitation_id=hexid("a"),
+            conversation_id=hexid("c"),
+            action="accept",
+            content={"answer": "staging"},
+            server_client=server_client,
+        )
+        assert recovered is True
+        assert fake_server.consumed == [hexid("a")]
+        # The wake rode exactly one hidden meta message.
+        assert len(fake_server.wakes) == 1
+        assert "answered: 'staging'" in fake_server.wakes[0]
+        assert "sys_ask_user" in fake_server.wakes[0]
+
+    async def test_duplicate_recovery_is_a_noop(self, fake_server: _FakeServer) -> None:
+        server_client, _ = _clients(fake_server)
+        fake_server.durable_state[hexid("a")] = {
+            "status": "resolved",
+            "action": "accept",
+            "content": {"answer": "staging"},
+        }
+        first = await ask_user.recover_answered_ask(
+            elicitation_id=hexid("a"),
+            conversation_id=hexid("c"),
+            action="accept",
+            content={"answer": "staging"},
+            server_client=server_client,
+        )
+        second = await ask_user.recover_answered_ask(
+            elicitation_id=hexid("a"),
+            conversation_id=hexid("c"),
+            action="accept",
+            content={"answer": "staging"},
+            server_client=server_client,
+        )
+        assert first is True and second is False
+        # The second recovery claimed nothing, so it never re-attempted the
+        # wake — exactly-once at the recovery layer too (the store's consume
+        # gate enforces the same property behind the real server).
+        assert len(fake_server.wakes) == 1

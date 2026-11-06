@@ -254,3 +254,70 @@ async def test_unwired_store_rejects_registration(
     session_id = await _create_session(client, agent["id"])
     result = await _register_durable(client, session_id)
     assert result.get("error")
+
+
+async def test_paused_call_checkpoint_persists(client: httpx.AsyncClient, _wired_store) -> None:
+    """The registration's paused-call checkpoint is persisted for recovery."""
+    from omnigent.runtime.durable_ask_user import durable_store
+
+    agent = await create_test_agent(client, "durable-checkpoint")
+    session_id = await _create_session(client, agent["id"])
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "durable_ask",
+            "data": {
+                "invocation_id": "call_ask_1",
+                "arguments": {"question": "Env?", "options": ["staging", "prod"]},
+                "paused_call": {
+                    "call_id": "call_ask_1",
+                    "tool_name": "sys_ask_user",
+                    "arguments": {"question": "Env?", "options": ["staging", "prod"]},
+                    "response_id": "resp_turn_1",
+                },
+            },
+        },
+    )
+    assert resp.status_code in {200, 202}, resp.text
+    elicitation_id = resp.json()["elicitation_id"]
+    store = durable_store()
+    assert store is not None
+    record = store.get(elicitation_id)
+    assert record is not None
+    assert record.paused_call is not None
+    assert record.paused_call["call_id"] == "call_ask_1"
+    assert record.paused_call["response_id"] == "resp_turn_1"
+
+
+async def test_unconsumed_listing_after_answer(client: httpx.AsyncClient, _wired_store) -> None:
+    """The recovery listing returns answered-unconsumed asks with content."""
+    agent = await create_test_agent(client, "durable-unconsumed")
+    session_id = await _create_session(client, agent["id"])
+    registered = await _register_durable(client, session_id)
+    elicitation_id = registered["elicitation_id"]
+
+    resp = await client.get(f"/v1/sessions/{session_id}/durable_elicitations/unconsumed")
+    assert resp.status_code == 200
+    assert resp.json() == {"unconsumed": []}  # still pending
+
+    await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "accept", "content": {"answer": "staging"}},
+    )
+    listing = (
+        await client.get(f"/v1/sessions/{session_id}/durable_elicitations/unconsumed")
+    ).json()["unconsumed"]
+    assert [row["elicitation_id"] for row in listing] == [elicitation_id]
+    assert listing[0]["action"] == "accept"
+    assert listing[0]["content"] == {"answer": "staging"}
+
+    # Consuming removes it from the recovery listing — exactly-once.
+    await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "durable_ask_consumed",
+            "data": {"elicitation_id": elicitation_id},
+        },
+    )
+    resp = await client.get(f"/v1/sessions/{session_id}/durable_elicitations/unconsumed")
+    assert resp.json() == {"unconsumed": []}

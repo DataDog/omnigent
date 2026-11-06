@@ -39,6 +39,7 @@ def _to_entity(row: SqlDurableElicitation) -> DurableElicitation:
         tool_name=row.tool_name,
         message=row.message,
         requested_schema=json.loads(row.requested_schema),
+        paused_call=json.loads(row.paused_call) if row.paused_call else None,
         state=decode_durable_elicitation_state(row.state),
         answer_action=(
             decode_durable_elicitation_action(row.answer_action)

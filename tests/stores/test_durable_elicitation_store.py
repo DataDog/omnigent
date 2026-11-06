@@ -243,3 +243,38 @@ class TestCancellationAndRouting:
         # ...and the child (owner) view may consume it.
         _, claimed = store.mark_consumed(record.id)
         assert claimed
+
+
+class TestPausedCallCheckpoint:
+    """The paused-call checkpoint must survive a reopen (runner-restart recovery)."""
+
+    def test_checkpoint_persists_through_reopen(
+        self, store: SqlAlchemyDurableElicitationStore, db_uri: str
+    ) -> None:
+        question = _question(["staging", "prod"])
+        checkpoint = {
+            "call_id": "call_ask_1",
+            "tool_name": "sys_ask_user",
+            "arguments": {"question": question.question, "options": ["staging", "prod"]},
+            "response_id": "resp_abc123",
+        }
+        record, created = store.create_or_get(
+            elicitation_id=hexid("a"),
+            conversation_id=OWNER,
+            invocation_id="call_ask_1",
+            fingerprint=question_fingerprint(question),
+            tool_name="sys_ask_user",
+            message=question.question,
+            requested_schema=build_requested_schema(question),
+            paused_call=checkpoint,
+        )
+        assert created
+        assert record.paused_call == checkpoint
+        reopened = SqlAlchemyDurableElicitationStore(db_uri)
+        fetched = reopened.get(record.id)
+        assert fetched is not None
+        assert fetched.paused_call == checkpoint
+
+    def test_checkpoint_defaults_to_none(self, store: SqlAlchemyDurableElicitationStore) -> None:
+        record, _ = _register(store)
+        assert record.paused_call is None

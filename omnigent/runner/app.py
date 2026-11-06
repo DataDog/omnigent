@@ -6946,6 +6946,11 @@ def create_runner_app(
                         action=_elicit_action,
                         content=(_elicit_content if isinstance(_elicit_content, dict) else None),
                         server_client=server_client,
+                        paused_call=(
+                            _data.get("paused_call")
+                            if isinstance(_data.get("paused_call"), dict)
+                            else None
+                        ),
                     )
                 )
                 _background_tasks.add(_recovery_task)

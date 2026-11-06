@@ -378,6 +378,7 @@ async def recover_answered_ask(
     action: str,
     content: dict[str, Any] | None,
     server_client: httpx.AsyncClient,
+    paused_call: dict[str, Any] | None = None,
 ) -> bool:
     """
     Continue a parked ``sys_ask_user`` execution whose harness turn died.
@@ -404,6 +405,11 @@ async def recover_answered_ask(
         ``cancel``).
     :param content: The committed content map on accept.
     :param server_client: Runner → server HTTP client.
+    :param paused_call: The persisted paused-call checkpoint (call id, tool
+        name, arguments, response id). When present, the tool result is
+        first persisted as a proper ``function_call_output`` item keyed to
+        the dangling call, so the committed history is complete before the
+        wake starts the continuation turn.
     :returns: ``True`` when this call claimed the consumption AND posted
         the continuation wake; ``False`` when the ask was already consumed
         (a duplicate recovery is a no-op).
@@ -426,6 +432,26 @@ async def recover_answered_ask(
     )
     if claimed is None or not claimed.get("consumed"):
         return False
+    if paused_call and isinstance(paused_call.get("call_id"), str):
+        # Persist the tool result against the dangling call so the history
+        # is structurally complete (function_call + function_call_output)
+        # before the continuation turn starts.
+        await _post_server_event(
+            server_client,
+            conversation_id,
+            {
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "function_call_output",
+                    "item_data": {
+                        "call_id": paused_call["call_id"],
+                        "output": tool_output,
+                    },
+                    "response_id": paused_call.get("response_id")
+                    or f"resp_durable_{elicitation_id[:12]}",
+                },
+            },
+        )
     # Wake the session with one hidden meta message (bounded retries —
     # delivery failures leave a stuck turn, never a duplicate continuation).
     for attempt in range(3):
