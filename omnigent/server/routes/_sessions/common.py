@@ -72,6 +72,19 @@ _APPROVAL_TYPE: str = "approval"
 _MCP_ELICITATION_TYPE: str = "mcp_elicitation"
 
 
+# Durable ``sys_ask_user`` registration event: same runner→server surface
+# as ``mcp_elicitation``, but the question persists before the card is
+# published so it survives server restarts (see
+# :mod:`omnigent.runtime.durable_ask_user`).
+_DURABLE_ASK_TYPE: str = "durable_ask"
+
+
+# Runner → server consumption acknowledgment for a durable ask: fired only
+# after the harness acknowledged the tool_result, so the server's
+# exactly-once consumption gate never outruns delivery.
+_DURABLE_ASK_CONSUMED_TYPE: str = "durable_ask_consumed"
+
+
 _COMPACT_TYPE: str = "compact"
 
 
@@ -555,6 +568,8 @@ _RUNNER_FORWARD_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool
 _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) | {
     _INTERRUPT_TYPE,
     _APPROVAL_TYPE,
+    _DURABLE_ASK_TYPE,
+    _DURABLE_ASK_CONSUMED_TYPE,
     _MCP_ELICITATION_TYPE,
     _COMPACT_TYPE,
     _STOP_SESSION_TYPE,
@@ -1123,6 +1138,8 @@ __all__ = [
     "_DEVIN_NATIVE_SUBAGENT_TOOL_USE_ID_LABEL_KEY",
     "_DEVIN_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
     "_DEVIN_NATIVE_WRAPPER_LABEL_VALUE",
+    "_DURABLE_ASK_CONSUMED_TYPE",
+    "_DURABLE_ASK_TYPE",
     "_EVALUATE_HOOK_ELICITATION_ID_RE",
     "_EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE",
     "_EXTERNAL_ASSISTANT_MESSAGE_TYPE",

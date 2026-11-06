@@ -44,6 +44,7 @@ _TEST_CTX = ToolContext(task_id="task_test", agent_id="agent_test")
 # ``check_task`` was dropped per design step 11.
 _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
     {
+        "sys_ask_user",
         "sys_cancel_task",
         "sys_call_async",
         "sys_read_inbox",

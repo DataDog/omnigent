@@ -6969,27 +6969,53 @@ async def dispatch_tool_locally(
             "dispatch_tool_locally requires conversation_id to POST the "
             "harness session-keyed URL; got None/empty"
         )
-    output = await execute_tool(
-        tool_name=tool_name,
-        arguments=arguments,
-        server_client=server_client,
-        terminal_registry=terminal_registry,
-        resource_registry=resource_registry,
-        agent_spec=agent_spec,
-        conversation_id=conversation_id,
-        task_id=task_id,
-        agent_id=agent_id,
-        agent_name=agent_name,
-        runner_workspace=runner_workspace,
-        local_tool_workdir=local_tool_workdir,
-        mcp_manager=mcp_manager,
-        session_inbox=session_inbox,
-        session_async_tasks=session_async_tasks,
-        harness_client=harness_client,
-        filesystem_registry=filesystem_registry,
-        publish_event=publish_event,
-        effective_harness=effective_harness,
-    )
+    # Durable sys_ask_user intercept: registers a persisted question, parks
+    # indefinitely on the human verdict, and suspends the harness turn's
+    # watchdogs while the question is pending. Consummation of ordinary
+    # tool dispatch (policy gates, MCP relay) is untouched.
+    if tool_name == "sys_ask_user":
+        from omnigent.runner import ask_user as _ask_user
+
+        try:
+            parsed_args, _parse_error = parse_json_object_arguments(arguments)
+        except Exception:  # noqa: BLE001 — malformed JSON is a tool error
+            parsed_args = None
+        if parsed_args is None:
+            output = json.dumps({"error": "malformed JSON arguments"})
+        elif server_client is None or harness_client is None:
+            output = json.dumps({"error": "sys_ask_user requires server and harness clients"})
+        else:
+            output = await _ask_user.execute_ask_user(
+                args=parsed_args,
+                call_id=call_id,
+                conversation_id=conversation_id,
+                server_client=server_client,
+                harness_client=harness_client,
+                response_id=response_id,
+                publish_event=publish_event,
+            )
+    else:
+        output = await execute_tool(
+            tool_name=tool_name,
+            arguments=arguments,
+            server_client=server_client,
+            terminal_registry=terminal_registry,
+            resource_registry=resource_registry,
+            agent_spec=agent_spec,
+            conversation_id=conversation_id,
+            task_id=task_id,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            runner_workspace=runner_workspace,
+            local_tool_workdir=local_tool_workdir,
+            mcp_manager=mcp_manager,
+            session_inbox=session_inbox,
+            session_async_tasks=session_async_tasks,
+            harness_client=harness_client,
+            filesystem_registry=filesystem_registry,
+            publish_event=publish_event,
+            effective_harness=effective_harness,
+        )
 
     # A file-mutating tool just ran — nudge the web to refetch the
     # changed-files list (throttled, coalesced client-side).
@@ -7010,6 +7036,18 @@ async def dispatch_tool_locally(
                 timeout=30.0,
             )
             resp.raise_for_status()
+            # Consume the durable ask only after the harness acknowledged
+            # the result — a consumed-but-undelivered answer would strand
+            # the parked harness turn.
+            if tool_name == "sys_ask_user" and server_client is not None:
+                from omnigent.runner import ask_user as _ask_user
+
+                await _ask_user.mark_consumed_if_ask(
+                    tool_name=tool_name,
+                    call_id=call_id,
+                    conversation_id=conversation_id,
+                    server_client=server_client,
+                )
             return output
         except Exception as exc:
             retryable = isinstance(exc, httpx.TransportError) or (

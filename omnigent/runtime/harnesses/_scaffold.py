@@ -409,13 +409,43 @@ class PolicyVerdictEvent(BaseModel):
     data: dict[str, Any] | None = None
 
 
+class DurableAskEvent(BaseModel):
+    """
+    Downward ``durable_ask_pending`` / ``durable_ask_resolved`` event —
+    bracket a durable human wait (``sys_ask_user``) on the in-flight
+    turn.
+
+    While a durable ask is pending, the turn's idle AND absolute
+    watchdogs are suspended: the human may answer hours later, after a
+    client disconnect and reconnect. Ordinary human waits (policy ASKs,
+    tool-permission elicitations) only hold the idle window open — the
+    absolute ceiling still bounds them; only a durable, persisted
+    question justifies pausing the ceiling.
+
+    Loose semantics — stale ``call_id`` entries silently no-op, same as
+    :class:`ToolResultEvent`.
+
+    :param type: Event discriminator; ``"durable_ask_pending"`` or
+        ``"durable_ask_resolved"``.
+    :param call_id: The tool call id the durable ask is parked under.
+    """
+
+    type: Literal["durable_ask_pending", "durable_ask_resolved"]
+    call_id: str
+
+
 # Discriminated union of every downward event the harness accepts on
 # ``POST /v1/sessions/{conversation_id}/events``. FastAPI / Pydantic
 # v2 dispatches by the ``type`` field at request-validation time;
 # unknown values raise 422 (fail-loud per
 # ``designs/DESIGN_PRINCIPLES.md``).
 InboundEventRequest = Annotated[
-    MessageEvent | InterruptEvent | ToolResultEvent | ApprovalEvent | PolicyVerdictEvent,
+    MessageEvent
+    | InterruptEvent
+    | ToolResultEvent
+    | ApprovalEvent
+    | PolicyVerdictEvent
+    | DurableAskEvent,
     Field(discriminator="type"),
 ]
 
@@ -478,6 +508,11 @@ class TurnContext:
         # the idle window open so an unanswered wait isn't failed as a
         # wedged turn; the absolute ceiling still applies.
         self._pending_human_waits = 0
+        # Durable human waits in flight (``sys_ask_user``). Unlike ordinary
+        # human waits these suspend BOTH watchdogs — idle and absolute —
+        # while > 0: the question is persisted server-side and the human
+        # may answer hours later, after a disconnect/reconnect.
+        self._durable_human_waits = 0
         # Layer 3 per-policy-evaluation state:
         # ``evaluation_id`` → Future[PolicyVerdictPayload].
         # Populated by ``evaluate_policy``; resolved by the
@@ -540,7 +575,9 @@ class TurnContext:
                 self._has_progress = True
             if self._reset_idle_watchdog is not None:
                 self._reset_idle_watchdog()
-        elif self._pending_human_waits > 0 and self._hold_idle_watchdog is not None:
+        elif (self._pending_human_waits > 0 or self._durable_human_waits > 0) and (
+            self._hold_idle_watchdog is not None
+        ):
             self._hold_idle_watchdog()
         self._event_queue.put_nowait(event)
 
@@ -1293,6 +1330,8 @@ class HarnessApp:
             )
         if isinstance(body, PolicyVerdictEvent):
             return await self._handle_policy_verdict_event(body)
+        if isinstance(body, DurableAskEvent):
+            return self._handle_durable_ask_event(body)
         # Pydantic's discriminated-union validator should reject
         # unknown variants before we reach this branch; if it ever
         # falls through, fail loud rather than silently no-op.
@@ -1346,6 +1385,29 @@ class HarnessApp:
         """
         for ctx in self._in_flight.values():
             if ctx._complete_tool(body.call_id, body.output):
+                break
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    def _handle_durable_ask_event(self, body: DurableAskEvent) -> Response:
+        """
+        Bracket a durable human wait on the in-flight turn.
+
+        ``durable_ask_pending`` increments the turn's durable-wait counter
+        (suspending the idle and absolute watchdogs); ``durable_ask_resolved``
+        decrements it (restoring normal budgets). Loose semantics — stale
+        ``call_id`` entries silently no-op, same as tool_result.
+
+        :param body: The decoded :class:`DurableAskEvent`.
+        :returns: 204 No Content.
+        """
+        for ctx in self._in_flight.values():
+            if body.call_id in ctx._pending_tool_calls or (
+                body.type == "durable_ask_resolved" and ctx._durable_human_waits > 0
+            ):
+                if body.type == "durable_ask_pending":
+                    ctx._durable_human_waits += 1
+                else:
+                    ctx._durable_human_waits = max(0, ctx._durable_human_waits - 1)
                 break
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -1716,8 +1778,16 @@ class HarnessApp:
                             # ONLY the idle deadline, never the absolute
                             # ceiling — an approval that is never answered
                             # must still terminate at the hard cap.
+                            # EXCEPTION: a durable human wait
+                            # (``sys_ask_user``) suspends the absolute
+                            # ceiling too — the question is persisted
+                            # server-side and the answer may arrive hours
+                            # later, after a client disconnect/reconnect.
+                            ctx_durable = getattr(ctx, "_durable_human_waits", 0)
                             if not idle_wd.expired():
                                 idle_wd.reschedule(loop.time() + idle_timeout)
+                            if ctx_durable > 0 and not absolute_wd.expired():
+                                absolute_wd.reschedule(loop.time() + idle_timeout)
 
                         ctx._reset_idle_watchdog = _reset
                         ctx._hold_idle_watchdog = _hold_idle

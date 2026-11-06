@@ -2338,9 +2338,14 @@ async def _resolve_elicitation(
     *,
     actor_user_id: str | None = None,
     session_owner_id: str | None = None,
-) -> None:
+) -> str | None:
     """
     Resolve one outstanding elicitation from an approval payload.
+
+    :returns: The durable resolution outcome when the id named a durable
+        question (``"resolved"`` / ``"idempotent"`` / ``"conflict"`` /
+        ``"forbidden"``), or ``None`` when the verdict was handled by the
+        legacy in-memory paths or fell through for an unknown id.
 
     Shared by the two entry points that deliver a verdict for a
     parked elicitation: the ``type == "approval"`` branch of
@@ -2400,6 +2405,98 @@ async def _resolve_elicitation(
         and bool(elicitation_id)
         and (pending_elicitations.lookup(elicitation_id) or (None,))[0] == session_id
     )
+    # Durable sys_ask_user questions resolve through the persisted store
+    # FIRST (commit-before-publish): the terminal state commits before any
+    # event is announced, and the answer is validated against the
+    # persisted schema so a malformed body leaves the question pending.
+    # Legacy policy/MCP elicitations never match a durable row and fall
+    # through to the in-memory paths unchanged.
+    from omnigent.runtime.durable_ask_user import (
+        CONFLICT,
+        FORBIDDEN,
+        IDEMPOTENT,
+        NOT_FOUND,
+        RESOLVED,
+        durable_store,
+        resolve_durable_question,
+    )
+
+    if (
+        durable_store() is not None
+        and isinstance(elicitation_id, str)
+        and elicitation_id
+        and action in {"accept", "decline", "cancel"}
+    ):
+        outcome, resolved_record, error = await asyncio.to_thread(
+            resolve_durable_question,
+            elicitation_id=elicitation_id,
+            session_id=session_id,
+            action=action,
+            content=(data.get("content") if isinstance(data.get("content"), dict) else None),
+        )
+        if outcome == "invalid":
+            _logger.warning(
+                "Durable elicitation %s answer rejected: %s",
+                elicitation_id,
+                error,
+            )
+            # Malformed answers fail cleanly; the question stays pending.
+            return "invalid"
+        if outcome == NOT_FOUND:
+            pass  # Not durable — fall through to the legacy paths.
+        else:
+            if outcome == CONFLICT:
+                _logger.info(
+                    "Durable elicitation %s conflicting answer ignored; first answer stands",
+                    elicitation_id,
+                )
+            elif outcome == FORBIDDEN:
+                _logger.warning(
+                    "Durable elicitation %s resolution from non-owner session %s rejected",
+                    elicitation_id,
+                    session_id,
+                )
+                return None
+            if outcome in {RESOLVED, IDEMPOTENT}:
+                # All follow-ups target the OWNING row's conversation, never
+                # the resolving view: a parent-view answer to a child's
+                # question must resolve on the child's stream (its live
+                # subscribers drop the card), mirror to the child's ancestors
+                # (which includes the parent), and forward to the runner
+                # under the child's session id — so a no-live-waiter recovery
+                # consumes the child's row and wakes the CHILD. Waking the
+                # resolving session instead would strand the child forever
+                # (row consumed, never re-adopted) and start a bogus
+                # continuation turn on the parent.
+                owner_id = resolved_record.conversation_id if resolved_record else session_id
+                _publish_elicitation_resolved(owner_id, elicitation_id, action=action)
+                if conversation_store is not None:
+                    await asyncio.to_thread(
+                        _publish_elicitation_resolved_to_ancestors,
+                        conversation_store,
+                        owner_id,
+                        elicitation_id,
+                        action,
+                    )
+                # Forward the verdict to the runner (commit already
+                # happened). The durable flag lets a runner with no live
+                # waiter (process restarted mid-question) recognize the
+                # verdict and recover from the paused-call checkpoint
+                # instead of dropping it. Delivery is retryable via the
+                # store's unconsumed reconcile when the runner is offline.
+                await _forward_approval_to_runner(
+                    owner_id,
+                    {
+                        **data,
+                        "durable": True,
+                        # Paused-call checkpoint: a runner with no live
+                        # waiter rebuilds the dangling tool call's output
+                        # item from this instead of guessing.
+                        "paused_call": (resolved_record.paused_call if resolved_record else None),
+                    },
+                    runner_router,
+                )
+            return outcome
     harness_future = _harness_elicitation_registry.get(elicitation_id)
     if harness_future is not None and not harness_future.done():
         # Only the session that owns this elicitation
@@ -2517,6 +2614,7 @@ async def _resolve_elicitation(
             # Approval delivery is authoritative; metrics are observational.
             pass
     await _forward_approval_to_runner(session_id, data, runner_router)
+    return None
 
 
 def _spawn_native_approval_popup_forward(

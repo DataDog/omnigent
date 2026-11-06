@@ -137,6 +137,8 @@ from omnigent.server.routes._sessions.common import (
     _APPROVAL_TYPE,
     _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
     _COMPACT_TYPE,
+    _DURABLE_ASK_CONSUMED_TYPE,
+    _DURABLE_ASK_TYPE,
     _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
@@ -770,6 +772,8 @@ def register_events_routes(
     runner_tunnel_tokens: frozenset[str] | None = None,
     register_runner_ingest: Callable[[Callable[..., Awaitable[EventAckFrame]]], None]
     | None = None,
+    register_recovery_ingest: Callable[[Callable[..., Awaitable[dict[str, bool | str]]]], None]
+    | None = None,
     register_startup_dispatch: Callable[[StartupDispatch], None] | None = None,
 ) -> None:
     """Register the events, stream, and delete routes on router."""
@@ -1023,6 +1027,31 @@ def register_events_routes(
     if register_runner_ingest is not None:
         register_runner_ingest(ingest_runner_batch)
 
+    async def post_recovery_session_event(
+        *,
+        app: Any,
+        runner_id: str,
+        owner: str | None,
+        session_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, bool | str]:
+        """Apply one server-initiated recovery event through the HTTP event logic.
+
+        The durable-ask recovery sweep (server-side, on runner connect)
+        uses this to persist + relay the continuation wake with the same
+        authentication shape and persistence path as a runner-originated
+        event — one code path for "start a turn from committed history".
+        """
+        request = _RunnerEventContext(app, Headers(), owner, runner_id)
+        return await _post_event_impl(
+            request,
+            session_id,
+            SessionEventInput.model_validate(payload),
+        )
+
+    if register_recovery_ingest is not None:
+        register_recovery_ingest(post_recovery_session_event)
+
     async def _post_event_impl(
         request: Request | _RunnerEventContext | StartupInputContext,
         session_id: str,
@@ -1196,6 +1225,8 @@ def register_events_routes(
         if body.type not in (
             _INTERRUPT_TYPE,
             _APPROVAL_TYPE,
+            _DURABLE_ASK_TYPE,
+            _DURABLE_ASK_CONSUMED_TYPE,
             _MCP_ELICITATION_TYPE,
             _COMPACT_TYPE,
             _SLASH_COMMAND_TYPE,
@@ -1917,6 +1948,100 @@ def register_events_routes(
                 _mcp_elicit_payload,
             )
             return {"queued": False, "elicitation_id": elicit_id}
+        if body.type == _DURABLE_ASK_TYPE:
+            # The runner's sys_ask_user intercept registers a DURABLE
+            # question: persist BEFORE publishing so a crash between
+            # publish and answer leaves an answerable pending row (the
+            # snapshot replays it after a cold server start). The answer
+            # arrives via ``type: "approval"`` → ``_resolve_elicitation``'s
+            # durable branch, which validates against the persisted schema
+            # and commits atomically before forwarding to the runner.
+            from omnigent.runtime.durable_ask_user import (
+                DurableAskUserUnavailable,
+                pending_event_for_record,
+                register_durable_question,
+            )
+            from omnigent.stores.durable_elicitation_store import (
+                DuplicateRegistrationError,
+            )
+
+            ask_data = body.data or {}
+            ask_arguments = ask_data.get("arguments")
+            if not isinstance(ask_arguments, dict):
+                return {"queued": False, "error": "arguments must be an object"}
+            invocation_id = ask_data.get("invocation_id")
+            if not isinstance(invocation_id, str) or not invocation_id:
+                return {"queued": False, "error": "invocation_id is required"}
+            target_conversation_id = ask_data.get("target_conversation_id")
+            if not isinstance(target_conversation_id, str) or not target_conversation_id:
+                target_conversation_id = None
+            # Production child routing: a question asked by a child session
+            # presents on its user-facing parent, so ancestor cold snapshots
+            # replay it (target_conversation_id) and parent-view answers
+            # resolve the child's parked call.
+            if target_conversation_id is None and conv.parent_conversation_id:
+                target_conversation_id = conv.parent_conversation_id
+            paused_call = ask_data.get("paused_call")
+            if not isinstance(paused_call, dict):
+                paused_call = None
+            try:
+                record, _created = await asyncio.to_thread(
+                    register_durable_question,
+                    conversation_id=session_id,
+                    invocation_id=invocation_id,
+                    arguments=ask_arguments,
+                    target_conversation_id=target_conversation_id,
+                    paused_call=paused_call,
+                )
+            except DurableAskUserUnavailable:
+                return {"queued": False, "error": "durable elicitation store unavailable"}
+            except ValueError as exc:
+                return {"queued": False, "error": str(exc)}
+            except DuplicateRegistrationError as exc:
+                # A replayed registration under the same invocation identity
+                # with a different payload: surface the existing question's
+                # id rather than silently asking a different thing.
+                return {
+                    "queued": False,
+                    "error": "invocation_id already registered with a different question",
+                    "elicitation_id": exc.existing.id if exc.existing else "",
+                }
+            ask_payload = pending_event_for_record(record)
+            from omnigent.server.routes import sessions as _sessions_facade
+
+            _sessions_facade.session_stream.publish(session_id, ask_payload)
+            metric_actor, metric_owner = await _usage_identity(session_id, user_id)
+            _record_terminal_usage(
+                feature_name="approval",
+                operation="request",
+                actor_user_id=metric_actor,
+                session_owner_id=metric_owner,
+                outcome="success",
+            )
+            await asyncio.to_thread(
+                _publish_elicitation_request_to_ancestors,
+                conversation_store,
+                session_id,
+                ask_payload,
+            )
+            return {"queued": False, "elicitation_id": record.id}
+        if body.type == _DURABLE_ASK_CONSUMED_TYPE:
+            # The runner delivered the tool_result for a durable ask and
+            # now acknowledges consumption. The store's claimed gate makes
+            # this exactly-once: retries after a lost ack are idempotent
+            # no-ops, never a second continuation.
+            from omnigent.runtime.durable_ask_user import durable_store
+
+            store = durable_store()
+            consumed_data = body.data or {}
+            consumed_id = consumed_data.get("elicitation_id")
+            if store is None or not isinstance(consumed_id, str) or not consumed_id:
+                return {"queued": False, "consumed": False}
+            try:
+                _record, consumed = await asyncio.to_thread(store.mark_consumed, consumed_id)
+            except (KeyError, ValueError):
+                consumed = False
+            return {"queued": False, "consumed": consumed}
         if body.type == _COMPACT_TYPE:
             # Unified control dispatch (designs/CLAUDE_NATIVE.md
             # "Control events dispatch on the runner"): forward /compact

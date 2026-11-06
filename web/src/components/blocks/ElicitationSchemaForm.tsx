@@ -26,7 +26,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
 /** One value MCP allows in an ``ElicitResult.content`` map. */
-export type ElicitValue = string | number | boolean;
+export type ElicitValue = string | number | boolean | string[];
 
 /** The answers gathered from the form, keyed by property name. */
 export type ElicitationAnswers = Record<string, ElicitValue>;
@@ -42,6 +42,10 @@ interface SchemaProperty {
   default?: unknown;
   title?: string;
   description?: string;
+  /** ``array`` properties declare their members under ``items``. */
+  items?: { type?: string; enum?: unknown[]; enumNames?: unknown[] };
+  minItems?: number;
+  uniqueItems?: boolean;
 }
 
 /** A property paired with the name it is keyed under. */
@@ -95,6 +99,9 @@ function initialValue(field: SchemaField): ElicitValue | undefined {
   const { prop } = field;
   if (prop.default !== undefined && isElicitValue(prop.default)) return prop.default;
   if (prop.type === "boolean") return undefined;
+  // A multiple-choice field starts with nothing selected; "no selection yet"
+  // is not the same answer as the empty selection the schema may forbid.
+  if (prop.type === "array") return [];
   return "";
 }
 
@@ -110,13 +117,33 @@ function asText(value: unknown): string {
 
 /** True when a value is one of the primitives MCP allows in ``content``. */
 function isElicitValue(value: unknown): value is ElicitValue {
-  return typeof value === "string" || typeof value === "number" || typeof value === "boolean";
+  return (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    (Array.isArray(value) && value.every((v) => typeof v === "string"))
+  );
 }
 
 /** The enum members of a property, as strings, or an empty array. */
 function enumValues(prop: SchemaProperty): string[] {
   if (!Array.isArray(prop.enum)) return [];
   return prop.enum
+    .filter((v): v is string => typeof v === "string" || typeof v === "number")
+    .map(String);
+}
+
+/**
+ * The enum members of an ``array`` property's ``items``, as strings.
+ *
+ * A multiple-choice question declares its selectable options here, not at
+ * the property level — an empty result means the array carries no choice
+ * set and falls back to free-form rendering.
+ */
+function arrayEnumValues(prop: SchemaProperty): string[] {
+  const items = prop.items;
+  if (!items || !Array.isArray(items.enum)) return [];
+  return items.enum
     .filter((v): v is string => typeof v === "string" || typeof v === "number")
     .map(String);
 }
@@ -145,6 +172,9 @@ export function isComplete(fields: SchemaField[], answers: ElicitationDraft): bo
   return fields.every((field) => {
     const value = answers[field.name];
     if (typeof value === "boolean") return true;
+    // A multiple-choice field is complete when at least one option is
+    // selected — the schema's minItems: 1 floor.
+    if (Array.isArray(value)) return value.length > 0 || !field.required;
     const blank = value === undefined || String(value).trim().length === 0;
     // An optional field may be left alone, but not filled in wrongly: dropping
     // what someone typed while reporting success is the worse of the two.
@@ -182,6 +212,12 @@ export function toContent(fields: SchemaField[], answers: ElicitationDraft): Eli
   for (const field of fields) {
     const value = answers[field.name];
     if (value === undefined) continue;
+    if (Array.isArray(value)) {
+      // Multiple choice: send the selections as-is. An empty selection on a
+      // required field cannot reach here — isComplete gates submit.
+      content[field.name] = value;
+      continue;
+    }
     if (typeof value === "boolean") {
       content[field.name] = value;
       continue;
@@ -231,7 +267,7 @@ export function ElicitationSchemaForm({ fields, onSubmit, onReject }: Elicitatio
         const { name, prop, required } = field;
         const label = asText(prop.title) || name;
         const description = asText(prop.description);
-        const options = enumValues(prop);
+        const options = prop.type === "array" ? arrayEnumValues(prop) : enumValues(prop);
         const value = answers[name];
         const controlId = `${scope}-${name}`;
         const describedBy = asText(prop.description) ? `${controlId}-description` : undefined;
@@ -246,7 +282,32 @@ export function ElicitationSchemaForm({ fields, onSubmit, onReject }: Elicitatio
                 {description}
               </span>
             )}
-            {options.length > 0 ? (
+            {options.length > 0 && prop.type === "array" ? (
+              <div role="group" aria-label={label} className="flex flex-col gap-1">
+                {options.map((option, index) => {
+                  const selected = Array.isArray(value) && value.includes(option);
+                  return (
+                    <label key={option} className="flex items-center gap-2 text-ui text-foreground">
+                      <input
+                        id={`${controlId}-${index}`}
+                        type="checkbox"
+                        className="size-4"
+                        aria-describedby={describedBy}
+                        checked={selected}
+                        onChange={(e) => {
+                          const current = Array.isArray(value) ? value : [];
+                          const next = e.target.checked
+                            ? [...current, option]
+                            : current.filter((v) => v !== option);
+                          set(name, next);
+                        }}
+                      />
+                      {enumLabel(prop.items ?? prop, index, option)}
+                    </label>
+                  );
+                })}
+              </div>
+            ) : options.length > 0 ? (
               <select
                 id={controlId}
                 className="rounded border bg-background px-2 py-1 text-ui text-foreground"

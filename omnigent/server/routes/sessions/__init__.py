@@ -809,6 +809,7 @@ def create_sessions_router(
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     register_runner_ingest: Callable[..., None] | None = None,
+    register_recovery_ingest: Callable[..., None] | None = None,
     register_startup_dispatch: Callable[..., None] | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
 ) -> APIRouter:
@@ -975,6 +976,7 @@ def create_sessions_router(
         background_title_coordinator=background_title_coordinator,
         runner_tunnel_tokens=runner_tunnel_tokens,
         register_runner_ingest=register_runner_ingest,
+        register_recovery_ingest=register_recovery_ingest,
         register_startup_dispatch=register_startup_dispatch,
     )
 
