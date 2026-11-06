@@ -291,3 +291,199 @@ def test_durable_ask_survives_runner_restart(
     ).json()
     assert body["status"] == "resolved"
     assert body["action"] == "accept"
+
+
+def _run_ask_turn(stack: _AskUserStack, model: str, yaml_text: str, prompt: str) -> str:
+    """Start a session, run the prompt, park it on the durable ask; return (session, eid)."""
+    create = post_session_bundle(
+        httpx.post,
+        f"{stack.base_url}/v1/sessions",
+        bundle_files({"config.yaml": yaml_text.encode()}),
+        timeout=30.0,
+        trust_env=False,
+    )
+    create.raise_for_status()
+    session_id = str(create.json()["session_id"])
+    bind = httpx.patch(
+        f"{stack.base_url}/v1/sessions/{session_id}",
+        json={"runner_id": stack.runner_id},
+        timeout=10.0,
+        trust_env=False,
+    )
+    bind.raise_for_status()
+    posted = httpx.post(
+        f"{stack.base_url}/v1/sessions/{session_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+        },
+        timeout=30.0,
+        trust_env=False,
+    )
+    posted.raise_for_status()
+    pending = _wait(_durable_pending, stack.base_url, session_id, 60, "durable pending question")
+    return session_id, pending[0]["elicitation_id"]
+
+
+def test_durable_decline_reaches_the_model(stack: _AskUserStack, mock_llm_server_url: str) -> None:
+    """A decline must arrive as the structured tool result, not kill the turn."""
+    model = f"ask-decline-{uuid.uuid4().hex[:8]}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_ask_decline",
+                        "name": "sys_ask_user",
+                        "arguments": json.dumps(
+                            {
+                                "question": "Deploy to production?",
+                                "options": ["yes", "no"],
+                            }
+                        ),
+                    }
+                ]
+            }
+        ],
+        key=model,
+    )
+    set_fallback_mock_llm(
+        mock_llm_server_url, model, "DECLINE_PATH_DONE production deployment refused."
+    )
+    yaml_text = _AGENT_YAML.format(
+        model=model, mock_base_url=json.dumps(f"{mock_llm_server_url}/v1")
+    )
+    session_id, elicitation_id = _run_ask_turn(stack, model, yaml_text, "Deploy please")
+
+    # Decline through the real resolve endpoint with the runner ALIVE — the
+    # structured {"action": "decline"} must reach the parked waiter and flow
+    # to the model as the tool result; the legacy decline→interrupt gate must
+    # NOT cancel the parked turn first.
+    resolved = httpx.post(
+        f"{stack.base_url}/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "decline"},
+        timeout=30.0,
+        trust_env=False,
+    )
+    resolved.raise_for_status()
+
+    def _completed(base_url: str, session_id: str):
+        snap = _snapshot(base_url, session_id)
+        if snap.get("status") in {"idle", "completed", "succeeded"}:
+            items = httpx.get(
+                f"{base_url}/v1/sessions/{session_id}/items",
+                params={"limit": 200},
+                timeout=10.0,
+                trust_env=False,
+            ).json()["data"]
+            text = json.dumps(items)
+            if "DECLINE_PATH_DONE" in text:
+                return text
+        return None
+
+    final_items = _wait(
+        _completed, stack.base_url, session_id, 120, "decline continuation completion"
+    )
+
+    # The structured non-answer reached the model: exactly one decline tool
+    # result, the session completed (not failed/interrupted), one completion.
+    ask_outputs = [
+        str(item.get("output") or "")
+        for item in httpx.get(
+            f"{stack.base_url}/v1/sessions/{session_id}/items",
+            params={"limit": 200},
+            timeout=10.0,
+            trust_env=False,
+        ).json()["data"]
+        if item.get("type") == "function_call_output" and item.get("call_id") == "call_ask_decline"
+    ]
+    assert ask_outputs == ['{"action": "decline"}'], ask_outputs
+    assert final_items.count("DECLINE_PATH_DONE") == 1
+    snap = _snapshot(stack.base_url, session_id)
+    assert snap.get("status") == "idle", snap.get("last_task_error")
+
+
+def test_interrupt_while_pending_stays_stopped(
+    stack: _AskUserStack, mock_llm_server_url: str
+) -> None:
+    """An explicit interrupt stops the turn; the canceled ask is never re-woken."""
+    model = f"ask-interrupt-{uuid.uuid4().hex[:8]}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_ask_interrupt",
+                        "name": "sys_ask_user",
+                        "arguments": json.dumps(
+                            {"question": "Proceed?", "options": ["yes", "no"]}
+                        ),
+                    }
+                ]
+            }
+        ],
+        key=model,
+    )
+    # A DIFFERENT response queued behind the cancel — if recovery resurrected
+    # the canceled execution, the model would run again and this would appear.
+    set_fallback_mock_llm(mock_llm_server_url, model, "RESURRECTED_AFTER_INTERRUPT")
+    yaml_text = _AGENT_YAML.format(
+        model=model, mock_base_url=json.dumps(f"{mock_llm_server_url}/v1")
+    )
+    session_id, elicitation_id = _run_ask_turn(stack, model, yaml_text, "Deploy please")
+
+    # Explicit interrupt while the question is pending.
+    interrupted = httpx.post(
+        f"{stack.base_url}/v1/sessions/{session_id}/events",
+        json={"type": "interrupt"},
+        timeout=30.0,
+        trust_env=False,
+    )
+    interrupted.raise_for_status()
+
+    # The canceled row is terminal and invisible to recovery + snapshots.
+    deadline = time.monotonic() + 30
+    row = None
+    while time.monotonic() < deadline:
+        resp = httpx.get(
+            f"{stack.base_url}/v1/sessions/{session_id}/elicitations/{elicitation_id}",
+            timeout=10.0,
+            trust_env=False,
+        )
+        body = resp.json()
+        if body.get("status") == "resolved":
+            row = body
+            break
+        time.sleep(0.5)
+    assert row is not None, "interrupt must cancel the pending question"
+    assert row["action"] == "cancel"
+    listing = httpx.get(
+        f"{stack.base_url}/v1/sessions/{session_id}/durable_elicitations/unconsumed",
+        timeout=10.0,
+        trust_env=False,
+    ).json()["unconsumed"]
+    assert all(r["elicitation_id"] != elicitation_id for r in listing), (
+        "canceled rows must never be adopted by recovery"
+    )
+    snap = _snapshot(stack.base_url, session_id)
+    ids = [e.get("elicitation_id") for e in (snap.get("pending_elicitations") or [])]
+    assert elicitation_id not in ids, "canceled rows must not re-render as cards"
+
+    # No resurrection: give the runner ample time to (wrongly) continue; the
+    # queued RESURRECTED_AFTER_INTERRUPT reply must never appear, and the
+    # session must not start a new turn.
+    time.sleep(15)
+    snap = _snapshot(stack.base_url, session_id)
+    items = httpx.get(
+        f"{stack.base_url}/v1/sessions/{session_id}/items",
+        params={"limit": 200},
+        timeout=10.0,
+        trust_env=False,
+    ).json()["data"]
+    text = json.dumps(items)
+    assert "RESURRECTED_AFTER_INTERRUPT" not in text, (
+        "the canceled execution was resurrected after an explicit interrupt"
+    )
+    assert snap.get("status") in {"failed", "idle", "interrupted", "cancelled"}, snap.get("status")

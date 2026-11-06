@@ -54,6 +54,31 @@ _FETCH_TIMEOUT_S = 15.0
 # answer would strand the parked harness turn). Entries are removed on exit.
 _active_asks: dict[str, str] = {}
 
+# conversation_id → dispatch tasks parked on a durable ask. An explicit
+# interrupt cancels these — the harness-side future alone does NOT unwind the
+# runner-side park, and the park's cancellation handler is what cancels the
+# question server-side so a late answer cannot resurrect the stopped turn.
+_active_ask_tasks: dict[str, set[asyncio.Task]] = {}
+
+
+def cancel_active_asks(conversation_id: str) -> int:
+    """
+    Cancel every durable-ask dispatch parked for a session (explicit interrupt).
+
+    Cancelling the dispatch task triggers its cancellation handler, which
+    cancels the pending question server-side — the turn stays stopped.
+
+    :param conversation_id: Session id.
+    :returns: The number of parked asks cancelled.
+    """
+    tasks = _active_ask_tasks.get(conversation_id)
+    if not tasks:
+        return 0
+    count = len(tasks)
+    for task in list(tasks):
+        task.cancel()
+    return count
+
 
 def reset_for_tests() -> None:
     """Clear in-flight ask bookkeeping. Test isolation only."""
@@ -249,6 +274,9 @@ async def execute_ask_user(
         return json.dumps({"error": "server returned no elicitation_id"})
 
     _active_asks[call_id] = elicitation_id
+    _me = asyncio.current_task()
+    assert _me is not None
+    _active_ask_tasks.setdefault(conversation_id, set()).add(_me)
     # Suspend the harness turn's deadlines while the human decides.
     await _post_harness_event(
         harness_client,
@@ -303,7 +331,11 @@ async def execute_ask_user(
             answer = raw if isinstance(raw, (str, list)) else None
             output = format_tool_result(action="accept", answer=answer)
         else:
-            output = format_tool_result(action="decline")
+            # A cancel is NOT a decline: the model must see the truthful
+            # terminal action so it does not read the question as refused.
+            output = format_tool_result(
+                action=verdict.action if verdict.action in {"decline", "cancel"} else "decline"
+            )
         return output
     except asyncio.CancelledError:
         # Explicit interrupt: cancel the pending question server-side so a
@@ -323,6 +355,12 @@ async def execute_ask_user(
         raise
     finally:
         pending_approvals.cleanup(elicitation_id)
+        _me = asyncio.current_task()
+        _tasks = _active_ask_tasks.get(conversation_id)
+        if _tasks is not None and _me is not None:
+            _tasks.discard(_me)
+            if not _tasks:
+                _active_ask_tasks.pop(conversation_id, None)
         # _active_asks[call_id] is intentionally kept: dispatch_tool_locally
         # reads it after the tool_result POST lands to mark consumption, and
         # mark_consumed_if_ask removes the entry itself.
@@ -420,6 +458,16 @@ async def recover_answered_ask(
         action=action if action in {"accept", "decline", "cancel"} else "decline",
         answer=content.get("answer") if action == "accept" and isinstance(content, dict) else None,
     )
+    if action == "cancel":
+        # Explicit user cancellation: the parked turn is dead by intent.
+        # Never wake — an interrupt must stay stopped, and a canceled row
+        # must never be resurrected by a forwarded verdict or a sweep.
+        _logger.info(
+            "sys_ask_user %s was explicitly canceled; recovery skipped",
+            elicitation_id,
+            extra={"session_id": conversation_id},
+        )
+        return False
     wake_text = continuation_wake_text(action=action, content=content, tool_output=tool_output)
     # Claim FIRST (exactly-once); a duplicate recovery attempt is a no-op.
     claimed = await _post_server_event(

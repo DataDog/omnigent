@@ -15,6 +15,7 @@ import pytest
 from omnigent.runtime.durable_ask_user import configure_durable_elicitation_store
 from tests.server.helpers import create_test_agent
 from tests.server.integration.test_sessions_elicitation_resolve_url import (
+    _create_child_session,
     _create_session,
 )
 
@@ -321,3 +322,94 @@ async def test_unconsumed_listing_after_answer(client: httpx.AsyncClient, _wired
     )
     resp = await client.get(f"/v1/sessions/{session_id}/durable_elicitations/unconsumed")
     assert resp.json() == {"unconsumed": []}
+
+
+async def test_interrupt_stays_stopped(client: httpx.AsyncClient, _wired_store) -> None:
+    """Explicit cancel is terminal: never re-listed for recovery, never re-rendered."""
+    from omnigent.runtime.durable_ask_user import durable_store
+
+    agent = await create_test_agent(client, "durable-interrupt")
+    session_id = await _create_session(client, agent["id"])
+    registered = await _register_durable(client, session_id)
+    elicitation_id = registered["elicitation_id"]
+
+    # Explicit interrupt: the runner posts a cancel verdict.
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "cancel"},
+    )
+    assert resp.status_code == 202, resp.text
+
+    # The canceled row is terminal: not re-listed for recovery adoption…
+    listing = (
+        await client.get(f"/v1/sessions/{session_id}/durable_elicitations/unconsumed")
+    ).json()["unconsumed"]
+    assert listing == [], "canceled rows must never be adopted by recovery"
+    # …and not re-rendered as an answerable card in the snapshot.
+    snap = (await client.get(f"/v1/sessions/{session_id}")).json()
+    ids = [e.get("elicitation_id") for e in (snap.get("pending_elicitations") or [])]
+    assert elicitation_id not in ids, "canceled rows must not re-render as cards"
+    store = durable_store()
+    assert store is not None
+    row = store.get(elicitation_id)
+    assert row is not None
+    assert row.state == "canceled"
+    assert row.consumed_at is None  # bookkeeping: never consumed, never re-woken
+
+
+async def test_child_question_routes_to_parent(
+    client: httpx.AsyncClient, _wired_store, db_uri: str
+) -> None:
+    """A child's durable question surfaces on the parent and resolves the child's call."""
+    agent = await create_test_agent(client, "durable-child")
+    parent_id = await _create_session(client, agent["id"])
+    child_id = _create_child_session(db_uri, parent_id=parent_id, agent_id=agent["id"])
+    registered = await _register_durable(client, child_id)
+    elicitation_id = registered["elicitation_id"]
+
+    # Parent cold snapshot replays the child's question, routed to the child.
+    snap = (await client.get(f"/v1/sessions/{parent_id}")).json()
+    pending = [
+        e
+        for e in (snap.get("pending_elicitations") or [])
+        if e.get("elicitation_id") == elicitation_id
+    ]
+    assert len(pending) == 1, f"child question missing from parent snapshot: {pending}"
+    assert pending[0]["params"].get("target_session_id") == child_id
+
+    # Answering from the parent view resolves the child's parked call.
+    resp = await client.post(
+        f"/v1/sessions/{parent_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "accept", "content": {"answer": "staging"}},
+    )
+    assert resp.status_code == 202, resp.text
+    from omnigent.runtime.durable_ask_user import durable_store
+
+    store = durable_store()
+    assert store is not None
+    row = store.get(elicitation_id)
+    assert row is not None
+    assert row.conversation_id == child_id
+    assert row.answer_content == {"answer": "staging"}
+
+
+async def test_conflicting_answer_returns_409(client: httpx.AsyncClient, _wired_store) -> None:
+    """A second, different answer fails loud (409) — the first answer stands."""
+    agent = await create_test_agent(client, "durable-conflict-409")
+    session_id = await _create_session(client, agent["id"])
+    registered = await _register_durable(client, session_id)
+    elicitation_id = registered["elicitation_id"]
+    first = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "accept", "content": {"answer": "staging"}},
+    )
+    assert first.status_code == 202
+    conflict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "accept", "content": {"answer": "production"}},
+    )
+    assert conflict.status_code == 409, conflict.text
+    assert conflict.json()["error"]["code"] == "conflict"
+    # The first answer still stands.
+    data = (await client.get(f"/v1/sessions/{session_id}/elicitations/{elicitation_id}")).json()
+    assert data["content"] == {"answer": "staging"}

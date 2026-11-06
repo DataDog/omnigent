@@ -273,3 +273,49 @@ class TestRecovery:
         # wake — exactly-once at the recovery layer too (the store's consume
         # gate enforces the same property behind the real server).
         assert len(fake_server.wakes) == 1
+
+
+class TestInterruptStaysStopped:
+    """Explicit cancellation is terminal — recovery must never re-wake it."""
+
+    async def test_cancel_verdict_is_never_rewoken(self, fake_server: _FakeServer) -> None:
+        server_client, _ = _clients(fake_server)
+        fake_server.durable_state[hexid("a")] = {
+            "status": "resolved",
+            "action": "cancel",
+            "content": None,
+        }
+        # Recovery invoked with the canceled verdict (as any sweep or
+        # forwarded event would): must refuse without posting a wake.
+        recovered = await ask_user.recover_answered_ask(
+            elicitation_id=hexid("a"),
+            conversation_id=hexid("c"),
+            action="cancel",
+            content=None,
+            server_client=server_client,
+        )
+        assert recovered is False
+        assert fake_server.wakes == [], "an explicitly canceled ask must never wake"
+        assert fake_server.consumed == [], "cancel needs no consumption claim"
+
+
+class TestVerdictActionLabel:
+    """The model sees the truthful terminal action, not a decline mislabel."""
+
+    async def test_cancel_verdict_formats_as_cancel(self, fake_server: _FakeServer) -> None:
+        task = asyncio.create_task(_run(fake_server, {"question": "Proceed?"}))
+        await asyncio.sleep(0.02)
+        (elicitation_id,) = fake_server.questions.keys()
+        pending_approvals.resolve(elicitation_id, approved=False, action="cancel")
+        output = json.loads(await asyncio.wait_for(task, timeout=5))
+        assert output == {"action": "cancel"}
+
+    async def test_decline_verdict_still_formats_as_decline(
+        self, fake_server: _FakeServer
+    ) -> None:
+        task = asyncio.create_task(_run(fake_server, {"question": "Proceed?"}))
+        await asyncio.sleep(0.02)
+        (elicitation_id,) = fake_server.questions.keys()
+        pending_approvals.resolve(elicitation_id, approved=False, action="decline")
+        output = json.loads(await asyncio.wait_for(task, timeout=5))
+        assert output == {"action": "decline"}

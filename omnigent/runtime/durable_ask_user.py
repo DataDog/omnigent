@@ -330,7 +330,10 @@ def snapshot_for_session(conversation_id: str) -> list[dict[str, Any]]:
         )
         return []
     for record in owned:
-        if record.state == "consumed":
+        # Canceled rows are EXPLICIT user cancellation — terminal, never
+        # re-rendered as an answerable card (an answered-but-unconsumed row
+        # still replays so the client can show its committed outcome).
+        if record.state in {"consumed", "canceled"}:
             continue
         seen.add(record.id)
         events.append(pending_event_for_record(record))

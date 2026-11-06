@@ -3708,7 +3708,12 @@ def create_app(
                 )
                 continue
             for row in rows:
-                if row.state not in {"answered", "declined", "canceled"}:
+                # Only answered/declined rows carry a delivery obligation.
+                # "canceled" is EXPLICIT user cancellation (interrupt/stop):
+                # the parked turn is dead by intent — recovery must never
+                # wake a canceled question, or an interrupt would resurrect
+                # the execution it stopped.
+                if row.state not in {"answered", "declined"}:
                     continue
                 if row.consumed_at is not None:
                     continue

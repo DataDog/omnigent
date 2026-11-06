@@ -10,6 +10,7 @@ from fastapi import (
     Request,
 )
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     pending_elicitations,
@@ -139,7 +140,7 @@ def register_elicitations_routes(
             owner_id = await asyncio.to_thread(_get_session_owner_id, session_id, permission_store)
         except Exception:
             owner_id = None
-        await _resolve_elicitation(
+        outcome = await _resolve_elicitation(
             session_id,
             _resolve_data,
             runner_router,
@@ -147,6 +148,15 @@ def register_elicitations_routes(
             actor_user_id=user_id or owner_id or "local",
             session_owner_id=owner_id,
         )
+        if outcome == "conflict":
+            # A different answer was already committed for this question.
+            # Fail loud (409) rather than silently accepting a no-op so a
+            # client knows its answer did NOT stand.
+            raise OmnigentError(
+                f"Elicitation {elicitation_id} was already answered with a "
+                "different answer; the first answer stands.",
+                code=ErrorCode.CONFLICT,
+            )
         # Apply any policy writes deferred by the relay tool-call ASK gate
         # (e.g. a cost-budget checkpoint) now that the verdict is in.
         await _apply_pending_policy_ask_writes(
@@ -199,7 +209,9 @@ def register_elicitations_routes(
                     "content": row.answer_content,
                 }
                 for row in rows
-                if row.state in {"answered", "declined", "canceled"} and row.consumed_at is None
+                # Explicitly canceled rows are terminal by user intent and
+                # are never adopted by recovery.
+                if row.state in {"answered", "declined"} and row.consumed_at is None
             ]
         }
 

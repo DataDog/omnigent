@@ -1839,6 +1839,12 @@ def register_events_routes(
             target_conversation_id = ask_data.get("target_conversation_id")
             if not isinstance(target_conversation_id, str) or not target_conversation_id:
                 target_conversation_id = None
+            # Production child routing: a question asked by a child session
+            # presents on its user-facing parent, so ancestor cold snapshots
+            # replay it (target_conversation_id) and parent-view answers
+            # resolve the child's parked call.
+            if target_conversation_id is None and conv.parent_conversation_id:
+                target_conversation_id = conv.parent_conversation_id
             paused_call = ask_data.get("paused_call")
             if not isinstance(paused_call, dict):
                 paused_call = None

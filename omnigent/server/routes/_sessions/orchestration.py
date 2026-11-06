@@ -2301,7 +2301,13 @@ async def _resolve_elicitation(
     *,
     actor_user_id: str | None = None,
     session_owner_id: str | None = None,
-) -> None:
+) -> str | None:
+    """
+    :returns: The durable resolution outcome when the id named a durable
+        question (``"resolved"`` / ``"idempotent"`` / ``"conflict"`` /
+        ``"forbidden"``), or ``None`` when the verdict was handled by the
+        legacy in-memory paths or fell through for an unknown id.
+    """
     """
     Resolve one outstanding elicitation from an approval payload.
 
@@ -2399,7 +2405,7 @@ async def _resolve_elicitation(
                 error,
             )
             # Malformed answers fail cleanly; the question stays pending.
-            return
+            return "invalid"
         if outcome == NOT_FOUND:
             pass  # Not durable — fall through to the legacy paths.
         else:
@@ -2414,7 +2420,7 @@ async def _resolve_elicitation(
                     elicitation_id,
                     session_id,
                 )
-                return
+                return None
             if outcome in {RESOLVED, IDEMPOTENT}:
                 _publish_elicitation_resolved(session_id, elicitation_id, action=action)
                 if conversation_store is not None:
@@ -2443,7 +2449,7 @@ async def _resolve_elicitation(
                     },
                     runner_router,
                 )
-            return
+            return outcome
     harness_future = _harness_elicitation_registry.get(elicitation_id)
     if harness_future is not None and not harness_future.done():
         # Only the session that owns this elicitation
@@ -2561,6 +2567,7 @@ async def _resolve_elicitation(
             # Approval delivery is authoritative; metrics are observational.
             pass
     await _forward_approval_to_runner(session_id, data, runner_router)
+    return None
 
 
 def _spawn_native_approval_popup_forward(

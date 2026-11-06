@@ -3958,6 +3958,13 @@ def create_runner_app(
         """
         if process_manager is None:
             return
+        # Cancel the runner-side durable-ask parks FIRST: the harness-side
+        # future alone does not unwind a runner dispatch parked on a durable
+        # human question, and its cancellation handler is what cancels the
+        # pending question server-side (an interrupt must stay stopped).
+        from omnigent.runner import ask_user as _ask_user
+
+        _ask_user.cancel_active_asks(conv_id)
         try:
             harness_client = await process_manager.get_client(conv_id, "any")
             await harness_client.post(
@@ -6927,8 +6934,14 @@ def create_runner_app(
                 _data.get("elicitation_id", ""),
                 _elicit_action == "accept",
                 _elicit_content if isinstance(_elicit_content, dict) else None,
+                action=_elicit_action or None,
             )
-            if not _resolved and _data.get("durable") and server_client is not None:
+            if (
+                not _resolved
+                and _data.get("durable")
+                and server_client is not None
+                and _elicit_action != "cancel"
+            ):
                 # A durable sys_ask_user verdict arrived with NO live parked
                 # waiter in this runner process: the harness turn (and
                 # possibly the whole runner) died while the question was
@@ -6937,6 +6950,10 @@ def create_runner_app(
                 # wake the session with one hidden meta message. The
                 # committed history already carries the original prompt and
                 # every preceding tool result, so nothing replays.
+                # EXCLUSION: action == "cancel" is explicit user cancellation
+                # (session interrupt/stop) — the parked turn is dead BY
+                # INTENT and must stay stopped; recovery must never
+                # resurrect an explicitly canceled question.
                 from omnigent.runner import ask_user as _ask_user
 
                 _recovery_task = asyncio.ensure_future(
@@ -6955,7 +6972,7 @@ def create_runner_app(
                 )
                 _background_tasks.add(_recovery_task)
                 _recovery_task.add_done_callback(_background_tasks.discard)
-            if _elicit_action == "decline":
+            if _elicit_action == "decline" and not _data.get("durable"):
                 try:
                     _int_client = await process_manager.get_client(conversation_id, "any")
                     await _int_client.post(
