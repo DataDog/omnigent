@@ -22,10 +22,11 @@ import {
   WORKSPACE_FILE_LINK_ATTR,
 } from "@/components/ai-elements/streamdown-security";
 import { ZoomableImage } from "@/components/ImageLightbox";
+import { VideoPlayer } from "@/components/VideoPlayer";
+import { isRemoteVideoUrl, isVideoFile } from "@/lib/video";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
 import { withBasePath } from "@/lib/basePath";
-import { isNativeShell } from "@/lib/nativeBridge";
-import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
+import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import {
   useFileViewer,
@@ -97,7 +98,7 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
   const { exists, settled } = useWorkspaceFileExists(
     conversationId,
     openFile && linkPath && !isChanged ? linkPath : null,
-    explicitLink || (resolution?.trusted ?? false),
+    explicitLink || (resolution?.trusted ?? false) || isVideoFile(cited),
   );
 
   if (!openFile || !linkPath || !(isChanged || exists)) {
@@ -225,44 +226,6 @@ function githubPullRequest(href: string | undefined): string | null {
   }
 }
 
-/**
- * Follows an external chat link (`target="_blank"`) on a plain click, with a
- * same-tab fallback where popup creation is withheld. In a normal browser tab
- * the link still opens a new tab, but in an embedding host pane (or under a
- * popup blocker) a bare `_blank` click is silently swallowed — nothing opens
- * and nothing navigates — so a click must fall back to navigating in place.
- * Modified clicks (cmd/ctrl/shift/alt, non-primary buttons) keep their native
- * open-in-new-tab / menu semantics. In a native shell the default path is the
- * shell's window-open policy (external browser / system handlers) — except
- * when the user opted in to the in-app browser, where a plain click on a web
- * link routes to the conversation's embedded browser pane instead. The web
- * popup fallback never runs natively: the shell's policy reports `null` from
- * window.open regardless, so it would navigate twice.
- */
-function followLinkWithPopupFallback(
-  event: React.MouseEvent<HTMLAnchorElement>,
-  href: string,
-  conversationId: string | undefined,
-): void {
-  if (event.defaultPrevented || event.button !== 0) return;
-  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-  if (isNativeShell()) {
-    if (maybeOpenLinkInApp(conversationId, href)) event.preventDefault();
-    return;
-  }
-  if (!/^(?:https?:)?\/\//i.test(href)) return;
-  event.preventDefault();
-  const popup = window.open("about:blank", "_blank");
-  if (popup) {
-    popup.opener = null;
-  }
-  const link = (popup?.document ?? document).createElement("a");
-  link.href = href;
-  link.target = "_self";
-  link.rel = "noopener noreferrer";
-  link.click();
-}
-
 function PullRequestLinkLabel({ children }: { children: React.ReactNode }) {
   const words = typeof children === "string" ? children.match(/^(\S+)([\s\S]*)$/) : null;
   const prefix = (
@@ -305,6 +268,15 @@ function WorkspaceFileLink({
   const conversationId = useFileViewerConversationId();
 
   if (!path) {
+    if (typeof href === "string" && isRemoteVideoUrl(href)) {
+      return (
+        <VideoPlayer
+          compact
+          src={href}
+          title={typeof children === "string" ? children : "Video recording"}
+        />
+      );
+    }
     // Rebase an app-internal link (e.g. an agent's `/clear` "the new chat"
     // `/c/<id>`) under the deployment base path; no-op for external URLs, `#`
     // fragments, and at the origin root. The router basename does not reach raw
@@ -384,6 +356,20 @@ function WorkspaceFileLink({
       <span className={className} title={title ?? path}>
         {children}
       </span>
+    );
+  }
+
+  if (conversationId && isVideoFile(resolvedPath)) {
+    return (
+      <VideoPlayer
+        compact
+        conversationId={conversationId}
+        path={resolvedPath}
+        title={
+          typeof children === "string" ? children : (resolvedPath.split("/").pop() ?? resolvedPath)
+        }
+        onOpenFile={openWorkspaceFile}
+      />
     );
   }
 

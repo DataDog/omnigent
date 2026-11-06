@@ -33,6 +33,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -43,7 +44,11 @@ from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
-from omnigent.server.schemas import CreateResponseRequest
+from omnigent.server.schemas import (
+    CreateResponseRequest,
+    HeartbeatEvent,
+    OutputTextDeltaEvent,
+)
 
 _TEST_HARNESS_NAME = "scaffold_fixture"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_scaffold_harnesses"
@@ -247,6 +252,191 @@ async def test_build_terminal_event_handles_pending_task_cancellation() -> None:
     assert terminal.type == "response.cancelled"
     assert terminal.sequence_number == 3
     assert terminal.response.status == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_dispatch_tool_holds_idle_watchdog_while_parked(cancel: bool) -> None:
+    """A parked client-owned tool call counts as a human-approval wait for the idle watchdog.
+
+    Without this, a client-tool call that waits on a person for longer than
+    the idle window (default 1h) would fail the turn via the idle watchdog
+    even though the harness is healthy and simply waiting on an answer —
+    the same reason ``elicit`` already holds the watchdog open. Pins the
+    counter transition directly (0 -> 1 while parked -> 0 once settled),
+    for both a normal answer and a cancelled (interrupted) wait. Passes
+    ``client_owned=True`` explicitly (the default) to document the branch
+    under test — see ``test_dispatch_tool_with_client_owned_false_...``
+    below for the server-executed counterpart.
+    """
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext("resp_dispatch_tool", queue, asyncio.Event())
+    assert ctx._pending_human_waits == 0
+
+    task = asyncio.create_task(
+        ctx.dispatch_tool("call_test", "lookup", "{}", "test-agent", client_owned=True)
+    )
+    parked_event = await queue.get()
+    assert parked_event.item["status"] == "action_required"
+    # Parked: the idle watchdog's hold hook must now be eligible to fire on
+    # every heartbeat — without this, an unanswered call would eventually
+    # fail the turn even though nothing is actually wedged.
+    assert ctx._pending_human_waits == 1
+
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        ctx._pending_tool_calls["call_test"].set_result("the answer")
+        assert await task == "the answer"
+
+    # Settled either way: the hold must release so a later, unrelated
+    # approval wait on the same turn isn't left permanently "held".
+    assert ctx._pending_human_waits == 0
+    assert ctx._pending_tool_calls == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_dispatch_tool_with_client_owned_false_never_holds_idle_watchdog(
+    cancel: bool,
+) -> None:
+    """A server-executed tool call (``client_owned=False``) never counts as a human wait.
+
+    A host-tool-bridge dispatch (e.g. ``sys_os_shell``) is answered by
+    Omnigent's own machinery, not a person — if it wedged, a ``dispatch_tool``
+    that unconditionally incremented ``_pending_human_waits`` would suppress
+    the idle watchdog for a genuinely stuck server-side call. Pins the
+    counter stays at 0 throughout, for both a normal answer and a cancelled
+    (interrupted) wait.
+    """
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext("resp_dispatch_tool_server", queue, asyncio.Event())
+    assert ctx._pending_human_waits == 0
+
+    task = asyncio.create_task(
+        ctx.dispatch_tool("call_host", "sys_os_shell", "{}", "test-agent", client_owned=False)
+    )
+    parked_event = await queue.get()
+    assert parked_event.item["status"] == "action_required"
+    # Never held — nothing here is waiting on a person, so a wedged call
+    # must still be caught by the idle watchdog like any other stalled step.
+    assert ctx._pending_human_waits == 0
+
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        ctx._pending_tool_calls["call_host"].set_result("shell output")
+        assert await task == "shell output"
+
+    assert ctx._pending_human_waits == 0
+    assert ctx._pending_tool_calls == {}
+
+
+async def test_client_owned_wait_outlives_idle_timeout_without_failing_the_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A genuine client-owned wait survives past the idle window via heartbeats.
+
+    Mirrors what a live turn does: the heartbeat loop keeps calling
+    ``ctx.emit`` on a fixed cadence, and each heartbeat holds the idle
+    deadline open while ``_pending_human_waits > 0``. The parked call here
+    outlives the (shortened) idle window several times over purely on
+    heartbeats, then answers — the turn must complete normally, proving the
+    exemption actually works end to end through ``_guarded_run_turn``, not
+    just as an isolated counter check.
+    """
+    from omnigent.runtime.harnesses import _scaffold
+
+    class _ParksOnClientOwnedCall(HarnessApp):
+        async def run_turn(self, request: Any, ctx: TurnContext) -> None:
+            del request
+            result = await ctx.dispatch_tool(
+                "call_human", "ask_human", "{}", "test-agent", client_owned=True
+            )
+            ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta=result))
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 10.0)
+
+    app = _ParksOnClientOwnedCall()
+    event_queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext(
+        response_id="resp_client_owned_long_wait",
+        event_queue=event_queue,
+        cancelled=asyncio.Event(),
+    )
+
+    async def _hold_with_heartbeats_then_answer() -> None:
+        # Six heartbeats at 0.15s > the 0.2s idle window's total elapsed
+        # (0.9s) — without the hold, the idle watchdog would have fired
+        # well before the human answers.
+        for _ in range(6):
+            await asyncio.sleep(0.15)
+            ctx.emit(HeartbeatEvent(type="response.heartbeat"))
+        future = ctx._pending_tool_calls.get("call_human")
+        assert future is not None and not future.done()
+        future.set_result("the human's answer")
+
+    async with asyncio.timeout(5):
+        await asyncio.gather(
+            app._guarded_run_turn(None, ctx),  # type: ignore[arg-type]
+            _hold_with_heartbeats_then_answer(),
+        )
+    assert ctx._pending_human_waits == 0
+
+
+async def test_server_executed_wait_still_times_out_via_idle_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A wedged server-executed call (``client_owned=False``) still fails the turn.
+
+    Even with the same heartbeat cadence that holds a genuine client-owned
+    wait open, a server-executed dispatch must not be exempted — nothing is
+    waiting on a person, so a stuck host-tool-bridge call is exactly the
+    wedge the idle watchdog exists to catch.
+    """
+    from omnigent.runtime.harnesses import _scaffold
+
+    class _ParksOnServerExecutedCall(HarnessApp):
+        async def run_turn(self, request: Any, ctx: TurnContext) -> None:
+            del request
+            await ctx.dispatch_tool(
+                "call_host_wedge", "sys_os_shell", "{}", "test-agent", client_owned=False
+            )
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 10.0)
+
+    app = _ParksOnServerExecutedCall()
+    event_queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext(
+        response_id="resp_server_executed_wedge",
+        event_queue=event_queue,
+        cancelled=asyncio.Event(),
+    )
+
+    async def _emit_heartbeats_forever() -> None:
+        # Same cadence as the client-owned test — proves these heartbeats do
+        # NOT hold the deadline open when nothing is counted as a human wait.
+        while True:
+            await asyncio.sleep(0.15)
+            ctx.emit(HeartbeatEvent(type="response.heartbeat"))
+
+    heartbeat_task = asyncio.create_task(_emit_heartbeats_forever())
+    try:
+        async with asyncio.timeout(5):
+            with pytest.raises(RuntimeError, match="idle watchdog"):
+                await app._guarded_run_turn(None, ctx)  # type: ignore[arg-type]
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
 
 
 @pytest.mark.asyncio
@@ -1647,6 +1837,96 @@ async def test_interrupt_then_message_without_prev_id_starts_fresh_turn(
         await followup_client.aclose()
 
 
+async def test_steer_after_interrupt_does_not_start_a_stray_turn(
+    use_cancellable: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """A steer landing after its turn was interrupted must not start a turn.
+
+    The runner forwards a mid-turn message (stamped ``injection_id``) while it
+    still sees the turn as live, and also buffers it for a continuation turn.
+    If the harness turn was already interrupted, starting a turn for the steer
+    makes the runner's continuation turn-start get a 204 injection instead —
+    the user's next message fails with "turn failed (status 204)".
+    """
+    conv_id = "conv_steer_after_interrupt"
+    stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    steer_client = _make_side_client(str(manager.socket_path(conv_id)))
+    next_client = _make_side_client(str(manager.socket_path(conv_id)))
+    start_body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
+    followup = [{"type": "input_text", "text": "say hi"}]
+    steer_body = {**start_body, "content": followup, "injection_id": "inj_after_interrupt"}
+    next_body = {**start_body, "content": followup}
+    steer_status: int | None = None
+    next_status: int | None = None
+    try:
+        async with stream_client.stream(
+            "POST", f"/v1/sessions/{conv_id}/events", json=start_body
+        ) as response:
+            async for event in _stream_iter(response):
+                if event.event != "response.in_progress":
+                    continue
+                cancel_resp = await side_client.post(
+                    f"/v1/sessions/{conv_id}/events", json={"type": "interrupt"}
+                )
+                assert cancel_resp.status_code == 204
+                # Hold the steer's response open so a stray turn it starts stays
+                # live while the runner's continuation turn-start arrives.
+                async with steer_client.stream(
+                    "POST", f"/v1/sessions/{conv_id}/events", json=steer_body
+                ) as steer:
+                    steer_status = steer.status_code
+                    async with next_client.stream(
+                        "POST", f"/v1/sessions/{conv_id}/events", json=next_body
+                    ) as nxt:
+                        next_status = nxt.status_code
+                break
+        assert next_status == 200, (
+            f"the continuation turn must start a fresh turn (200), got {next_status}"
+        )
+        assert steer_status == 409, (
+            f"a steer with no live turn must be refused, got {steer_status}"
+        )
+    finally:
+        await side_client.aclose()
+        await steer_client.aclose()
+        await next_client.aclose()
+
+
+async def test_steer_with_injection_id_injects_live_turn(
+    use_injection: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """A runner steer (``injection_id`` set) still injects into a live turn."""
+    conv_id = "conv_steer_live_turn"
+    stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    start_body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
+    steer_body = {
+        **start_body,
+        "content": [{"type": "input_text", "text": "x"}],
+        "injection_id": "inj_live",
+    }
+    deltas: list[str] = []
+    try:
+        async with stream_client.stream(
+            "POST", f"/v1/sessions/{conv_id}/events", json=start_body
+        ) as response:
+            async for event in _stream_iter(response):
+                if event.event != "response.output_text.delta":
+                    continue
+                deltas.append(event.data["delta"])
+                if event.data["delta"] == "ready:":
+                    steer = await side_client.post(
+                        f"/v1/sessions/{conv_id}/events", json=steer_body
+                    )
+                    assert steer.status_code == 204
+        assert deltas == ["ready:", "got_1"]
+    finally:
+        await side_client.aclose()
+
+
 async def test_interrupt_then_message_with_prev_id_starts_fresh_turn(
     use_cancellable: None,
     manager: HarnessProcessManager,
@@ -1915,14 +2195,19 @@ async def test_idle_watchdog_attaches_recent_forwarder_post_failure(
             await asyncio.Event().wait()
 
     # Short idle window so the watchdog trips quickly; absolute kept high so the
-    # idle ceiling (not the absolute one) is what fails the turn. The reader's
-    # recency window is 2x the idle timeout, comfortably covering the record
-    # made just before run_turn started plus scheduling overhead.
-    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.2)
+    # idle ceiling (not the absolute one) is what fails the turn.
+    idle_timeout = 0.2
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", idle_timeout)
     monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 3600.0)
+    # Age the failure by exactly the wedged attempts' idle windows (plus a
+    # margin) on a fake clock, so a stalled runner can't push it out of range.
+    health_clock = {"now": 1000.0}
+    monkeypatch.setattr(health, "time", SimpleNamespace(monotonic=lambda: health_clock["now"]))
 
     health.clear()
     health.record_post_failure("external_session_status", httpx.ConnectError("No route to host"))
+    attempts = 1 + _scaffold._WEDGED_TURN_RECOVERY_RETRIES
+    health_clock["now"] += idle_timeout * attempts + 0.05
 
     app = _WedgedApp()
     ctx = TurnContext(

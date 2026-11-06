@@ -20,11 +20,13 @@ minted session cookie is the production code path.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 import httpx
 import jwt
@@ -54,10 +56,21 @@ _ISSUER = "https://accounts.google.com"
 _CLIENT_ID = "cid"
 
 
+def _cli_pkce_pair() -> tuple[str, str]:
+    verifier = "v" * 64
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    return verifier, challenge
+
+
 def _oidc_config(
     skip_email_verification: bool = False,
     email_claim: str = "email",
     client_secret: str | None = "secret",
+    allow_missing_auth_time: bool = False,
 ) -> OIDCConfig:
     """Build a generic-OIDC config over plain HTTP (so TestClient cookies stick).
 
@@ -87,6 +100,7 @@ def _oidc_config(
         allow_invites=False,
         skip_email_verification=skip_email_verification,
         email_claim=email_claim,
+        allow_missing_auth_time=allow_missing_auth_time,
     )
 
 
@@ -233,14 +247,20 @@ def _do_callback(client: TestClient, id_token: str) -> httpx.Response:
 
 
 @pytest.mark.parametrize(
-    "redirect_uri",
-    [None, "http://127.0.0.1:53682/callback", "ai.omnigent.ios:/oauth/callback"],
-    ids=["browser", "desktop", "ios"],
+    ("redirect_uri", "cli_ticket"),
+    [
+        (None, False),
+        (None, True),
+        ("http://127.0.0.1:53682/callback", False),
+        ("ai.omnigent.ios:/oauth/callback", False),
+    ],
+    ids=["browser", "browser-cli-consent", "desktop", "ios"],
 )
 def test_callback_persists_provider_binding_in_encrypted_session(
     tmp_path: Path,
     db_uri: str,
     redirect_uri: str | None,
+    cli_ticket: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Browser and native login retain the verified provider identity for Habitat."""
@@ -280,7 +300,13 @@ def test_callback_persists_provider_binding_in_encrypted_session(
 
     try:
         with TestClient(app) as client:
-            token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+            token = keys.sign_id_token(
+                {
+                    "email": "alice@example.com",
+                    "email_verified": True,
+                    "auth_time": int(time.time()),
+                }
+            )
             if redirect_uri is not None:
                 verifier = "v" * 64
                 login = client.get(
@@ -294,6 +320,20 @@ def test_callback_persists_provider_binding_in_encrypted_session(
                     follow_redirects=False,
                 )
                 state = parse_qs(urlparse(login.headers["location"]).query)["state"][0]
+                pending_id_token[0] = token
+                response = client.get(
+                    "/auth/callback",
+                    params={"code": "idp-code", "state": state},
+                    follow_redirects=False,
+                )
+            elif cli_ticket:
+                verifier, challenge = _cli_pkce_pair()
+                ticket = client.post(
+                    "/auth/cli-login",
+                    json={"code_challenge": challenge, "code_challenge_method": "S256"},
+                ).json()["ticket"]
+                login = client.get(f"/auth/login?ticket={ticket}&reauth=1", follow_redirects=False)
+                state = parse_qs(urlsplit(login.headers["location"]).query)["state"][0]
                 pending_id_token[0] = token
                 response = client.get(
                     "/auth/callback",
@@ -314,6 +354,22 @@ def test_callback_persists_provider_binding_in_encrypted_session(
                 handle = exchanged.json()["token"]
             else:
                 handle = response.cookies.get("ap_session")
+            if cli_ticket:
+                assert client.get(response.headers["location"]).status_code == 200
+                assert (
+                    client.get(
+                        f"/auth/cli-poll?ticket={ticket}&code_verifier={verifier}"
+                    ).status_code
+                    == 202
+                )
+                approved = client.post(
+                    "/auth/cli-approve",
+                    data={"ticket": ticket},
+                    headers={"Origin": "http://testserver"},
+                )
+                assert "Approved" in approved.text
+                redeemed = client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={verifier}")
+                assert redeemed.json()["token"] == handle
             assert handle is not None
             resolved = store.resolve(handle)
             assert resolved is not None
@@ -727,6 +783,65 @@ def test_reauth_callback_rejects_missing_auth_time(
     assert resp.cookies.get("ap_session") is None
 
 
+@pytest.mark.parametrize(
+    "callback_client",
+    [{"allow_missing_auth_time": True}],
+    indirect=True,
+)
+def test_reauth_callback_allows_missing_auth_time_when_enabled(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A trusted OIDC token without auth_time works only with the opt-in."""
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    resp = _do_callback_reauth(client, token, reauth_at=int(time.time()))
+
+    assert resp.status_code == 302, resp.text
+    assert resp.cookies.get("ap_session") is not None
+
+
+@pytest.mark.parametrize(
+    "callback_client",
+    [{"allow_missing_auth_time": True}],
+    indirect=True,
+)
+def test_reauth_callback_still_rejects_stale_auth_time_when_enabled(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """The opt-in does not accept a known stale authentication."""
+    client, keys = callback_client
+    reauth_at = int(time.time())
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": reauth_at - 3600}
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 403, resp.text
+    assert "did not re-authenticate" in resp.json()["error"]
+
+
+@pytest.mark.parametrize(
+    "callback_client",
+    [{"allow_missing_auth_time": True}],
+    indirect=True,
+)
+def test_reauth_callback_rejects_invalid_auth_time_when_enabled(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A malformed claim is not the Ticino missing-claim compatibility case."""
+    client, keys = callback_client
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": "invalid"}
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=int(time.time()))
+
+    assert resp.status_code == 403, resp.text
+    assert "did not confirm re-authentication" in resp.json()["error"]
+
+
 def test_non_reauth_callback_ignores_auth_time(
     callback_client: tuple[TestClient, _IdpKeys],
 ) -> None:
@@ -746,6 +861,125 @@ def test_non_reauth_callback_ignores_auth_time(
 
 
 # ── CLI login tickets + login-issued refresh grants ───────────────
+
+
+@pytest.mark.parametrize("reauth", ["1", "0", None])
+def test_cli_ticket_generic_oidc_reauth_round_trip(
+    callback_client: tuple[TestClient, _IdpKeys],
+    reauth: str | None,
+) -> None:
+    client, keys = callback_client
+    verifier, challenge = _cli_pkce_pair()
+    created = client.post(
+        "/auth/cli-login", json={"code_challenge": challenge, "code_challenge_method": "S256"}
+    ).json()
+    login_url = httpx.URL(created["login_url"]).copy_remove_param("reauth")
+    if reauth is not None:
+        login_url = login_url.copy_set_param("reauth", reauth)
+    login = client.get(str(login_url), follow_redirects=False)
+    authorization = parse_qs(urlsplit(login.headers["location"]).query)
+    assert authorization["prompt"] == ["login"]
+    assert authorization["max_age"] == ["0"]
+    state = jwt.decode(
+        client.cookies[_AUTH_STATE_COOKIE_PLAIN], _TEST_SECRET, algorithms=["HS256"]
+    )
+    assert state["ticket"] == created["ticket"]
+    client.app.state.pending_id_token[0] = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": state["reauth_at"]}
+    )
+    callback = client.get(
+        "/auth/callback",
+        params={"code": "auth-code", "state": authorization["state"][0]},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 302
+    consent = client.get(callback.headers["location"])
+    assert "Authorize sign-in" in consent.text
+    poll_params = {"ticket": created["ticket"]}
+    poll_headers = {"X-Omnigent-Code-Verifier": verifier}
+    assert (
+        client.get("/auth/cli-poll", params=poll_params, headers=poll_headers).status_code == 202
+    )
+    approval = client.post(
+        "/auth/cli-approve", data=poll_params, headers={"Origin": "http://testserver"}
+    )
+    assert "<h1>Approved</h1>" in approval.text
+    redeemed = client.get("/auth/cli-poll", params=poll_params, headers=poll_headers)
+    assert redeemed.status_code == 200
+    assert redeemed.json()["user_id"] == "alice@example.com"
+
+
+@pytest.mark.parametrize(
+    "login_kind",
+    ["ordinary_session", "other_ticket", "legacy_state"],
+)
+def test_cli_approval_requires_authentication_for_its_ticket(
+    callback_client: tuple[TestClient, _IdpKeys], login_kind: str
+) -> None:
+    client, keys = callback_client
+    verifier, challenge = _cli_pkce_pair()
+    body = {"code_challenge": challenge, "code_challenge_method": "S256"}
+    created = client.post("/auth/cli-login", json=body).json()
+    ticket = created["ticket"]
+    consent_url = f"/auth/cli-consent?ticket={ticket}"
+    if login_kind == "other_ticket":
+        login_url = client.post("/auth/cli-login", json=body).json()["login_url"]
+    else:
+        login_url = str(httpx.URL("/auth/login", params={"return_to": consent_url}))
+    login = client.get(login_url, follow_redirects=False)
+    authorization = parse_qs(urlsplit(login.headers["location"]).query)
+    state = jwt.decode(
+        client.cookies[_AUTH_STATE_COOKIE_PLAIN], _TEST_SECRET, algorithms=["HS256"]
+    )
+    if login_kind == "legacy_state":
+        state["ticket"] = ticket
+        for cookie in client.cookies.jar:
+            if cookie.name == _AUTH_STATE_COOKIE_PLAIN:
+                cookie.value = jwt.encode(state, _TEST_SECRET, algorithm="HS256")
+    claims: dict[str, object] = {"email": "alice@example.com", "email_verified": True}
+    claims["auth_time"] = int(time.time())
+    client.app.state.pending_id_token[0] = keys.sign_id_token(claims)
+    callback = client.get(
+        "/auth/callback",
+        params={"code": "auth-code", "state": authorization["state"][0]},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 302
+    approval = client.post(
+        "/auth/cli-approve", data={"ticket": ticket}, headers={"Origin": "http://testserver"}
+    )
+    assert "<h1>Approved</h1>" not in approval.text
+    poll_params = {"ticket": ticket}
+    poll_headers = {"X-Omnigent-Code-Verifier": verifier}
+    assert (
+        client.get("/auth/cli-poll", params=poll_params, headers=poll_headers).status_code == 202
+    )
+    consent = client.get(consent_url, follow_redirects=False)
+    assert consent.status_code == 302
+    bounce_params = parse_qs(urlsplit(consent.headers["location"]).query)
+    assert bounce_params["ticket"] == [ticket]
+    login = client.get(consent.headers["location"], follow_redirects=False)
+    authorization = parse_qs(urlsplit(login.headers["location"]).query)
+    assert authorization["prompt"] == ["login"]
+    state = jwt.decode(
+        client.cookies[_AUTH_STATE_COOKIE_PLAIN], _TEST_SECRET, algorithms=["HS256"]
+    )
+    claims["auth_time"] = state["reauth_at"]
+    client.app.state.pending_id_token[0] = keys.sign_id_token(claims)
+    callback = client.get(
+        "/auth/callback",
+        params={"code": "auth-code", "state": authorization["state"][0]},
+        follow_redirects=False,
+    )
+    assert callback.status_code == 302
+    assert client.get(consent_url).status_code == 200
+    approval = client.post(
+        "/auth/cli-approve", data=poll_params, headers={"Origin": "http://testserver"}
+    )
+    assert "<h1>Approved</h1>" in approval.text
+    assert (
+        client.get("/auth/cli-poll", params=poll_params, headers=poll_headers).status_code == 200
+    )
 
 
 def test_cli_ticket_fulfillment_issues_refresh_grant(
@@ -805,14 +1039,19 @@ def test_cli_ticket_fulfillment_issues_refresh_grant(
 
     with TestClient(app) as client:
         # 1. CLI requests a ticket.
-        r = client.post("/auth/cli-login")
+        cli_verifier, cli_challenge = _cli_pkce_pair()
+        r = client.post(
+            "/auth/cli-login",
+            json={"code_challenge": cli_challenge, "code_challenge_method": "S256"},
+        )
         assert r.status_code == 200, r.text
         ticket = r.json()["ticket"]
 
         # 2. Browser completes the IdP flow; the state cookie carries the
-        # ticket so the callback fulfills it.
+        # ticket so the callback redirects to the consent page.
+        reauth_at = int(time.time())
         pending_id_token[0] = keys.sign_id_token(
-            {"email": "alice@example.com", "email_verified": True}
+            {"email": "alice@example.com", "email_verified": True, "auth_time": reauth_at}
         )
         state = "state-token-xyz"
         state_jwt = jwt.encode(
@@ -821,6 +1060,7 @@ def test_cli_ticket_fulfillment_issues_refresh_grant(
                 "code_verifier": "verifier",
                 "return_to": "/",
                 "ticket": ticket,
+                "reauth_at": reauth_at,
                 "exp": int(time.time()) + 300,
             },
             _TEST_SECRET,
@@ -831,10 +1071,17 @@ def test_cli_ticket_fulfillment_issues_refresh_grant(
             f"/auth/callback?code=auth-code&state={state}",
             follow_redirects=False,
         )
-        assert r.status_code == 200, r.text  # HTML "Login successful" page
+        assert r.status_code == 302, r.text
+        assert r.headers["location"] == f"/auth/cli-consent?ticket={ticket}"
+        r = client.post(
+            "/auth/cli-approve",
+            data={"ticket": ticket},
+            headers={"Origin": "http://localhost:8000"},
+        )
+        assert r.status_code == 200, r.text
 
         # 3. The CLI polls: session token AND refresh material.
-        r = client.get(f"/auth/cli-poll?ticket={ticket}")
+        r = client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={cli_verifier}")
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["user_id"] == "alice@example.com"
@@ -897,10 +1144,15 @@ def test_cli_poll_without_grant_store_keeps_legacy_shape(
         prefix="/auth",
     )
     with TestClient(app) as client:
-        r = client.post("/auth/cli-login")
+        cli_verifier, cli_challenge = _cli_pkce_pair()
+        r = client.post(
+            "/auth/cli-login",
+            json={"code_challenge": cli_challenge, "code_challenge_method": "S256"},
+        )
         ticket = r.json()["ticket"]
+        reauth_at = int(time.time())
         pending_id_token[0] = keys.sign_id_token(
-            {"email": "alice@example.com", "email_verified": True}
+            {"email": "alice@example.com", "email_verified": True, "auth_time": reauth_at}
         )
         state = "state-token-xyz"
         state_jwt = jwt.encode(
@@ -909,13 +1161,21 @@ def test_cli_poll_without_grant_store_keeps_legacy_shape(
                 "code_verifier": "verifier",
                 "return_to": "/",
                 "ticket": ticket,
+                "reauth_at": reauth_at,
                 "exp": int(time.time()) + 300,
             },
             _TEST_SECRET,
             algorithm="HS256",
         )
         client.cookies.set(_AUTH_STATE_COOKIE_PLAIN, state_jwt)
-        client.get(f"/auth/callback?code=auth-code&state={state}", follow_redirects=False)
-        r = client.get(f"/auth/cli-poll?ticket={ticket}")
+        r = client.get(f"/auth/callback?code=auth-code&state={state}", follow_redirects=False)
+        assert r.status_code == 302
+        r = client.post(
+            "/auth/cli-approve",
+            data={"ticket": ticket},
+            headers={"Origin": "http://localhost:8000"},
+        )
+        assert r.status_code == 200
+        r = client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={cli_verifier}")
         assert r.status_code == 200, r.text
         assert "refresh_token" not in r.json()

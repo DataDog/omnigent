@@ -263,10 +263,11 @@ _CLAUDE_NATIVE_PERMISSION_MODES: frozenset[str] = frozenset(
     {"default", "acceptEdits", "plan", "auto"}
 )
 # Modes the forwarder can read off the pane footer. A session launched into
-# ``bypassPermissions`` reports it so the label and picker show the real mode;
-# it is still not a PATCH target.
+# ``bypassPermissions`` or ``dontAsk`` reports it so the label and picker show
+# the real mode; neither is a PATCH target.
 _CLAUDE_NATIVE_READABLE_PERMISSION_MODES: frozenset[str] = _CLAUDE_NATIVE_PERMISSION_MODES | {
-    "bypassPermissions"
+    "bypassPermissions",
+    "dontAsk",
 }
 
 
@@ -798,6 +799,7 @@ class _PendingPolicyAskWrites:
         (e.g. ``INCREMENT`` state updates for cost-budget counters).
     :param reviewed_arguments: Original MCP arguments shown for approval.
     :param transformed_arguments: Policy transform stored with that approval.
+    :param mcp_call_identity: Session, tool, policy actor and credential user.
     """
 
     state_updates: list[StateUpdate] | None
@@ -805,6 +807,7 @@ class _PendingPolicyAskWrites:
     from_mcp: bool = False
     reviewed_arguments: dict[str, Any] | None = None
     transformed_arguments: dict[str, Any] | None = None
+    mcp_call_identity: tuple[str, str, str | None, str | None] | None = None
 
 
 # Workspace-scoped: keyed by a harness elicitation id, which can be

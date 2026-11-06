@@ -447,6 +447,60 @@ def test_publishing_non_elicitation_event_leaves_pending_index_untouched() -> No
     pending_elicitations.reset_for_tests()
 
 
+# ── Side-channel: pending-client-tool-calls index ─────────────────────
+
+
+def test_publishing_action_required_event_updates_pending_client_tool_index() -> None:
+    """
+    Publishing an ``action_required`` function_call event registers the
+    call in the per-conversation pending-client-tool-calls index.
+
+    Wiring it to ``session_stream.publish`` is what makes a parked call
+    visible to a client that reconnects after missing the live event —
+    a regression that decouples them would silently reintroduce the bug
+    this index exists to fix.
+    """
+    from omnigent.runtime import pending_client_tool_calls
+
+    pending_client_tool_calls.reset_for_tests()
+    session_stream.publish(
+        "conv_r",
+        {
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "status": "action_required",
+                "call_id": "call_publish_test",
+                "name": "lookup_secret_token",
+                "arguments": "{}",
+            },
+        },
+    )
+    # 1 = the publish side-channel ran. If 0, the import or call in
+    # ``session_stream.publish`` was removed; a reconnecting client
+    # would never see the parked call again.
+    assert len(pending_client_tool_calls.snapshot_for("conv_r")) == 1
+    pending_client_tool_calls.reset_for_tests()
+
+
+def test_publishing_non_tool_call_event_leaves_pending_client_tool_index_untouched() -> None:
+    """
+    A regular SSE event does NOT register anything in the
+    pending-client-tool-calls index — the hot publish path's type
+    filter must reject everything else.
+    """
+    from omnigent.runtime import pending_client_tool_calls
+
+    pending_client_tool_calls.reset_for_tests()
+    session_stream.publish(
+        "conv_s",
+        {"type": "response.output_text.delta", "delta": "hello"},
+    )
+    session_stream.publish("conv_s", {"type": "response.completed"})
+    assert pending_client_tool_calls.snapshot_for("conv_s") == []
+    pending_client_tool_calls.reset_for_tests()
+
+
 # ── Idle keepalive: session.heartbeat ────────────────────────────────
 
 
@@ -962,6 +1016,40 @@ def test_sse_safe_attributes_whitelists_ids_and_excludes_content() -> None:
         "secret_pii_value",
     ):
         assert leaked.lower() not in flat
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_sse_status_preserves_background_task_count_without_details(count: int) -> None:
+    attrs = session_stream._sse_safe_attributes(
+        {
+            "type": "session.status",
+            "status": "idle",
+            "background_task_count": count,
+            "background_tasks": [{"description": "private shell command"}],
+            "blocked_on": "private task description",
+        }
+    )
+    assert attrs == {"status": "idle", "background_task_count": count}
+
+
+@pytest.mark.parametrize("count", [None, -1, True, False, 1.5, "2", "private text", {}, []])
+def test_sse_status_omits_invalid_background_task_count(count: object) -> None:
+    assert (
+        session_stream._sse_safe_attributes(
+            {"type": "session.status", "background_task_count": count}
+        )
+        == {}
+    )
+
+
+def test_sse_background_task_count_is_status_specific() -> None:
+    assert session_stream._sse_safe_attributes({"type": "session.status"}) == {}
+    assert (
+        session_stream._sse_safe_attributes(
+            {"type": "response.completed", "background_task_count": 2}
+        )
+        == {}
+    )
 
 
 def test_sse_child_creation_preserves_relationship_without_content() -> None:

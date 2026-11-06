@@ -32,6 +32,8 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
     the stub explicitly.
     """
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
+    monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
 
     def _stub_version_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
@@ -231,6 +233,31 @@ def test_login_probe_caches_positive_verdicts_with_ttl(
         hi._LOGIN_PROBE_CACHE[cache_key] = 0.0
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
     assert len(runs) == 2
+
+
+def test_invalidate_login_probe_cache_forces_fresh_positive_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Manual readiness refreshes must not reuse a cached login verdict."""
+    hi.invalidate_harness_login_probe_cache()
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    runs: list[list[str]] = []
+
+    def _positive_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        runs.append(argv)
+        return subprocess.CompletedProcess(
+            args=argv, returncode=0, stdout='{"loggedIn": true}', stderr=""
+        )
+
+    monkeypatch.setattr(hi.subprocess, "run", _positive_run)
+
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    hi.invalidate_harness_login_probe_cache()
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
+    assert len(runs) == 2
+    hi.invalidate_harness_login_probe_cache()
 
 
 def test_login_probe_never_caches_negative_verdicts(
