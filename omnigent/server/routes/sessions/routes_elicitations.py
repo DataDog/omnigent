@@ -155,6 +155,52 @@ def register_elicitations_routes(
         return {"queued": False}
 
     @router.get(
+        "/sessions/{session_id}/durable_elicitations/unconsumed",
+        # Internal durable-ask recovery flow — hidden from the public API
+        # reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def list_unconsumed_durable_elicitations(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """
+        List answered-but-unconsumed durable questions for a session.
+
+        The runner's reconnect catch-up scan adopts these: an answer that
+        committed while the runner was down must resume the parked
+        execution (claim exactly-once + one continuation wake) instead of
+        sitting unconsumed forever.
+
+        :param request: The inbound request, used for identity extraction.
+        :param session_id: Owning session id.
+        :returns: ``{"unconsumed": [{elicitation_id, action, content}]}``.
+        :raises OmnigentError: 404 if the session does not exist.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, ELICITATION_RESOLVE_LEVEL, permission_store, conversation_store
+        )
+        from omnigent.runtime.durable_ask_user import durable_store
+
+        store = durable_store()
+        if store is None:
+            return {"unconsumed": []}
+        rows = await asyncio.to_thread(store.list_for_conversation, session_id)
+        return {
+            "unconsumed": [
+                {
+                    "elicitation_id": row.id,
+                    "action": row.answer_action,
+                    "content": row.answer_content,
+                }
+                for row in rows
+                if row.state in {"answered", "declined", "canceled"} and row.consumed_at is None
+            ]
+        }
+
+    @router.get(
         "/sessions/{session_id}/elicitations/{elicitation_id}",
         # Internal elicitation flow — hidden from the public API reference.
         include_in_schema=False,

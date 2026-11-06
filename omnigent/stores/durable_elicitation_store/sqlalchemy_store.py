@@ -93,6 +93,7 @@ class SqlAlchemyDurableElicitationStore:
         message: str,
         requested_schema: dict,
         target_conversation_id: str | None = None,
+        paused_call: dict | None = None,
     ) -> tuple[DurableElicitation, bool]:
         """
         Register a durable question, or return the existing one.
@@ -142,6 +143,7 @@ class SqlAlchemyDurableElicitationStore:
                 tool_name=tool_name,
                 message=message,
                 requested_schema=json.dumps(requested_schema, sort_keys=True),
+                paused_call=(json.dumps(paused_call, sort_keys=True) if paused_call else None),
                 created_at=now,
             )
             session.add(row)

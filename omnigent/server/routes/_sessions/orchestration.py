@@ -2426,9 +2426,14 @@ async def _resolve_elicitation(
                         action,
                     )
                 # Forward the verdict to the runner (commit already
-                # happened). Delivery is retryable via the store's
-                # unconsumed reconcile when the runner is offline here.
-                await _forward_approval_to_runner(session_id, data, runner_router)
+                # happened). The durable flag lets a runner with no live
+                # waiter (process restarted mid-question) recognize the
+                # verdict and recover from the paused-call checkpoint
+                # instead of dropping it. Delivery is retryable via the
+                # store's unconsumed reconcile when the runner is offline.
+                await _forward_approval_to_runner(
+                    session_id, {**data, "durable": True}, runner_router
+                )
             return
     harness_future = _harness_elicitation_registry.get(elicitation_id)
     if harness_future is not None and not harness_future.done():

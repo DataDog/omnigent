@@ -712,6 +712,8 @@ def register_events_routes(
     runner_tunnel_tokens: frozenset[str] | None = None,
     register_runner_ingest: Callable[[Callable[..., Awaitable[EventAckFrame]]], None]
     | None = None,
+    register_recovery_ingest: Callable[[Callable[..., Awaitable[dict[str, bool | str]]]], None]
+    | None = None,
 ) -> None:
     """Register the events, stream, and delete routes on router."""
 
@@ -937,6 +939,31 @@ def register_events_routes(
 
     if register_runner_ingest is not None:
         register_runner_ingest(ingest_runner_batch)
+
+    async def post_recovery_session_event(
+        *,
+        app: Any,
+        runner_id: str,
+        owner: str | None,
+        session_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, bool | str]:
+        """Apply one server-initiated recovery event through the HTTP event logic.
+
+        The durable-ask recovery sweep (server-side, on runner connect)
+        uses this to persist + relay the continuation wake with the same
+        authentication shape and persistence path as a runner-originated
+        event — one code path for "start a turn from committed history".
+        """
+        request = _RunnerEventContext(app, Headers(), owner, runner_id)
+        return await _post_event_impl(
+            request,
+            session_id,
+            SessionEventInput.model_validate(payload),
+        )
+
+    if register_recovery_ingest is not None:
+        register_recovery_ingest(post_recovery_session_event)
 
     async def _post_event_impl(
         request: Request | _RunnerEventContext,
@@ -1812,6 +1839,9 @@ def register_events_routes(
             target_conversation_id = ask_data.get("target_conversation_id")
             if not isinstance(target_conversation_id, str) or not target_conversation_id:
                 target_conversation_id = None
+            paused_call = ask_data.get("paused_call")
+            if not isinstance(paused_call, dict):
+                paused_call = None
             try:
                 record, _created = await asyncio.to_thread(
                     register_durable_question,
@@ -1819,6 +1849,7 @@ def register_events_routes(
                     invocation_id=invocation_id,
                     arguments=ask_arguments,
                     target_conversation_id=target_conversation_id,
+                    paused_call=paused_call,
                 )
             except DurableAskUserUnavailable:
                 return {"queued": False, "error": "durable elicitation store unavailable"}

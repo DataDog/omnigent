@@ -1807,6 +1807,10 @@ class SqlDurableElicitation(OmnigentBase):
     tool_name: Mapped[str] = mapped_column(String(64), nullable=False)
     message: Mapped[str] = mapped_column(CompressedText, nullable=False)
     requested_schema: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    # JSON checkpoint of the parked tool call (response id, call id, tool
+    # name, arguments) — lets a restarted runner continue the same logical
+    # execution from committed history instead of replaying the prompt.
+    paused_call: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     state: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     answer_action: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     answer_content: Mapped[str | None] = mapped_column(CompressedText, nullable=True)

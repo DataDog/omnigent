@@ -102,6 +102,7 @@ def register_durable_question(
     arguments: dict[str, Any],
     tool_name: str = "sys_ask_user",
     target_conversation_id: str | None = None,
+    paused_call: dict[str, Any] | None = None,
 ) -> tuple[DurableElicitation, bool]:
     """
     Validate arguments and persist the question; return the record.
@@ -117,6 +118,8 @@ def register_durable_question(
     :param arguments: Parsed tool arguments.
     :param tool_name: Registering tool name.
     :param target_conversation_id: Presentation session for child questions.
+    :param paused_call: Checkpoint of the parked tool call (response id,
+        call id, tool name, arguments) for runner-restart recovery.
     :returns: ``(record, created)``.
     :raises ValueError: Invalid arguments.
     """
@@ -134,6 +137,7 @@ def register_durable_question(
         message=question.question,
         requested_schema=build_requested_schema(question),
         target_conversation_id=target_conversation_id,
+        paused_call=paused_call,
     )
 
 
@@ -224,6 +228,42 @@ def resolve_durable_question(
     except AnswerConflictError:
         return CONFLICT, record, None
     return RESOLVED, record, None
+
+
+def continuation_wake_text(
+    *,
+    action: str,
+    content: dict[str, Any] | None,
+    tool_output: str,
+) -> str:
+    """
+    Build the hidden meta message that continues a dead parked execution.
+
+    The committed history already carries the original prompt, the model's
+    own ``sys_ask_user`` call, and every preceding tool result, so this one
+    message is the ONLY thing recovery adds: the model reads its pending
+    call from history plus the answer and proceeds. Nothing replays.
+
+    :param action: The committed answer action.
+    :param content: The committed content map on accept.
+    :param tool_output: The formatted tool result JSON the model should
+        treat as the output of its pending call.
+    :returns: The wake message text.
+    """
+    if action == "accept":
+        answer = content.get("answer") if isinstance(content, dict) else None
+        summary = f"answered: {answer!r}" if answer is not None else "accepted"
+    elif action in {"decline", "cancel"}:
+        summary = action
+    else:
+        summary = "decline"
+    return (
+        f"[System: sys_ask_user continuation] The question you asked via "
+        f"sys_ask_user was {summary}. Its tool result is "
+        f"{tool_output} — treat it as the output of your pending "
+        f"sys_ask_user tool call and continue exactly where that call left "
+        f"off. Do not repeat any earlier work or re-ask the question."
+    )
 
 
 def pending_event_for_record(

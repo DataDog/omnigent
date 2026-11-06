@@ -186,6 +186,7 @@ async def execute_ask_user(
     conversation_id: str,
     server_client: httpx.AsyncClient,
     harness_client: httpx.AsyncClient,
+    response_id: str | None = None,
     publish_event: Any = None,
 ) -> str:
     """
@@ -202,6 +203,9 @@ async def execute_ask_user(
     :param conversation_id: Session id.
     :param server_client: Runner → server HTTP client.
     :param harness_client: Runner → harness HTTP client.
+    :param response_id: The in-flight turn's response id, recorded in the
+        paused-call checkpoint so a restarted runner can identify the
+        interrupted logical execution.
     :param publish_event: Runner SSE publish callable (unused; kept for
         dispatch-signature parity).
     :returns: JSON tool output (``{"action": ..., "answer": ...}`` or
@@ -223,6 +227,14 @@ async def execute_ask_user(
             "data": {
                 "invocation_id": invocation_id,
                 "arguments": args,
+                # Paused-call checkpoint: lets a restarted runner continue
+                # the same logical execution from committed history.
+                "paused_call": {
+                    "call_id": call_id,
+                    "tool_name": "sys_ask_user",
+                    "arguments": args,
+                    "response_id": response_id,
+                },
             },
         },
     )
@@ -354,3 +366,94 @@ async def mark_consumed_if_ask(
             "data": {"elicitation_id": elicitation_id},
         },
     )
+
+
+# ── Runner-restart recovery ────────────────────────────────────────────
+
+
+async def recover_answered_ask(
+    *,
+    elicitation_id: str,
+    conversation_id: str,
+    action: str,
+    content: dict[str, Any] | None,
+    server_client: httpx.AsyncClient,
+) -> bool:
+    """
+    Continue a parked ``sys_ask_user`` execution whose harness turn died.
+
+    A runner process restart kills the harness turn parked in
+    ``dispatch_tool``; the answer may arrive afterwards (this runner's
+    approval-event handler saw an unknown elicitation id) or already be
+    committed (adopted at reconnect). Recovery continues the SAME logical
+    execution without replaying anything: the original prompt and every
+    preceding tool result are already in the committed history, so a
+    single hidden meta message — the established wake mechanism (timers
+    use it) — starts a continuation turn where the model reads its own
+    dangling ``sys_ask_user`` call from history plus the answer, and
+    proceeds. Nothing is re-executed.
+
+    Ordering is claim-first: the durable ask is marked consumed BEFORE the
+    wake is posted, so a crash can strand the continuation (a stuck turn,
+    visible and recoverable by re-asking) but can never duplicate it —
+    delivery retries are acceptable, duplicate logical continuation is not.
+
+    :param elicitation_id: The durable question's correlation id.
+    :param conversation_id: Owning session id.
+    :param action: The committed answer action (``accept``/``decline``/
+        ``cancel``).
+    :param content: The committed content map on accept.
+    :param server_client: Runner → server HTTP client.
+    :returns: ``True`` when this call claimed the consumption AND posted
+        the continuation wake; ``False`` when the ask was already consumed
+        (a duplicate recovery is a no-op).
+    """
+    from omnigent.runtime.durable_ask_user import continuation_wake_text
+
+    tool_output = format_tool_result(
+        action=action if action in {"accept", "decline", "cancel"} else "decline",
+        answer=content.get("answer") if action == "accept" and isinstance(content, dict) else None,
+    )
+    wake_text = continuation_wake_text(action=action, content=content, tool_output=tool_output)
+    # Claim FIRST (exactly-once); a duplicate recovery attempt is a no-op.
+    claimed = await _post_server_event(
+        server_client,
+        conversation_id,
+        {
+            "type": "durable_ask_consumed",
+            "data": {"elicitation_id": elicitation_id},
+        },
+    )
+    if claimed is None or not claimed.get("consumed"):
+        return False
+    # Wake the session with one hidden meta message (bounded retries —
+    # delivery failures leave a stuck turn, never a duplicate continuation).
+    for attempt in range(3):
+        delivered = await _post_server_event(
+            server_client,
+            conversation_id,
+            {
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "is_meta": True,
+                    "content": [{"type": "input_text", "text": wake_text}],
+                },
+            },
+            timeout=30.0,
+        )
+        if delivered is not None:
+            _logger.info(
+                "sys_ask_user %s recovered after runner restart; continuation wake delivered",
+                elicitation_id,
+                extra={"session_id": conversation_id},
+            )
+            return True
+        await asyncio.sleep(2.0 * (attempt + 1))
+    _logger.error(
+        "sys_ask_user %s consumed but the continuation wake could not be "
+        "delivered after retries; the session turn is stuck",
+        elicitation_id,
+        extra={"session_id": conversation_id},
+    )
+    return False

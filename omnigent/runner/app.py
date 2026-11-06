@@ -6923,11 +6923,33 @@ def create_runner_app(
             # more than consent (an MCP ``requestedSchema``). Dropping it here
             # is what used to make the awaiting caller invent one.
             _elicit_content = _data.get("content")
-            pending_approvals.resolve(
+            _resolved = pending_approvals.resolve(
                 _data.get("elicitation_id", ""),
                 _elicit_action == "accept",
                 _elicit_content if isinstance(_elicit_content, dict) else None,
             )
+            if not _resolved and _data.get("durable") and server_client is not None:
+                # A durable sys_ask_user verdict arrived with NO live parked
+                # waiter in this runner process: the harness turn (and
+                # possibly the whole runner) died while the question was
+                # pending. Continue the same logical execution from the
+                # persisted checkpoint — claim the answer exactly-once and
+                # wake the session with one hidden meta message. The
+                # committed history already carries the original prompt and
+                # every preceding tool result, so nothing replays.
+                from omnigent.runner import ask_user as _ask_user
+
+                _recovery_task = asyncio.ensure_future(
+                    _ask_user.recover_answered_ask(
+                        elicitation_id=_data.get("elicitation_id", ""),
+                        conversation_id=conversation_id,
+                        action=_elicit_action,
+                        content=(_elicit_content if isinstance(_elicit_content, dict) else None),
+                        server_client=server_client,
+                    )
+                )
+                _background_tasks.add(_recovery_task)
+                _recovery_task.add_done_callback(_background_tasks.discard)
             if _elicit_action == "decline":
                 try:
                     _int_client = await process_manager.get_client(conversation_id, "any")

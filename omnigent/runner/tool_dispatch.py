@@ -6979,6 +6979,7 @@ async def dispatch_tool_locally(
                 conversation_id=conversation_id,
                 server_client=server_client,
                 harness_client=harness_client,
+                response_id=response_id,
                 publish_event=publish_event,
             )
     else:

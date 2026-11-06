@@ -42,6 +42,7 @@ class DurableElicitation:
     tool_name: str
     message: str
     requested_schema: dict[str, Any]
+    paused_call: dict[str, Any] | None = None
     target_conversation_id: str | None = None
     state: str = "pending"
     answer_action: str | None = None
