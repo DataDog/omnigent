@@ -302,21 +302,38 @@ async def execute_ask_user(
                         server_client, conversation_id, elicitation_id
                     )
                     if state is not None and state.get("status") == "resolved":
+                        adopted_action = state.get("action")
                         answer = _answer_from_state(state)
                         if answer is not None:
                             verdict = pending_approvals.Verdict(
-                                approved=state.get("action") == "accept",
+                                approved=adopted_action == "accept",
                                 content=(
                                     state.get("content")
                                     if isinstance(state.get("content"), dict)
-                                    and state.get("action") == "accept"
+                                    and adopted_action == "accept"
+                                    else None
+                                ),
+                                # Carry the TRUE committed action through
+                                # adoption: a cancel adopted after a
+                                # reconnect must format as cancel, not
+                                # decline.
+                                action=(
+                                    adopted_action
+                                    if adopted_action in {"accept", "decline", "cancel"}
                                     else None
                                 ),
                             )
                         else:
                             # Terminal without a usable answer (decline/
                             # cancel committed by another surface).
-                            verdict = pending_approvals.Verdict(approved=False)
+                            verdict = pending_approvals.Verdict(
+                                approved=False,
+                                action=(
+                                    adopted_action
+                                    if adopted_action in {"decline", "cancel"}
+                                    else "decline"
+                                ),
+                            )
                         break
                     await asyncio.sleep(_RECHECK_INTERVAL_S)
                 fut = pending_approvals.register(

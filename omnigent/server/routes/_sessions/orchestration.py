@@ -2303,13 +2303,12 @@ async def _resolve_elicitation(
     session_owner_id: str | None = None,
 ) -> str | None:
     """
+    Resolve one outstanding elicitation from an approval payload.
+
     :returns: The durable resolution outcome when the id named a durable
         question (``"resolved"`` / ``"idempotent"`` / ``"conflict"`` /
         ``"forbidden"``), or ``None`` when the verdict was handled by the
         legacy in-memory paths or fell through for an unknown id.
-    """
-    """
-    Resolve one outstanding elicitation from an approval payload.
 
     Shared by the two entry points that deliver a verdict for a
     parked elicitation: the ``type == "approval"`` branch of
@@ -2422,12 +2421,23 @@ async def _resolve_elicitation(
                 )
                 return None
             if outcome in {RESOLVED, IDEMPOTENT}:
-                _publish_elicitation_resolved(session_id, elicitation_id, action=action)
+                # All follow-ups target the OWNING row's conversation, never
+                # the resolving view: a parent-view answer to a child's
+                # question must resolve on the child's stream (its live
+                # subscribers drop the card), mirror to the child's ancestors
+                # (which includes the parent), and forward to the runner
+                # under the child's session id — so a no-live-waiter recovery
+                # consumes the child's row and wakes the CHILD. Waking the
+                # resolving session instead would strand the child forever
+                # (row consumed, never re-adopted) and start a bogus
+                # continuation turn on the parent.
+                owner_id = resolved_record.conversation_id if resolved_record else session_id
+                _publish_elicitation_resolved(owner_id, elicitation_id, action=action)
                 if conversation_store is not None:
                     await asyncio.to_thread(
                         _publish_elicitation_resolved_to_ancestors,
                         conversation_store,
-                        session_id,
+                        owner_id,
                         elicitation_id,
                         action,
                     )
@@ -2438,7 +2448,7 @@ async def _resolve_elicitation(
                 # instead of dropping it. Delivery is retryable via the
                 # store's unconsumed reconcile when the runner is offline.
                 await _forward_approval_to_runner(
-                    session_id,
+                    owner_id,
                     {
                         **data,
                         "durable": True,

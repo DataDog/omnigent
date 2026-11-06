@@ -9,6 +9,8 @@ conflicting, and malformed answers behave per the durable contract.
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -413,3 +415,120 @@ async def test_conflicting_answer_returns_409(client: httpx.AsyncClient, _wired_
     # The first answer still stands.
     data = (await client.get(f"/v1/sessions/{session_id}/elicitations/{elicitation_id}")).json()
     assert data["content"] == {"answer": "staging"}
+
+
+async def test_owner_targeted_wake_and_forward(
+    client: httpx.AsyncClient, _wired_store, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parent-view answer must wake the CHILD, never the resolving parent.
+
+    With no live runner waiter, recovery consumes the owner's row and posts
+    the continuation wake on the owner's session. If the forward targeted the
+    resolving session instead, the child would be stranded (row consumed,
+    never re-adopted) and the parent would start a bogus continuation turn.
+    """
+
+    from omnigent.runtime.durable_ask_user import durable_store
+    from omnigent.server.routes._sessions import orchestration as _orch
+
+    agent = await create_test_agent(client, "durable-owner-wake")
+    parent_id = await _create_session(client, agent["id"])
+    child_id = _create_child_session(db_uri, parent_id=parent_id, agent_id=agent["id"])
+    # Register the ask ON the child (the owner).
+    registered = await _register_durable(client, child_id)
+    elicitation_id = registered["elicitation_id"]
+
+    forwarded: list[tuple[str, dict]] = []
+    published: list[tuple[str, str]] = []
+    original_forward = _orch._forward_approval_to_runner
+    original_publish = _orch._publish_elicitation_resolved
+
+    async def _capture_forward(session_id, data, runner_router):
+        forwarded.append((session_id, data))
+
+    def _capture_publish(session_id, elicitation_id, action=None, reason=None):
+        published.append((session_id, elicitation_id))
+
+    monkeypatch.setattr(_orch, "_forward_approval_to_runner", _capture_forward)
+    monkeypatch.setattr(_orch, "_publish_elicitation_resolved", _capture_publish)
+    try:
+        # Answer from the PARENT view (the parent is the presentation target).
+        outcome = await _orch._resolve_elicitation(
+            parent_id,
+            {
+                "elicitation_id": elicitation_id,
+                "action": "accept",
+                "content": {"answer": "staging"},
+            },
+            None,
+            None,
+        )
+    finally:
+        monkeypatch.setattr(_orch, "_forward_approval_to_runner", original_forward)
+        monkeypatch.setattr(_orch, "_publish_elicitation_resolved", original_publish)
+
+    assert outcome == "resolved"
+    # The commit targeted the child's row…
+    store = durable_store()
+    assert store is not None
+    row = store.get(elicitation_id)
+    assert row is not None
+    assert row.conversation_id == child_id
+    assert row.answer_content == {"answer": "staging"}
+    # …the runner forward targets the OWNER (child), never the parent…
+    assert [sid for sid, _ in forwarded] == [child_id]
+    # …and the resolved signal publishes on the child's stream (its live
+    # subscribers drop the card); the parent is reached via ancestor mirroring.
+    assert [sid for sid, _ in published] == [child_id]
+
+
+async def test_recovery_wake_targets_owner_not_resolving_session(
+    client: httpx.AsyncClient, _wired_store, db_uri: str
+) -> None:
+    """recover_answered_ask invoked on the owner's session wakes the owner only."""
+    from omnigent.runner import ask_user as _ask_user
+
+    agent = await create_test_agent(client, "durable-owner-recovery")
+    parent_id = await _create_session(client, agent["id"])
+    child_id = _create_child_session(db_uri, parent_id=parent_id, agent_id=agent["id"])
+    registered = await _register_durable(client, child_id)
+    elicitation_id = registered["elicitation_id"]
+    # Commit the answer WITHOUT a live waiter (simulates resolve while the
+    # runner was down), then adopt it exactly as the sweep would: recovery
+    # runs against the OWNER's session id.
+    await client.post(
+        f"/v1/sessions/{parent_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "accept", "content": {"answer": "staging"}},
+    )
+
+    captured: list[tuple[str, dict]] = []
+
+    class _CaptureTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content) if request.content else {}
+            captured.append((request.url.path, body if isinstance(body, dict) else {}))
+            if body.get("type") == "durable_ask_consumed":
+                return httpx.Response(202, json={"queued": False, "consumed": True})
+            if body.get("type") == "message":
+                return httpx.Response(202, json={"queued": False})
+            return httpx.Response(200, json={})
+
+    server_client = httpx.AsyncClient(transport=_CaptureTransport(), base_url="http://test")
+    recovered = await _ask_user.recover_answered_ask(
+        elicitation_id=elicitation_id,
+        conversation_id=child_id,  # the OWNER, as the sweep resolves it
+        action="accept",
+        content={"answer": "staging"},
+        server_client=server_client,
+    )
+    assert recovered is True
+    wakes = [body for _path, body in captured if body.get("type") == "message"]
+    assert len(wakes) == 1, captured
+    # The wake rode the OWNER's session path, never the parent's.
+    assert all("/sessions/" + child_id + "/events" in path for path, _ in captured)
+    # The consume claim was posted exactly once (the capture transport
+    # models the store's exactly-once gate; the store behavior itself is
+    # pinned by tests/stores/test_durable_elicitation_store.py).
+    consume_calls = [body for _p, body in captured if body.get("type") == "durable_ask_consumed"]
+    assert len(consume_calls) == 1
+    assert consume_calls[0]["data"]["elicitation_id"] == elicitation_id

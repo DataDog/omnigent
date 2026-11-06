@@ -487,3 +487,154 @@ def test_interrupt_while_pending_stays_stopped(
         "the canceled execution was resurrected after an explicit interrupt"
     )
     assert snap.get("status") in {"failed", "idle", "interrupted", "cancelled"}, snap.get("status")
+
+
+def test_parent_view_answer_resumes_child_exactly_once(
+    stack: _AskUserStack, mock_llm_server_url: str
+) -> None:
+    """A parent-view answer to a child's question resumes the CHILD, never the parent."""
+    model = f"ask-child-{uuid.uuid4().hex[:8]}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_ask_child",
+                        "name": "sys_ask_user",
+                        "arguments": json.dumps(
+                            {"question": "Proceed?", "options": ["yes", "no"]}
+                        ),
+                    }
+                ]
+            }
+        ],
+        key=model,
+    )
+    set_fallback_mock_llm(mock_llm_server_url, model, "CHILD_RESUMED_ONCE deployment confirmed.")
+    yaml_text = _AGENT_YAML.format(
+        model=model, mock_base_url=json.dumps(f"{mock_llm_server_url}/v1")
+    )
+
+    # Parent session through the normal flow.
+    create = post_session_bundle(
+        httpx.post,
+        f"{stack.base_url}/v1/sessions",
+        bundle_files({"config.yaml": yaml_text.encode()}),
+        timeout=30.0,
+        trust_env=False,
+    )
+    create.raise_for_status()
+    parent_id = str(create.json()["session_id"])
+    bind = httpx.patch(
+        f"{stack.base_url}/v1/sessions/{parent_id}",
+        json={"runner_id": stack.runner_id},
+        timeout=10.0,
+        trust_env=False,
+    )
+    bind.raise_for_status()
+
+    # Child session row owned by the parent, bound to the same runner.
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    agent_id = httpx.get(
+        f"{stack.base_url}/v1/sessions/{parent_id}/agent",
+        timeout=10.0,
+        trust_env=False,
+    ).json()["id"]
+    child_id = (
+        SqlAlchemyConversationStore(f"sqlite:///{stack._db_path}")
+        .create_conversation(
+            kind="sub_agent",
+            title="child:ask",
+            parent_conversation_id=parent_id,
+            agent_id=agent_id,
+        )
+        .id
+    )
+    bind_child = httpx.patch(
+        f"{stack.base_url}/v1/sessions/{child_id}",
+        json={"runner_id": stack.runner_id},
+        timeout=10.0,
+        trust_env=False,
+    )
+    bind_child.raise_for_status()
+
+    # Park the durable ask on the CHILD.
+    posted = httpx.post(
+        f"{stack.base_url}/v1/sessions/{child_id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "go"}]},
+        },
+        timeout=30.0,
+        trust_env=False,
+    )
+    posted.raise_for_status()
+    pending = _wait(_durable_pending, stack.base_url, child_id, 60, "child durable ask")
+    elicitation_id = pending[0]["elicitation_id"]
+
+    # No live waiter: kill the runner, then answer from the PARENT view.
+    stack.kill_runner()
+    resolved = httpx.post(
+        f"{stack.base_url}/v1/sessions/{parent_id}/elicitations/{elicitation_id}/resolve",
+        json={"action": "accept", "content": {"answer": "yes"}},
+        timeout=30.0,
+        trust_env=False,
+    )
+    resolved.raise_for_status()
+
+    # Respawn: recovery must resume the CHILD exactly once; the parent is
+    # untouched (no continuation wake, no completion).
+    stack.start_runner()
+
+    def _child_done(base_url: str, session_id: str):
+        snap = _snapshot(base_url, child_id)
+        if snap.get("status") in {"idle", "completed", "succeeded"}:
+            items = httpx.get(
+                f"{base_url}/v1/sessions/{child_id}/items",
+                params={"limit": 200},
+                timeout=10.0,
+                trust_env=False,
+            ).json()["data"]
+            text = json.dumps(items)
+            if "CHILD_RESUMED_ONCE" in text:
+                return text
+        return None
+
+    child_items = _wait(_child_done, stack.base_url, child_id, 120, "child continuation")
+    assert child_items.count("CHILD_RESUMED_ONCE") == 1
+
+    # Exactly one tool result on the child, keyed to the parked call.
+    child_ask_outputs = [
+        item
+        for item in httpx.get(
+            f"{stack.base_url}/v1/sessions/{child_id}/items",
+            params={"limit": 200},
+            timeout=10.0,
+            trust_env=False,
+        ).json()["data"]
+        if item.get("type") == "function_call_output" and item.get("call_id") == "call_ask_child"
+    ]
+    assert len(child_ask_outputs) == 1
+
+    # The parent stream/history carries NO continuation wake or completion.
+    parent_items = httpx.get(
+        f"{stack.base_url}/v1/sessions/{parent_id}/items",
+        params={"limit": 200},
+        timeout=10.0,
+        trust_env=False,
+    ).json()["data"]
+    parent_text = json.dumps(parent_items)
+    assert "CHILD_RESUMED_ONCE" not in parent_text
+    assert "sys_ask_user continuation" not in parent_text
+
+    # The child row was consumed exactly once: nothing left for re-adoption.
+    listing = httpx.get(
+        f"{stack.base_url}/v1/sessions/{child_id}/durable_elicitations/unconsumed",
+        timeout=10.0,
+        trust_env=False,
+    ).json()["unconsumed"]
+    assert all(r["elicitation_id"] != elicitation_id for r in listing)
