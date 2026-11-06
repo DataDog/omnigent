@@ -126,9 +126,36 @@ def test_unknown_provider_is_404_but_only_after_auth(db_uri: str) -> None:
     assert tc.get("/v1/hosts/host1/credentials/gitlab").status_code == 401
 
 
-def test_resolver_fault_degrades_to_connected_false() -> None:
+def test_resolver_fault_reports_temporary_provider_failure() -> None:
     hs = _FakeHostStore("host1", "launch-tok", "alice@example.com")
     tc = _app(hs, github_store=_BoomStore())
     resp = tc.get("/v1/hosts/host1/credentials/github", headers=_HDR)
-    assert resp.status_code == 200
-    assert resp.json() == {"connected": False}
+    assert resp.status_code == 502
+    assert resp.json() == {"detail": "Credential provider temporarily unavailable"}
+
+
+def test_backend_outage_is_503_and_still_requires_host_authorization(db_uri, monkeypatch):
+    from unittest.mock import Mock
+
+    from omnigent.stores.credential_store.backend import CredentialBackendUnavailable
+
+    store = GithubConnectionStore(db_uri, SecretBox("enc-secret"))
+    store.upsert(
+        "alice@example.com",
+        github_login="alice",
+        github_user_id=42,
+        tokens=GitHubTokenSet("private-token", None, None, None, "repo"),
+    )
+    hs = _FakeHostStore("host1", "launch-tok", "alice@example.com")
+    client = _app(hs, github_store=store)
+    path = "/v1/hosts/host1/credentials/github"
+    assert client.get(path, headers=_HDR).status_code == 200  # warm cache
+    get = Mock(side_effect=CredentialBackendUnavailable("private-marker"))
+    monkeypatch.setattr(store._store.cache.backend, "get", get)
+    assert client.get(path).status_code == 401
+    get.assert_not_called()
+    failure = client.get(path, headers=_HDR)
+    assert failure.status_code == 503
+    assert "temporarily unavailable" in failure.text
+    assert "connected" not in failure.json()
+    assert "private" not in failure.text

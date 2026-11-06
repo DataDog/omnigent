@@ -85,27 +85,41 @@ class DatabricksConnectionHooks:
         )
 
     async def complete(self, user_id: str, code: str, claims: dict[str, Any]) -> None:
-        workspace_host = normalize_workspace_host(str(claims.get("workspace_host") or ""))
-        nonce = claims.get("nonce")
-        if workspace_host is None or not nonce:
-            raise ConnectionError("missing workspace host or PKCE nonce in state")
-        verifier, _challenge = derive_pkce(self.config.client_secret, str(nonce))
+        cache = self.store._store.cache
+        key = cache.key(user_id, "databricks")
+        generation = cache.begin(key)
         try:
-            tokens = await self.api.exchange_code(workspace_host, code, code_verifier=verifier)
-            user_name, databricks_user_id = await self.api.fetch_user(
-                workspace_host, tokens.access_token
-            )
-        except (DatabricksAppError, HTTPError, ValueError) as exc:
-            raise ConnectionError(str(exc)) from exc
-        await asyncio.to_thread(
-            self.store.upsert,
-            user_id,
-            workspace_host=workspace_host,
-            databricks_user=user_name,
-            databricks_user_id=databricks_user_id,
-            tokens=tokens,
-        )
-        _logger.info("Databricks workspace %s connected for %s", workspace_host, user_id)
+            workspace_host = normalize_workspace_host(str(claims.get("workspace_host") or ""))
+            nonce = claims.get("nonce")
+            if workspace_host is None or not nonce:
+                raise ConnectionError("missing workspace host or PKCE nonce in state")
+            verifier, _challenge = derive_pkce(self.config.client_secret, str(nonce))
+            try:
+                tokens = await self.api.exchange_code(workspace_host, code, code_verifier=verifier)
+                user_name, databricks_user_id = await self.api.fetch_user(
+                    workspace_host, tokens.access_token
+                )
+            except (DatabricksAppError, HTTPError, ValueError):
+                raise ConnectionError("Authorization failed; try connecting again") from None
+
+            def persist():
+                with cache.mutation_lock(key):
+                    if not cache.current(key, generation):
+                        raise ConnectionError(
+                            "Account connection changed; start authorization again"
+                        )
+                    return self.store.upsert(
+                        user_id,
+                        workspace_host=workspace_host,
+                        databricks_user=user_name,
+                        databricks_user_id=databricks_user_id,
+                        tokens=tokens,
+                    )
+
+            await asyncio.to_thread(persist)
+            _logger.info("Provider account connected")
+        finally:
+            cache.end(key)
 
 
 def create_connections_databricks_router(

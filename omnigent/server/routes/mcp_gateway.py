@@ -11,6 +11,7 @@ from omnigent.server.mcp_registry import McpUpstreamError
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._sessions.helpers import _mcp_error_response, _mcp_ok_response
 from omnigent.server.routes.connections_base import ConnectionError
+from omnigent.stores.credential_store.backend import CredentialBackendUnavailable
 
 
 def create_mcp_gateway_router(adapter: McpPolicyAdapter) -> APIRouter:
@@ -53,6 +54,8 @@ def create_mcp_gateway_router(adapter: McpPolicyAdapter) -> APIRouter:
             try:
                 tools = await adapter.list_tools(request, context)
                 return _mcp_ok_response(rpc_id, {"tools": tools})
+            except CredentialBackendUnavailable as exc:
+                return _mcp_error_response(rpc_id, -32001, str(exc))
             except (ConnectionError, McpUpstreamError) as exc:
                 return _mcp_error_response(rpc_id, -32000, str(exc))
             except Exception:  # noqa: BLE001 — upstream errors may contain credentials

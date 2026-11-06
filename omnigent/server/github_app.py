@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import jwt
 
@@ -59,8 +59,8 @@ class GitHubTokenSet:
         (usually empty for Apps — permissions are set on the App).
     """
 
-    access_token: str
-    refresh_token: str | None
+    access_token: str = field(repr=False)
+    refresh_token: str | None = field(repr=False)
     expires_at: int | None
     refresh_token_expires_at: int | None
     scopes: str
@@ -245,8 +245,18 @@ def token_set_from_payload(payload: dict) -> GitHubTokenSet:
         an access token.
     """
     if "error" in payload:
-        detail = payload.get("error_description", payload["error"])
-        raise GitHubAppError(f"GitHub token exchange failed: {detail}")
+        raise GitHubAppError(
+            "Authorization rejected by provider",
+            reauth_required=payload["error"]
+            in {
+                "invalid_grant",
+                "invalid_token",
+                "bad_refresh_token",
+                "expired_token",
+                "access_denied",
+                "bad_verification_code",
+            },
+        )
     access = payload.get("access_token")
     if not access:
         raise GitHubAppError("GitHub token response missing access_token")
@@ -256,11 +266,20 @@ def token_set_from_payload(payload: dict) -> GitHubTokenSet:
     return GitHubTokenSet(
         access_token=str(access),
         refresh_token=payload.get("refresh_token") or None,
-        expires_at=now + int(expires_in) if expires_in else None,
-        refresh_token_expires_at=(now + int(refresh_expires_in) if refresh_expires_in else None),
+        expires_at=now + int(expires_in) if expires_in is not None else None,
+        refresh_token_expires_at=(
+            now + int(refresh_expires_in) if refresh_expires_in is not None else None
+        ),
         scopes=str(payload.get("scope", "")),
     )
 
 
 class GitHubAppError(Exception):
     """Raised when a GitHub App API interaction fails."""
+
+    def __init__(
+        self, message: str, *, reauth_required: bool = False, refresh_retry_safe: bool = False
+    ) -> None:
+        super().__init__(message)
+        self.reauth_required = reauth_required
+        self.refresh_retry_safe = refresh_retry_safe

@@ -20,6 +20,7 @@ from omnigent.server.github_app import (
     GitHubTokenSet,
     token_set_from_payload,
 )
+from omnigent.stores.credential_store.refresh_retry import refresh_retry_safe
 
 _TOKEN_ENDPOINT = "https://github.com/login/oauth/access_token"
 _USER_ENDPOINT = "https://api.github.com/user"
@@ -93,7 +94,9 @@ class GitHubAppClient:
                 },
             )
         if resp.status_code != 200:
-            raise GitHubAppError(f"GitHub /user returned {resp.status_code}")
+            raise GitHubAppError(
+                "GitHub identity request failed", reauth_required=resp.status_code == 401
+            )
         data = resp.json()
         login = data.get("login")
         user_id = data.get("id")
@@ -130,7 +133,9 @@ class GitHubAppClient:
                     headers=headers,
                 )
                 if resp.status_code != 200:
-                    raise GitHubAppError(f"GitHub /user/repos returned {resp.status_code}")
+                    raise GitHubAppError(
+                        "GitHub repository request failed", reauth_required=resp.status_code == 401
+                    )
                 batch = resp.json()
                 if not isinstance(batch, list) or not batch:
                     break
@@ -180,7 +185,7 @@ class GitHubAppClient:
                 )
                 if resp.status_code != 200:
                     raise GitHubAppError(
-                        f"GitHub /repos/{full_name}/branches returned {resp.status_code}"
+                        "GitHub branches request failed", reauth_required=resp.status_code == 401
                     )
                 batch = resp.json()
                 if not isinstance(batch, list) or not batch:
@@ -201,5 +206,9 @@ class GitHubAppClient:
                 headers={"Accept": "application/json"},
             )
         if resp.status_code != 200:
-            raise GitHubAppError(f"GitHub token endpoint returned {resp.status_code}")
+            raise GitHubAppError(
+                "Credential provider token request failed",
+                reauth_required=resp.status_code in (400, 401),
+                refresh_retry_safe=refresh_retry_safe(resp),
+            )
         return token_set_from_payload(resp.json())

@@ -30,6 +30,7 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import ProviderConnection
+from omnigent.stores.credential_store.backend import CredentialBackendUnavailable
 from omnigent.stores.credential_store.secret_cipher import SecretCipher, SecretTooLargeError
 
 _logger = logging.getLogger(__name__)
@@ -115,12 +116,26 @@ class CredentialStore:
             updated_at=row.updated_at,
         )
 
+    def _encrypt(self, plaintext: str, *, context: dict[str, str]) -> str:
+        try:
+            return self._cipher.encrypt(plaintext, context=context)
+        except SecretTooLargeError:
+            raise
+        except Exception:  # noqa: BLE001 — required cipher failures may contain secrets
+            raise CredentialBackendUnavailable() from None
+
+    def _decrypt(self, ciphertext: str, *, context: dict[str, str]) -> str | None:
+        try:
+            return self._cipher.decrypt(ciphertext, context=context)
+        except Exception:  # noqa: BLE001 — preserve None for corrupt/mismatched ciphertext only
+            raise CredentialBackendUnavailable() from None
+
     def _to_entity(self, row: SqlConnection, *, with_secret: bool) -> ProviderConnection:
         """Convert an ORM row to an entity, optionally decrypting the secret."""
         secret: dict[str, Any] | None = None
         if with_secret:
             context = _enc_context(row.workspace_id, row.user_id, row.provider, row.account_id)
-            plaintext = self._cipher.decrypt(row.secret_enc, context=context)
+            plaintext = self._decrypt(row.secret_enc, context=context)
             # ``None`` (wrong key/context or corrupt) degrades to "reconnect",
             # not a 500; the JSON parse is soft-fail for the same reason.
             secret = _safe_json_obj(plaintext) if plaintext is not None else None
@@ -147,7 +162,7 @@ class CredentialStore:
         workspace_id = current_workspace_id()
         pk = (workspace_id, user_id, provider, account_id)
         context = _enc_context(workspace_id, user_id, provider, account_id)
-        secret_enc = self._cipher.encrypt(json.dumps(secret), context=context)
+        secret_enc = self._encrypt(json.dumps(secret), context=context)
         _check_encrypted_size(secret_enc, self._engine.dialect.name)
         metadata_json = json.dumps(metadata)
 
@@ -209,7 +224,7 @@ class CredentialStore:
         """
         workspace_id = current_workspace_id()
         context = _enc_context(workspace_id, user_id, provider, account_id)
-        secret_enc = self._cipher.encrypt(json.dumps(secret), context=context)
+        secret_enc = self._encrypt(json.dumps(secret), context=context)
         _check_encrypted_size(secret_enc, self._engine.dialect.name)
         metadata_json = json.dumps(metadata) if metadata is not None else None
         updated_at = now_epoch()
