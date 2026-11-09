@@ -49,6 +49,27 @@ from tests.e2e._harness_probes import cli_unavailable_reason
 pexpect = pytest.importorskip("pexpect")
 pyte = pytest.importorskip("pyte")
 
+
+class _TolerantScreen(pyte.Screen):
+    """pyte 0.8.2's parser passes ``private=True`` for private-mode CSI
+    (device-status/attribute and mode set/reset queries), but its
+    ``Screen`` methods don't accept the keyword — any TUI that sends one
+    crashes the renderer mid-stream. The footer rendering only needs the
+    text buffer, so absorb the keyword on the affected handlers."""
+
+    def report_device_status(self, mode, private=False):  # type: ignore[override]
+        pass
+
+    def report_device_attributes(self, mode, private=False):  # type: ignore[override]
+        pass
+
+    def set_mode(self, *modes, private=False):  # type: ignore[override]
+        super().set_mode(*modes)
+
+    def reset_mode(self, *modes, private=False):  # type: ignore[override]
+        super().reset_mode(*modes)
+
+
 pytestmark = [
     pytest.mark.skipif(
         sys.platform != "linux",
@@ -257,7 +278,7 @@ class PiTui:
 
     def __init__(self, process: Any) -> None:
         self.process = process
-        self.screen = pyte.Screen(_SCREEN_COLS, _SCREEN_ROWS)
+        self.screen = _TolerantScreen(_SCREEN_COLS, _SCREEN_ROWS)
         self.stream = pyte.Stream(self.screen)
         self.raw: list[str] = []
 
