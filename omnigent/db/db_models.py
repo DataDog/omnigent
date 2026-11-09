@@ -1730,3 +1730,123 @@ class SqlOidcSession(OmnigentBase):
         Index("ix_oidc_sessions_user_id", "workspace_id", "user_id"),
         Index("ix_oidc_sessions_expiry_id", "workspace_id", "absolute_expiry", "id"),
     )
+
+
+class SqlDurableElicitation(OmnigentBase):
+    """
+    SQLAlchemy model for the ``durable_elicitations`` table.
+
+    One row per durable ``sys_ask_user`` question — the persisted pending
+    state that lets a hosted agent block on a human answer across client
+    disconnects, Omnigent server restarts, and runner reconnects.
+
+    Lifecycle: ``pending`` → (``answered`` | ``declined`` | ``canceled``) →
+    ``consumed``. ``consumed`` means the owning runner session has received
+    the answer and persisted exactly one tool result. The first valid
+    terminal answer wins; conflicting later answers are rejected at the
+    store boundary without altering the recorded one.
+
+    Legacy policy approvals and external MCP elicitations do NOT use this
+    table — they keep their in-memory lifecycle. Only explicit
+    durable-user-question registrations (``sys_ask_user``) are stored here.
+
+    :param id: Elicitation id (UUID, 16 raw bytes) — the stable correlation
+        id the UI, resolve endpoint, and runner all key on.
+    :param conversation_id: Owning session — the session whose parked
+        execution the answer resumes (relates to ``conversations.id``; no
+        DB foreign key, Rule R032).
+    :param target_conversation_id: Session the question is *presented* on.
+        For child-session questions this is the user-facing parent session;
+        ``None`` when the owner itself is user-facing (the common case).
+        Answering from a parent view resolves against the owner.
+    :param invocation_id: Stable caller-supplied invocation identity (the
+        LLM tool-call id). Create-or-get is keyed on workspace + owner +
+        this id, so a replayed registration of the same call returns the
+        same row instead of a duplicate question.
+    :param fingerprint: Canonical payload fingerprint (see
+        :func:`omnigent.tools.builtins.sys_ask_user.question_fingerprint`).
+        A replay under the same invocation identity with a different
+        fingerprint is rejected rather than silently rewritten.
+    :param tool_name: Registering tool, e.g. ``"sys_ask_user"``.
+    :param message: The question text shown to the person.
+    :param requested_schema: JSON-encoded MCP-style ``requestedSchema``
+        (see :func:`build_requested_schema`) — the full answer contract the
+        resolve path validates against.
+    :param state: Lifecycle state as a stable int code (see
+        ``DURABLE_ELICITATION_STATE`` in omnigent.db.enum_codecs).
+    :param answer_action: Terminal action as a stable int code
+        (``DURABLE_ELICITATION_ACTION``): accept/decline/cancel. ``None``
+        while pending.
+    :param answer_content: JSON-encoded content map of the accepted answer,
+        e.g. ``{"answer": "staging"}``. ``None`` unless accepted.
+    :param delivered_at: Unix epoch seconds the answer was committed and
+        marked deliverable to the runner; ``None`` while pending.
+    :param consumed_at: Unix epoch seconds the runner acknowledged
+        consumption; ``None`` until the parked execution resumed exactly
+        once.
+    :param delivery_attempts: Number of delivery attempts made toward the
+        runner (informational; delivery is retryable while unanswered
+        consumption remains).
+    :param created_at: Unix epoch seconds at registration.
+    :param updated_at: Unix epoch seconds of the last write.
+    """
+
+    __tablename__ = "durable_elicitations"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    target_conversation_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    invocation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(512), nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    message: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    requested_schema: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    # JSON checkpoint of the parked tool call (response id, call id, tool
+    # name, arguments) — lets a restarted runner continue the same logical
+    # execution from committed history instead of replaying the prompt.
+    paused_call: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    state: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
+    answer_action: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    answer_content: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    delivered_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    consumed_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    delivery_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("state IN (1, 2, 3, 4, 5)", name="ck_durable_elicitations_state"),
+        CheckConstraint("answer_action IN (1, 2, 3)", name="ck_durable_elicitations_action"),
+        # Create-or-get identity: one durable question per logical tool-call
+        # invocation within a session. The relay/retry surface re-registers
+        # under this key and must land on the same row.
+        UniqueConstraint(
+            "workspace_id",
+            "conversation_id",
+            "invocation_id",
+            name="uq_durable_elicitations_invocation",
+        ),
+        # Snapshot/restore and reconcile scans: pending or answered-but-
+        # unconsumed rows for a session (and its presentation target).
+        Index(
+            "ix_durable_elicitations_conversation_state",
+            "workspace_id",
+            "conversation_id",
+            "state",
+            "id",
+        ),
+        Index(
+            "ix_durable_elicitations_target_state",
+            "workspace_id",
+            "target_conversation_id",
+            "state",
+            "id",
+        ),
+    )

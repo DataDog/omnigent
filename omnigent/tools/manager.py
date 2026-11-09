@@ -198,6 +198,23 @@ class ToolManager:
         # can drive the desktop app's browser without the spec opting in
         # (framework-owned).
         self._register_browser_tools()
+        # sys_ask_user is framework-owned and always available: a hosted
+        # agent asks the person a durable question without the spec opting
+        # in. Schema-only here; execution is runner-dispatched (see
+        # omnigent/runner/ask_user.py).
+        self._register_ask_user_tool()
+
+    def _register_ask_user_tool(self) -> None:
+        """
+        Auto-register the durable-question builtin ``sys_ask_user``.
+
+        Always available (framework-owned): the tool is schema-only and
+        execution is intercepted by the runner's durable-ask executor.
+        Reserved in ``_BUILTIN_REGISTRY`` so user specs cannot shadow it.
+        """
+        from omnigent.tools.builtins.sys_ask_user import SysAskUserTool
+
+        self._tools[SysAskUserTool.name()] = SysAskUserTool()
 
     def _register_policy_tools(self) -> None:
         """

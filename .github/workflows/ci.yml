@@ -79,7 +79,11 @@ jobs:
     name: Pytest (${{ matrix.group }})
     needs: scope
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.backend == 'true' }}
-    runs-on: ubuntu-latest
+    # ubuntu-latest now resolves to ubuntu 26.04, whose coreutils `env -S`/
+    # `${VAR}` semantics diverge from the env-wrapper model (see
+    # tests/host/test_harness_startup.py) and whose runners break other
+    # toolchain pins; pin to ubuntu-24.04 like ui-snapshot.yml/e2e-ui.yml.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false

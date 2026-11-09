@@ -1669,13 +1669,24 @@ def _pending_elicitation_snapshot_for_session(
         :class:`SessionResponse.pending_elicitations`.
     """
     events = pending_elicitations.snapshot_for(conv.id)
-    if not (set(pending_elicitations.pending_session_ids()) - {conv.id}):
-        return events
+    # Durable sys_ask_user questions replay from the database, so they
+    # survive a cold server start; the in-memory index keeps legacy
+    # policy/MCP prompts. Merged by id, in-memory entries win (the live
+    # payload is fresher than the persisted one for the same id).
+    from omnigent.runtime.durable_ask_user import snapshot_for_session as _durable_snapshot
+
     seen = {
         event.get("elicitation_id")
         for event in events
         if isinstance(event.get("elicitation_id"), str)
     }
+    for event in _durable_snapshot(conv.id):
+        durable_id = event.get("elicitation_id")
+        if isinstance(durable_id, str) and durable_id not in seen:
+            seen.add(durable_id)
+            events.append(event)
+    if not (set(pending_elicitations.pending_session_ids()) - {conv.id}):
+        return events
     for child in _descendant_sessions(conv_store, conv.id):
         for event in pending_elicitations.snapshot_for(child.id):
             elicitation_id = event.get("elicitation_id")
