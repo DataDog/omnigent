@@ -104,6 +104,29 @@ class OidcTokenManager:
             )
             if credentials is None:
                 raise ReauthenticationError("Session not found or expired")
+            if credentials.broker_session_credential:
+                if not self._has_stable_provider_binding(credentials):
+                    raise ReauthenticationError("Habitat session belongs to another OIDC provider")
+                from omnigent.server.habitat_broker import HabitatBroker
+
+                result = HabitatBroker.from_env().get_token(credentials.broker_session_credential)
+                claims = _validate_oidc_id_token({"id_token": result.client_token}, self._config)
+                email = _extract_verified_email(claims, self._config) if claims else None
+                if (
+                    not claims
+                    or email is None
+                    or email.lower() != expected_user_id.lower()
+                    or claims.get("sub") != credentials.provider_subject
+                ):
+                    raise ReauthenticationError("Habitat broker identity changed")
+                current = self._store.get_refresh_credentials(
+                    oidc_session_id, expected_user_id, now_epoch_seconds=int(self._clock())
+                )
+                if current is None:
+                    raise ReauthenticationError(
+                        "Session expired or was revoked during broker request"
+                    )
+                return IdTokenResult(result.client_token, result.token_expires_at_unix)
             credentials = self._ensure_stable_provider_binding(
                 oidc_session_id,
                 expected_user_id,
@@ -152,6 +175,16 @@ class OidcTokenManager:
             if time.monotonic() >= wait_deadline:
                 raise ReauthenticationError("Token refresh is already in progress")
             time.sleep(_REFRESH_WAIT_SECONDS)
+
+    def get_habitat_session_credential(self, session_id: str, expected_user_id: str) -> str:
+        credentials = self._store.get_refresh_credentials(session_id, expected_user_id)
+        if (
+            credentials is None
+            or not credentials.broker_session_credential
+            or not self._has_stable_provider_binding(credentials)
+        ):
+            raise ReauthenticationError("Sign in through the Habitat broker")
+        return credentials.broker_session_credential
 
     def _refresh(
         self,

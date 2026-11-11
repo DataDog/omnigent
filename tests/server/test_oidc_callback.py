@@ -1179,3 +1179,86 @@ def test_cli_poll_without_grant_store_keeps_legacy_shape(
         r = client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={cli_verifier}")
         assert r.status_code == 200, r.text
         assert "refresh_token" not in r.json()
+
+
+@pytest.mark.parametrize(
+    "admitted, cleanup_error", [(True, False), (True, True), (False, False), (False, True)]
+)
+def test_habitat_broker_callback_keeps_only_session_handle(
+    tmp_path, monkeypatch, admitted, cleanup_error, caplog
+):
+    """Broker login retains existing token validation and cleans up rejected sessions."""
+    from types import SimpleNamespace
+
+    from omnigent.server.habitat_broker import HabitatBroker
+
+    keys = _IdpKeys()
+    monkeypatch.setattr(jwt.PyJWKClient, "get_signing_key_from_jwt", lambda *_: keys.signing_key)
+    monkeypatch.setenv("OMNIGENT_SANDBOX_PROVIDER_MODULE", "omnigent_hab_launcher")
+    monkeypatch.setenv("OMNIGENT_HAB_ENABLED", "true")
+    calls = []
+    now = int(time.time())
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": admitted})
+
+    class Broker:
+        def start(self, callback_uri, reauth):
+            calls.append(("start", callback_uri, reauth))
+            return SimpleNamespace(
+                state="broker-state",
+                transaction_credential="transaction-secret",
+                authorization_url="https://idp.example.com/login",
+            )
+
+        def complete(self, transaction, callback_uri, state, code):
+            calls.append(("complete", transaction, callback_uri, state, code))
+            return SimpleNamespace(
+                client_token=token,
+                session_credential="broker-session-secret",
+                session_expires_at_unix=now + 600,
+            )
+
+        def logout(self, credential):
+            calls.append(("logout", credential))
+            if cleanup_error:
+                raise RuntimeError("broker-session-secret")
+
+    monkeypatch.setattr(HabitatBroker, "from_env", lambda: Broker())
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'broker.db'}", connect_args={"check_same_thread": False}
+    )
+    OmnigentBase.metadata.create_all(engine, tables=[SqlOidcSession.__table__])
+    store = OidcSessionStore(sessionmaker(bind=engine), credential_key=_TEST_SECRET)
+    provider = UnifiedAuthProvider(source="oidc", oidc_config=_oidc_config())
+    app = FastAPI()
+    app.include_router(
+        create_auth_router(
+            provider, None, AdminList(tmp_path / "admins"), oidc_session_store=store
+        ),
+        prefix="/auth",
+    )
+    with TestClient(app) as client:
+        login = client.get("/auth/login", follow_redirects=False)
+        assert login.headers["location"] == "https://idp.example.com/login"
+        response = client.get(
+            "/auth/callback",
+            params={"state": "broker-state", "code": "code-secret"},
+            follow_redirects=False,
+        )
+        if admitted:
+            assert response.status_code == 302
+            handle = client.cookies.get(_oidc_config().session_cookie_name)
+            resolved = store.resolve(handle)
+            credentials = store.get_refresh_credentials(resolved[1], resolved[0])
+            assert credentials.broker_session_credential == "broker-session-secret"
+            assert credentials.id_token == ""
+            assert credentials.refresh_token is None
+            assert credentials.absolute_expiry == now + 600
+            logout = client.get("/auth/logout", follow_redirects=False)
+            assert logout.status_code == 302
+            assert store.resolve(handle) is None
+            assert client.cookies.get(_oidc_config().session_cookie_name) is None
+        else:
+            assert response.status_code == 400
+        assert calls[-1] == ("logout", "broker-session-secret")
+        assert "broker-session-secret" not in caplog.text
+    engine.dispose()

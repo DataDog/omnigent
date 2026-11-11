@@ -51,6 +51,7 @@ from omnigent.server.auth import (
     UnifiedAuthProvider,
 )
 from omnigent.server.device_grant_store import DeviceGrantStore
+from omnigent.server.habitat_broker import HabitatBroker, habitat_broker_enabled
 from omnigent.server.oidc import (
     _GITHUB_EMAILS_ENDPOINT,
     derive_code_challenge,
@@ -232,6 +233,10 @@ def create_auth_router(
     if config is None:
         raise ValueError("OIDC auth router requires an OIDC-configured auth provider")
 
+    broker = HabitatBroker.from_env() if habitat_broker_enabled() else None
+    if broker is not None and (oidc_session_store is None or config.provider_type != "oidc"):
+        raise ValueError("Habitat broker authentication requires an encrypted OIDC session store")
+
     # Invites are opt-in AND require the token store. Both must hold.
     invite_store = account_store if config.allow_invites else None
     _invites_enabled = invite_store is not None
@@ -352,6 +357,17 @@ def create_auth_router(
             # id_token's auth_time proves the IdP actually re-authenticated
             # after this point (rather than silently reusing its session).
             state_payload["reauth_at"] = int(time.time())
+        started = None
+        if broker is not None:
+            try:
+                started = await asyncio.to_thread(broker.start, config.redirect_uri, reauth)
+            except RuntimeError:
+                return JSONResponse(
+                    status_code=503, content={"error": "Habitat authentication is unavailable"}
+                )
+            state_payload["state"] = started.state
+            state_payload["broker_transaction"] = started.transaction_credential
+            state_payload.pop("code_verifier", None)
         state_jwt = jwt.encode(state_payload, config.cookie_secret, algorithm="HS256")
 
         # Build the authorization URL.
@@ -377,6 +393,8 @@ def create_auth_router(
         ]
         auth_url = urlunsplit(endpoint._replace(query=urlencode(query + list(params.items()))))
 
+        if started is not None:
+            auth_url = started.authorization_url
         response = RedirectResponse(url=auth_url, status_code=302)
         response.set_cookie(
             key=_state_cookie,
@@ -391,6 +409,17 @@ def create_auth_router(
 
     @router.get("/callback")
     async def callback(request: Request) -> Response:
+        try:
+            return await _callback(request)
+        finally:
+            pending = getattr(request.state, "habitat_pending_session", None)
+            if pending and not getattr(request.state, "habitat_session_persisted", False):
+                try:
+                    await asyncio.to_thread(HabitatBroker.from_env().logout, pending)
+                except RuntimeError:
+                    _logger.warning("Habitat rejected-login session cleanup failed")
+
+    async def _callback(request: Request) -> Response:
         """Handle the IdP callback after user authentication.
 
         Validates the ``state`` parameter, exchanges the
@@ -474,39 +503,55 @@ def create_auth_router(
             token_data["client_secret"] = config.client_secret
 
         oidc_claims: dict[str, object] | None = None
-        async with httpx.AsyncClient() as client:
-            # GitHub requires Accept: application/json to get JSON
-            # response from the token endpoint.
-            headers = {"Accept": "application/json"} if config.provider_type == "github" else {}
-            token_resp = await client.post(
-                config.token_endpoint,
-                data=token_data,
-                headers=headers,
-                timeout=10.0,
-            )
-
-            if token_resp.status_code != 200:
-                _logger.error("Token exchange failed: %d", token_resp.status_code)
-                return fail(400, "Token exchange failed", "server_error")
-
-            token_json = _json_object(_response_json(token_resp))
-            if token_json is None:
-                _logger.error("Token exchange returned a non-object JSON response")
-                return fail(400, "Token exchange returned an invalid response", "server_error")
-
-            # Extract user email.
-            if config.provider_type == "github":
-                access_token = token_json.get("access_token")
-                email = await _resolve_github_email(
-                    client,
-                    access_token if isinstance(access_token, str) else "",
+        broker_result = None
+        if broker is not None:
+            transaction = state_payload.get("broker_transaction")
+            if not isinstance(transaction, str) or not transaction:
+                return fail(400, "Sign in again through Habitat")
+            try:
+                broker_result = await asyncio.to_thread(
+                    broker.complete, transaction, config.redirect_uri, state, code
                 )
-            else:
-                # Keep the established wrapper as the single email admission
-                # path. Credential-backed sessions validate once more below to
-                # persist the verified identity claims needed for refresh.
-                email = _resolve_oidc_email(token_json, config)
+            except RuntimeError:
+                return fail(503, "Habitat authentication is unavailable", "server_error")
+            request.state.habitat_pending_session = broker_result.session_credential
+            token_json = {"id_token": broker_result.client_token}
+            email = _resolve_oidc_email(token_json, config)
+        else:
+            async with httpx.AsyncClient() as client:
+                # GitHub requires Accept: application/json to get JSON
+                # response from the token endpoint.
+                headers = (
+                    {"Accept": "application/json"} if config.provider_type == "github" else {}
+                )
+                token_resp = await client.post(
+                    config.token_endpoint,
+                    data=token_data,
+                    headers=headers,
+                    timeout=10.0,
+                )
 
+                if token_resp.status_code != 200:
+                    _logger.error("Token exchange failed: %d", token_resp.status_code)
+                    return fail(400, "Token exchange failed", "server_error")
+
+                token_json = _json_object(_response_json(token_resp))
+                if token_json is None:
+                    _logger.error("Token exchange returned a non-object JSON response")
+                    return fail(400, "Token exchange returned an invalid response", "server_error")
+
+                # Extract user email.
+                if config.provider_type == "github":
+                    access_token = token_json.get("access_token")
+                    email = await _resolve_github_email(
+                        client,
+                        access_token if isinstance(access_token, str) else "",
+                    )
+                else:
+                    # Keep the established wrapper as the single email admission
+                    # path. Credential-backed sessions validate once more below to
+                    # persist the verified identity claims needed for refresh.
+                    email = _resolve_oidc_email(token_json, config)
         if not email:
             return fail(400, "Could not determine user email from IdP", "server_error")
 
@@ -623,13 +668,21 @@ def create_auth_router(
                 oidc_session_store.create_with_id,
                 user_id=email,
                 provider_subject=provider_subject,
-                id_token=id_token_val,
-                refresh_token=refresh_token_val,
+                id_token="" if broker_result is not None else id_token_val,
+                refresh_token=None if broker_result is not None else refresh_token_val,
+                broker_session_credential=(
+                    broker_result.session_credential if broker_result is not None else None
+                ),
                 id_token_expiry=provider_id_token_expiry,
-                absolute_expiry=now + config.session_ttl_hours * 3600,
+                absolute_expiry=min(
+                    now + config.session_ttl_hours * 3600, broker_result.session_expires_at_unix
+                )
+                if broker_result is not None
+                else now + config.session_ttl_hours * 3600,
                 provider_issuer=config.issuer,
                 provider_client_id=config.client_id,
             )
+            request.state.habitat_session_persisted = True
             session_credential = created_session.handle
             oidc_session_id = created_session.session_id
         else:
@@ -818,7 +871,21 @@ def create_auth_router(
             if token and token.startswith("sess_"):
                 resolved = await asyncio.to_thread(oidc_session_store.resolve, token)
                 if resolved is not None:
-                    await asyncio.to_thread(oidc_session_store.revoke, resolved[1])
+                    credentials = await asyncio.to_thread(
+                        oidc_session_store.get_refresh_credentials, resolved[1], resolved[0]
+                    )
+                    try:
+                        if credentials is not None and credentials.broker_session_credential:
+                            await asyncio.to_thread(
+                                HabitatBroker.from_env().logout,
+                                credentials.broker_session_credential,
+                            )
+                    except (RuntimeError, ValueError):
+                        _logger.warning(
+                            "Habitat remote logout failed; local session will be revoked"
+                        )
+                    finally:
+                        await asyncio.to_thread(oidc_session_store.revoke, resolved[1])
         base_path = getattr(request.app.state, "base_path", "")
         redirect_url = config.logout_redirect_uri or f"{base_path}/"
         response = RedirectResponse(url=redirect_url, status_code=302)
