@@ -111,3 +111,11 @@ def test_null_refresh_token(db_uri: str) -> None:
     conn = store.get("alice", with_tokens=True)
     assert conn is not None
     assert conn.refresh_token is None
+
+
+def test_update_reports_removed_row_and_preserves_omitted_refresh(db_uri):
+    store = _store(db_uri)
+    assert store.update_tokens("missing", _tokens()) is False
+    store.upsert("alice", github_login="alice", github_user_id=7, tokens=_tokens())
+    assert store.update_tokens("alice", _tokens("new", refresh=None)) is True
+    assert store.get("alice", with_tokens=True).refresh_token == "ghr_a"

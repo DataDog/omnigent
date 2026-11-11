@@ -538,12 +538,19 @@ def register_agent_routes(
                     if spec is not None and any(
                         c.transport == "registry" for c in spec.mcp_servers
                     ):
-                        extra = await registry_tools(
-                            registry,
-                            request,
-                            spec,
-                            user_id,
+                        from omnigent.stores.credential_store.backend import (
+                            CredentialBackendUnavailable,
                         )
+
+                        try:
+                            extra = await registry_tools(
+                                registry,
+                                request,
+                                spec,
+                                user_id,
+                            )
+                        except CredentialBackendUnavailable as exc:
+                            return _mcp_error_response(rpc_id, -32001, str(exc))
                         tools = data.get("result", {}).get("tools", [])
                         return _mcp_ok_response(rpc_id, {**data["result"], "tools": tools + extra})
             return response

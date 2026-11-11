@@ -13,6 +13,7 @@ from omnigent.server.mcp_gateway import gateway_backend
 from omnigent.server.mcp_registry import McpRegistry, McpUpstreamError
 from omnigent.server.routes.connections_base import ConnectionError
 from omnigent.spec.types import AgentSpec, MCPServerConfig
+from omnigent.stores.credential_store.backend import CredentialBackendUnavailable
 
 _logger = logging.getLogger(__name__)
 
@@ -52,6 +53,8 @@ async def registry_tools(
                             "name": f"{config.name}__{tool.name}",
                         }
                     )
+        except CredentialBackendUnavailable:
+            raise
         except ConnectionError:
             continue
         except Exception:  # noqa: BLE001 — SDK errors may contain upstream credentials
@@ -92,6 +95,8 @@ async def execute_registry_tool(
             result.isError,
         )
         return {"result": {"output": output}, "isError": result.isError}
+    except CredentialBackendUnavailable as exc:
+        return {"error": {"code": -32001, "message": str(exc)}}
     except McpUpstreamError as exc:
         _logger.warning(
             "Registry MCP call failed service=%s tool=%s session=%s failure=%s http_status=%s",
