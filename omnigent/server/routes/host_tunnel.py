@@ -82,7 +82,7 @@ from omnigent.server.host_registry import (
     RunnerExitReports,
 )
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
-from omnigent.stores.host_store import HostStore
+from omnigent.stores.host_store import HostNameConflictError, HostStore
 
 _logger = logging.getLogger(__name__)
 
@@ -575,6 +575,21 @@ def create_host_tunnel_router(
                             "on_host_disconnect callback failed for %s",
                             host_id,
                         )
+        except HostNameConflictError as exc:
+            disconnect_error = exc
+            ended_by = "host_name_conflict"
+            _logger.warning(
+                "Refusing host %s: name %r is held by live host %s of owner %r",
+                host_id,
+                exc.name,
+                exc.holder_host_id,
+                tunnel_owner,
+            )
+            # Non-retryable: the daemon exits with this message instead of
+            # reconnect-looping or displacing the host that holds the name.
+            await _send_connection_error(ws, stage=stage, error=str(exc), retryable=False)
+            with contextlib.suppress(Exception):
+                await ws.close(code=4010, reason="host name conflict")
         except Exception as exc:
             disconnect_error = exc
             _logger.exception(

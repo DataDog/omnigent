@@ -893,6 +893,39 @@ async def test_host_tunnel_reports_registration_failure(
     assert registry.get(_HOST_ID) is None
 
 
+async def test_same_name_second_host_is_refused_and_first_survives(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """A second machine reusing a live host's name is refused, non-retryably.
+
+    Rotating the first host's row away while its tunnel stays registered
+    would make GET /v1/hosts/{first} return 404 for a connected host.
+    """
+    app, registry, store = host_app
+    first = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(first, registry)
+
+    other_id = "f" * 32
+    second = await _connect_route(app, f"/v1/hosts/{other_id}/tunnel")
+    await second.send_input({"type": "websocket.receive", "text": _make_hello()})
+
+    sent = await second.receive_output(timeout=budget(1.0))
+    error = decode_host_frame(sent["text"])
+    assert isinstance(error, HostConnectionErrorFrame)
+    assert error.stage == "registration"
+    assert error.retryable is False
+    assert "already registered to another host" in error.error
+    close = await second.receive_output(timeout=budget(1.0))
+    assert close["type"] == "websocket.close"
+    assert close["code"] == 4010
+
+    assert registry.get(other_id) is None
+    assert registry.get(_HOST_ID) is not None
+    survivor = store.get_host(_HOST_ID)
+    assert survivor is not None and survivor.status == "online"
+    assert store.get_host(other_id) is None
+
+
 async def test_registry_failure_marks_persisted_host_offline(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
     monkeypatch: pytest.MonkeyPatch,
