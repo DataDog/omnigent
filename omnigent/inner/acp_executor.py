@@ -320,6 +320,15 @@ def _inline_text_file_data(file_data: object) -> str:
         return ""
 
 
+def _image_unsupported_notice(agent_name: str, count: int) -> str:
+    """User-visible notice for images an image-incapable ACP agent cannot receive."""
+    what = "1 attached image was" if count == 1 else f"{count} attached images were"
+    return (
+        f"⚠️ This agent ({agent_name}) does not accept images; {what} not sent to it. "
+        "Describe the image in text instead.\n\n"
+    )
+
+
 def _parse_image_data_uri(data_uri: object) -> tuple[str, str] | None:
     """Split an ``image/*`` ``data:`` URI into ``(mime_type, base64_payload)``.
 
@@ -1845,6 +1854,7 @@ class AcpExecutor(Executor):
 
         user_text = ""
         image_blocks: list[_AcpJsonObject] = []
+        dropped_image_count = 0
         latest_user_idx: int | None = None
         for idx in range(len(messages) - 1, -1, -1):
             msg = messages[idx]
@@ -1857,6 +1867,12 @@ class AcpExecutor(Executor):
                 elif isinstance(content, list):
                     if self._image_supported:
                         image_blocks = self._image_blocks_from_content(content)
+                    else:
+                        dropped_image_count = sum(
+                            1
+                            for block in content
+                            if isinstance(block, dict) and block.get("type") == "input_image"
+                        )
                     user_text = self._text_from_blocks(
                         content, emit_image_marker=not self._image_supported
                     )
@@ -1912,6 +1928,13 @@ class AcpExecutor(Executor):
 
         deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
         accumulated_text: list[str] = []
+
+        # The agent advertised promptCapabilities.image=false, so attached images
+        # cannot be forwarded. Tell the user instead of dropping them silently.
+        if dropped_image_count:
+            notice = _image_unsupported_notice(self._config.name, dropped_image_count)
+            accumulated_text.append(notice)
+            yield TextChunk(text=notice)
 
         while True:
             remaining = deadline - loop.time()

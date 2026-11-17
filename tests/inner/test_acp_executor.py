@@ -2744,3 +2744,67 @@ async def test_start_process_guard_deleted_process_cwd_relative_cwd() -> None:
     msg = error_events[0].message
     assert "deleted" in msg, f"expected 'deleted' in: {msg!r}"
     assert "/workspace/project" in msg, f"expected path in: {msg!r}"
+
+
+# An agent whose image capability is set per test; it echoes the prompt block
+# types it received so the test can see exactly what crossed the wire.
+_FAKE_IMAGE_AGENT = r"""
+import sys, json
+IMAGE = sys.argv[1] == "1"
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    msg = json.loads(line)
+    mid, method = msg.get("id"), msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": 1,
+            "agentCapabilities": {"promptCapabilities": {"image": IMAGE}},
+        }})
+    elif method == "session/new":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "img-session"}})
+    elif method == "session/prompt":
+        sid = msg["params"]["sessionId"]
+        kinds = ",".join(b["type"] for b in msg["params"]["prompt"])
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid,
+              "update": {"sessionUpdate": "agent_message_chunk",
+                         "content": {"type": "text", "text": "got:" + kinds}}}})
+        send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_supported", [False, True])
+async def test_image_input_against_fake_acp_agent(tmp_path: Path, image_supported: bool) -> None:
+    """VIT-2026: an agent advertising promptCapabilities.image=false (e.g. acp:vit)
+    must not have attached images dropped silently; the user sees a notice. An
+    image-capable agent still receives real ACP image blocks and no notice."""
+    agent_path = tmp_path / "fake_image_agent.py"
+    agent_path.write_text(_FAKE_IMAGE_AGENT)
+    command = shlex.join([sys.executable, str(agent_path), "1" if image_supported else "0"])
+    ex = AcpExecutor(AcpAgentConfig(command=command, name="vit"))
+    content = [
+        {"type": "input_text", "text": "what is in this picture?"},
+        {"type": "input_image", "image_url": "data:image/png;base64,AAAB", "filename": "a.png"},
+    ]
+    events = []
+    try:
+        async for ev in ex.run_turn([{"role": "user", "content": content}], [], ""):
+            events.append(ev)
+    finally:
+        await ex.close()
+
+    text = "".join(e.text for e in events if isinstance(e, TextChunk))
+    print("STREAMED:", repr(text))
+    final = [e for e in events if isinstance(e, TurnComplete)]
+    assert len(final) == 1
+    if image_supported:
+        assert "got:text,image" in text
+        assert "does not accept images" not in text
+    else:
+        assert text.endswith("got:text")
+        assert "This agent (vit) does not accept images; 1 attached image was not sent" in text
+        assert "does not accept images" in final[0].response
