@@ -478,6 +478,29 @@ def _call_factory_with_declined(
     return factory(), getattr(factory, "declined", False)
 
 
+class _UserCredentialFactory:
+    """A stored-login / SDK token factory that can be told its token was rejected."""
+
+    def __init__(self, call: Callable[[], str | None], invalidate: Callable[[], bool]) -> None:
+        """
+        :param call: Returns the current bearer token.
+        :param invalidate: Records the last stored-login token as rejected.
+        """
+        self._call = call
+        self._invalidate = invalidate
+        self._lock = threading.Lock()
+
+    def __call__(self) -> str | None:
+        """Return a bearer, force-renewing a rejected stored login first."""
+        with self._lock:
+            return self._call()
+
+    def invalidate(self) -> bool:
+        """Force the next call to renew a stored-login token the server rejected."""
+        with self._lock:
+            return self._invalidate()
+
+
 def _invalidate_auth_token_factory(factory: Callable[[], str | None]) -> bool:
     """Invalidate a bootstrap token factory when it supports that operation.
 
@@ -713,6 +736,8 @@ def _make_auth_token_factory(
             refused_binding_token = binding_token
 
     sdk_token_source: _ReusedDatabricksTokenSource | None = None
+    # The stored-login token last returned, and one the server rejected.
+    stored_login_state: dict[str, str | None] = {"last": None, "rejected": None}
 
     def _factory() -> str | None:
         """Return a fresh auth token.
@@ -726,34 +751,26 @@ def _make_auth_token_factory(
         nonlocal sdk_token_source
         # Check stored OIDC token first.
         if resolved_server_url:
-            from omnigent.cli_auth import (
-                REFRESH_MIN_REMAINING_SECONDS,
-                load_token,
-                refresh_stored_token,
-            )
+            from omnigent.cli_auth import load_or_refresh_token, refresh_stored_token
 
-            # Require enough remaining life that the token cannot lapse
-            # mid-handshake; a token inside that window falls through to
-            # the renewal path below rather than being used and rejected.
-            oidc_token = load_token(
-                resolved_server_url,
-                min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS,
-            )
+            rejected = stored_login_state["rejected"]
+            if rejected is not None:
+                # The server refused the token we last handed out: force the
+                # refresh grant even if that token still looks fresh locally.
+                stored_login_state["rejected"] = None
+                forced = refresh_stored_token(resolved_server_url, rejected_token=rejected)
+                if forced and forced != rejected:
+                    stored_login_state["last"] = forced
+                    return forced
+            # Expired or near-lapse tokens renew from the login-issued refresh
+            # grant. This keeps an unattended host alive past session-JWT
+            # expiry — the tunnel rebuilds headers through this factory on
+            # every reconnect.
+            oidc_token = load_or_refresh_token(resolved_server_url)
             if oidc_token:
+                stored_login_state["last"] = oidc_token
                 return oidc_token
-            # Expired or near-lapse: renew from the login-issued refresh
-            # grant when one exists. This is what keeps an unattended host
-            # alive past session-JWT expiry — the tunnel rebuilds headers
-            # through this factory on every reconnect.
-            refreshed = refresh_stored_token(resolved_server_url)
-            if refreshed:
-                return refreshed
-            # Nothing to renew with: a near-expiry token that has NOT
-            # actually lapsed still authenticates, so prefer it over
-            # falling through to no credential at all.
-            still_valid = load_token(resolved_server_url)
-            if still_valid:
-                return still_valid
+        stored_login_state["last"] = None
         if sdk_token_source is None:
             # Optional SDK imports must not prevent delegated/OIDC recovery or
             # bypass the managed-mint fallback when the executor cannot load.
@@ -762,10 +779,21 @@ def _make_auth_token_factory(
             sdk_token_source = _ReusedDatabricksTokenSource(resolved_server_url)
         return sdk_token_source.current_token()
 
+    def _invalidate() -> bool:
+        """Mark the stored-login token last returned as rejected by the server.
+
+        :returns: ``True`` when a stored-login token was invalidated.
+        """
+        last = stored_login_state["last"]
+        if last is None:
+            return False
+        stored_login_state["rejected"] = last
+        return True
+
     # Probe once to check if a user credential is available.
     try:
         if _factory() is not None:
-            return _factory
+            return _UserCredentialFactory(_factory, _invalidate)
     except (ValueError, OSError, ImportError):
         pass
 

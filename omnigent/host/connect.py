@@ -39,6 +39,14 @@ from omnigent._platform import (
     installed_interactive_shells,
     normalize_interactive_shells,
 )
+from omnigent.cli_auth import (
+    RefreshOutcome,
+    has_refreshable_login,
+    is_stored_login_rejection_status,
+    load_token,
+    refresh_stored_token_with_outcome,
+    relogin_message,
+)
 from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import (
     ORIGIN_WORKSPACE_ID_ENV_VAR,
@@ -496,6 +504,13 @@ _RECYCLE_PROMPT_MAX_STREAK = 10
 # Fresh hosts get a short auth-retry window for Databricks OAuth refreshes.
 # Established hosts retry auth failures indefinitely to preserve sessions.
 _MAX_CONSECUTIVE_AUTH_ERRORS = 3
+# Proactive stored-login renewal: check this often, and renew once the stored
+# access token has less than the window left. Keeps the shared
+# auth_tokens.json fresh for the CLI and runners while a daemon runs.
+_LOGIN_RENEW_CHECK_INTERVAL_S = 60.0
+_LOGIN_RENEW_WINDOW_S = 600.0
+# After a renewal that only a re-login can fix, wait this long before retrying.
+_LOGIN_RENEW_REFUSED_BACKOFF_S = 900.0
 # Consecutive connection-refused failures against a loopback server before the
 # host exits (~5 minutes at the backoff cap). Refused on loopback means no
 # process listens on the port — the local server is gone, not unreachable.
@@ -1275,6 +1290,16 @@ class HostProcess:
         self._login_redirect_streak = 0
         # Reset by a successful upgrade or non-auth error; bounds fresh-host refresh retries.
         self._auth_retry_streak = 0
+        # Stored-login renewal state: the bearer last sent on an upgrade, why
+        # the last on-rejection renewal ended, and whether the re-login notice
+        # was printed for the current outage.
+        self._last_sent_token: str | None = None
+        self._last_refresh_outcome: RefreshOutcome | None = None
+        self._relogin_notice_printed = False
+        self._login_renewal_task: asyncio.Task[None] | None = None
+        self._login_renew_skip_until = 0.0
+        # A plain (non-Databricks) 403 gets one renewal per outage.
+        self._forbidden_renewal_spent = False
         # Consecutive connection-refused connect failures; reset by an accepted
         # upgrade or any non-refused error. Fatal past a bounded streak only
         # when the server URL is loopback (the local server is gone).
@@ -1659,6 +1684,19 @@ class HostProcess:
         if status == 404:
             return self._classify_transient_404()
         if status in (401, 403):
+            outcome = self._last_refresh_outcome
+            if outcome is not None and outcome.needs_relogin:
+                # The refresh grant itself failed: only a new login helps.
+                relogin = (
+                    f"Connection refused (HTTP {status}): {relogin_message(self._server_url)}"
+                )
+                if not self._ever_connected:
+                    return HostConnectError(relogin)
+                if not self._relogin_notice_printed:
+                    self._relogin_notice_printed = True
+                    _logger.warning("%s Still retrying.", relogin)
+                    print(f"⚠ {relogin} Still retrying.", file=sys.stderr, flush=True)
+                return None
             # Fresh hosts can race OAuth refresh; connected hosts preserve active sessions.
             self._auth_retry_streak += 1
             cause = f"Connection refused (HTTP {status}): the host tunnel was rejected."
@@ -4152,6 +4190,9 @@ class HostProcess:
         self._suspend_task = asyncio.create_task(
             watch_for_resume(self._on_resume_from_suspend), name="host-suspend-watch"
         )
+        self._login_renewal_task = asyncio.create_task(
+            self._login_renewal_loop(), name="host-login-renewal"
+        )
         # Warm the runner zygote now: start() blocks on its one-time import
         # of the runner graph (~1-2s), which otherwise lands inside the first
         # session launch of the daemon's life. Best-effort — a failure
@@ -4365,6 +4406,11 @@ class HostProcess:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await self._suspend_task
                 self._suspend_task = None
+            if self._login_renewal_task is not None:
+                self._login_renewal_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._login_renewal_task
+                self._login_renewal_task = None
             if self._lifecycle_task is not None:
                 self._lifecycle_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -4476,39 +4522,58 @@ class HostProcess:
         # (no OpenSSL default cert path), which fails handshake verification.
         # ``ssl=None`` for ws:// is the library default (no TLS).
         ssl_ctx = client_ssl_context() if url.startswith("wss://") else None
-        try:
-            ws_cm = websockets.asyncio.client.connect(
-                url,
-                additional_headers=headers,
-                max_size=100 * 1024 * 1024,
-                ssl=ssl_ctx,
-                open_timeout=(
-                    _RECONNECT_OPEN_TIMEOUT_S
-                    if self._ever_connected
-                    else _INITIAL_CONNECT_OPEN_TIMEOUT_S
-                ),
-                # Align the host->server tunnel's protocol keepalive to the same
-                # 90 s app-level budget as the runner tunnel (not the 20 s library
-                # default that drops a busy-but-healthy tunnel with 1011 — #1116).
-                # Symmetric with serve.py's runner-side connect().
-                ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
-                ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
-            )
-            ws = await ws_cm.__aenter__()
-        except (InvalidURI, InvalidStatus) as exc:
-            # The upgrade itself was rejected. Fail loud on permanent
-            # failures (auth / authorization / outdated server); let the
-            # reconnect loop retry transient ones.
-            fatal = self._fatal_upgrade_error(exc)
-            if fatal is not None:
-                raise fatal from exc
-            raise
+        renewal_attempted = False
+        while True:
+            try:
+                ws_cm = websockets.asyncio.client.connect(
+                    url,
+                    additional_headers=headers,
+                    max_size=100 * 1024 * 1024,
+                    ssl=ssl_ctx,
+                    open_timeout=(
+                        _RECONNECT_OPEN_TIMEOUT_S
+                        if self._ever_connected
+                        else _INITIAL_CONNECT_OPEN_TIMEOUT_S
+                    ),
+                    # Align the host->server tunnel's protocol keepalive to the same
+                    # 90 s app-level budget as the runner tunnel (not the 20 s library
+                    # default that drops a busy-but-healthy tunnel with 1011 — #1116).
+                    # Symmetric with serve.py's runner-side connect().
+                    ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
+                    ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
+                )
+                ws = await ws_cm.__aenter__()
+                break
+            except (InvalidURI, InvalidStatus) as exc:
+                if (
+                    not renewal_attempted
+                    and isinstance(exc, InvalidStatus)
+                    and self._should_renew_on_upgrade_status(exc.response.status_code)
+                ):
+                    # The stored login was rejected: renew it from the refresh
+                    # grant and retry the upgrade once, right away.
+                    renewal_attempted = True
+                    if await self._run_host_subprocess_in_thread(self._renew_rejected_login):
+                        headers = await self._run_host_subprocess_in_thread(
+                            self._build_connect_headers
+                        )
+                        continue
+                # The upgrade itself was rejected. Fail loud on permanent
+                # failures (auth / authorization / outdated server); let the
+                # reconnect loop retry transient ones.
+                fatal = self._fatal_upgrade_error(exc)
+                if fatal is not None:
+                    raise fatal from exc
+                raise
         # An accepted upgrade proves the credentials work: login redirects
         # from here on are server restarts, not an unauthenticated host.
         reconnect = self._ever_connected
         self._ever_connected = True
         self._login_redirect_streak = 0
         self._auth_retry_streak = 0
+        self._last_refresh_outcome = None
+        self._relogin_notice_printed = False
+        self._forbidden_renewal_spent = False
         self._refused_streak = 0
         self._transient_404_streak = 0
         self._conn_upgrade_accepted = True
@@ -4695,9 +4760,89 @@ class HostProcess:
             headers[MANAGED_HOST_TOKEN_HEADER] = managed_token
             return headers
         token = self._current_auth_token()
+        self._last_sent_token = token
         if token:
             headers["Authorization"] = f"Bearer {token}"
         return headers
+
+    def _should_renew_on_upgrade_status(self, status: int) -> bool:
+        """Decide whether a rejected upgrade should trigger a login renewal.
+
+        401 (and 403 on a Databricks-fronted URL) always means the bearer was
+        refused. Omnigent's own tunnel route also answers a bad bearer with
+        403, which is indistinguishable from a permission refusal, so a plain
+        403 gets one renewal per outage; a persistent permission 403 then
+        spends no further refresh exchanges on reconnect.
+
+        :param status: The upgrade response status.
+        :returns: ``True`` to renew and retry the upgrade once.
+        """
+        if is_stored_login_rejection_status(self._server_url, status):
+            return True
+        if status == 403 and not self._forbidden_renewal_spent:
+            self._forbidden_renewal_spent = True
+            return True
+        return False
+
+    def _renew_rejected_login(self) -> bool:
+        """Renew a stored login after the server rejected the tunnel upgrade.
+
+        Blocking (lock + HTTP); run it in a worker thread.
+
+        :returns: ``True`` when a new token was stored and the upgrade should
+            be retried; the outcome is kept for :meth:`_classify_http_status`.
+        """
+        from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+        if os.environ.get(HOST_TOKEN_ENV_VAR) or not has_refreshable_login(self._server_url):
+            self._last_refresh_outcome = None
+            return False
+        rejected = self._last_sent_token
+        token, outcome = refresh_stored_token_with_outcome(
+            self._server_url, rejected_token=rejected
+        )
+        self._last_refresh_outcome = outcome
+        if token and token != rejected:
+            factory = self._auth_token_factory
+            if factory is not None:
+                # The runner factory must not re-send the rejected token.
+                from omnigent.runner._entry import _invalidate_auth_token_factory
+
+                _invalidate_auth_token_factory(factory)
+            self._last_refresh_outcome = None
+            return True
+        return False
+
+    def _renew_login_if_expiring(self) -> RefreshOutcome | None:
+        """Renew the stored login once it is inside the proactive window.
+
+        Skips managed hosts and logins without refresh material. Blocking.
+
+        :returns: The renewal outcome, or ``None`` when nothing was attempted.
+        """
+        from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
+        if os.environ.get(HOST_TOKEN_ENV_VAR) or not has_refreshable_login(self._server_url):
+            return None
+        if time.monotonic() < self._login_renew_skip_until:
+            return None
+        if load_token(self._server_url, min_remaining_seconds=_LOGIN_RENEW_WINDOW_S):
+            return None
+        _, outcome = refresh_stored_token_with_outcome(
+            self._server_url, min_remaining_seconds=_LOGIN_RENEW_WINDOW_S
+        )
+        if outcome.needs_relogin:
+            self._login_renew_skip_until = time.monotonic() + _LOGIN_RENEW_REFUSED_BACKOFF_S
+        return outcome
+
+    async def _login_renewal_loop(self) -> None:
+        """Periodically renew the stored login before it expires."""
+        while True:
+            await asyncio.sleep(_LOGIN_RENEW_CHECK_INTERVAL_S)
+            try:
+                await asyncio.to_thread(self._renew_login_if_expiring)
+            except Exception as exc:  # noqa: BLE001 - background best effort
+                _logger.debug("Proactive login renewal failed: %s", type(exc).__name__)
 
     def _current_auth_token(self, *, initialize: bool = True) -> str | None:
         """Return a bearer from the host's retained refreshable auth context.

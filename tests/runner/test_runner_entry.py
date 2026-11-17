@@ -457,7 +457,7 @@ def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
     monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "host-bootstrap-token")
     monkeypatch.setenv("OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN", "host-binding-token")
     monkeypatch.setenv("OMNIGENT_RUNNER_DELEGATED_AUTH", "1")
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
     monkeypatch.setattr(
         "omnigent.inner.databricks_executor._resolve_databricks_auth", _no_sdk_auth
     )
@@ -1257,7 +1257,7 @@ def test_managed_mint_factory_proxy_auth_failure_falls_through_to_sdk(
 
     # _make_managed_mint_factory must not install the factory when the
     # construction probe gets a proxy auth failure.
-    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
     installed = _make_managed_mint_factory(
         "https://s.example.com", "bind-tok", proxy_bearer="expired-bearer"
     )
@@ -3316,11 +3316,13 @@ def test_auth_token_factory_refreshes_expired_oidc_token(
     # ...but the refresh grant mints a fresh session JWT.
     refresh_calls: list[str] = []
 
-    def _refresh(url: str) -> str:
-        refresh_calls.append(url)
-        return "refreshed-jwt"
+    from omnigent.cli_auth import RefreshOutcome
 
-    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", _refresh)
+    def _refresh(url: str, **_kw: object) -> tuple[str, RefreshOutcome]:
+        refresh_calls.append(url)
+        return "refreshed-jwt", RefreshOutcome.RENEWED
+
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token_with_outcome", _refresh)
 
     factory = _make_auth_token_factory()
 
