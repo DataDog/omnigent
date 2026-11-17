@@ -58,6 +58,29 @@ class _HostOwnershipError(IntegrityError):
     """An ownership refusal, not a retryable insert conflict."""
 
 
+class HostNameConflictError(ValueError):
+    """A connecting host's name is held by a different host of the same owner.
+
+    ``(workspace_id, user_id, name)`` is unique, so two distinct machines
+    (different ``host_id``) of one owner cannot share a name. A same-name
+    registration is only treated as an identity rotation when the current
+    holder is no longer live; otherwise rotating would delete the row of a
+    host whose tunnel is still up. The connecting host must pick another
+    name, or wait until the holder has stopped and gone stale.
+    """
+
+    def __init__(self, *, name: str, holder_host_id: str) -> None:
+        super().__init__(
+            f"host name {name!r} is already registered to another host "
+            f"({holder_host_id}) on this account. Give this host a unique name "
+            "(the `name` field in its config.yaml). If the other host is this "
+            "same machine and has stopped or crashed, its name is released "
+            f"about {HOST_LIVENESS_TTL_S}s after its last heartbeat; retry then."
+        )
+        self.name = name
+        self.holder_host_id = holder_host_id
+
+
 @dataclass
 class Host:
     """
@@ -374,6 +397,18 @@ class HostStore:
                     )
                 # Known host_id (same user_id, or reown opted in): update
                 # user_id/name in case they changed, then refresh status and timestamp.
+                if row.name != name or row.user_id != user_id:
+                    holder = session.execute(
+                        select(SqlHost).where(
+                            SqlHost.workspace_id == current_workspace_id(),
+                            SqlHost.user_id == user_id,
+                            SqlHost.name == name,
+                            SqlHost.host_id != host_id,
+                            SqlHost.deleted_at.is_(None),
+                        )
+                    ).scalar_one_or_none()
+                    if holder is not None:
+                        raise HostNameConflictError(name=name, holder_host_id=holder.host_id)
                 row.user_id = user_id
                 row.account_generation = generation
                 row.name = name
@@ -408,8 +443,16 @@ class HostStore:
                     SqlHost.deleted_at.is_(None),
                 )
             ).scalar_one_or_none()
+            if existing_by_name is not None and host_is_live(_row_to_host(existing_by_name), now):
+                # A *different* machine is connected under this name right now.
+                # Rotating would delete its row while its tunnel stays up, so
+                # it 404s on GET /v1/hosts/{id} yet keeps printing "Connected".
+                # Refuse the newcomer loudly instead.
+                raise HostNameConflictError(name=name, holder_host_id=existing_by_name.host_id)
             if existing_by_name is not None:
-                # Same (user_id, name), different host_id: identity rotation.
+                # Same (user_id, name), different host_id, and the old host is
+                # offline or stale: the same machine regenerated its identity
+                # file. Treat it as an identity rotation.
                 # host_id is now part of the PK, so we can't UPDATE it via the
                 # ORM — delete the old row and insert a fresh one that carries
                 # the new host_id while preserving created_at.

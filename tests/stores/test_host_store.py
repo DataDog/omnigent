@@ -11,6 +11,7 @@ from sqlalchemy import event, insert, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
+import omnigent.stores.host_store as host_store_module
 from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import SqlHost, SqlUser, current_workspace_id, workspace_scope
 from omnigent.db.utils import get_or_create_engine, now_epoch, run_write_transaction
@@ -19,6 +20,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.host_store import (
     HOST_LIVENESS_TTL_S,
     Host,
+    HostNameConflictError,
     HostStore,
     host_is_live,
 )
@@ -329,6 +331,8 @@ def test_reconnect_with_rotated_host_id_repoints_bound_conversations(
         host_id="a1ed1ab71de2311e20488a989e61701c",
         workspace="/Users/dana/proj",
     )
+    # The old identity's daemon has stopped before the machine rejoins.
+    host_store.set_offline("a1ed1ab71de2311e20488a989e61701c")
 
     # Same (owner, name), rotated host_id — this used to raise.
     updated = host_store.upsert_on_connect(
@@ -770,6 +774,7 @@ def test_upsert_replaces_host_id_on_owner_name_conflict(
     broken.
     """
     host_store.upsert_on_connect("660d14a93e762f508ff74112a7a81eea", "laptop", "eve@example.com")
+    host_store.set_offline("660d14a93e762f508ff74112a7a81eea")
     host_store.upsert_on_connect("9b4beb1282718551dd43288ed246fdae", "laptop", "eve@example.com")
 
     hosts = host_store.list_hosts("eve@example.com")
@@ -799,6 +804,7 @@ def test_upsert_conflict_preserves_created_at(
         "frank@example.com",
     )
     original_created = original.created_at
+    host_store.set_offline("4a7dab2e281a9dc8db539e9f59919109")
 
     host_store.upsert_on_connect(
         "a9dac0e66482a6e9ab8a4aae5135f59b",
@@ -1866,3 +1872,63 @@ def test_replace_managed_host_sandbox_refuses_cross_owner(db_uri: str) -> None:
     assert resolved.sandbox_id == "sb-m7"
     # Bob's token never armed Alice's host: it does not match the stored digest.
     assert store.resolve_launch_token("58f80f7592c6a72ba121eb5aedde8a82", "bob-token-7") is None
+
+
+def test_same_name_live_host_rejects_newcomer_without_evicting(
+    host_store: HostStore,
+) -> None:
+    """Two machines of one owner sharing a name must not evict each other.
+
+    Treating the second registration as an identity rotation would delete
+    the first host's row while its tunnel is still connected.
+    """
+
+    first = "1" * 32
+    second = "2" * 32
+    host_store.upsert_on_connect(first, "devbox", "gina@example.com")
+
+    with pytest.raises(HostNameConflictError, match="devbox"):
+        host_store.upsert_on_connect(second, "devbox", "gina@example.com")
+
+    hosts = host_store.list_hosts("gina@example.com")
+    assert [h.host_id for h in hosts] == [first]
+    assert host_store.get_host(first) is not None
+    assert host_store.get_host(second) is None
+
+
+def test_same_name_stale_host_still_rotates(
+    host_store: HostStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A holder that died without a clean close (stale heartbeat) can be rotated."""
+    first = "3" * 32
+    second = "4" * 32
+    host_store.upsert_on_connect(first, "devbox", "hal@example.com")
+    real_now = now_epoch()
+    monkeypatch.setattr(host_store_module, "now_epoch", lambda: real_now + HOST_LIVENESS_TTL_S + 5)
+
+    rotated = host_store.upsert_on_connect(second, "devbox", "hal@example.com")
+
+    assert rotated.host_id == second
+    assert [h.host_id for h in host_store.list_hosts("hal@example.com")] == [second]
+
+
+def test_rename_onto_another_hosts_name_is_rejected(host_store: HostStore) -> None:
+    host_store.upsert_on_connect("5" * 32, "alpha", "ivy@example.com")
+    host_store.upsert_on_connect("6" * 32, "beta", "ivy@example.com")
+
+    with pytest.raises(HostNameConflictError):
+        host_store.upsert_on_connect("6" * 32, "alpha", "ivy@example.com")
+
+    assert {h.name for h in host_store.list_hosts("ivy@example.com")} == {"alpha", "beta"}
+
+
+def test_single_host_reconnect_unchanged(host_store: HostStore) -> None:
+    host_id = "7" * 32
+    host_store.upsert_on_connect(host_id, "solo", "jay@example.com")
+    host_store.set_offline(host_id)
+    again = host_store.upsert_on_connect(host_id, "solo", "jay@example.com")
+    live_again = host_store.upsert_on_connect(host_id, "solo", "jay@example.com")
+
+    assert again.status == "online"
+    assert live_again.host_id == host_id
+    assert [h.host_id for h in host_store.list_hosts("jay@example.com")] == [host_id]

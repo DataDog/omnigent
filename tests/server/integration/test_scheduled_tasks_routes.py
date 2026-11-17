@@ -86,7 +86,7 @@ def _register_host(app: FastAPI, host_id: str, owner: str) -> None:
     contacts the host (no ``host.stat`` / workspace RPC in the no-workspace
     path), so the host does not need to be online in the registry.
     """
-    app.state.host_store.upsert_on_connect(host_id, f"{owner}-laptop", owner)
+    app.state.host_store.upsert_on_connect(host_id, f"{owner}-laptop-{host_id[:8]}", owner)
 
 
 @pytest_asyncio.fixture()
