@@ -1004,8 +1004,9 @@ def test_run_chat_with_server_url_routes_through_daemon(
     agent_yaml.write_text("name: hello\nprompt: Say hi.\n")
     calls: dict[str, object] = {}
 
-    def _fake_ensure_backend(server: str | None) -> str:
+    def _fake_ensure_backend(server: str | None, *, extra_acp_passthrough: object = ()) -> str:
         calls["ensure_backend"] = server
+        calls["extra_acp_passthrough"] = extra_acp_passthrough
         return "https://example.databricksapps.com"
 
     def _fake_via_daemon(
@@ -1024,6 +1025,7 @@ def test_run_chat_with_server_url_routes_through_daemon(
     )
 
     assert calls["ensure_backend"] == "https://example.databricksapps.com"
+    assert calls["extra_acp_passthrough"] == ()
     via = calls["via_daemon"]
     assert isinstance(via, dict)
     assert via["base_url"] == "https://example.databricksapps.com"
@@ -4781,3 +4783,34 @@ def test_cursor_native_resume_never_drives_an_omnigent_turn(
     )
 
     assert redirected["session_id"] == "conv_abc123"
+
+
+@pytest.mark.parametrize(
+    ("spec_yaml", "expected"),
+    [
+        (
+            "name: a\nprompt: hi\nexecutor:\n  harness: acp:x\n"
+            "os_env:\n  sandbox:\n    env_passthrough: [SPEC_ONLY_TOKEN]\n",
+            ("SPEC_ONLY_TOKEN",),
+        ),
+        (
+            "name: a\nprompt: hi\nexecutor:\n  harness: acp:helper\n"
+            "  acp_agent:\n    name: Helper\n    command: helper --acp\n"
+            "    env_passthrough: [VIT_PASSTHROUGH_TOKEN]\n",
+            ("VIT_PASSTHROUGH_TOKEN",),
+        ),
+        (
+            "name: a\nprompt: hi\nexecutor:\n  harness: codex\n"
+            "os_env:\n  sandbox:\n    env_passthrough: [SPEC_ONLY_TOKEN]\n",
+            (),
+        ),
+        ("{not: [valid", ()),
+    ],
+    ids=["shorthand-os-env", "embedded-acp-agent", "non-acp", "load-failure"],
+)
+def test_spec_acp_passthrough_names(
+    tmp_path: Path, spec_yaml: str, expected: tuple[str, ...]
+) -> None:
+    spec = tmp_path / "agent.yaml"
+    spec.write_text(spec_yaml)
+    assert chat_module._spec_acp_passthrough_names(str(spec)) == expected

@@ -8,6 +8,7 @@ import contextlib
 import contextvars
 import copy
 import errno
+import functools
 import hashlib
 import json
 import logging
@@ -21,7 +22,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from importlib import import_module, resources
 from pathlib import Path
@@ -3452,12 +3453,17 @@ def _load_or_create_host_id() -> str | None:
         return None
 
 
-def _ensure_host_daemon(server_url: str | None) -> bool:
+def _ensure_host_daemon(
+    server_url: str | None, *, extra_acp_passthrough: Iterable[str] = ()
+) -> bool:
     """Start or reuse a host daemon for one target.
 
     :param server_url: Omnigent server URL the daemon connects to, or ``None``
         for local mode — the daemon starts (or reuses) a persistent local
         Omnigent server and connects to that.
+    :param extra_acp_passthrough: ACP passthrough names the launching spec
+        declares; forwarded into a newly spawned daemon. A reused daemon keeps
+        the env it started with (``omni stop`` to pick up new names).
     :returns: ``True`` when an existing daemon was torn down and respawned
         because its config (auth source) changed — the caller
         should ask the user to re-run against the freshly-restarted server
@@ -3494,7 +3500,9 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
     # without changing the caller's working directory or agent workspace.
     args = [sys.executable, "-P", "-m", "omnigent.host._daemon_entry", *mode_args]
     config_sig = server_config_signature(include_features=not server_url)
-    daemon_env = _build_host_daemon_env(server_url=server_url)
+    daemon_env = _build_host_daemon_env(
+        server_url=server_url, extra_acp_passthrough=extra_acp_passthrough
+    )
     daemon_env[DAEMON_CONFIG_SIG_ENV_VAR] = config_sig
     expected_host_id = _load_existing_host_id()
     spawned = _spawn_host_daemon_process(args=args, env=daemon_env)
@@ -3538,6 +3546,7 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
 def _build_host_daemon_env(
     *,
     server_url: str | None,
+    extra_acp_passthrough: Iterable[str] = (),
 ) -> dict[str, str]:
     """
     Build the environment for the background host daemon.
@@ -3553,20 +3562,32 @@ def _build_host_daemon_env(
     through :func:`omnigent.host.connect._build_runner_env`, so these
     local-server credentials do not leak into runner subprocesses.
 
+    Declared passthrough names also cross: ``OMNIGENT_RUNNER_ENV_PASSTHROUGH``
+    names, every ``acp.agents[].env_passthrough`` name, and
+    *extra_acp_passthrough*. The ACP-scoped names are recorded (names only) in
+    ``OMNIGENT_ACP_ENV_PASSTHROUGH`` so the runner hop forwards them only
+    for ACP launches.
+
     :param server_url: Omnigent server URL for remote mode, e.g.
         ``"https://example.databricksapps.com"``, or a falsey value
         such as ``None`` / ``""`` for local daemon mode.
+    :param extra_acp_passthrough: ACP passthrough names declared by the
+        launching spec, e.g. ``("XAI_API_KEY",)``.
     :returns: Environment dict for ``subprocess.Popen``.
     """
     from omnigent.host.connect import (
         _RUNNER_ENV_ALLOWLIST,
         _RUNNER_ENV_ALLOWLIST_PREFIXES,
+        ACP_ENV_PASSTHROUGH_ENV_VAR,
+        RUNNER_ENV_PASSTHROUGH_ENV_VAR,
+        _split_env_names,
     )
     from omnigent.host.identity import (
         HOST_ID_ENV_VAR,
         HOST_NAME_ENV_VAR,
         HOST_TOKEN_ENV_VAR,
     )
+    from omnigent.onboarding.acp_auth import acp_env_passthrough_names
 
     identity_env_vars = frozenset(
         {
@@ -3623,6 +3644,17 @@ def _build_host_daemon_env(
 
     env.pop(DISPATCH_TRACEPARENT_ENV_VAR, None)
     env.pop(DISPATCH_TRACESTATE_ENV_VAR, None)
+    acp_names = (
+        _split_env_names(os.environ.get(ACP_ENV_PASSTHROUGH_ENV_VAR))
+        | set(acp_env_passthrough_names())
+        | {name.strip() for name in extra_acp_passthrough if name.strip()}
+    )
+    passthrough = acp_names | _split_env_names(os.environ.get(RUNNER_ENV_PASSTHROUGH_ENV_VAR))
+    for name in passthrough:
+        if name in os.environ:
+            env[name] = os.environ[name]
+    if acp_names:
+        env[ACP_ENV_PASSTHROUGH_ENV_VAR] = ",".join(sorted(acp_names))
     return env
 
 
@@ -3754,7 +3786,7 @@ def _ensure_databricks_server_auth(server: str, *, non_interactive: bool = False
     _databricks_login(server, workspace_host, org_id=_org_id_from_url(server))
 
 
-def _ensure_backend(server: str | None) -> str:
+def _ensure_backend(server: str | None, *, extra_acp_passthrough: Iterable[str] = ()) -> str:
     """Ensure the host daemon is running and return the Omnigent server URL.
 
     The daemon is the single backend for ``attach`` / ``run`` / ``claude`` /
@@ -3766,6 +3798,8 @@ def _ensure_backend(server: str | None) -> str:
         ``""`` selects local mode: the daemon starts (or reuses) a
         persistent local Omnigent server and this returns its discovered loopback
         URL.
+    :param extra_acp_passthrough: ACP passthrough names the launching spec
+        declares; see :func:`_ensure_host_daemon`.
     :returns: A concrete base URL, e.g. ``"http://127.0.0.1:8123"`` or the
         remote URL passed in.
     :raises click.ClickException: If local mode's server never becomes
@@ -3800,7 +3834,13 @@ def _ensure_backend(server: str | None) -> str:
         ):
             auth_future = pool.submit(_ensure_databricks_server_auth, server)
             daemon_context = contextvars.copy_context()
-            daemon_future = pool.submit(daemon_context.run, _ensure_host_daemon, server)
+            daemon_future = pool.submit(
+                daemon_context.run,
+                functools.partial(
+                    _ensure_host_daemon, extra_acp_passthrough=extra_acp_passthrough
+                ),
+                server,
+            )
             # Raise auth errors before daemon errors: a login failure is
             # more actionable than a daemon-connect failure that would
             # have been caused by the same missing credentials.
@@ -3814,7 +3854,7 @@ def _ensure_backend(server: str | None) -> str:
     # before the REPL/terminal the caller brings up — and falls back to plain
     # stderr lines off a TTY (CI, daemon logfiles).
     with runner_startup_progress(initial_message=STARTUP_PHASE_STARTING) as progress:
-        config_changed = _ensure_host_daemon(None)
+        config_changed = _ensure_host_daemon(None, extra_acp_passthrough=extra_acp_passthrough)
         progress.update(STARTUP_PHASE_LOCAL_SERVER)
         local_url = _discover_local_server_url()
     _update_daemon_resolved_server_url(_LOCAL_DAEMON_MARKER, local_url)

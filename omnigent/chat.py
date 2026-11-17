@@ -477,7 +477,9 @@ def run_chat(
         # claude-native.
         from omnigent.cli import _ensure_backend
 
-        base_url = _ensure_backend(server_url)
+        base_url = _ensure_backend(
+            server_url, extra_acp_passthrough=_spec_acp_passthrough_names(target)
+        )
         _chat_via_daemon(
             target,
             base_url,
@@ -2999,6 +3001,34 @@ async def _resolve_latest_conversation_id_async(
     if not sessions:
         return None
     return sessions[0].id
+
+
+def _spec_acp_passthrough_names(target: str) -> tuple[str, ...]:
+    """ACP passthrough names an ACP agent spec declares, for the daemon env.
+
+    Reads ``os_env.sandbox.env_passthrough`` and an embedded
+    ``executor.config.acp_agent.env_passthrough``. Non-ACP specs and specs
+    that fail to load yield nothing; the launch reports load errors itself.
+
+    :param target: Agent path passed to ``omni run``.
+    :returns: Declared names, e.g. ``("XAI_API_KEY",)``.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.inner.agent_env import declared_passthrough
+    from omnigent.onboarding.acp_auth import parse_env_passthrough
+
+    try:
+        spec = load_spec(Path(target))
+        config = spec.executor.config if spec.executor is not None else {}
+        if not isinstance(config, dict) or canonicalize_harness(config.get("harness")) != "acp":
+            return ()
+        names = list(declared_passthrough(spec.os_env))
+        embedded = config.get("acp_agent")
+        if isinstance(embedded, dict):
+            names.extend(parse_env_passthrough(embedded.get("env_passthrough")))
+    except Exception:  # noqa: BLE001 — best effort; launch surfaces real errors
+        return ()
+    return tuple(dict.fromkeys(names))
 
 
 def _materialize_override_bundle(source: Path, overrides: ChatOverrides) -> Path:

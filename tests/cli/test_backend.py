@@ -1232,7 +1232,7 @@ def test_ensure_backend_exits_clean_on_config_change(
     in-flight command (the server was just restarted into a new auth mode);
     it exits 0 so the user re-runs against the fresh server.
     """
-    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server: True)
+    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server, **_kw: True)
     monkeypatch.setattr(cli, "_discover_local_server_url", lambda: "http://127.0.0.1:8000")
     monkeypatch.setattr(cli, "_update_daemon_resolved_server_url", lambda target, url: None)
     monkeypatch.setattr(
@@ -1252,7 +1252,7 @@ def test_ensure_backend_continues_when_no_config_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A plain reuse / heal does NOT exit — the command continues normally."""
-    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server: False)
+    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server, **_kw: False)
     monkeypatch.setattr(cli, "_discover_local_server_url", lambda: "http://127.0.0.1:8000")
     monkeypatch.setattr(cli, "_update_daemon_resolved_server_url", lambda target, url: None)
 
@@ -2871,7 +2871,7 @@ def test_stop_session_keys_event_by_resolved_host(
 def test_ensure_backend_remote_passthrough(monkeypatch: pytest.MonkeyPatch) -> None:
     """A remote URL ensures a daemon for it and returns the normalized URL."""
     calls: list[str | None] = []
-    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda s: calls.append(s))
+    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda s, **_kw: calls.append(s))
     # Identity normalization: the workspace-URL expansion probes the
     # network and has dedicated tests.
     monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
@@ -2893,7 +2893,7 @@ def test_ensure_backend_local_discovers_url(monkeypatch: pytest.MonkeyPatch) -> 
     ``None`` (local mode).
     """
     calls: list[str | None] = []
-    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda s: calls.append(s))
+    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda s, **_kw: calls.append(s))
     monkeypatch.setattr(cli, "_discover_local_server_url", lambda: "http://127.0.0.1:8123")
 
     assert _ensure_backend(None) == "http://127.0.0.1:8123"
@@ -2908,7 +2908,7 @@ def test_ensure_backend_defaults_scheme_https(monkeypatch: pytest.MonkeyPatch) -
     through ``_ensure_backend``; the guide hands out schemeless URLs.
     """
     seen: list[str] = []
-    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda s: False)
+    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda s, **_kw: False)
     monkeypatch.setattr(cli, "_workspace_api_server_url", _recording_expander(seen))
     monkeypatch.setattr(cli, "_ensure_databricks_server_auth", lambda server: None)
 
@@ -3104,7 +3104,7 @@ def test_ensure_backend_databricks_preflight_runs_login_on_tty(
     with an opaque "non-JSON response (status=302)" traceback.
     """
     login_calls = _patch_auth_preflight(monkeypatch, probe_status=302, tty=True)
-    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server: False)
+    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server, **_kw: False)
 
     result = _ensure_backend("https://myapp-1234.aws.databricksapps.com/")
 
@@ -3121,7 +3121,7 @@ def test_ensure_backend_databricks_preflight_hints_headless(
 ) -> None:
     """Headless invocations get the exact login command, not a browser."""
     login_calls = _patch_auth_preflight(monkeypatch, probe_status=302, tty=False)
-    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server: False)
+    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server, **_kw: False)
 
     with pytest.raises(click.ClickException) as exc:
         _ensure_backend("https://myapp-1234.aws.databricksapps.com")
@@ -3136,7 +3136,7 @@ def test_ensure_backend_databricks_preflight_skips_when_authenticated(
 ) -> None:
     """A 200 probe (valid creds / header mode) never invokes login."""
     login_calls = _patch_auth_preflight(monkeypatch, probe_status=200, tty=True)
-    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server: False)
+    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server, **_kw: False)
 
     result = _ensure_backend("https://myapp-1234.aws.databricksapps.com")
 
