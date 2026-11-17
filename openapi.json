@@ -8137,6 +8137,17 @@
             "title": "Todos",
             "type": "array"
           },
+          "token_usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelUsage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Flat token totals over the same subtree usage, independent of model attribution and pricing, e.g. `ModelUsage(input_tokens=1200, output_tokens=340, total_tokens=1540)`. Populated even when `usage_by_model` and `total_cost_usd` are `None` (a harness that reports tokens but no model, such as a generic ACP agent). `total_cost_usd` on it is set only when priced. `None` when no tokens were recorded or `usage_included` is `False`."
+          },
           "total_cost_usd": {
             "anyOf": [
               {
