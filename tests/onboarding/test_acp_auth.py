@@ -160,3 +160,29 @@ def test_shadowed_builtin_acp_rows_matches_row_ids_only() -> None:
 def test_shadowed_builtin_acp_rows_empty_without_config() -> None:
     """No configured agents → no rows suppressed (the common case)."""
     assert shadowed_builtin_acp_rows([]) == frozenset()
+
+
+def test_acp_env_passthrough_names_unions_agents() -> None:
+    from omnigent.onboarding.acp_auth import acp_env_passthrough_names
+
+    config = {
+        "acp": {
+            "agents": [
+                {
+                    "name": "vit",
+                    "command": "vit acp",
+                    "env_passthrough": ["PASSWORD_STORE_GPG_OPTS"],
+                },
+                {"name": "other", "command": "other", "env_passthrough": "XAI_API_KEY"},
+                {"name": "plain", "command": "plain"},
+            ]
+        }
+    }
+    assert acp_env_passthrough_names(config) == {"PASSWORD_STORE_GPG_OPTS", "XAI_API_KEY"}
+
+
+def test_acp_env_passthrough_names_malformed_config_is_empty() -> None:
+    from omnigent.onboarding.acp_auth import acp_env_passthrough_names
+
+    bad = {"acp": {"agents": [{"name": "x", "command": "x", "env_passthrough": ["A=secret"]}]}}
+    assert acp_env_passthrough_names(bad) == frozenset()

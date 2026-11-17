@@ -184,6 +184,26 @@ def acp_agents(config: dict[str, object] | None = None) -> list[AcpAgentEntry]:
     return entries
 
 
+def acp_env_passthrough_names(config: dict[str, object] | None = None) -> frozenset[str]:
+    """Union of ``env_passthrough`` names across every configured ACP agent.
+
+    The host daemon and runner env filters use this to forward the values an
+    ACP agent declared; the executor still narrows the vendor env to the
+    launching agent's own names. Malformed config yields an empty set so it
+    never blocks a daemon or runner spawn.
+
+    :param config: A pre-loaded config mapping; ``None`` loads it.
+    :returns: The declared names, e.g. ``frozenset({"XAI_API_KEY"})``.
+    """
+    from omnigent.errors import OmnigentError
+
+    try:
+        entries = acp_agents(config)
+    except (ValueError, OSError, OmnigentError):
+        return frozenset()
+    return frozenset(name for entry in entries for name in entry.env_passthrough)
+
+
 def resolve_acp_agent(slug: str, config: dict[str, object] | None = None) -> AcpAgentEntry | None:
     """Return the configured agent for *slug*, or ``None`` if not found.
 

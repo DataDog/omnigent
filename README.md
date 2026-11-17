@@ -332,9 +332,13 @@ silently dropped: both run their account-default model. To pin one, configure an
 Use the vendor login rather than an API key. A builtin ACP row has no
 `env_passthrough` of its own, and `XAI_API_KEY` is not in the host-to-runner
 credential allowlist, so exporting it in your shell does not reach the agent.
-If you need the key route, pass it explicitly with
-`OMNIGENT_RUNNER_ENV_PASSTHROUGH=XAI_API_KEY`, or configure an `acp:` agent that
-declares the passthrough.
+If you need the key route, configure an `acp:` agent that declares it in
+`env_passthrough` (or declare it in the spec's `os_env.sandbox.env_passthrough`).
+The ACP spawn env is deny-by-default, so `OMNIGENT_RUNNER_ENV_PASSTHROUGH` alone
+gets the value to the runner but not into the agent process. Declared names are
+forwarded through the background host daemon by `omni run`; a daemon that was
+already running keeps its old env, so run `omni stop` after adding a name.
+(`OMNIGENT_ACP_ENV_PASSTHROUGH` is set internally on that daemon; don't set it yourself.)
 
 </details>
 

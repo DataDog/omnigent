@@ -134,7 +134,7 @@ def test_remote_backend_preserves_startup_context_in_host_thread(
         lambda **_kwargs: contextlib.nullcontext(),
     )
 
-    def ensure_host(server: str) -> None:
+    def ensure_host(server: str, **_kwargs: object) -> None:
         startup.record_startup_event(
             "host_state_observed",
             details={

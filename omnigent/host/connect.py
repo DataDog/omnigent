@@ -768,6 +768,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # This carries variable names only; their values still follow normal forwarding.
         "OMNIGENT_PI_ENV_UNSET",
         "OMNIGENT_ACP_ENV_UNSET",
+        # Names-only list of ACP-declared passthrough vars the CLI forwarded
+        # into the daemon; read by _build_runner_env for ACP launches.
+        "OMNIGENT_ACP_ENV_PASSTHROUGH",
         # Keep host and spawned-runner routing decisions aligned when the
         # host-slice-key kill switch is explicitly disabled.
         "OMNIGENT_HOST_SLICE_KEY_ENABLED",
@@ -834,6 +837,17 @@ HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
 # SDK knobs). Operator-controlled: the host owner names exactly what
 # their runners need; everything unnamed stays behind the allowlist.
 RUNNER_ENV_PASSTHROUGH_ENV_VAR: str = "OMNIGENT_RUNNER_ENV_PASSTHROUGH"
+
+# Comma-separated names an ACP agent or spec declared via ``env_passthrough``.
+# Set by the CLI on the daemon it spawns (the daemon can't see the spec), and
+# forwarded host→runner only for ACP launches.
+ACP_ENV_PASSTHROUGH_ENV_VAR: str = "OMNIGENT_ACP_ENV_PASSTHROUGH"
+
+
+def _split_env_names(raw: str | None) -> set[str]:
+    """Parse a comma-separated env var name list, dropping blanks."""
+    return {name.strip() for name in (raw or "").split(",") if name.strip()}
+
 
 # HTTP statuses on the WebSocket upgrade that are worth retrying. Everything
 # else in the 4xx range is a permanent client error (auth, authorization,
@@ -906,6 +920,9 @@ def _build_runner_env(
     forward when present, so runners can authenticate to LLM providers
     with the credentials the host owner provisioned for them.
 
+    ACP launches also forward names declared by ``acp.agents[].env_passthrough``
+    and by :data:`ACP_ENV_PASSTHROUGH_ENV_VAR`; other harnesses never see them.
+
     :param base_env: Host process environment to filter, e.g.
         ``os.environ``.
     :param server_url: Omnigent server URL the runner connects back to, e.g.
@@ -927,11 +944,14 @@ def _build_runner_env(
         host janitor. ``None`` preserves the standalone runner default.
     :returns: The runner subprocess environment.
     """
-    extra_names = {
-        name.strip()
-        for name in base_env.get(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "").split(",")
-        if name.strip()
-    }
+    extra_names = _split_env_names(base_env.get(RUNNER_ENV_PASSTHROUGH_ENV_VAR))
+    from omnigent.harness_aliases import canonicalize_harness
+
+    if canonicalize_harness(harness) == "acp":
+        from omnigent.onboarding.acp_auth import acp_env_passthrough_names
+
+        extra_names |= _split_env_names(base_env.get(ACP_ENV_PASSTHROUGH_ENV_VAR))
+        extra_names |= acp_env_passthrough_names()
     # Forward env vars that the providers config references via
     # ``api_key_ref: env:VAR`` or ``api_key: $VAR``. Without this, a user
     # who configures a gateway provider with a custom env var (e.g.
