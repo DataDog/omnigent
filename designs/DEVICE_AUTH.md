@@ -394,16 +394,32 @@ the stored `{token, user_id, expires_at}` record simply lapsed, default
   the client persisting) into a permanently revoked grant. Only the
   short-lived access token is renewed; revocation and the absolute lifetime
   cap still bound exposure. Device grants keep rotating.
-- **Renewal** — `omnigent.cli_auth.refresh_stored_token` POSTs
-  `grant_type=refresh_token`, persists the result, and returns the
-  fresh access token. The runner/host auth-token factory
-  calls it when the stored token lapses, and the host tunnel rebuilds
-  headers through that factory on every reconnect — so an unattended
-  host renews itself for the grant's lifetime. Refreshes on one machine
-  are serialized by an advisory file lock with a re-check after acquire,
-  so a losing racer picks up the winner's rotated pair instead of
-  replaying the stale token (which reuse detection would punish by
-  revoking the grant).
+- **Renewal** — `omnigent.cli_auth.refresh_stored_token_with_outcome`
+  POSTs `grant_type=refresh_token`, persists the result atomically, and
+  returns the fresh access token plus a `RefreshOutcome` (renewed,
+  already fresh, refused, no refresh material, unreachable, …). Every
+  stored-login consumer renews through it:
+  - **Expired or near expiry** (under 90 s left): the runner/host token
+    factory, the CLI's static headers and its per-request httpx auth
+    renew before sending, via `load_or_refresh_token`.
+  - **Rejected by the server** (401, or 403 on a Databricks-fronted URL):
+    the CLI server client, `host status`/management calls, the host
+    tunnel upgrade and runner callbacks force a refresh with
+    `rejected_token=<the sent token>` (even when it still looks fresh
+    locally) and retry **once**. At most one exchange runs per request.
+  - **Proactively**: a running host daemon renews the stored login once it
+    has under 10 minutes left (checked every 60 s), keeping the shared
+    `auth_tokens.json` fresh for the CLI, runners and desktop app.
+  - **Cannot renew** (`refused` / `no_refresh_material`): callers show one
+    sentence telling the user to run `omni login <url>`; a never-connected
+    host exits with it, a connected host prints it once and keeps retrying.
+    Transient failures keep the existing network/VPN guidance.
+
+  Token-file writers (login, org-id selector, refresh, logout) all hold an
+  advisory file lock, re-entrant per thread, with a re-check after
+  acquire: of concurrent renewals on one machine only one performs the
+  exchange and the rest pick up its result, and no write drops another
+  server's entry. Access and refresh tokens are never logged.
 - **One grant per host replica (recommended)** — since login grants do
   not rotate, N replicas sharing one token file no longer revoke each
   other. A per-replica login is still preferred so a single host can be

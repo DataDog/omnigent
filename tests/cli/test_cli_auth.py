@@ -960,6 +960,8 @@ def test_refresh_no_material_does_not_touch_lock_file(token_dir, monkeypatch) ->
     from omnigent.cli_auth import refresh_stored_token, store_token
 
     store_token("http://localhost:6767", token="jwt", user_id="a@x", expires_at=time.time() - 10)
+    # The store itself takes the lock; only the refresh path is under test.
+    (token_dir / "auth_tokens.lock").unlink(missing_ok=True)
 
     def _boom(*_a, **_kw):
         raise AssertionError("lock file must not be created when nothing to refresh")

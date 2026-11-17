@@ -46,6 +46,7 @@ from omnigent._wrapper_labels import (
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
 )
+from omnigent.cli_auth import RefreshOutcome
 from omnigent.cli_invocation import cli_invocation
 from omnigent.conversation_browser import (
     announce_conversation_url,
@@ -73,6 +74,7 @@ from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
 from omnigent.spec.parser import discover_host_skills
 from omnigent.spec.types import AgentSpec, SkillSpec
+from omnigent.util.threaded_auth import ThreadedAuth
 
 if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
@@ -727,10 +729,11 @@ def _remote_headers(
         # 1. Explicit env-var token.
         headers["Authorization"] = f"Bearer {token}"
     elif server_url:
-        from omnigent.cli_auth import load_token
+        from omnigent.cli_auth import load_or_refresh_token
 
-        # 2. Stored OIDC session token from `omnigent login`.
-        oidc_token = load_token(server_url)
+        # 2. Stored OIDC session token from `omnigent login`, renewed from its
+        #    refresh grant when expired or about to expire.
+        oidc_token = load_or_refresh_token(server_url)
         if oidc_token:
             headers["Authorization"] = f"Bearer {oidc_token}"
         else:
@@ -786,7 +789,7 @@ def _stored_databricks_record_token(server_url: str) -> str | None:
     return source.current_token()
 
 
-class _DatabricksTokenAuth(httpx.Auth):
+class _DatabricksTokenAuth(ThreadedAuth):
     """
     httpx Auth that authenticates via the Databricks SDK, refreshing
     OAuth tokens transparently.
@@ -797,7 +800,15 @@ class _DatabricksTokenAuth(httpx.Auth):
       3. Databricks SDK credentials — resolved ONCE and reused, so the
          SDK serves the cached token from memory and only re-runs the
          Databricks CLI near expiry (not on every request).
+
+    A stored login the server rejects (401, or 403 on a workspace-hosted
+    URL) is renewed once from its refresh grant and the request replayed.
+    Credential work is blocking, so async clients run it off the event loop.
     """
+
+    # The rejected request is replayed with the renewed bearer, so its body
+    # (e.g. a multipart session create) must be buffered.
+    requires_request_body = True
 
     def __init__(
         self,
@@ -821,6 +832,8 @@ class _DatabricksTokenAuth(httpx.Auth):
         # the Databricks CLI (~0.5s) every time — a heavy tax on the
         # long-lived transcript-forwarder client that posts reply items.
         self._sdk_token_source = _ReusedDatabricksTokenSource(server_url)
+        # Why the last stored-login renewal attempt ended, or ``None``.
+        self.last_refresh_outcome: RefreshOutcome | None = None
 
     def pin_session(self, session_id: str | None) -> None:
         """Repoint this auth at a different session's host.
@@ -878,23 +891,78 @@ class _DatabricksTokenAuth(httpx.Auth):
             request.headers.update(
                 databricks_request_headers(self._server_url, host_id=session_host)
             )
+        oidc_token: str | None = None
+        load_outcome: RefreshOutcome | None = None
         if self._static_token:
             request.headers["Authorization"] = f"Bearer {self._static_token}"
         else:
             # Check stored OIDC token from `omnigent login`, then fall back to
             # the reused Databricks SDK auth.
-            oidc_token = None
             if self._server_url:
-                from omnigent.cli_auth import load_token
+                from omnigent.cli_auth import load_or_refresh_token_with_outcome
 
-                oidc_token = load_token(self._server_url)
+                oidc_token, load_outcome = load_or_refresh_token_with_outcome(self._server_url)
+                if load_outcome is not None:
+                    self.last_refresh_outcome = load_outcome
             if oidc_token:
                 request.headers["Authorization"] = f"Bearer {oidc_token}"
             else:
                 token = self._sdk_token()
                 if token:
                     request.headers["Authorization"] = f"Bearer {token}"
-        yield request
+        response = yield request
+        if self._static_token or not self._server_url:
+            return
+        if not _is_stored_login_rejection(self._server_url, response):
+            return
+        from omnigent.cli_auth import has_refreshable_login, refresh_stored_token_with_outcome
+
+        if not has_refreshable_login(self._server_url):
+            return
+        if load_outcome is not None and load_outcome is not RefreshOutcome.ALREADY_FRESH:
+            # This request already ran one refresh exchange (renewed or
+            # refused); never spend a second one on the same request.
+            return
+        renewed, outcome = refresh_stored_token_with_outcome(
+            self._server_url, rejected_token=oidc_token
+        )
+        self.last_refresh_outcome = outcome
+        if renewed and renewed != oidc_token:
+            request.headers["Authorization"] = f"Bearer {renewed}"
+            yield request
+
+
+def _is_stored_login_rejection(server_url: str, response: httpx.Response) -> bool:
+    """Return whether *response* says the stored login bearer was refused.
+
+    :param server_url: The server the request went to.
+    :param response: The server's response.
+    :returns: ``True`` for 401, or 403 on a Databricks-fronted URL.
+    """
+    from omnigent.cli_auth import is_stored_login_rejection_status
+
+    return is_stored_login_rejection_status(server_url, response.status_code)
+
+
+def relogin_hint_for(server_url: str, auth: httpx.Auth | None) -> str | None:
+    """Return the re-login message when the stored login cannot be renewed.
+
+    :param server_url: The server URL.
+    :param auth: The auth used for the failed request, if any.
+    :returns: The message, or ``None`` when renewal is still possible or
+        no stored login is involved.
+    """
+    from omnigent import cli_auth
+
+    outcome = getattr(auth, "last_refresh_outcome", None)
+    if isinstance(outcome, cli_auth.RefreshOutcome):
+        # A known outcome decides: transient failures never prompt a re-login.
+        return cli_auth.relogin_message(server_url) if outcome.needs_relogin else None
+    if cli_auth.stored_token_status(server_url) == "expired":
+        # Expired and the read path could not renew it.
+        if cli_auth.load_or_refresh_token(server_url) is None:
+            return cli_auth.relogin_message(server_url)
+    return None
 
 
 def _server_headers(
@@ -951,9 +1019,19 @@ def _server_auth(
     # Check stored `omnigent login` records: a session JWT or a
     # Databricks Apps pointer record.
     if server_url:
-        from omnigent.cli_auth import load_databricks_workspace_host, load_token
+        from omnigent.cli_auth import (
+            has_refreshable_login,
+            load_databricks_workspace_host,
+            load_token,
+        )
 
-        if load_token(server_url) or load_databricks_workspace_host(server_url):
+        # An expired-but-renewable login still gets an auth, which renews it
+        # per request instead of sending the request with no bearer.
+        if (
+            load_token(server_url)
+            or has_refreshable_login(server_url)
+            or load_databricks_workspace_host(server_url)
+        ):
             return _DatabricksTokenAuth(server_url=server_url, session_id=session_id)
     creds = _read_databrickscfg(None)
     if creds is not None and creds.token:
@@ -1511,7 +1589,7 @@ def _await_accounts_first_run_setup(
     from omnigent import cli_auth
 
     # Already authenticated to this server — nothing to wait for.
-    if cli_auth.load_token(base_url) is not None:
+    if cli_auth.load_or_refresh_token(base_url) is not None:
         return
     try:
         info = _server_get(f"{base_url}/v1/info", timeout=5.0).json()
@@ -1683,6 +1761,12 @@ async def _prepare_chat_session_via_daemon(
                 # /health but has no session API, a fork of a session that is gone,
                 # a permission refusal. Name the URL, since a wrong one is the case
                 # that looks least like itself, and pass the server's message through.
+                if exc.status_code in (401, 403):
+                    hint = relogin_hint_for(base_url, auth)
+                    if hint is not None:
+                        raise click.ClickException(
+                            f"Could not start a session on {base_url}: {hint}"
+                        ) from exc
                 raise click.ClickException(
                     f"Could not start a session on {base_url}: {exc}"
                 ) from exc

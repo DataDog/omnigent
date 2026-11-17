@@ -9516,6 +9516,50 @@ def _is_loopback_base_url(base_url: str) -> bool:
     return is_loopback_url(base_url)
 
 
+def _renew_host_http_headers(
+    *,
+    base_url: str,
+    host_id: str | None,
+    headers: dict[str, str],
+    response: object,
+) -> tuple[dict[str, str] | None, str | None]:
+    """Renew a stored login the server just rejected, for one retry.
+
+    :param base_url: Server base URL.
+    :param host_id: Host the request was scoped to (part of the cache key).
+    :param headers: The headers the rejected request carried.
+    :param response: The server's ``httpx.Response``.
+    :returns: ``(new_headers, relogin_text)`` — fresh headers to retry with
+        (or ``None``), and the re-login message when renewal is impossible.
+    """
+    import httpx
+
+    from omnigent import cli_auth
+    from omnigent.chat import _REMOTE_AUTH_TOKEN_ENV, _is_stored_login_rejection, _remote_headers
+
+    if not isinstance(response, httpx.Response):
+        return None, None
+    if os.environ.get(_REMOTE_AUTH_TOKEN_ENV, "").strip():
+        return None, None
+    if not _is_stored_login_rejection(base_url, response):
+        return None, None
+    if cli_auth.stored_token_status(base_url) == "absent":
+        return None, None
+    auth_header = headers.get("Authorization", "")
+    sent = auth_header.removeprefix("Bearer ") if auth_header.startswith("Bearer ") else None
+    renewed, outcome = cli_auth.refresh_stored_token_with_outcome(base_url, rejected_token=sent)
+    if renewed and renewed != sent:
+        with _host_http_headers_lock:
+            for key in [k for k in _host_http_headers_cache if k[0] == base_url]:
+                del _host_http_headers_cache[key]
+            fresh = _remote_headers(server_url=base_url, host_id=host_id)
+            _host_http_headers_cache[(base_url, host_id)] = fresh
+        return fresh, None
+    if outcome.needs_relogin:
+        return None, cli_auth.relogin_message(base_url)
+    return None, None
+
+
 def _host_http_json(
     *,
     base_url: str,
@@ -9561,6 +9605,7 @@ def _host_http_json(
                         server_url=base_url, host_id=host_id
                     )
         headers = _host_http_headers_cache[cache_key]
+        relogin_text: str | None = None
         with httpx.Client(
             base_url=base_url,
             headers=headers,
@@ -9568,6 +9613,16 @@ def _host_http_json(
             trust_env=_trust_env_for(base_url),
         ) as client:
             resp = client.request(method, path, params=params, json=json_body)
+            renewed_headers, relogin_text = _renew_host_http_headers(
+                base_url=base_url, host_id=host_id, headers=headers, response=resp
+            )
+            if renewed_headers is not None:
+                # Renewed: a failure on the retry is an ordinary HTTP error.
+                resp = client.request(
+                    method, path, params=params, json=json_body, headers=renewed_headers
+                )
+        if relogin_text is not None:
+            return _HostHttpResult(status_code=resp.status_code, body=relogin_text)
     except (httpx.HTTPError, OSError, ImportError) as exc:
         # httpx raises ImportError while building the client when the ambient
         # environment selects a proxy whose optional extra is missing (e.g. an
