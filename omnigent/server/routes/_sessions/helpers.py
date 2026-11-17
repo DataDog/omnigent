@@ -2298,6 +2298,38 @@ def _add_model_usage_delta(
         bucket["total_cost_usd"] = bucket.get("total_cost_usd", 0.0) + cost_delta
 
 
+def _token_usage_for_display(usage: dict[str, Any]) -> ModelUsage | None:
+    """
+    Project the flat (model-independent) usage counters into :class:`ModelUsage`.
+
+    The per-model view (:func:`_usage_by_model_for_display`) only exists when
+    a turn's model is known, and ``total_cost_usd`` only when it was priced.
+    Harnesses that report token counts without a model (generic ACP agents
+    such as ``acp:vit``) would otherwise have recorded tokens with no way to
+    read them back. This exposes the flat subtree totals regardless of model.
+
+    :param usage: A subtree-summed usage dict, e.g.
+        ``{"input_tokens": 1200, "output_tokens": 340, "total_tokens": 1540}``.
+    :returns: The flat totals (``total_cost_usd`` only when priced), or
+        ``None`` when no token counter was recorded.
+    """
+    fields: dict[str, Any] = {}
+    for key in _MODEL_TOKEN_KEYS:
+        value = usage.get(key)
+        if value is None:
+            continue
+        try:
+            fields[key] = int(value)
+        except (TypeError, ValueError):
+            continue
+    if not any(fields.values()):
+        return None
+    cost = _priced_cost_for_display(usage)
+    if cost is not None:
+        fields["total_cost_usd"] = cost
+    return ModelUsage(**fields)
+
+
 def _usage_by_model_for_display(usage: dict[str, Any]) -> dict[str, ModelUsage] | None:
     """
     Project the nested ``by_model`` usage map into typed :class:`ModelUsage`.
@@ -12170,6 +12202,7 @@ __all__ = [
     "_structured_ask_user_question",
     "_targeted_elicitation_event",
     "_title_content_from_item",
+    "_token_usage_for_display",
     "_truncate_label",
     "_usage_by_model_for_display",
     "_utc_day",

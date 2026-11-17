@@ -2288,6 +2288,13 @@ class SessionResponse(BaseModel):
         recorded before this field existed, or before the first turn). Lets
         the UI show which models a session spent its tokens / budget on.
         Also ``None`` when ``usage_included`` is ``False``.
+    :param token_usage: Flat token totals over the same subtree usage,
+        independent of model attribution and pricing, e.g.
+        ``ModelUsage(input_tokens=1200, output_tokens=340, total_tokens=1540)``.
+        Populated even when ``usage_by_model`` and ``total_cost_usd`` are
+        ``None`` (a harness that reports tokens but no model, such as a
+        generic ACP agent). ``total_cost_usd`` on it is set only when priced.
+        ``None`` when no tokens were recorded or ``usage_included`` is ``False``.
     :param usage_included: ``False`` when the caller skipped usage aggregation
         with ``include_usage=false``. Both usage fields are then unknown,
         not zero or this session's own-only spend. Display clients can load
@@ -2434,6 +2441,7 @@ class SessionResponse(BaseModel):
     last_total_tokens: int | None = None
     total_cost_usd: float | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
+    token_usage: ModelUsage | None = None
     usage_included: bool = True
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None

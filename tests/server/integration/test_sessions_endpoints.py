@@ -7437,6 +7437,53 @@ async def test_accumulate_session_usage_codex_unpinned_model_gets_by_model_entry
     assert snapshot["usage_by_model"]["gpt-5.4-mini"]["input_tokens"] == 200
 
 
+async def test_session_token_usage_surfaces_model_less_acp_usage(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tokens reported without a model still read back via ``token_usage``.
+
+    Generic ACP harnesses (``acp:vit``) report ``result.usage`` counts but no
+    model, so ``usage_by_model`` stays empty and the turn is unpriced. Before
+    ``token_usage`` existed the recorded tokens had no read path on
+    ``GET /v1/sessions/{id}``.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", lambda model: None)
+    agent = await create_test_agent(client, include_llm=False)
+    session = await _create_session(client, agent["id"])
+
+    fresh = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert fresh.get("token_usage") is None
+
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": 1200,
+                "output_tokens": 340,
+                "total_tokens": 1540,
+                "cache_read_input_tokens": 900,
+                "cache_creation_input_tokens": 50,
+            }
+        },
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+    snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert snapshot["usage_by_model"] is None
+    assert snapshot["total_cost_usd"] is None
+    assert snapshot["token_usage"] == {
+        "input_tokens": 1200,
+        "output_tokens": 340,
+        "total_tokens": 1540,
+        "cache_read_input_tokens": 900,
+        "cache_creation_input_tokens": 50,
+        "total_cost_usd": None,
+    }
+
+
 async def test_accumulate_session_usage_records_per_model_breakdown(
     client: httpx.AsyncClient,
     db_uri: str,

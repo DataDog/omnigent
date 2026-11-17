@@ -529,6 +529,7 @@ from omnigent.server.routes._sessions.helpers import (
     _structured_ask_user_question as _structured_ask_user_question,
     _targeted_elicitation_event as _targeted_elicitation_event,
     _title_content_from_item as _title_content_from_item,
+    _token_usage_for_display as _token_usage_for_display,
     _truncate_label as _truncate_label,
     _usage_by_model_for_display as _usage_by_model_for_display,
     _utc_day as _utc_day,
