@@ -9,7 +9,7 @@ export function assistantItemEvent(sourceId: string, text: string): Record<strin
     type: "external_conversation_item",
     data: {
       item_type: "message",
-      item_data: { role: "assistant", content: [{ type: "output_text", text }] },
+      item_data: { role: "assistant", agent: "vitrine", content: [{ type: "output_text", text }] },
       source_id: sourceId,
     },
   };
