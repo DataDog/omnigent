@@ -146,10 +146,12 @@ npm ci && npm test                     # runner-id vector + frame round trip
 scripts/start-server.sh &              # accounts auth, 127.0.0.1:18766, state in .run/
 npm run bootstrap                      # creates alice (admin) + bob; creds in .run/users.json
 npm run check:1   # … through check:9 except check:8
-# check 8: restart with an allow-list, then restore
+# check 8a: allow-list set -> remote peer refused, loopback accepted
 kill %1; TUNNEL_ALLOWLIST=$(openssl rand -hex 16) scripts/start-server.sh &
 npm run check:8
+# check 8b (control): no allow-list -> remote peer accepted, loopback accepted
 kill %1; scripts/start-server.sh &
+EXPECT_ALLOWLIST=0 npm run check:8
 rm -rf .run                            # cleanup
 ```
 

@@ -20,11 +20,14 @@ async function attempt(label: string, extraHeaders: Record<string, string>, toke
   return { tunnel, closed, listed };
 }
 
-const allowListed = Boolean(process.env.EXPECT_ALLOWLIST ?? "1");
+// EXPECT_ALLOWLIST=0 is the control run against a server started without TUNNEL_ALLOWLIST.
+const allowListed = process.env.EXPECT_ALLOWLIST !== "0";
 const remote = await attempt("non-loopback peer (XFF), token not in allow-list", remotePeer);
 if (allowListed) {
   ev.expect("non-loopback peer refused 4004 'runner tunnel token is not authorized'",
     remote.closed?.code === 4004 && remote.closed.reason === "runner tunnel token is not authorized");
+} else {
+  ev.expect("without allow-list: non-loopback peer accepted and listed", remote.closed === null && remote.listed);
 }
 const loopback = await attempt("loopback peer, token not in allow-list", {});
 ev.expect("loopback fallback accepts token-bound id", loopback.closed === null && loopback.listed);
