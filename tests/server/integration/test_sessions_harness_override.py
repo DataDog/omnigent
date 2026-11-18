@@ -40,6 +40,13 @@ class _CaptureClient:
             headers: dict[str, str] = {}
             text = ""
 
+            def raise_for_status(self) -> None:
+                """A 202 acceptance never raises."""
+
+            def json(self) -> dict[str, Any]:
+                """A bodyless 202 acceptance."""
+                return {}
+
         return _Resp()
 
     async def get(self, *_: Any, **__: Any) -> Any:
@@ -255,6 +262,16 @@ async def test_runner_first_event_forwards_harness_override(
     )
     assert resp.status_code == 201, resp.text
     sid = resp.json()["id"]
+    if override.startswith("acp"):
+        # ACP turns need a bound runner to carry detached-action authority.
+        from omnigent.runtime import get_conversation_store
+        from omnigent.server.routes import sessions as sessions_mod
+
+        async def _skip_relay_readiness(*_: Any, **__: Any) -> None:
+            return None
+
+        monkeypatch.setattr(sessions_mod, "_ensure_runner_relay_ready", _skip_relay_readiness)
+        get_conversation_store().replace_runner_id(sid, "runner-harness-override")
 
     event = await client.post(
         f"/v1/sessions/{sid}/events",

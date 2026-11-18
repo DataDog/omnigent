@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 from omnigent.runner import background_work_reports
+from omnigent.runner.app import create_runner_app
 from omnigent.runner.background_work_reports import BackgroundWorkReporter
 from tests._helpers.polling import poll_until_async
 
@@ -268,3 +269,164 @@ async def test_old_server_disable_is_retried_after_server_reconnect() -> None:
     await _settle()
 
     assert server.posts == [(_URL, _event(True)), (_URL, _event(True))]
+
+
+@pytest.mark.asyncio
+async def test_strict_waiter_does_not_accept_success_from_replaced_generation() -> None:
+    """A stale successful response cannot release the current-generation ACP waiter."""
+    old_request_release = asyncio.Event()
+    calls: list[tuple[str, bool]] = []
+    current_request_sent = asyncio.Event()
+
+    async def post(url: str, *, json: dict[str, Any]) -> httpx.Response:
+        running = json["data"]["running"]
+        calls.append((url, running))
+        if len(calls) == 1:
+            await old_request_release.wait()
+            return _response(202)
+        current_request_sent.set()
+        return _response(202)
+
+    reporter = BackgroundWorkReporter(post)
+    waiter = asyncio.create_task(reporter.report_and_wait("conv_1", True))
+    await _settle()
+    assert calls == [(_URL, True)]
+    assert not waiter.done()
+
+    reporter.resume()
+    reporter.report("conv_1", True)
+    old_request_release.set()
+    await asyncio.wait_for(current_request_sent.wait(), timeout=1)
+    await asyncio.wait_for(waiter, timeout=1)
+
+    assert calls == [(_URL, True), (_URL, True)]
+
+
+class _AppBackgroundServer:
+    """Capture the runner app's combined shell/ACP activity reports."""
+
+    def __init__(self) -> None:
+        self.posts: list[tuple[bool, int]] = []
+        self.stored: tuple[bool, int] | None = None
+        self.false_started = asyncio.Event()
+        self.release_late_false = asyncio.Event()
+        self.late_false_written = asyncio.Event()
+        self.stale_false_task: asyncio.Task[None] | None = None
+        self.hold_late_false = False
+
+    def _store_if_newer(self, running: bool, reported_at: int) -> None:
+        if self.stored is None or reported_at > self.stored[1]:
+            self.stored = (running, reported_at)
+
+    async def post(self, url: str, *, json: dict[str, Any]) -> httpx.Response:
+        del url
+        running = json["data"]["running"]
+        reported_at = json["data"]["reported_at"]
+        self.posts.append((running, reported_at))
+        if running is False and not self.false_started.is_set():
+            self.false_started.set()
+            if self.hold_late_false:
+
+                async def write_stale_false() -> None:
+                    await self.release_late_false.wait()
+                    self._store_if_newer(running, reported_at)
+                    self.late_false_written.set()
+
+                # The runner request times out, but the server-side write may
+                # still land later. Its older report time must not clear newer
+                # ACP work.
+                self.stale_false_task = asyncio.create_task(write_stale_false())
+                await asyncio.Event().wait()
+        self._store_if_newer(running, reported_at)
+        return httpx.Response(202, request=httpx.Request("POST", _URL))
+
+
+def _background_app(server: _AppBackgroundServer):
+    return create_runner_app(process_manager=None, server_client=server)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_source_to_finish", ["shell", "acp"])
+async def test_runner_app_keeps_combined_shell_or_acp_state_until_both_finish(
+    first_source_to_finish: str,
+) -> None:
+    """Either completion order leaves the session busy while the other source runs."""
+    server = _AppBackgroundServer()
+    app = _background_app(server)
+    shell = app.state.publish_session_background
+    acp = app.state.publish_acp_background
+
+    if first_source_to_finish == "shell":
+        shell("conv_1", True)
+        await poll_until_async(lambda: bool(server.posts), timeout_s=1)
+        await acp("conv_1", True)
+        before_shell_finish = len(server.posts)
+        shell("conv_1", False)
+        await poll_until_async(lambda: len(server.posts) > before_shell_finish, timeout_s=1)
+        assert all(running is True for running, _reported_at in server.posts)
+        await acp("conv_1", False)
+    else:
+        await acp("conv_1", True)
+        shell("conv_1", True)
+        await acp("conv_1", False)
+        assert all(running is True for running, _reported_at in server.posts)
+        shell("conv_1", False)
+
+    await poll_until_async(
+        lambda: bool(server.posts) and server.posts[-1][0] is False,
+        timeout_s=1,
+    )
+    states = [running for running, _reported_at in server.posts]
+    assert states[-1] is False
+
+
+@pytest.mark.asyncio
+async def test_catch_up_scan_reasserts_quiet_active_acp_state_after_reconnect() -> None:
+    """Reconnect resends the known combined state even without a new ACP edge."""
+    server = _AppBackgroundServer()
+    app = _background_app(server)
+    await app.state.publish_acp_background("conv_1", True)
+    assert server.posts == [(True, server.posts[0][1])]
+
+    await app.state.catch_up_scan()
+    await poll_until_async(lambda: len(server.posts) == 2, timeout_s=1.0)
+
+    assert [running for running, _reported_at in server.posts] == [True, True]
+    assert server.posts[1][1] > server.posts[0][1]
+    assert server.stored == server.posts[1]
+
+
+@pytest.mark.asyncio
+async def test_late_shell_false_cannot_clear_newer_acp_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out shell completion cannot overwrite a newer ACP start."""
+    monkeypatch.setattr(background_work_reports, "_REQUEST_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(background_work_reports, "_RETRY_INITIAL_S", 0.0)
+    server = _AppBackgroundServer()
+    server.hold_late_false = True
+    app = _background_app(server)
+    shell = app.state.publish_session_background
+    acp = app.state.publish_acp_background
+    try:
+        shell("conv_1", True)
+        await poll_until_async(
+            lambda: bool(server.posts) and server.stored == (True, server.posts[0][1]),
+            timeout_s=1,
+        )
+        shell("conv_1", False)
+        await asyncio.wait_for(server.false_started.wait(), timeout=1.0)
+
+        await acp("conv_1", True)
+        assert server.stored is not None and server.stored[0] is True
+        newest_reported_at = server.stored[1]
+        server.release_late_false.set()
+        await asyncio.wait_for(server.late_false_written.wait(), timeout=1.0)
+
+        stale_false = next(reported_at for running, reported_at in server.posts if not running)
+        assert stale_false < newest_reported_at
+        assert server.stored == (True, newest_reported_at)
+    finally:
+        server.release_late_false.set()
+        if server.stale_false_task is not None:
+            await server.stale_false_task

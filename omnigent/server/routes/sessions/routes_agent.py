@@ -86,6 +86,10 @@ from omnigent.server.schemas import (
     PolicySummary,
     SkillSummary,
 )
+from omnigent.server.session_action_origins import (
+    action_context_fields,
+    resolve_action_origin_context,
+)
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
@@ -297,6 +301,7 @@ def register_agent_routes(
                 **selection_headers,
                 "X-Agent-Id": agent.id,
                 "X-Agent-Version": str(agent.version),
+                "X-Agent-Bundle-Location": agent.bundle_location,
                 "X-Agent-Name": agent.name,
                 # Provenance for the runner's env-expansion decision:
                 # user agents are tenant input and must NOT have ${VAR}
@@ -515,9 +520,6 @@ def register_agent_routes(
             )
 
         user_id = _require_user(request, auth_provider)
-        await _require_access(
-            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
-        )
 
         # Parse JSON-RPC body. Return a parse-error response (not HTTP
         # 400) on failure — JSON-RPC errors travel in the body.
@@ -532,6 +534,53 @@ def register_agent_routes(
         rpc_id: int | str | None = body.get("id")
         method: str = body.get("method") or ""
         params: dict[str, Any] = body.get("params") or {}
+        if not isinstance(params, dict):
+            return _mcp_error_response(rpc_id, -32602, "Expected object params")
+
+        try:
+            action_token, action_generation = action_context_fields(params)
+        except OmnigentError as exc:
+            return _mcp_error_response(rpc_id, -32000, str(exc))
+        action_spec = None
+        action_actor: dict[str, str] | None = None
+        action_conversation = None
+        if action_token is not None:
+            action_conversation = await asyncio.to_thread(
+                conversation_store.get_conversation, session_id
+            )
+            if action_conversation is None:
+                return _mcp_error_response(rpc_id, -32000, "Session not found")
+            from omnigent.runtime import get_agent_cache
+
+            try:
+                _action_origin, action_spec, action_actor = await asyncio.to_thread(
+                    resolve_action_origin_context,
+                    request,
+                    conversation=action_conversation,
+                    conversation_store=conversation_store,
+                    token=action_token,
+                    generation=action_generation or "",
+                    credential_principal=user_id,
+                    agent_cache=agent_cache or get_agent_cache(),
+                )
+            except OmnigentError as exc:
+                return _mcp_error_response(rpc_id, -32000, str(exc))
+            if action_actor is None:
+                return _mcp_error_response(rpc_id, -32000, "Detached child origin is unavailable")
+            try:
+                await _require_access(
+                    action_actor["run_as"],
+                    session_id,
+                    LEVEL_EDIT,
+                    permission_store,
+                    conversation_store,
+                )
+            except OmnigentError as exc:
+                return _mcp_error_response(rpc_id, -32000, str(exc))
+        else:
+            await _require_access(
+                user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+            )
 
         _logger.debug(
             "MCP proxy: session=%r method=%r rpc_id=%r",
@@ -558,6 +607,8 @@ def register_agent_routes(
                 rpc_id,
                 session_id,
                 runner_router,
+                action_context_token=action_token,
+                action_context_generation=action_generation,
             )
             registry = getattr(request.app.state, "mcp_registry", None)
             if registry is not None and not params.get("_omnigent_skip_registry"):
@@ -569,9 +620,13 @@ def register_agent_routes(
                 data = json.loads(bytes(response.body))
                 if "error" in data:
                     return response
-                conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                conv = action_conversation or await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
                 if conv is not None and not conv.archived:
-                    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+                    spec = action_spec or await asyncio.to_thread(
+                        _load_agent_spec_for_session, conv, agent_store
+                    )
                     if spec is not None and any(
                         c.transport == "registry" for c in spec.mcp_servers
                     ):
@@ -588,8 +643,14 @@ def register_agent_routes(
         if method == "tools/call":
             from omnigent.server.mcp_identity import mcp_policy_actor
 
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            actor = mcp_policy_actor(request, conv, user_id) if conv else _build_actor(user_id)
+            conv = action_conversation or await asyncio.to_thread(
+                conversation_store.get_conversation, session_id
+            )
+            actor = (
+                action_actor
+                if action_actor is not None
+                else (mcp_policy_actor(request, conv, user_id) if conv else _build_actor(user_id))
+            )
             return await _handle_mcp_tools_call(
                 rpc_id,
                 session_id,
@@ -600,6 +661,7 @@ def register_agent_routes(
                 actor=actor,
                 credential_user=user_id,
                 request=request,
+                resolved_spec=action_spec,
             )
 
         return _mcp_error_response(rpc_id, -32601, f"Method not found: {method!r}")

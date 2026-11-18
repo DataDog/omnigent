@@ -463,6 +463,324 @@ async def test_relay_persists_acp_reported_model(db_uri: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_relay_publishes_canonical_acp_tool_result_after_native_clear(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A delayed duplicate from response A publishes the latest stored item."""
+    import hashlib
+    from types import SimpleNamespace
+
+    from omnigent.entities import FunctionCallOutputData, NewConversationItem
+    from omnigent.inner.acp_standard_subagents import (
+        ACP_TOOL_CALL_SCOPE_METADATA_KEY,
+        acp_standard_canonical_tool_item_id,
+        acp_standard_report_source_id,
+        acp_standard_tool_entity_id,
+        acp_standard_tool_output_entity_id,
+    )
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.conversation_store import AcpToolCallAppendScope
+
+    store = SqlAlchemyConversationStore(
+        db_uri,
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+    )
+    runner_id = "runner-relay-canonical-test"
+    root = store.create_conversation(runner_id=runner_id)
+    server_identity = "server-relay-canonical-test"
+    native_epoch = "native-epoch-relay-canonical-test"
+    root_native_session_id = "native-root-relay-canonical-test"
+    context_generation = "relay-canonical-context-test"
+    journal_id = hashlib.sha256(root.id.encode()).hexdigest()[:32]
+    server_connection_id = hashlib.sha256(f"connection:{root.id}".encode()).hexdigest()[:32]
+    connection_admission_id = store.prepare_acp_report_connection_attempt(
+        root.id,
+        runner_id,
+        "owner@example.test",
+        server_connection_id,
+    )
+    connection_context = SimpleNamespace(
+        runner_id=runner_id,
+        owner="owner@example.test",
+        server_connection_id=server_connection_id,
+        superseded=False,
+    )
+    store.admit_acp_report_connection(
+        connection_admission_id,
+        connection_context,
+        expected_root_id=root.id,
+    )
+    store.admit_acp_report_owner(root.id, connection_admission_id, 1, journal_id)
+    store.activate_acp_report_epoch(
+        root.id,
+        connection_admission_id,
+        1,
+        journal_id,
+        native_epoch,
+        1,
+    )
+
+    call_id = "relay-canonical-call"
+    response_id = "response-relay-canonical-A"
+    action_origin_token = "a" * 32
+    action_origin_generation = "relay-canonical-action-generation"
+    anchor_source_id = acp_standard_report_source_id(server_identity, root.id, native_epoch, 1)
+    append_scope = AcpToolCallAppendScope(
+        source_id=anchor_source_id,
+        native_call_id=call_id,
+        action_origin_token=action_origin_token,
+        action_origin_generation=action_origin_generation,
+        response_id=response_id,
+    )
+
+    def apply_report(
+        sequence: int,
+        kind: str,
+        operation: dict[str, Any],
+        *,
+        action_origin: dict[str, str] | None = None,
+    ) -> None:
+        source_id = acp_standard_report_source_id(server_identity, root.id, native_epoch, sequence)
+        payload_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "sequence": sequence,
+                    "target": root_native_session_id,
+                    "parent": None,
+                    "kind": kind,
+                    "operation": operation,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        store.apply_acp_session_report(
+            root_conversation_id=root.id,
+            connection_admission_id=connection_admission_id,
+            runtime_incarnation=1,
+            journal_id=journal_id,
+            journal_sequence=sequence,
+            epoch_ordinal=1,
+            native_epoch=native_epoch,
+            ingress_sequence=sequence,
+            source_id=source_id,
+            payload_hash=payload_hash,
+            context_generation=context_generation,
+            root_native_session_id=root_native_session_id,
+            target_session_id=root_native_session_id,
+            parent_session_id=None,
+            conversation_id=root.id,
+            kind=kind,
+            operation=operation,
+            action_origin=action_origin,
+        )
+
+    action_origin = {
+        "token": action_origin_token,
+        "agent": "test-agent",
+        "generation": action_origin_generation,
+    }
+    apply_report(
+        1,
+        "tool.references",
+        {
+            "entity_type": "item",
+            "entity_id": acp_standard_tool_entity_id(call_id),
+            "call_id": call_id,
+            "response_id": response_id,
+        },
+        action_origin=action_origin,
+    )
+    store.append(
+        root.id,
+        [
+            NewConversationItem(
+                type="function_call_output",
+                response_id=response_id,
+                data=FunctionCallOutputData(
+                    acp_agent_identity="unknown",
+                    call_id=call_id,
+                    output="older generic result",
+                ),
+            )
+        ],
+        acp_tool_call_scope=append_scope,
+    )
+
+    allow_duplicate = asyncio.Event()
+    duplicate_started = asyncio.Event()
+
+    def scoped_item(token: str) -> dict[str, Any]:
+        return {
+            "type": "function_call_output",
+            "status": "completed",
+            "call_id": call_id,
+            "output": "delayed generic result",
+            ACP_TOOL_CALL_SCOPE_METADATA_KEY: {
+                "source_id": anchor_source_id,
+                "native_call_id": call_id,
+                "action_origin_token": token,
+                "action_origin_generation": action_origin_generation,
+                "response_id": response_id,
+            },
+        }
+
+    def encode_sse_event(event: dict[str, Any]) -> bytes:
+        return f"data: {json.dumps(event)}\n\n".encode()
+
+    class InterleavedStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b'data: {"type":"session.heartbeat"}\n\n'
+            yield (
+                'data: {"type":"response.in_progress","response":{"id":"' + response_id + '"}}\n\n'
+            ).encode()
+            yield encode_sse_event(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "status": "completed",
+                        "call_id": call_id,
+                        "name": "generic_worker",
+                        "arguments": "{}",
+                        "agent": response_id,
+                    },
+                }
+            )
+            yield (
+                b'data: {"type":"response.in_progress","response":{"id":"'
+                b'response-relay-canonical-B"}}\n\n'
+            )
+            yield encode_sse_event(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "status": "completed",
+                        "call_id": call_id,
+                        "name": "generic_worker",
+                        "arguments": "{}",
+                        "agent": "response-relay-canonical-B",
+                    },
+                }
+            )
+            yield (
+                b'data: {"type":"response.completed","response":{"id":"'
+                b'response-relay-canonical-B"}}\n\n'
+            )
+            # The same authorized response A resumes; the completed B call
+            # left a stale response mapping for this reused native call id.
+            yield (
+                'data: {"type":"response.in_progress","response":{"id":"' + response_id + '"}}\n\n'
+            ).encode()
+            duplicate_started.set()
+            await allow_duplicate.wait()
+            yield encode_sse_event(
+                {
+                    "type": "response.output_item.done",
+                    "item": scoped_item(action_origin_token),
+                }
+            )
+            # Structurally valid, same-response retry whose append proof
+            # conflicts with the accepted anchor. It must fail closed before
+            # publishing the raw, stale result.
+            yield encode_sse_event(
+                {
+                    "type": "response.output_item.done",
+                    "item": scoped_item("b" * 32),
+                }
+            )
+            yield b"data: [DONE]\n\n"
+
+    runner_client = httpx.AsyncClient(
+        base_url="http://runner",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, stream=InterleavedStream())
+        ),
+    )
+
+    collector = await start_session_stream_collector(root.id)
+    try:
+        relay_task = asyncio.create_task(
+            _relay_runner_stream_once(
+                root.id,
+                runner_client,
+                store,
+            )
+        )
+        try:
+            response_a_starts = 0
+            while response_a_starts < 2:
+                event = await collector.next_event(timeout=_TASK_TIMEOUT_S)
+                if (
+                    event.get("type") == "response.in_progress"
+                    and event.get("response", {}).get("id") == response_id
+                ):
+                    response_a_starts += 1
+            await asyncio.wait_for(duplicate_started.wait(), timeout=_TASK_TIMEOUT_S)
+
+            # Response A is still active when the newer native report clears
+            # its canonical output. The relay then receives a delayed generic
+            # duplicate from that same response.
+            apply_report(
+                2,
+                "entity.upsert",
+                {
+                    "entity_type": "item",
+                    "entity_id": acp_standard_tool_output_entity_id(call_id),
+                    "call_id": call_id,
+                    "value": {
+                        "item_type": "function_call_output",
+                        "response_id": response_id,
+                        "item_data": {
+                            "acp_agent_identity": "unknown",
+                            "call_id": call_id,
+                            "output": None,
+                        },
+                    },
+                },
+            )
+            before_relay = store.list_items(root.id).data
+            before_output = next(
+                item for item in before_relay if item.type == "function_call_output"
+            )
+            assert before_output.data.output is None
+            allow_duplicate.set()
+
+            published: dict[str, Any] | None = None
+            while published is None:
+                event = await collector.next_event(timeout=_TASK_TIMEOUT_S)
+                if event.get("type") == "response.output_item.done":
+                    published = event
+
+            with pytest.raises(ValueError):
+                await asyncio.wait_for(relay_task, timeout=_TASK_TIMEOUT_S)
+
+            persisted = store.list_items(root.id).data
+            canonical = next(item for item in persisted if item.type == "function_call_output")
+            assert canonical.data.output is None
+            assert published["item"] == canonical.to_api_dict()
+            assert published["item"]["id"] == acp_standard_canonical_tool_item_id(
+                root.id, anchor_source_id, "function_call_output"
+            )
+            public_json = json.dumps(published["item"])
+            assert ACP_TOOL_CALL_SCOPE_METADATA_KEY not in public_json
+            await collector.assert_no_event(within=0.1)
+        finally:
+            allow_duplicate.set()
+            if not relay_task.done():
+                relay_task.cancel()
+            await asyncio.gather(relay_task, return_exceptions=True)
+            await runner_client.aclose()
+            session_stream.close(root.id)
+    finally:
+        await collector.stop()
+
+
+@pytest.mark.asyncio
 async def test_relay_text_flush_publishes_persisted_item(db_uri: str) -> None:
     """
     The relay's text flush publishes the persisted message to live clients.

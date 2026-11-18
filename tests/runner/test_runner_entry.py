@@ -670,7 +670,10 @@ async def test_tunnel_boot_hands_its_auth_resolution_to_create_app(
     with pytest.raises(_Stop):
         await entry_mod._run_tunnel_from_env()
 
-    assert seen == {"auth_token_factory": None, "auth_resolved": True}
+    assert seen["auth_token_factory"] is None
+    assert seen["auth_resolved"] is True
+    assert set(seen) == {"auth_token_factory", "auth_resolved", "event_dispatcher"}
+    assert isinstance(seen["event_dispatcher"], RunnerEventDispatcher)
 
 
 def test_make_auth_token_factory_none_without_creds_or_binding_token(

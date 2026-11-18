@@ -40,7 +40,15 @@ def test_single_alembic_head() -> None:
 
 @pytest.mark.parametrize(
     "revision",
-    ["r6a8c0e2f4b6", "m016dd0930a", "mm1a2b3c4d5e", "7b915a1fce74", "a7d4c2e9f610"],
+    [
+        "r6a8c0e2f4b6",
+        "m016dd0930a",
+        "mm1a2b3c4d5e",
+        "7b915a1fce74",
+        "a7d4c2e9f610",
+        "ab13c7d9e026",
+        "m022dd1118a",
+    ],
 )
 def test_upgrade_from_datadog_oidc_revision_to_merged_head(tmp_path: Path, revision: str) -> None:
     uri = f"sqlite:///{tmp_path / 'datadog-oidc.db'}"
@@ -51,8 +59,10 @@ def test_upgrade_from_datadog_oidc_revision_to_merged_head(tmp_path: Path, revis
 
     with engine.connect() as conn:
         versions = set(conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalars())
-    assert versions == {"m022dd1118a"}
-    assert "durable_elicitations" in sa.inspect(engine).get_table_names()
+    assert versions == {"m023dd1121a"}
+    assert {"durable_elicitations", "acp_session_report_receipts"} <= set(
+        sa.inspect(engine).get_table_names()
+    )
     assert "inference_snapshot" in {
         column["name"]
         for column in sa.inspect(engine).get_columns("omnigent_conversation_metadata")

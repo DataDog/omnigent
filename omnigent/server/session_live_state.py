@@ -38,6 +38,7 @@ unaffected.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import functools
 import logging
@@ -120,7 +121,13 @@ def conversation_store() -> ConversationStore | None:
     return _store
 
 
-def submit(description: str, fn, *args, on_failure=None) -> Future[Any]:  # type: ignore[no-untyped-def]
+def submit(
+    description: str,
+    fn,
+    *args,
+    on_failure=None,
+    propagate_errors: bool = False,
+) -> Future[Any]:  # type: ignore[no-untyped-def]
     """
     Run one store-backed task on the ordered background worker.
 
@@ -141,6 +148,9 @@ def submit(description: str, fn, *args, on_failure=None) -> Future[Any]:  # type
         thread) when the write raises. Used to evict a dedupe entry so a
         dropped write's value can be re-attempted by the next identical
         publish instead of being swallowed.
+    :param propagate_errors: Re-raise a failed write into the returned future
+        for durability-sensitive callers. Existing display-state writers keep
+        the best-effort default.
     :returns: Future containing the result, or ``None`` after a logged write failure.
     """
     global _executor
@@ -156,6 +166,8 @@ def submit(description: str, fn, *args, on_failure=None) -> Future[Any]:  # type
             _logger.warning("session live-state write failed (%s)", description, exc_info=True)
             if on_failure is not None:
                 on_failure()
+            if propagate_errors:
+                raise
 
     return _executor.submit(ctx.run, _run)
 
@@ -201,6 +213,37 @@ def persist_live_status(session_id: str, status: str) -> None:
             _last_status.pop(session_id, None)
 
     submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
+
+
+async def persist_live_status_required(session_id: str, status: str) -> None:
+    """Persist a status through the ordered writer and raise if it did not land.
+
+    This is reserved for protocol edges whose caller cannot acknowledge its
+    durable source until the database write commits. It intentionally writes
+    even when the best-effort dedupe cache already has the same value: that
+    cache records queued writes, not committed writes.
+    """
+    if _store is None:
+        raise RuntimeError("durable session status persistence is unavailable")
+    if status not in _KNOWN_LIVE_STATUSES:
+        raise ValueError(f"cannot persist unsupported live status {status!r}")
+
+    store = _store
+    _last_status[session_id] = status
+
+    def _evict() -> None:
+        if _last_status.get(session_id) == status:
+            _last_status.pop(session_id, None)
+
+    future = submit(
+        "required_live_status",
+        store.set_session_live_status,
+        session_id,
+        status,
+        on_failure=_evict,
+        propagate_errors=True,
+    )
+    await asyncio.wrap_future(future)
 
 
 def handoff_count(session_id: str) -> int:

@@ -29,6 +29,7 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id, generate_task_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event, runner_log_scope
@@ -70,6 +71,10 @@ from omnigent.host.frames import (
 )
 from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
+)
+from omnigent.inner.acp_standard_subagents import (
+    ACP_TOOL_CALL_SCOPE_METADATA_KEY,
+    acp_standard_canonical_tool_item_id,
 )
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.mcp_selection import mcp_selection_revision
@@ -148,7 +153,9 @@ from omnigent.server._elicitation_registry import (
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
+    local_single_user_enabled,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -206,6 +213,7 @@ from omnigent.server.routes._session_create_validation import (
 # ``__all__`` and the facade's explicit re-exports, preserving its real runtime
 # bindings so a facade-level monkeypatch is honoured in this module too.
 from omnigent.server.routes._sessions.common import (  # noqa: F401
+    _ACP_SUBAGENT_ID_LABEL_KEY,
     _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S,
     _CLAUDE_NATIVE_MODEL,
     _CLAUDE_NATIVE_UI_LABEL_KEY,
@@ -293,6 +301,7 @@ from omnigent.server.routes._sessions.helpers import (
     _drop_claude_launch_args_from_another_host,
     _emit_server_routing_decision,
     _error_item_from_sse,
+    _extract_acp_tool_call_append_scope_from_sse,
     _extract_claude_native_runner_failure,
     _extract_persistent_item_from_sse,
     _extract_user_text_for_routing,
@@ -393,9 +402,13 @@ from omnigent.server.routes._sessions.helpers import (
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
 )
-from omnigent.server.runner_session_init import RunnerSessionInitializer
+from omnigent.server.runner_session_init import (
+    RunnerSessionInitializer,
+    prepare_acp_report_connection_attempt_for_client,
+)
 from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile, saved_profile
 from omnigent.server.schemas import (
+    AcpSessionObservation,
     BackgroundTaskInfo,
     ChildSessionSummary,
     CreatedSessionResponse,
@@ -550,6 +563,62 @@ def _harness_elicitation_request_fingerprint(params: ElicitationRequestParams) -
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+async def _targeted_harness_elicitation_owner(
+    target_session_id: str,
+    elicitation_id: object,
+    conversation_store: ConversationStore | None = None,
+) -> str | None:
+    """Find a pending parent-owned elicitation explicitly targeted at a child."""
+    if not isinstance(elicitation_id, str) or not elicitation_id:
+        return None
+    if pending_elicitations.lookup(elicitation_id, conversation_id=target_session_id) is not None:
+        # A local pending entry owns the result; an ancestor's mirror must not
+        # redirect a child-owned MCP prompt back to the parent's runner.
+        return None
+    owner_session_id = _harness_elicitation_owners.get(elicitation_id)
+    if owner_session_id == target_session_id:
+        return None
+    target_child = None
+    if conversation_store is not None:
+        target_child = await asyncio.to_thread(
+            conversation_store.get_conversation, target_session_id
+        )
+        if target_child is None:
+            return None
+        if owner_session_id is None:
+            owner_session_id = target_child.parent_conversation_id
+    if owner_session_id is None:
+        return None
+    pending = pending_elicitations.lookup(elicitation_id, conversation_id=owner_session_id)
+    params = pending[1].get("params") if pending is not None else None
+    if not isinstance(params, dict) or params.get("target_session_id") != target_session_id:
+        return None
+    if conversation_store is not None:
+        if target_child is None or target_child.parent_conversation_id != owner_session_id:
+            return None
+    return owner_session_id
+
+
+async def _has_unowned_parent_pending_elicitation(
+    target_session_id: str,
+    elicitation_id: object,
+    conversation_store: ConversationStore,
+) -> bool:
+    """Return whether a child's parent still owns an unmatched elicitation id."""
+    if not isinstance(elicitation_id, str) or not elicitation_id:
+        return False
+    if pending_elicitations.lookup(elicitation_id, conversation_id=target_session_id) is not None:
+        # A local pending entry owns the result even if its card is mirrored.
+        return False
+    target_child = await asyncio.to_thread(conversation_store.get_conversation, target_session_id)
+    parent_session_id = target_child.parent_conversation_id if target_child is not None else None
+    if parent_session_id is None:
+        return False
+    return (
+        pending_elicitations.lookup(elicitation_id, conversation_id=parent_session_id) is not None
+    )
 
 
 async def _publish_and_wait_for_harness_elicitation(
@@ -1521,6 +1590,7 @@ def _build_session_response(
     agent_cache: AgentCache | None = None,
     side_chat_sealed: bool = False,
     background_agents: list[BackgroundTaskInfo] | None = None,
+    acp_session_observation: AcpSessionObservation | None = None,
 ) -> SessionResponse:
     """
     Build a :class:`SessionResponse` from store-side entities.
@@ -1730,6 +1800,7 @@ def _build_session_response(
         active_response_id=_session_active_response_cache.get(conv.id),
         project_id=conv.project_id,
         side_chat_parent_id=conv.side_chat_parent_id,
+        acp_session_observation=acp_session_observation,
     )
 
 
@@ -2573,11 +2644,74 @@ async def _resolve_elicitation(
     # matches, no resolved event published) rather than 500-ing the
     # client — the runner forward still fires so the runner can reject.
     elicitation_id = data.get("elicitation_id", "")
+    owner_session_id = session_id
+    harness_owner = (
+        _harness_elicitation_owners.get(elicitation_id)
+        if isinstance(elicitation_id, str)
+        else None
+    )
+    targeted_owner = await _targeted_harness_elicitation_owner(
+        session_id, elicitation_id, conversation_store
+    )
+    if targeted_owner is not None:
+        if harness_owner is not None and harness_owner != targeted_owner:
+            raise OmnigentError(
+                "This approval does not target the requested child session.",
+                code=ErrorCode.FORBIDDEN,
+            )
+        owner_session_id = targeted_owner
+    elif harness_owner is not None and harness_owner != session_id:
+        raise OmnigentError(
+            "This approval does not target the requested child session.",
+            code=ErrorCode.FORBIDDEN,
+        )
+    content = data.get("content")
+    if (
+        isinstance(elicitation_id, str)
+        and isinstance(content, dict)
+        and content.get("remember") is True
+    ):
+        pending_entry = pending_elicitations.lookup(
+            elicitation_id, conversation_id=owner_session_id
+        )
+        request_params = pending_entry[1].get("params") if pending_entry is not None else None
+        if not isinstance(request_params, dict):
+            if "request_fingerprint" in content:
+                raise OmnigentError(
+                    "This command approval is no longer pending.", code=ErrorCode.INVALID_INPUT
+                )
+        elif request_params.get("phase") == "codex_command_approval":
+            displayed_fingerprint = content.get("request_fingerprint")
+            current_fingerprint = request_params.get("approval_request_fingerprint")
+            parked = _harness_parked_elicitations.get(elicitation_id)
+            try:
+                pending_fingerprint = _harness_elicitation_request_fingerprint(
+                    ElicitationRequestParams.model_validate(request_params)
+                )
+            except ValidationError as err:
+                raise OmnigentError(
+                    "Invalid command approval request.", code=ErrorCode.INVALID_INPUT
+                ) from err
+            if (
+                not isinstance(current_fingerprint, str)
+                or displayed_fingerprint != current_fingerprint
+                or (
+                    parked is not None
+                    and (
+                        _harness_elicitation_owners.get(elicitation_id) != owner_session_id
+                        or parked.request_fingerprint != pending_fingerprint
+                    )
+                )
+            ):
+                raise OmnigentError(
+                    "This command approval changed. Refresh it before remembering a rule.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
     action = data.get("action")
     pending = (
         isinstance(elicitation_id, str)
         and bool(elicitation_id)
-        and (pending_elicitations.lookup(elicitation_id) or (None,))[0] == session_id
+        and (pending_elicitations.lookup(elicitation_id) or (None,))[0] == owner_session_id
     )
     # Durable sys_ask_user questions resolve through the persisted store
     # FIRST (commit-before-publish): the terminal state commits before any
@@ -2672,15 +2806,26 @@ async def _resolve_elicitation(
                 )
             return outcome
     if isinstance(elicitation_id, str) and await _resolve_native_delivery(
-        session_id, elicitation_id, data, conversation_store
+        owner_session_id, elicitation_id, data, conversation_store
     ):
         return None
     harness_future = _harness_elicitation_registry.get(elicitation_id)
+    # Server-parked harness gates own their verdict end-to-end: setting this
+    # Future returns the verdict to the runner's pending policy evaluation.
+    # They are not runner-owned ``ctx.elicit`` prompts, so forwarding the same
+    # approval to the runner's generic /events path is both redundant and
+    # unsupported by session-action-only harnesses, so skip it only for a
+    # parent-owned gate targeted at an ACP session-action child.
+    server_harness_owns_approval = (
+        harness_future is not None
+        and targeted_owner is not None
+        and _harness_elicitation_owners.get(elicitation_id) == owner_session_id
+    )
     if harness_future is not None and not harness_future.done():
         # Only the session that owns this elicitation
         # may resolve its server-side Future. A mismatch skips
         # resolution (the runner forward still fires below).
-        if _harness_elicitation_owners.get(elicitation_id) == session_id:
+        if _harness_elicitation_owners.get(elicitation_id) == owner_session_id:
             result_payload = {k: v for k, v in data.items() if k != "elicitation_id"}
             try:
                 verdict_result = ElicitationResult.model_validate(result_payload)
@@ -2706,7 +2851,7 @@ async def _resolve_elicitation(
                 _prune_pre_resolved_harness_elicitations()
                 _harness_pre_resolved_elicitations[elicitation_id] = (
                     _PreResolvedHarnessElicitation(
-                        session_id=session_id,
+                        session_id=owner_session_id,
                         created_at=time.time(),
                         result=verdict_result,
                         request_fingerprint=(
@@ -2732,7 +2877,9 @@ async def _resolve_elicitation(
             # tombstone with the question's params: a later, different
             # question that reuses this id must not inherit the verdict.
             gap_fingerprint: str | None = None
-            pending_entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+            pending_entry = pending_elicitations.lookup(
+                elicitation_id, conversation_id=owner_session_id
+            )
             if pending_entry is not None:
                 try:
                     gap_fingerprint = _harness_elicitation_request_fingerprint(
@@ -2742,7 +2889,7 @@ async def _resolve_elicitation(
                     gap_fingerprint = None
             _prune_pre_resolved_harness_elicitations()
             _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
-                session_id=session_id,
+                session_id=owner_session_id,
                 created_at=time.time(),
                 result=pre_resolved,
                 request_fingerprint=gap_fingerprint,
@@ -2754,7 +2901,10 @@ async def _resolve_elicitation(
     # parked-is-None branch would clobber the verdict-carrying tombstone.
     if isinstance(elicitation_id, str) and elicitation_id:
         _parked = _harness_parked_elicitations.get(elicitation_id)
-        if _parked is not None and _harness_elicitation_owners.get(elicitation_id) == session_id:
+        if (
+            _parked is not None
+            and _harness_elicitation_owners.get(elicitation_id) == owner_session_id
+        ):
             _parked.resolved_elsewhere.set()
 
     # Fan-out for every other subscribed client (other tabs, REPL
@@ -2763,12 +2913,12 @@ async def _resolve_elicitation(
     # The verdict rides along so the parent-side resolution notice
     # states how the gate was answered instead of a bare "resolved".
     if isinstance(elicitation_id, str) and elicitation_id:
-        _publish_elicitation_resolved(session_id, elicitation_id, action=data.get("action"))
+        _publish_elicitation_resolved(owner_session_id, elicitation_id, action=data.get("action"))
         if conversation_store is not None:
             await asyncio.to_thread(
                 _publish_elicitation_resolved_to_ancestors,
                 conversation_store,
-                session_id,
+                owner_session_id,
                 elicitation_id,
                 data.get("action"),
             )
@@ -2777,7 +2927,9 @@ async def _resolve_elicitation(
     if (
         pending
         and action in {"accept", "decline", "cancel", "timeout"}
-        and _claim_approval_usage(_approval_usage_resolutions_seen, session_id, elicitation_id)
+        and _claim_approval_usage(
+            _approval_usage_resolutions_seen, owner_session_id, elicitation_id
+        )
     ):
         try:
             usage = get_feature_usage_recorder().operation(
@@ -2791,7 +2943,8 @@ async def _resolve_elicitation(
         except Exception:  # noqa: BLE001
             # Approval delivery is authoritative; metrics are observational.
             pass
-    await _forward_approval_to_runner(session_id, data, runner_router)
+    if not server_harness_owns_approval:
+        await _forward_approval_to_runner(owner_session_id, data, runner_router)
     return None
 
 
@@ -2896,6 +3049,7 @@ async def _hold_native_ask_gate_impl(
     result: PolicyResult,
     conversation_store: ConversationStore,
     elicitation_id: str | None = None,
+    target_session_id: str | None = None,
     actor_user_id: str | None = None,
 ) -> bool:
     """
@@ -2962,6 +3116,7 @@ async def _hold_native_ask_gate_impl(
         phase=phase.value,
         policy_name=result.deciding_policy or "unknown",
         content_preview=json.dumps(data)[:1024],
+        target_session_id=target_session_id,
     )
     # Per-policy ``ask_timeout`` override wins over the spec-level default.
     timeout_s = float(resolve_ask_timeout(engine, result))
@@ -6424,12 +6579,19 @@ async def _ensure_runner_session_initialized(
         else:
             from omnigent.version import VERSION
 
+            report_attempt_id = await prepare_acp_report_connection_attempt_for_client(
+                conv,
+                conversation_store=conversation_store,
+                runner_client=runner_client,
+            )
+
             resp = await runner_client.post(
                 "/v1/sessions",
                 json=build_runner_session_init_payload(
                     conv,
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
+                    acp_report_connection_attempt_id=report_attempt_id,
                 ),
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
             )
@@ -7606,6 +7768,10 @@ async def _forward_event_to_runner(
     host_store: HostStore | None = None,
     agent_revision: str | None = None,
     startup_input_id: str | None = None,
+    agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
+    action_origin_eligible: bool = False,
+    action_origin_actor: str | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -7642,6 +7808,66 @@ async def _forward_event_to_runner(
     :returns: The store-assigned id of the persisted item.
     """
     import uuid
+
+    caller_user_id = action_origin_actor if action_origin_actor is not None else created_by
+    if caller_user_id is None and local_single_user_enabled():
+        # Local sessions deliberately omit the reserved sentinel from message
+        # attribution; detached ACP work still needs the authenticated turn
+        # principal, which is the server's explicit local identity here.
+        caller_user_id = RESERVED_USER_LOCAL
+
+    origin_agent = None
+    origin_spec = None
+    if body.type == "message" and conv.agent_id is not None:
+        if agent_store is None or agent_cache is None:
+            from omnigent.runtime import _globals as _runtime_globals
+
+            agent_store = agent_store or _runtime_globals._agent_store
+            agent_cache = agent_cache or _runtime_globals._agent_cache
+        if agent_store is not None and agent_cache is not None:
+            try:
+                origin_agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
+                if origin_agent is not None:
+                    origin_spec = await asyncio.to_thread(
+                        agent_cache.load,
+                        origin_agent.id,
+                        origin_agent.bundle_location,
+                        expand_env=origin_agent.operator_authored,
+                    )
+                    from omnigent.server.session_action_origins import (
+                        action_origin_eligible_from_spec,
+                    )
+
+                    # Re-resolve from the exact bundle this forward will pin.
+                    # The route-level hint is useful for early checks, but a
+                    # stale or omitted hint must not decide whether the runner
+                    # receives detached-action authority.
+                    action_origin_eligible = action_origin_eligible_from_spec(origin_spec.spec)
+            except Exception as exc:
+                if action_origin_eligible:
+                    raise OmnigentError(
+                        "The turn's detached-action context could not be resolved safely.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    ) from exc
+                origin_agent = None
+                origin_spec = None
+        if (conv.harness_override or "").startswith("acp"):
+            action_origin_eligible = True
+    if action_origin_eligible and body.type == "message":
+        if not caller_user_id:
+            # A prior human turn's actor must not be inherited by a scheduled
+            # or system-originated ACP turn whose actor is unknown.
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                session_id,
+                {_TURN_ACTOR_LABEL: ""},
+            )
+            raise OmnigentError(
+                "This ACP turn has no trusted actor for detached actions.",
+                code=ErrorCode.FORBIDDEN,
+            )
+        # Without a bound agent and runner no origin is captured below, so the
+        # turn forwards parent-only, without detached-action authority.
 
     turn_id = f"turn_{uuid.uuid4().hex}"
     # A web send is persisted under its client stable id (see _web_send_stable_id).
@@ -7756,6 +7982,8 @@ async def _forward_event_to_runner(
     }
     if agent_revision is not None:
         runner_body["agent_revision"] = agent_revision
+    if caller_user_id is not None:
+        runner_body["caller_user_id"] = caller_user_id
     # Persist the turn-initiating actor so /policies/evaluate and MCP
     # tools/call can read it back on any server replica.  Skip system-driven
     # forwards (sub-agent results, parent-wake carry created_by=None) — they
@@ -7767,12 +7995,88 @@ async def _forward_event_to_runner(
     # (before the runner queues the message), not at runner-turn-start time.
     # For the common case (sequential users or single-user sessions) this is
     # correct; strictly concurrent shared-session use is an accepted gap.
-    if created_by is not None:
+    turn_actor = action_origin_actor if action_origin_actor is not None else created_by
+    if turn_actor is None and local_single_user_enabled():
+        turn_actor = RESERVED_USER_LOCAL
+    if turn_actor is not None:
         await asyncio.to_thread(
             conversation_store.set_labels,
             session_id,
-            {_TURN_ACTOR_LABEL: created_by},
+            {_TURN_ACTOR_LABEL: turn_actor},
         )
+    # Capture the authority and execution snapshot on the server before this
+    # turn crosses the runner boundary. The runner receives only the opaque
+    # handle; it cannot choose the actor, turn id, bundle, or MCP selection.
+    action_origin_token: str | None = None
+    if (
+        action_origin_eligible
+        and body.type == "message"
+        and caller_user_id is not None
+        and conv.agent_id is not None
+        and conv.runner_id is not None
+    ):
+        from omnigent.server.session_action_origins import mcp_selection_snapshot
+        from omnigent.session_action_origin import (
+            effective_policy_scope_digest,
+            effective_spec_digest,
+            operator_environment_digest,
+        )
+
+        if agent_store is None or agent_cache is None:
+            from omnigent.runtime import _globals as _runtime_globals
+
+            agent_store = agent_store or _runtime_globals._agent_store
+            agent_cache = agent_cache or _runtime_globals._agent_cache
+        if (
+            agent_store is None
+            or agent_cache is None
+            or origin_agent is None
+            or origin_spec is None
+        ):
+            raise OmnigentError(
+                "The turn's detached-action context could not be captured safely.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        try:
+            base_spec = origin_spec.spec
+            origin_selection = mcp_selection_snapshot(conv.labels)
+            action_origin_token = secrets.token_hex(16)
+            origin_record: dict[str, Any] = {
+                "session_id": session_id,
+                "workspace_id": current_workspace_id(),
+                "runner_id": conv.runner_id,
+                "turn_id": turn_id,
+                "agent_id": origin_agent.id,
+                "bundle_location": origin_agent.bundle_location,
+                "agent_provenance": "operator" if origin_agent.operator_authored else "tenant",
+                "operator_authored": origin_agent.operator_authored,
+                "operator_environment_digest": operator_environment_digest(
+                    base_spec, operator_authored=origin_agent.operator_authored
+                ),
+                "policy_scope_digest": effective_policy_scope_digest(base_spec),
+                "mcp_selection_snapshot": origin_selection,
+                "effective_spec_digest": effective_spec_digest(base_spec),
+                "actor": caller_user_id,
+            }
+            await asyncio.to_thread(
+                conversation_store.register_session_action_origin,
+                session_id,
+                action_origin_token,
+                origin_record,
+            )
+            runner_body["_omnigent_action_origin_token"] = action_origin_token
+        except Exception as exc:
+            action_origin_token = None
+            _logger.warning(
+                "Could not capture ACP action origin for session=%s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            raise OmnigentError(
+                "The turn's detached-action context could not be captured safely.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            ) from exc
     # Forward request-supplied client-side tool schemas so non-native
     # harnesses can emit (and tunnel) the caller's tools — the runner
     # merges these into the harness tool list (_merge_request_client_tools).
@@ -8091,6 +8395,19 @@ async def _forward_event_to_runner(
     # The runner's sessions-native POST returns 202 immediately
     # and starts the turn as a background task. No streaming
     # response to drain — events flow through GET /stream.
+    async def _discard_unbound_action_origin() -> None:
+        if action_origin_token is None or conv.runner_id is None or caller_user_id is None:
+            return
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(
+                conversation_store.release_session_action_origin,
+                session_id,
+                action_origin_token,
+                conv.runner_id,
+                None,
+                caller_user_id,
+            )
+
     try:
         _forward_resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
@@ -8107,6 +8424,7 @@ async def _forward_event_to_runner(
         # status rather than via ``raise_for_status`` so the runner-client fakes
         # that only expose ``status_code`` behave as they do in production.
         if _forward_resp.status_code >= 400:
+            await _discard_unbound_action_origin()
             # The live runner took nothing, so ``idle`` would read as a finished
             # turn that never ran. Persist the reason: the status edge is
             # SSE-only and would vanish on reload. Not strictly terminal — the
@@ -8243,6 +8561,7 @@ async def _forward_event_to_runner(
                     attempted_override=_overridden,
                 )
     except (httpx.HTTPError, ConnectionError) as exc:
+        await _discard_unbound_action_origin()
         # Transport failure — the runner never answered. The message is already
         # persisted (invariant I1), and a trailing user item is what
         # ``create_session`` replays as a recovery turn when the runner
@@ -8541,6 +8860,10 @@ async def _dispatch_session_event_to_runner_impl(
     background_titles_enabled: bool = True,
     agent_revision: str | None = None,
     startup_input: StartupInputContext | None = None,
+    agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
+    action_origin_eligible: bool = False,
+    action_origin_actor: str | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -8970,6 +9293,10 @@ async def _dispatch_session_event_to_runner_impl(
         host_store=host_store,
         agent_revision=agent_revision,
         startup_input_id=startup_input.input_id if startup_input is not None else None,
+        agent_store=agent_store,
+        agent_cache=agent_cache,
+        action_origin_eligible=action_origin_eligible,
+        action_origin_actor=action_origin_actor,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
@@ -9769,6 +10096,18 @@ async def _relay_runner_stream_once(
                         event = json.loads(payload)
                     except json.JSONDecodeError:
                         continue
+                    try:
+                        acp_tool_call_scope = _extract_acp_tool_call_append_scope_from_sse(
+                            event,
+                            response_id=current_response_id,
+                            root_conversation_id=session_id,
+                        )
+                    except ValueError:
+                        _logger.warning(
+                            "Relay rejected malformed private ACP tool-call scope for session=%s",
+                            session_id,
+                        )
+                        raise
                     evt_type = event.get("type", "")
                     # The runner emits session.status events
                     # directly.
@@ -10049,14 +10388,20 @@ async def _relay_runner_stream_once(
                         and isinstance(_item_call_id, str)
                         and current_response_id is not None
                     ):
-                        tool_call_response_ids[_item_call_id] = current_response_id
+                        tool_call_response_ids[_item_call_id] = (
+                            acp_tool_call_scope.response_id
+                            if acp_tool_call_scope is not None
+                            else current_response_id
+                        )
 
                     # For function_call_output, use the response_id
                     # of the matching function_call so the web UI
                     # pairs them in the same bubble even when a new
                     # response.in_progress has already overwritten
                     # current_response_id.
-                    if (
+                    if _item_type == "function_call_output" and acp_tool_call_scope is not None:
+                        _persist_rid = acp_tool_call_scope.response_id
+                    elif (
                         _item_type == "function_call_output"
                         and isinstance(_item_call_id, str)
                         and _item_call_id in tool_call_response_ids
@@ -10064,6 +10409,13 @@ async def _relay_runner_stream_once(
                         _persist_rid = tool_call_response_ids[_item_call_id]
                     else:
                         _persist_rid = current_response_id
+                    if (
+                        acp_tool_call_scope is not None
+                        and _persist_rid != acp_tool_call_scope.response_id
+                    ):
+                        raise ValueError(
+                            "completed ACP tool call does not match its fenced response"
+                        )
 
                     # Flush buffered narration as its own message BEFORE the
                     # function_call it preceded, so the transcript interleaves
@@ -10105,11 +10457,27 @@ async def _relay_runner_stream_once(
                         response_id=_persist_rid,
                     )
                     if conv_item is not None:
-                        await _relay_persist(
+                        if acp_tool_call_scope is not None:
+                            stable_item_id = acp_standard_canonical_tool_item_id(
+                                session_id,
+                                acp_tool_call_scope.source_id,
+                                conv_item.type,
+                            )
+                            conv_item = conv_item.model_copy(update={"stable_id": stable_item_id})
+                        persisted_item = await _relay_persist(
                             conversation_store,
                             session_id,
                             conv_item,
+                            acp_tool_call_scope=acp_tool_call_scope,
                         )
+                        if acp_tool_call_scope is not None:
+                            if persisted_item is None:
+                                raise RuntimeError(
+                                    "scoped ACP tool append returned no canonical item"
+                                )
+                            public_item = persisted_item.to_api_dict()
+                            public_item.pop(ACP_TOOL_CALL_SCOPE_METADATA_KEY, None)
+                            event = {**event, "item": public_item}
 
                     # On ANY terminal event (not just completed), persist the
                     # final text segment: narration streamed before a failure /
@@ -10436,6 +10804,7 @@ async def _relay_runner_stream_once(
                     # tool result with its call in the same bubble.
                     if (
                         evt_type == "response.output_item.done"
+                        and acp_tool_call_scope is None
                         and isinstance(event.get("item"), dict)
                         and event["item"].get("type") == "function_call_output"
                     ):
@@ -11078,6 +11447,7 @@ async def _wake_parent_for_blocked_child(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
 ) -> bool:
     """
     Deliver a parent-wake notice when a sub-agent blocks on an approval.
@@ -11146,6 +11516,44 @@ async def _wake_parent_for_blocked_child(
         if agent_store is not None and parent_conv.agent_id
         else None
     )
+    action_origin_eligible = False
+    if parent_agent is not None:
+        if agent_cache is None:
+            with contextlib.suppress(RuntimeError):
+                from omnigent.runtime import get_agent_cache
+
+                agent_cache = get_agent_cache()
+        if agent_cache is not None:
+            try:
+                parent_spec = await asyncio.to_thread(
+                    agent_cache.load,
+                    parent_agent.id,
+                    parent_agent.bundle_location,
+                    expand_env=parent_agent.operator_authored,
+                )
+                from omnigent.server.session_action_origins import (
+                    action_origin_eligible_from_spec,
+                )
+
+                action_origin_eligible = action_origin_eligible_from_spec(parent_spec.spec)
+            except (KeyError, AttributeError, ValueError, ImportError, OSError):
+                # Still deliver the notice, parent-only, without detached-action authority.
+                _logger.warning(
+                    "Could not resolve parent action context for blocked-child wake",
+                    exc_info=True,
+                    extra={"session_id": parent_id},
+                )
+                action_origin_eligible = False
+    initiating_actor = parent_conv.labels.get(_TURN_ACTOR_LABEL)
+    if action_origin_eligible and not initiating_actor:
+        if local_single_user_enabled():
+            initiating_actor = RESERVED_USER_LOCAL
+        else:
+            _logger.error(
+                "Blocked-child wake cannot start an ACP parent turn without its initiating actor",
+                extra={"session_id": parent_id},
+            )
+            return False
     try:
         # None args: a system notice carries no agent/files/artifacts; the runner
         # recomputes has_mcp_servers from the parent's cached spec.
@@ -11159,9 +11567,14 @@ async def _wake_parent_for_blocked_child(
             file_store=None,
             artifact_store=None,
             runner_router=runner_router,
+            created_by=initiating_actor,
             agent_revision=mcp_selection_revision(parent_agent.bundle_location, parent_conv.labels)
             if parent_agent is not None
             else None,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+            action_origin_eligible=action_origin_eligible,
+            action_origin_actor=initiating_actor if action_origin_eligible else None,
         )
     except (httpx.HTTPError, OmnigentError):
         _logger.warning(
@@ -11178,6 +11591,7 @@ def configure_subagent_block_notifier(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
 ) -> Callable[[], None]:
     """
     Install the parent-wake notifier on the elicitation publish path.
@@ -11223,6 +11637,7 @@ def configure_subagent_block_notifier(
             conversation_store=conversation_store,
             runner_router=runner_router,
             agent_store=agent_store,
+            agent_cache=agent_cache,
         )
 
     notifier = SubagentBlockNotifier(
@@ -12923,6 +13338,32 @@ async def _create_session_from_existing_agent(
         pass
 
     if body.initial_items:
+        _initial_action_origin_eligible = False
+        if agent_cache is not None:
+            try:
+                _initial_agent_spec = await asyncio.to_thread(
+                    agent_cache.load,
+                    agent.id,
+                    agent.bundle_location,
+                    expand_env=agent.operator_authored,
+                )
+                from omnigent.server.session_action_origins import (
+                    action_origin_eligible_from_spec,
+                )
+
+                _initial_action_origin_eligible = action_origin_eligible_from_spec(
+                    _initial_agent_spec.spec
+                )
+            except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
+                _logger.warning(
+                    "Could not inspect the initial session ACP configuration",
+                    exc_info=True,
+                    extra={"session_id": conv.id},
+                )
+                raise OmnigentError(
+                    "The initial session action context could not be captured safely.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                ) from exc
         runner_client = await _get_runner_client(
             conv.id,
             runner_router,
@@ -12973,6 +13414,16 @@ async def _create_session_from_existing_agent(
                     host_store=getattr(request.app.state, "host_store", None),
                     background_titles_enabled=background_session_titles_enabled(request.headers),
                     agent_revision=mcp_selection_revision(agent.bundle_location, conv.labels),
+                    agent_store=agent_store,
+                    agent_cache=agent_cache,
+                    action_origin_eligible=_initial_action_origin_eligible,
+                    action_origin_actor=(
+                        user_id
+                        if user_id is not None
+                        else RESERVED_USER_LOCAL
+                        if local_single_user_enabled()
+                        else None
+                    ),
                 )
                 if pending_background_title is not None:
                     pending_background_title.schedule(expected_seed_title=conv.title)
@@ -13174,11 +13625,25 @@ async def _child_session_summaries_from_conversations(
         child_id: _latest_message_preview(message_items)
         for child_id, message_items in message_items_by_child.items()
     }
+    acp_child_ids = [
+        child.id for child in children if child.labels.get(_ACP_SUBAGENT_ID_LABEL_KEY)
+    ]
+    acp_observation_data: dict[str, dict[str, Any]] = {}
+    if acp_child_ids:
+        acp_observation_data = await asyncio.to_thread(
+            conv_store.get_acp_session_observations,
+            acp_child_ids,
+        )
     return [
         _child_session_summary_from_conversation(
             child,
             (parent_ids or {}).get(child.id, parent_session_id),
             previews.get(child.id),
+            acp_session_observation=(
+                AcpSessionObservation.model_validate(acp_observation_data[child.id])
+                if child.id in acp_observation_data
+                else None
+            ),
         )
         for child in children
     ]
@@ -13196,6 +13661,7 @@ async def _handle_mcp_tools_call(
     request: Request | None = None,
     execute_tool: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
     credential_user: str | None = None,
+    resolved_spec: AgentSpec | None = None,
 ) -> Response:
     """
     Handle a ``tools/call`` JSON-RPC request for the MCP proxy endpoint.
@@ -13253,6 +13719,19 @@ async def _handle_mcp_tools_call(
         return _mcp_error_response(rpc_id, -32000, "Invalid runner MCP operation id")
     operation_id = cast("str | None", operation_id_value)
     is_retry = request_state_str is not None
+    action_context_token = params.get("_omnigent_action_context_token")
+    action_context_generation = params.get("_omnigent_action_context_generation")
+    if action_context_token is not None and (
+        not isinstance(action_context_token, str)
+        or not action_context_token
+        or len(action_context_token) > 256
+        or not isinstance(action_context_generation, str)
+        or not action_context_generation
+        or len(action_context_generation) > 256
+    ):
+        return _mcp_error_response(rpc_id, -32000, "Invalid action context")
+    if action_context_generation is not None and action_context_token is None:
+        return _mcp_error_response(rpc_id, -32000, "Invalid action context")
 
     def _runner_execute_body(
         execute_params: dict[str, Any],
@@ -13260,6 +13739,9 @@ async def _handle_mcp_tools_call(
         step: str,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"method": "tools/call", "params": execute_params}
+        if action_context_token is not None:
+            execute_params["_omnigent_action_context_token"] = action_context_token
+            execute_params["_omnigent_action_context_generation"] = action_context_generation
         if operation_id is not None:
             body["_omnigent_operation"] = {"id": operation_id, "step": step}
         return body
@@ -13281,12 +13763,52 @@ async def _handle_mcp_tools_call(
     # loop so an MCP tool call doesn't stall the single-worker server and
     # serialize concurrent requests behind it.
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    if conv is None or conv.agent_id is None:
+    if conv is None:
         return _mcp_error_response(
             rpc_id, -32000, f"Session not found or has no agent: {session_id!r}"
         )
 
-    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+    action_origin_spec: AgentSpec | None = None
+    if action_context_token is not None:
+        if request is None or not isinstance(action_context_generation, str):
+            return _mcp_error_response(rpc_id, -32000, "Invalid action context")
+        from omnigent.runtime import get_agent_cache
+        from omnigent.server.session_action_origins import resolve_action_origin_context
+
+        try:
+            _origin, action_origin_spec, actor = await asyncio.to_thread(
+                resolve_action_origin_context,
+                request,
+                conversation=conv,
+                conversation_store=conversation_store,
+                token=action_context_token,
+                generation=action_context_generation,
+                credential_principal=credential_user,
+                agent_cache=get_agent_cache(),
+            )
+        except OmnigentError as exc:
+            return _mcp_error_response(rpc_id, -32000, str(exc))
+        if actor is not None and request is not None:
+            try:
+                from omnigent.server.routes._auth_helpers import require_access
+
+                await require_access(
+                    actor["run_as"],
+                    session_id,
+                    LEVEL_EDIT,
+                    getattr(request.app.state, "permission_store", None),
+                    conversation_store,
+                )
+            except OmnigentError as exc:
+                return _mcp_error_response(rpc_id, -32000, str(exc))
+
+    if conv.agent_id is None and action_origin_spec is None:
+        return _mcp_error_response(
+            rpc_id, -32000, f"Session not found or has no agent: {session_id!r}"
+        )
+    spec = action_origin_spec or resolved_spec
+    if spec is None:
+        spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
     if spec is None:
         return _mcp_error_response(rpc_id, -32000, f"Agent not found: {conv.agent_id!r}")
 
@@ -14439,6 +14961,15 @@ async def _get_session_snapshot(
         if include_usage
         else {}
     )
+    acp_observation_data = await asyncio.to_thread(
+        conv_store.get_acp_session_observation,
+        conv.id,
+    )
+    acp_session_observation = (
+        AcpSessionObservation.model_validate(acp_observation_data)
+        if acp_observation_data is not None
+        else None
+    )
     # Static signal telling the open view a host-bound, host-down session is a
     # resumable managed host it can wake by sending a message, vs a terminal
     # host_offline dead-end. Computed independently of liveness_lookup (the web
@@ -14486,6 +15017,7 @@ async def _get_session_snapshot(
         viewer_id=viewer_id,
         agent_store=agent_store,
         agent_cache=agent_cache,
+        acp_session_observation=acp_session_observation,
     )
     if request is not None:
         from omnigent.server.session_families import project_families

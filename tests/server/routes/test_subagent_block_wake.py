@@ -163,6 +163,11 @@ async def test_record_publish_delivers_wake_message_to_parent(
         # TypeErrors inside the notifier task and no wake lands.
         runner_router: Any | None = None,
         agent_revision: str | None = None,
+        created_by: str | None = None,
+        agent_store: Any | None = None,
+        agent_cache: Any | None = None,
+        action_origin_eligible: bool = False,
+        action_origin_actor: str | None = None,
     ) -> str:
         delivered.append(
             _DispatchCall(

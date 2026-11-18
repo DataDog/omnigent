@@ -124,6 +124,20 @@ class FakeProcessManager:
         self._apps.clear()
         self._clients.clear()
 
+    async def set_session_report_opt_in(self, conversation_id: str, enabled: bool) -> None:
+        """Accept the opt-in; the echo harness never reports ACP sessions."""
+        del conversation_id, enabled
+
+    def get_session_report_subscriber_generation(self, conversation_id: str) -> str | None:
+        """Return no generation because the echo harness never reports."""
+        del conversation_id
+        return None
+
+    def get_session_report_runtime_incarnation(self, conversation_id: str) -> int | None:
+        """Return no incarnation because the echo harness never reports."""
+        del conversation_id
+        return None
+
     async def get_client(
         self,
         conversation_id: str,

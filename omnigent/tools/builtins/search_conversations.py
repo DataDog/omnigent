@@ -168,5 +168,5 @@ def _extract_text(item: Any) -> str:
     if isinstance(item.data, FunctionCallData):
         return f"[tool call: {item.data.name}({item.data.arguments})]"
     if isinstance(item.data, FunctionCallOutputData):
-        return item.data.output
+        return item.data.output if item.data.output is not None else ""
     return ""

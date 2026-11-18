@@ -86,6 +86,9 @@ def _spec(*policies: FunctionPolicySpec) -> AgentSpec:
 @asynccontextmanager
 async def _create_session(spec: AgentSpec):
     pm = Mock(spec=HarnessProcessManager)
+    # A non-reporting harness has no ACP report generation or incarnation.
+    pm.get_session_report_subscriber_generation.return_value = None
+    pm.get_session_report_runtime_incarnation.return_value = None
     app = create_runner_app(
         process_manager=pm,
         spec_resolver=AsyncMock(return_value=spec),

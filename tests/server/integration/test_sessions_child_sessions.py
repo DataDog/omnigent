@@ -32,6 +32,7 @@ import pytest
 import yaml
 from fastapi import FastAPI
 
+from omnigent._wrapper_labels import ACP_SUBAGENT_ID_LABEL_KEY
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.runtime import session_stream
@@ -803,6 +804,77 @@ async def test_child_status_edge_fans_out_to_parent_stream(
         assert updates[1]["child"]["title"] == "researcher:auth"
         await asyncio.sleep(0.2)
         assert collector.queue.empty(), "a repeated identical edge must not fan out"
+    finally:
+        await collector.stop()
+        sessions_module._session_status_cache.pop(child.id, None)
+        session_stream.close(session["id"])
+
+
+async def test_acp_child_observation_matches_get_and_live_summary(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh and live summaries carry the same observation and idle semantics."""
+    from omnigent.runtime import session_stream
+    from tests.server.helpers import start_session_stream_collector
+
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="worker:reusable",
+        agent_id=session["agent_id"],
+    )
+    conv_store.set_labels(
+        child.id,
+        {ACP_SUBAGENT_ID_LABEL_KEY: "standard-acp-child-key"},
+    )
+    observation_data = {
+        "source_current": True,
+        "state": {
+            "present": True,
+            "value": {"state": "idle", "stopReason": "unknown native reason"},
+        },
+        "state_ingress_sequence": 23,
+        "last_ingress_sequence": 23,
+        "transport": {"state": "connected"},
+    }
+
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore,
+        "get_acp_session_observations",
+        lambda _store, conversation_ids: {
+            conversation_id: observation_data
+            for conversation_id in conversation_ids
+            if conversation_id == child.id
+        },
+    )
+    sessions_module._session_status_cache[child.id] = "idle"
+    collector = await start_session_stream_collector(session["id"])
+    try:
+        response = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+        assert response.status_code == 200
+        get_row = response.json()["data"][0]
+        assert get_row["busy"] is False
+        assert get_row["current_task_status"] is None
+        assert get_row["acp_session_observation"]["source_current"] is True
+        assert get_row["acp_session_observation"]["state"] == observation_data["state"]
+        assert get_row["acp_session_observation"]["state_ingress_sequence"] == 23
+
+        # A stale lifecycle edge must not turn this observed idle state into a
+        # task completion or replace the retained raw observation.
+        sessions_module._publish_status(child.id, "running")
+        while True:
+            event = await asyncio.wait_for(collector.queue.get(), timeout=5.0)
+            if event.get("type") == "session.child_session.updated":
+                break
+
+        live_child = event["child"]
+        assert live_child["busy"] is False
+        assert live_child["current_task_status"] is None
+        assert live_child["acp_session_observation"] == get_row["acp_session_observation"]
     finally:
         await collector.stop()
         sessions_module._session_status_cache.pop(child.id, None)

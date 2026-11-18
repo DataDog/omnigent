@@ -164,6 +164,7 @@ class Harness:
             _session_inboxes=self.inboxes,
             _session_runtime_cwd=_runtime_cwd,
             _session_spec_cache=self.spec_cache,
+            session_action_contexts={},
             filesystem_registry=None,
             mcp_execution_registry=self.registry,
             mcp_manager=mcp_manager,  # type: ignore[arg-type]

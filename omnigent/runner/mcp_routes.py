@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 from collections.abc import Callable, Coroutine, Mapping
@@ -59,6 +60,18 @@ _logger = logging.getLogger("omnigent.runner.app")
 _runner_llm_client: LLMClient | None = None
 
 
+@dataclasses.dataclass(frozen=True)
+class SessionActionMcpContext:
+    """Runner-owned spec snapshot for one detached ACP parent turn."""
+
+    spec: AgentSpec
+    workdir: Path | None
+    runner_workspace: Path | None
+    agent_id: str | None
+    caller_user_id: str | None
+    generation: str
+
+
 def _get_runner_llm_client() -> LLMClient:
     """Return the runner-process LLM client, creating it on first use.
 
@@ -92,6 +105,7 @@ def register_mcp_routes(
     _session_inboxes: dict[str, asyncio.Queue[_JsonObject]],
     _session_runtime_cwd: Callable[[str], Coroutine[Any, Any, Path | None]],
     _session_spec_cache: dict[str, _SpecEntry | None],
+    session_action_contexts: dict[str, dict[str, SessionActionMcpContext]],
     filesystem_registry: FilesystemRegistry | None,
     mcp_execution_registry: McpExecutionRegistry,
     mcp_manager: RunnerMcpManager | None,
@@ -119,6 +133,33 @@ def register_mcp_routes(
             )
         method: str = body.get("method") or ""
         params: _JsonObject = body.get("params") or {}
+        action_token = params.get("_omnigent_action_context_token")
+        action_generation = params.get("_omnigent_action_context_generation")
+        action_context: SessionActionMcpContext | None = None
+        if action_token is not None or action_generation is not None:
+            if (
+                not isinstance(action_token, str)
+                or not action_token
+                or len(action_token) > 256
+                or not isinstance(action_generation, str)
+                or not action_generation
+                or len(action_generation) > 256
+            ):
+                return JSONResponse(
+                    status_code=200,
+                    content={"error": {"code": -32000, "message": "Invalid action context"}},
+                )
+            action_context = session_action_contexts.get(session_id, {}).get(action_token)
+            if action_context is None or action_context.generation != action_generation:
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "error": {
+                            "code": -32000,
+                            "message": "Detached child origin context is unavailable.",
+                        }
+                    },
+                )
 
         raw_operation = body.get("_omnigent_operation")
         if method == "tools/call" and raw_operation is not None:
@@ -184,7 +225,11 @@ def register_mcp_routes(
                     },
                 )
             spec_entry = _session_spec_cache.get(session_id)
-            spec = _unwrap_resolved_spec(spec_entry)
+            spec = (
+                action_context.spec
+                if action_context is not None
+                else _unwrap_resolved_spec(spec_entry)
+            )
             if spec is None and spec_resolver is not None:
                 spec = await _resolve_session_agent_spec_or_none(session_id)
             if spec is None:
@@ -251,7 +296,11 @@ def register_mcp_routes(
                         },
                     )
                 spec_entry = _session_spec_cache.get(session_id)
-                spec = _unwrap_resolved_spec(spec_entry)
+                spec = (
+                    action_context.spec
+                    if action_context is not None
+                    else _unwrap_resolved_spec(spec_entry)
+                )
                 if spec is None and spec_resolver is not None:
                     spec = await _resolve_session_agent_spec_or_none(session_id)
                 if spec is None:
@@ -321,8 +370,16 @@ def register_mcp_routes(
                     )
             else:
                 spec_entry = _session_spec_cache.get(session_id)
-                spec_workdir = _resolved_workdir_for_spec(spec_entry, runner_workspace)
-                spec = _unwrap_resolved_spec(spec_entry)
+                spec_workdir = (
+                    action_context.workdir
+                    if action_context is not None
+                    else _resolved_workdir_for_spec(spec_entry, runner_workspace)
+                )
+                spec = (
+                    action_context.spec
+                    if action_context is not None
+                    else _unwrap_resolved_spec(spec_entry)
+                )
                 if spec is None and spec_resolver is not None:
                     try:
                         resolved_entry = await _resolve_session_spec_entry(session_id)
@@ -330,9 +387,17 @@ def register_mcp_routes(
                         spec = _unwrap_resolved_spec(resolved_entry)
                     except (OmnigentError, httpx.HTTPError, RuntimeError):
                         pass
-                _agent_id_local = _session_agent_ids.get(session_id)
+                _agent_id_local = (
+                    action_context.agent_id
+                    if action_context is not None
+                    else _session_agent_ids.get(session_id)
+                )
                 try:
-                    dispatch_workspace = await _session_runtime_cwd(session_id)
+                    dispatch_workspace = (
+                        action_context.runner_workspace
+                        if action_context is not None
+                        else await _session_runtime_cwd(session_id)
+                    )
                     output = await execute_tool(
                         tool_name=tool_name,
                         arguments=_json.dumps(arguments),
@@ -354,6 +419,9 @@ def register_mcp_routes(
                         filesystem_registry=filesystem_registry,
                         effective_harness=_session_harness_name(session_id),
                         wake_on_async_result=wake_on_async_result,
+                        caller_user_id=(
+                            action_context.caller_user_id if action_context is not None else None
+                        ),
                     )
                 except Exception as exc:
                     _logger.exception(

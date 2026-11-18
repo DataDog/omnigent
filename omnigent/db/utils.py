@@ -1528,6 +1528,15 @@ def delete_fts_by_conversation_ids(session: Session, conv_ids: list[str]) -> Non
         )
 
 
+def delete_fts_by_item_id(session: Session, item_id: str) -> None:
+    """Remove one item's FTS row on SQLite-family dialects."""
+    if session.bind and _supports_fts5(session.bind.dialect.name):
+        session.execute(
+            text(f"DELETE FROM {_FTS_TABLE} WHERE item_id = :item_id"),
+            {"item_id": item_id},
+        )
+
+
 # ── Search text extraction ─────────────────────────────
 
 
@@ -1537,8 +1546,9 @@ def extract_search_text(item: NewConversationItem) -> str:
 
     The item has already been Pydantic-validated, so required fields
     (content, name, arguments, output, summary) are guaranteed
-    present. We use direct dict access to fail loud if that
-    assumption is ever violated.
+    present. An explicitly cleared ACP tool output is the exception:
+    its ``output`` field is intentionally omitted from the dump and
+    contributes no searchable text.
 
     Content/summary blocks are heterogeneous (text, image, etc.)
     so we filter to only text-bearing blocks via ``.get("text")``.
@@ -1564,7 +1574,7 @@ def extract_search_text(item: NewConversationItem) -> str:
     if item.type == "function_call":
         return f"{data['name']} {data['arguments']}"
     if item.type == "function_call_output":
-        return str(data["output"])
+        return str(data.get("output") or "")
     if item.type == "error":
         return " ".join(part for part in (data["source"], data["code"], data["message"]) if part)
     if item.type == "reasoning":

@@ -476,6 +476,17 @@ class ProfileHostBinding:
     profile_host_id: str | None
 
 
+@dataclass(frozen=True)
+class AcpToolCallAppendScope:
+    """Private journal proof carried with one canonical ACP call or output append."""
+
+    source_id: str
+    native_call_id: str
+    action_origin_token: str
+    action_origin_generation: str
+    response_id: str
+
+
 class ConversationStore(ABC):
     """
     Abstract base for conversation persistence.
@@ -484,6 +495,24 @@ class ConversationStore(ABC):
     paginated listing, appending items, full-text search,
     updates, and deletion.
     """
+
+    @property
+    def acp_session_reporting_ready(self) -> bool:
+        """Whether durable standard ACP reports are configured for this store.
+
+        The additive default keeps custom and legacy stores usable for ordinary
+        conversation traffic while preventing the server from advertising ACP
+        report support they do not implement.
+        """
+        return False
+
+    def bind_artifact_store(self, artifact_store: Any) -> None:
+        """Bind ACP report blob storage when the store supports that feature.
+
+        The base implementation intentionally does nothing: configuration of
+        an unsupported store must not imply ACP report readiness.
+        """
+        del artifact_store
 
     def list_pending_inputs_page(
         self,
@@ -903,6 +932,8 @@ class ConversationStore(ABC):
         self,
         conversation_id: str,
         items: list[NewConversationItem],
+        *,
+        acp_tool_call_scope: AcpToolCallAppendScope | None = None,
     ) -> list[ConversationItem]:
         """
         Append items to a conversation. Assigns a globally unique
@@ -914,6 +945,9 @@ class ConversationStore(ABC):
         of inserting a duplicate. The existence check rides the append's
         own transaction, so idempotency costs no extra query.
 
+        ``acp_tool_call_scope`` is private runner transport context for one
+        canonical function call. It never becomes item data or a public DTO.
+
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
         :param items: List of :class:`NewConversationItem` objects
@@ -922,6 +956,140 @@ class ConversationStore(ABC):
             with store-assigned IDs and timestamps.
         """
         ...
+
+    def get_acp_session_association(
+        self, root_conversation_id: str, native_epoch: str, native_session_id: str
+    ) -> dict[str, Any] | None:
+        """Return the durable native-to-Omnigent mapping for one ACP session."""
+        raise NotImplementedError
+
+    def get_acp_session_association_for_conversation(
+        self, root_conversation_id: str, conversation_id: str
+    ) -> dict[str, Any] | None:
+        """Return the unique ACP association that owns one child conversation."""
+        raise NotImplementedError
+
+    def list_acp_session_associations(
+        self,
+        root_conversation_id: str,
+        *,
+        after: str | None = None,
+        limit: int = 128,
+    ) -> PagedList[dict[str, Any]]:
+        """Return one keyset page of durable ACP session bindings."""
+        raise NotImplementedError
+
+    def prepare_acp_report_connection_attempt(
+        self,
+        root_id: str,
+        authenticated_runner_id: str,
+        authenticated_principal: str | None,
+        server_connection_id: str,
+    ) -> str:
+        """Capture one durable, immutable source-revision precondition per tunnel."""
+        raise NotImplementedError
+
+    def admit_acp_report_connection(
+        self,
+        attempt_id: str,
+        connection_context: Any,
+        *,
+        expected_root_id: str | None = None,
+    ) -> dict[str, Any]:
+        """CAS a prepared connection attempt into root source authority."""
+        raise NotImplementedError
+
+    def admit_acp_report_owner(
+        self,
+        root_id: str,
+        connection_admission_id: str,
+        runtime_incarnation: int,
+        journal_id: str,
+    ) -> dict[str, Any]:
+        """Admit one runtime's immutable report journal under the current tunnel."""
+        raise NotImplementedError
+
+    def activate_acp_report_epoch(
+        self,
+        root_id: str,
+        connection_admission_id: str,
+        runtime_incarnation: int,
+        journal_id: str,
+        native_epoch: str,
+        epoch_ordinal: int,
+        *,
+        historical_only: bool = False,
+    ) -> dict[str, Any]:
+        """Bind an epoch, selecting it only for live activation."""
+        raise NotImplementedError
+
+    def reserve_acp_session_report(
+        self,
+        *,
+        root_conversation_id: str,
+        connection_admission_id: str,
+        runtime_incarnation: int,
+        journal_id: str,
+        journal_sequence: int,
+        epoch_ordinal: int,
+        native_epoch: str,
+        ingress_sequence: int,
+        source_id: str,
+        payload_hash: str,
+        context_generation: str,
+        root_native_session_id: str,
+        target_session_id: str,
+        parent_session_id: str,
+        action_origin: dict[str, Any] | None = None,
+    ) -> None:
+        """Admit an association report before creating its visible child row."""
+        raise NotImplementedError
+
+    def get_acp_session_observation(self, conversation_id: str) -> dict[str, Any] | None:
+        """Return the latest persisted ACP state observation for a conversation."""
+        raise NotImplementedError
+
+    def get_acp_session_observations(
+        self, conversation_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Return bounded ACP observation projections for known conversations.
+
+        Missing or ambiguous associations are omitted. Implementations should
+        share the singular getter's source-selection and currentness semantics.
+        Legacy stores can rely on the singular method while newer stores provide
+        a batched implementation.
+        """
+        observations: dict[str, dict[str, Any]] = {}
+        for conversation_id in dict.fromkeys(conversation_ids):
+            observation = self.get_acp_session_observation(conversation_id)
+            if observation is not None:
+                observations[conversation_id] = observation
+        return observations
+
+    def apply_acp_session_report(
+        self,
+        *,
+        root_conversation_id: str,
+        connection_admission_id: str,
+        runtime_incarnation: int,
+        journal_id: str,
+        journal_sequence: int,
+        epoch_ordinal: int,
+        native_epoch: str,
+        ingress_sequence: int,
+        source_id: str,
+        payload_hash: str,
+        context_generation: str,
+        root_native_session_id: str,
+        target_session_id: str,
+        parent_session_id: str | None,
+        conversation_id: str,
+        kind: str,
+        operation: dict[str, Any],
+        action_origin: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Apply one normalized ACP report and persist its replay fence atomically."""
+        raise NotImplementedError
 
     @abstractmethod
     def list_conversations(
@@ -1405,6 +1573,65 @@ class ConversationStore(ABC):
             Serialized as JSON. Empty dict is stored as ``"{}"``.
         """
         ...
+
+    @abstractmethod
+    def register_session_action_origin(
+        self,
+        conversation_id: str,
+        token: str,
+        origin: dict[str, Any],
+    ) -> None:
+        """Add a bounded private origin captured by the server before dispatch."""
+
+    @abstractmethod
+    def bind_session_action_origin(
+        self,
+        conversation_id: str,
+        token: str,
+        runner_id: str,
+        runner_generation: str,
+        credential_principal: str,
+        *,
+        context_generation: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Bind an origin to its runner generation and authenticated principal."""
+
+    @abstractmethod
+    def get_session_action_origin(self, conversation_id: str, token: str) -> dict[str, Any] | None:
+        """Return a copy of one private origin record, if present."""
+
+    @abstractmethod
+    def bind_session_action_origin_child(
+        self,
+        conversation_id: str,
+        token: str,
+        runner_id: str,
+        runner_generation: str,
+        credential_principal: str,
+        child_key: str,
+        child_id: str,
+        *,
+        native_epoch: str | None = None,
+        native_session_id: str | None = None,
+        parent_native_session_id: str | None = None,
+        context_generation: str | None = None,
+    ) -> bool:
+        """Bind an origin to one validated ACP child session idempotently."""
+
+    @abstractmethod
+    def list_session_action_origins(self, conversation_id: str) -> dict[str, dict[str, Any]]:
+        """Return private action-origin records for authenticated recovery filtering."""
+
+    @abstractmethod
+    def release_session_action_origin(
+        self,
+        conversation_id: str,
+        token: str,
+        runner_id: str,
+        runner_generation: str | None,
+        credential_principal: str,
+    ) -> bool:
+        """Remove an origin after matching runner, generation, and principal settlement."""
 
     @abstractmethod
     def set_session_usage(

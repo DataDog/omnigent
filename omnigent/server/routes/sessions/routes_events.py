@@ -6,7 +6,9 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import hashlib
 import itertools
+import json
 import secrets
 import time
 import weakref
@@ -58,6 +60,13 @@ from omnigent.host.frames import (
 from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
+from omnigent.inner.acp_standard_subagents import (
+    acp_standard_child_key,
+    acp_standard_report_source_id,
+    acp_standard_tool_entity_id,
+    validate_acp_association_patch,
+    validate_acp_native_identity,
+)
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.native.input_diagnostics import input_attributes
@@ -84,6 +93,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     EventBatchFrame,
     encode_frame,
 )
+from omnigent.runner.transports.ws_tunnel.registry import RunnerSession
 from omnigent.runtime import (
     inflight_text,
     pending_client_tool_calls,
@@ -94,7 +104,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.content_resolver import _resolve_message_content
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
-from omnigent.server import presence
+from omnigent.server import presence, session_live_state
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -108,7 +118,9 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     AuthProvider,
+    local_single_user_enabled,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -156,6 +168,8 @@ from omnigent.server.routes._auth_helpers import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._sessions.common import (
+    _ACP_SUBAGENT_DESCRIPTION_LABEL_KEY,
+    _ACP_SUBAGENT_ID_LABEL_KEY,
     _ALLOWED_EVENT_TYPES,
     _APPROVAL_TYPE,
     _CLEAR_TYPE,
@@ -163,6 +177,10 @@ from omnigent.server.routes._sessions.common import (
     _COMPACT_TYPE,
     _DURABLE_ASK_CONSUMED_TYPE,
     _DURABLE_ASK_TYPE,
+    _EXTERNAL_ACP_REPORT_CONNECTION_ADMIT_TYPE,
+    _EXTERNAL_ACP_REPORT_EPOCH_ACTIVATE_TYPE,
+    _EXTERNAL_ACP_REPORT_OWNER_ADMIT_TYPE,
+    _EXTERNAL_ACP_SESSION_REPORT_TYPE,
     _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
@@ -251,12 +269,14 @@ from omnigent.server.routes._sessions.helpers import (
     _persist_session_status_error_labels,
     _prune_session_read_state,
     _publish_btw_sidechat,
+    _publish_child_status_to_parent,
     _publish_compaction_completed,
     _publish_compaction_failed,
     _publish_compaction_in_progress,
     _publish_elicitation_request_to_ancestors,
     _publish_elicitation_resolved,
     _publish_elicitation_resolved_to_ancestors,
+    _publish_external_conversation_item,
     _publish_external_output_reasoning_delta,
     _publish_external_output_text_delta,
     _publish_external_tool_output_delta,
@@ -295,6 +315,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _ensure_runner_session_initialized,
     _evaluate_input_policy,
     _evaluate_tool_call_policy,
+    _has_unowned_parent_pending_elicitation,
     _heal_subagent_runner_binding_via_parent,
     _is_native_terminal_session,
     _mark_dispatch_in_flight,
@@ -316,12 +337,14 @@ from omnigent.server.routes._sessions.orchestration import (
     _session_is_moving,
     _side_chat_source_id,
     _stop_host_runner_intentionally,
+    _targeted_harness_elicitation_owner,
     _wait_for_host_bound_runner_client,
     _wait_for_host_reconnect,
     ensure_runner_connected,
 )
 from omnigent.server.scheduled.telemetry import start_fire_stage
 from omnigent.server.schemas import (
+    AcpSessionObservation,
     BackgroundTaskInfo,
     ConversationDeleted,
     ElicitationRequestEvent,
@@ -330,7 +353,12 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SessionEventInput,
 )
-from omnigent.server.session_live_state import handoff_count, last_liveness_stamp
+from omnigent.server.session_live_state import (
+    forget_live_status,
+    handoff_count,
+    last_liveness_stamp,
+    persist_live_status_required,
+)
 from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.session_orchestration import require_orchestration_source
 from omnigent.server.startup_inputs import StartupDispatch, StartupInputContext
@@ -411,6 +439,48 @@ _METADATA_OBSERVATION_EVENT_TYPES = frozenset(
 # booting (slow imports on a busy machine), so it earns a longer connect wait.
 _ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR = 2.0
 
+_ACP_ROSTER_INVALIDATION_BATCH_SIZE = 500
+
+
+def _enqueue_acp_child_roster_invalidation(
+    conversation_store: ConversationStore,
+    report_root_id: str,
+) -> None:
+    """Refresh active streams in the report root's stored session tree.
+
+    The event carries no observation or status; clients re-read the roster.
+    Subscriber discovery is an in-memory snapshot, while conversation reads
+    run in fixed-size database batches on the ordered live-state worker.
+    """
+
+    def _fan_out() -> None:
+        report_root = conversation_store.get_conversation(report_root_id)
+        if report_root is None:
+            return
+        tree_root_id = report_root.root_conversation_id or report_root_id
+        subscriber_ids = set(session_stream.subscribed_conversation_ids())
+        subscriber_ids.add(report_root_id)
+        stream_ids = sorted(subscriber_ids)
+        for start in range(0, len(stream_ids), _ACP_ROSTER_INVALIDATION_BATCH_SIZE):
+            batch = stream_ids[start : start + _ACP_ROSTER_INVALIDATION_BATCH_SIZE]
+            conversations = conversation_store.get_conversations(batch)
+            for stream_id in batch:
+                conversation = conversations.get(stream_id)
+                if conversation is None or conversation.root_conversation_id != tree_root_id:
+                    continue
+                session_stream.publish(
+                    stream_id,
+                    {
+                        "type": "session.child_sessions.invalidated",
+                        "conversation_id": stream_id,
+                    },
+                )
+
+    session_live_state.submit(
+        "acp_child_roster_invalidation",
+        _fan_out,
+    )
+
 
 def _relaunch_connect_timeout_s(*, acknowledged: bool) -> float:
     """Seconds a relaunch waits for its runner to connect.
@@ -449,6 +519,39 @@ def _is_batchable_external_item(event: SessionEventInput) -> bool:
         and item_data.get("kind") == "input"
     )
     return item_type != "slash_command" and not is_user_message and not is_shell_input
+
+
+_ACP_MIRROR_INDEPENDENT_EVENT_TYPES = frozenset(
+    {
+        "message",
+        "session_message",
+        _SLASH_COMMAND_TYPE,
+        _RETRY_SESSION_TYPE,
+        _COMPACT_TYPE,
+        _CLEAR_TYPE,
+        _INTERRUPT_TYPE,
+        _STOP_SESSION_TYPE,
+    }
+)
+
+
+def _is_acp_subagent_mirror(conversation: Conversation) -> bool:
+    """Whether this session mirrors an ACP-owned child process."""
+    return conversation.kind == "sub_agent" and bool(
+        (conversation.labels or {}).get(_ACP_SUBAGENT_ID_LABEL_KEY)
+    )
+
+
+def _reject_independent_acp_mirror_action(
+    conversation: Conversation, event: SessionEventInput
+) -> None:
+    """Keep independent client actions from taking over a mirrored ACP child."""
+    if _is_acp_subagent_mirror(conversation) and event.type in _ACP_MIRROR_INDEPENDENT_EVENT_TYPES:
+        raise OmnigentError(
+            "ACP sub-agent sessions mirror work owned by the parent process; "
+            "independent session actions are unavailable.",
+            code=ErrorCode.CONFLICT,
+        )
 
 
 def _event_body_too_large() -> HTTPException:
@@ -895,11 +998,17 @@ class _RunnerEventContext:
     headers: Headers
     user_id: str | None
     runner_id: str
+    # Server-initiated recovery events have no originating tunnel connection.
+    server_connection: RunnerSession | None = None
 
 
 _RUNNER_EVENT_TYPES = frozenset(
     {
         _EXTERNAL_CONVERSATION_ITEM_TYPE,
+        _EXTERNAL_ACP_SESSION_REPORT_TYPE,
+        _EXTERNAL_ACP_REPORT_CONNECTION_ADMIT_TYPE,
+        _EXTERNAL_ACP_REPORT_OWNER_ADMIT_TYPE,
+        _EXTERNAL_ACP_REPORT_EPOCH_ACTIVATE_TYPE,
         _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
         _EXTERNAL_SESSION_STATUS_TYPE,
         _EXTERNAL_SESSION_USAGE_TYPE,
@@ -1080,6 +1189,7 @@ def register_events_routes(
         session_id: str,
         *,
         external_transcript: bool = False,
+        runner_report: bool = False,
     ) -> tuple[str | None, Any]:
         """Authorize event writes, reserving transcripts for owners and bound runners."""
         user_id = (
@@ -1088,7 +1198,7 @@ def register_events_routes(
             else _get_user_id(request, auth_provider)
         )
         conv = None
-        if external_transcript:
+        if external_transcript or runner_report:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
@@ -1153,6 +1263,10 @@ def register_events_routes(
                         "session event batch exceeds the 100-event limit",
                         code=ErrorCode.INVALID_INPUT,
                     )
+                if any(event.type in _ACP_MIRROR_INDEPENDENT_EVENT_TYPES for event in body):
+                    _, conversation = await _authorized_conversation(request, session_id)
+                    for event in body:
+                        _reject_independent_acp_mirror_action(conversation, event)
                 # A sub-agent transcript arrives as one array of up to 100 items with a
                 # 10 s client timeout, and persisting it per entry on a store with
                 # per-append overhead outlasts that. Each run of batchable entries is
@@ -1195,16 +1309,191 @@ def register_events_routes(
         headers: Headers,
         owner: str | None,
         runner_id: str,
+        server_connection: RunnerSession,
         batch: EventBatchFrame,
     ) -> EventAckFrame:
         """Apply bounded, authenticated runner events through the HTTP event logic."""
         if len(batch.events) > 32 or len(encode_frame(batch).encode("utf-8")) > 256 * 1024:
             return EventAckFrame(batch.id, 0, "event batch exceeds count or size limit")
-        request = _RunnerEventContext(app, headers, owner, runner_id)
+        request = _RunnerEventContext(app, headers, owner, runner_id, server_connection)
         for index, payload in enumerate(batch.events):
             event_type = payload.get("type")
             if event_type not in _RUNNER_EVENT_TYPES:
                 return EventAckFrame(batch.id, index, "event type is not allowed on runner tunnel")
+            if event_type in {
+                _EXTERNAL_ACP_REPORT_CONNECTION_ADMIT_TYPE,
+                _EXTERNAL_ACP_REPORT_OWNER_ADMIT_TYPE,
+                _EXTERNAL_ACP_REPORT_EPOCH_ACTIVATE_TYPE,
+            }:
+                data = payload.get("data")
+                registry = getattr(app.state, "tunnel_registry", None)
+                if (
+                    not isinstance(data, dict)
+                    or registry is None
+                    or registry.get(runner_id) is not server_connection
+                    or server_connection.runner_id != runner_id
+                    or server_connection.superseded
+                ):
+                    return EventAckFrame(batch.id, index, ErrorCode.FORBIDDEN)
+                try:
+                    if event_type == _EXTERNAL_ACP_REPORT_CONNECTION_ADMIT_TYPE:
+                        if set(data) != {"attempt_id"}:
+                            raise ValueError("connection admission payload is malformed")
+                        attempt_id = data.get("attempt_id")
+                        if (
+                            not isinstance(attempt_id, str)
+                            or not attempt_id
+                            or len(attempt_id) > 128
+                        ):
+                            raise ValueError("connection admission attempt is invalid")
+                        result = await asyncio.to_thread(
+                            conversation_store.admit_acp_report_connection,
+                            attempt_id,
+                            server_connection,
+                            expected_root_id=batch.session_id,
+                        )
+                        if result.get("selector_changed") is True:
+                            _enqueue_acp_child_roster_invalidation(
+                                conversation_store,
+                                batch.session_id,
+                            )
+                        if result.get("current") is not True:
+                            raise ValueError("connection admission is no longer current")
+                    elif event_type == _EXTERNAL_ACP_REPORT_OWNER_ADMIT_TYPE:
+                        if set(data) != {
+                            "connection_admission_id",
+                            "runtime_incarnation",
+                            "journal_id",
+                        }:
+                            raise ValueError("runtime owner payload is malformed")
+                        connection_admission_id = data.get("connection_admission_id")
+                        runtime_incarnation = data.get("runtime_incarnation")
+                        journal_id = data.get("journal_id")
+                        if (
+                            not isinstance(connection_admission_id, str)
+                            or not connection_admission_id
+                            or len(connection_admission_id) > 128
+                            or isinstance(runtime_incarnation, bool)
+                            or not isinstance(runtime_incarnation, int)
+                            or not 1 <= runtime_incarnation <= 2**63 - 1
+                            or not isinstance(journal_id, str)
+                            or not journal_id
+                            or len(journal_id) > 128
+                        ):
+                            raise ValueError("runtime owner identity is invalid")
+                        admission = await asyncio.to_thread(
+                            conversation_store.admit_acp_report_connection,
+                            connection_admission_id,
+                            server_connection,
+                            expected_root_id=batch.session_id,
+                        )
+                        if admission.get("selector_changed") is True:
+                            _enqueue_acp_child_roster_invalidation(
+                                conversation_store,
+                                batch.session_id,
+                            )
+                        if admission.get("current") is not True:
+                            raise ValueError("connection admission is no longer current")
+                        result = await asyncio.to_thread(
+                            conversation_store.admit_acp_report_owner,
+                            batch.session_id,
+                            connection_admission_id,
+                            runtime_incarnation,
+                            journal_id,
+                        )
+                        if result.get("selector_changed") is True:
+                            _enqueue_acp_child_roster_invalidation(
+                                conversation_store,
+                                batch.session_id,
+                            )
+                        if result.get("current") is not True:
+                            raise ValueError("runtime owner is no longer current")
+                    else:
+                        epoch_fields = {
+                            "connection_admission_id",
+                            "runtime_incarnation",
+                            "journal_id",
+                            "native_epoch",
+                            "epoch_ordinal",
+                        }
+                        if set(data) == epoch_fields:
+                            historical_only = False
+                        elif (
+                            set(data) == epoch_fields | {"mode"}
+                            and data.get("mode") == "historical"
+                        ):
+                            historical_only = True
+                        else:
+                            raise ValueError("epoch activation payload is malformed")
+                        connection_admission_id = data.get("connection_admission_id")
+                        runtime_incarnation = data.get("runtime_incarnation")
+                        journal_id = data.get("journal_id")
+                        native_epoch = data.get("native_epoch")
+                        epoch_ordinal = data.get("epoch_ordinal")
+                        if (
+                            not isinstance(connection_admission_id, str)
+                            or not connection_admission_id
+                            or len(connection_admission_id) > 128
+                            or isinstance(runtime_incarnation, bool)
+                            or not isinstance(runtime_incarnation, int)
+                            or not 1 <= runtime_incarnation <= 2**63 - 1
+                            or not isinstance(journal_id, str)
+                            or not journal_id
+                            or len(journal_id) > 128
+                            or not isinstance(native_epoch, str)
+                            or not native_epoch
+                            or len(native_epoch) > 128
+                            or isinstance(epoch_ordinal, bool)
+                            or not isinstance(epoch_ordinal, int)
+                            or not 1 <= epoch_ordinal <= 2**63 - 1
+                        ):
+                            raise ValueError("epoch activation identity is invalid")
+                        admission = await asyncio.to_thread(
+                            conversation_store.admit_acp_report_connection,
+                            connection_admission_id,
+                            server_connection,
+                            expected_root_id=batch.session_id,
+                        )
+                        if admission.get("selector_changed") is True:
+                            _enqueue_acp_child_roster_invalidation(
+                                conversation_store,
+                                batch.session_id,
+                            )
+                        if admission.get("current") is not True:
+                            raise ValueError("connection admission is no longer current")
+                        result = await asyncio.to_thread(
+                            conversation_store.activate_acp_report_epoch,
+                            batch.session_id,
+                            connection_admission_id,
+                            runtime_incarnation,
+                            journal_id,
+                            native_epoch,
+                            epoch_ordinal,
+                            historical_only=historical_only,
+                        )
+                        if result.get("selector_changed") is True:
+                            _enqueue_acp_child_roster_invalidation(
+                                conversation_store,
+                                batch.session_id,
+                            )
+                        if historical_only:
+                            if result.get("bound") is not True:
+                                raise ValueError("historical epoch binding is no longer current")
+                        elif result.get("active") is not True:
+                            raise ValueError("epoch activation is no longer current")
+                except (TypeError, ValueError) as exc:
+                    _logger.info(
+                        "Rejecting ACP report control event",
+                        extra=debug_event(
+                            "acp_report_control_rejected",
+                            session_id=batch.session_id,
+                            runner_id=runner_id,
+                            event_type=event_type,
+                            error_type=type(exc).__name__,
+                        ),
+                    )
+                    return EventAckFrame(batch.id, index, ErrorCode.CONFLICT)
+                continue
             if event_type == _EXTERNAL_CONVERSATION_ITEM_TYPE:
                 data = payload.get("data")
                 if not isinstance(data, dict) or not isinstance(data.get("source_id"), str):
@@ -1414,7 +1703,22 @@ def register_events_routes(
                 _EXTERNAL_CONVERSATION_ITEM_TYPE,
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
+            runner_report=(
+                body.type == _EXTERNAL_ACP_SESSION_REPORT_TYPE
+                or (
+                    body.type == _EXTERNAL_ACP_SUBAGENT_START_TYPE
+                    and body.data.get("require_durable") is True
+                )
+            ),
         )
+        if body.type == _EXTERNAL_ACP_SESSION_REPORT_TYPE and not _has_bound_runner_authority(
+            request, conv
+        ):
+            raise OmnigentError(
+                "ACP session reports require the session's bound runner.",
+                code=ErrorCode.FORBIDDEN,
+            )
+        _reject_independent_acp_mirror_action(conv, body)
         native_harness = (
             await asyncio.to_thread(
                 _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
@@ -1615,6 +1919,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_TODOS_TYPE,
             _EXTERNAL_SUBAGENT_START_TYPE,
             _EXTERNAL_ACP_SUBAGENT_START_TYPE,
+            _EXTERNAL_ACP_SESSION_REPORT_TYPE,
             _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
             _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
             _EXTERNAL_DEVIN_SUBAGENT_START_TYPE,
@@ -2307,6 +2612,27 @@ def register_events_routes(
             # to the runner for runner-side (policy) elicitations.
             # The dedicated URL endpoint (``.../elicitations/{eid}/
             # resolve``) routes through the same helper.
+            owner_session_id = await _targeted_harness_elicitation_owner(
+                session_id, body.data.get("elicitation_id"), conversation_store
+            )
+            if owner_session_id is None and await _has_unowned_parent_pending_elicitation(
+                session_id, body.data.get("elicitation_id"), conversation_store
+            ):
+                return {"queued": False}
+            approval_conv = conv
+            if owner_session_id is not None:
+                owner_access = await _require_access_and_level(
+                    user_id,
+                    owner_session_id,
+                    LEVEL_EDIT,
+                    permission_store,
+                    conversation_store,
+                )
+                approval_conv = owner_access.conversation or await asyncio.to_thread(
+                    conversation_store.get_conversation, owner_session_id
+                )
+                if approval_conv is None:
+                    raise _session_not_found()
             metric_actor, metric_owner = await _usage_identity(session_id, user_id)
             await _resolve_elicitation(
                 session_id,
@@ -2317,9 +2643,13 @@ def register_events_routes(
                 session_owner_id=metric_owner,
             )
             # Apply any policy writes deferred by the relay tool-call ASK gate
-            # (e.g. a cost-budget checkpoint) now that the verdict is in.
+            # (e.g. a cost-budget checkpoint) on the runner-owning session.
             await _apply_pending_policy_ask_writes(
-                session_id, conv, conversation_store, agent_store, body.data
+                owner_session_id or session_id,
+                approval_conv,
+                conversation_store,
+                agent_store,
+                body.data,
             )
             return {"queued": False}
         if body.type == _MCP_ELICITATION_TYPE:
@@ -2781,6 +3111,46 @@ def register_events_routes(
                     f"{body.type} data.response_id must be a string",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            raw_require_durable = body.data.get("require_durable", False)
+            if not isinstance(raw_require_durable, bool):
+                raise OmnigentError(
+                    f"{body.type} data.require_durable must be a boolean",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            require_durable = raw_require_durable
+            raw_turn_outcome = body.data.get("turn_outcome")
+            if require_durable:
+                if (
+                    body.type != _EXTERNAL_SESSION_STATUS_TYPE
+                    or conv.kind != "sub_agent"
+                    or conv.parent_conversation_id is None
+                    or not conv.labels.get(_ACP_SUBAGENT_ID_LABEL_KEY)
+                ):
+                    raise OmnigentError(
+                        "durable external status is only supported for ACP sub-agent children",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                if not isinstance(response_id, str) or not response_id:
+                    raise OmnigentError(
+                        "durable external status requires a non-empty data.response_id",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                if status not in {"running", "idle", "failed"}:
+                    raise OmnigentError(
+                        "durable external status does not support this session status",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                if status in {"idle", "failed"}:
+                    if raw_turn_outcome not in ("completed", "failed", "cancelled"):
+                        raise OmnigentError(
+                            "durable terminal status requires data.turn_outcome",
+                            code=ErrorCode.INVALID_INPUT,
+                        )
+                    if (status == "idle") != (raw_turn_outcome == "completed"):
+                        raise OmnigentError(
+                            "durable terminal status and data.turn_outcome disagree",
+                            code=ErrorCode.INVALID_INPUT,
+                        )
             # ``None`` (field absent) = no information; leave the sticky
             # tally untouched (the PTY-activity ``idle`` carries none). An
             # explicit ``0`` from a ``Stop`` hook is authoritative and clears
@@ -2900,7 +3270,10 @@ def register_events_routes(
                 )
             # A confirmed turn completion after a failure means a later turn
             # succeeded, so the earlier failure must not outlive it.
-            turn_completed = status == "idle" and data.get("turn_completed") is True
+            turn_completed = status == "idle" and (
+                data.get("turn_completed") is True
+                or (require_durable and raw_turn_outcome == "completed")
+            )
             recovered_from_failure = (
                 turn_completed and _session_status_cache.get(session_id) == "failed"
             )
@@ -2914,9 +3287,17 @@ def register_events_routes(
                     conversation_store,
                     owner_runner_id=conv.runner_id,
                     agent_name=failed_agent_name,
+                    require_durable=require_durable,
                 )
             elif status == "running" or recovered_from_failure:
-                await _persist_session_status_error_labels(session_id, None, conversation_store)
+                await _persist_session_status_error_labels(
+                    session_id,
+                    None,
+                    conversation_store,
+                    require_durable=require_durable,
+                )
+            if require_durable:
+                await persist_live_status_required(session_id, status)
             _publish_status(
                 session_id,
                 status,
@@ -2929,6 +3310,7 @@ def register_events_routes(
                 background_task_count=bg_count,
                 background_tasks=bg_tasks,
                 blocked_on=blocked_on,
+                persist_live_status=not require_durable,
             )
             if (
                 conv.parent_conversation_id is not None
@@ -2954,6 +3336,7 @@ def register_events_routes(
                         conversation_store,
                         turn_id=response_id,
                         status=outcome,
+                        require_durable=require_durable,
                     )
             # Emit a turn-end telemetry event for native harnesses. "idle"
             # means the turn completed normally; "failed" means it errored.
@@ -3017,7 +3400,7 @@ def register_events_routes(
                     status,
                     runner_result,
                 )
-            return {"queued": False}
+            return {"queued": False, **({"durable": True} if require_durable else {})}
         if body.type == _EXTERNAL_BACKGROUND_WORK_TYPE:
             # Sidebar flag and composer tally: no status edge, so the turn status
             # stays as reported. A post may carry either or both.
@@ -3281,16 +3664,738 @@ def register_events_routes(
             # Returned to the devin-native forwarder so it can post the
             # reconstructed sub-agent transcript into the child id.
             return {"queued": False, "child_session_id": child_id}
+        if body.type == _EXTERNAL_ACP_SESSION_REPORT_TYPE:
+            report = body.data
+            sequence = report.get("sequence")
+            connection_admission_id = report.get("connection_admission_id")
+            runtime_incarnation = report.get("runtime_incarnation")
+            journal_id = report.get("journal_id")
+            epoch_ordinal = report.get("epoch_ordinal")
+            ingress_sequence = report.get("ingress_sequence")
+            native_epoch = report.get("native_epoch")
+            source_id = report.get("source_id")
+            kind = report.get("kind")
+            server_identity = report.get("server_identity")
+            root_id = report.get("root_conversation_id")
+            context_generation = report.get("context_generation")
+            root_native_session_id = report.get("root_native_session_id")
+            target_session_id = report.get("target_session_id")
+            parent_session_id = report.get("parent_session_id")
+            operation = report.get("operation")
+            if (
+                isinstance(sequence, bool)
+                or not isinstance(sequence, int)
+                or sequence < 1
+                or not isinstance(connection_admission_id, str)
+                or not connection_admission_id
+                or len(connection_admission_id) > 128
+                or isinstance(runtime_incarnation, bool)
+                or not isinstance(runtime_incarnation, int)
+                or not 1 <= runtime_incarnation <= 2**63 - 1
+                or not isinstance(journal_id, str)
+                or not journal_id
+                or len(journal_id) > 128
+                or isinstance(epoch_ordinal, bool)
+                or not isinstance(epoch_ordinal, int)
+                or not 1 <= epoch_ordinal <= 2**63 - 1
+                or isinstance(ingress_sequence, bool)
+                or not isinstance(ingress_sequence, int)
+                or ingress_sequence < 1
+                or not isinstance(native_epoch, str)
+                or not native_epoch
+                or len(native_epoch) > 128
+                or not isinstance(source_id, str)
+                or len(source_id) != 69
+                or kind
+                not in {
+                    "association.patch",
+                    "observation.patch",
+                    "entity.upsert",
+                    "entity.patch",
+                    "entity.append",
+                    "tool.references",
+                }
+                or not isinstance(server_identity, str)
+                or not server_identity
+                or not isinstance(root_id, str)
+                or root_id != session_id
+                or not isinstance(context_generation, str)
+                or not context_generation
+                or len(context_generation) > 256
+                or not isinstance(root_native_session_id, str)
+                or not root_native_session_id
+                or len(root_native_session_id) > 512
+                or not isinstance(target_session_id, str)
+                or not target_session_id
+                or len(target_session_id) > 512
+                or (
+                    parent_session_id is not None
+                    and (
+                        not isinstance(parent_session_id, str)
+                        or not parent_session_id
+                        or len(parent_session_id) > 512
+                    )
+                )
+                or not isinstance(operation, dict)
+            ):
+                raise OmnigentError(
+                    "external_acp_session_report has malformed v3 identity or operation data.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            try:
+                native_ids = [root_native_session_id, target_session_id]
+                if parent_session_id is not None:
+                    native_ids.append(parent_session_id)
+                call_id = operation.get("call_id")
+                if call_id is not None:
+                    native_ids.append(call_id)
+                validate_acp_native_identity(native_epoch, *native_ids)
+                entity_id = operation.get("entity_id")
+                if entity_id is not None:
+                    validate_acp_native_identity(native_epoch, entity_id)
+            except (TypeError, ValueError, UnicodeError) as exc:
+                raise OmnigentError(
+                    f"external_acp_session_report identity exceeds its storage limit: {exc}",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
+            if not set(report).issubset(
+                {
+                    "sequence",
+                    "connection_admission_id",
+                    "runtime_incarnation",
+                    "journal_id",
+                    "epoch_ordinal",
+                    "native_epoch",
+                    "ingress_sequence",
+                    "source_id",
+                    "kind",
+                    "server_identity",
+                    "root_conversation_id",
+                    "context_generation",
+                    "root_native_session_id",
+                    "target_session_id",
+                    "parent_session_id",
+                    "operation",
+                    "_omnigent_action_origin",
+                }
+            ):
+                raise OmnigentError(
+                    "external_acp_session_report contains unsupported fields.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            expected_source_id = acp_standard_report_source_id(
+                server_identity, root_id, native_epoch, ingress_sequence
+            )
+            if source_id != expected_source_id:
+                raise OmnigentError(
+                    "external_acp_session_report source identity is invalid.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+
+            action_origin = report.get("_omnigent_action_origin")
+            root_tool_references = (
+                kind == "tool.references"
+                and target_session_id == root_native_session_id
+                and parent_session_id is None
+            )
+            explicit_root_tool_references = root_tool_references and "references" in operation
+            if action_origin is not None:
+                if (
+                    (kind != "association.patch" and not root_tool_references)
+                    or not isinstance(action_origin, dict)
+                    or set(action_origin) != {"token", "agent", "generation"}
+                    or not isinstance(action_origin.get("token"), str)
+                    or not action_origin["token"]
+                    or len(action_origin["token"]) > 256
+                    or not isinstance(action_origin.get("generation"), str)
+                    or not action_origin["generation"]
+                    or len(action_origin["generation"]) > 256
+                    or (
+                        action_origin.get("agent") is not None
+                        and (
+                            not isinstance(action_origin.get("agent"), str)
+                            or len(action_origin["agent"]) > 256
+                        )
+                    )
+                ):
+                    raise OmnigentError(
+                        "external_acp_session_report private action origin is malformed.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+            if root_tool_references:
+                call_id = operation.get("call_id")
+                references = operation.get("references")
+                if (
+                    ("references" not in operation and action_origin is None)
+                    or (
+                        "references" not in operation
+                        and (
+                            not isinstance(operation.get("response_id"), str)
+                            or not operation["response_id"]
+                            or len(operation["response_id"]) > 64
+                        )
+                    )
+                    or ("references" in operation and "response_id" in operation)
+                    or not isinstance(call_id, str)
+                    or not call_id
+                    or len(call_id) > 512
+                    or not set(operation).issubset(
+                        {"entity_id", "call_id", "response_id", "references"}
+                    )
+                    or operation.get("entity_id") != acp_standard_tool_entity_id(call_id)
+                    or ("references" in operation and not isinstance(references, list))
+                ):
+                    raise OmnigentError(
+                        "Root ACP tool-reference identity is invalid or untrusted.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+
+            report_payload = {
+                key: value
+                for key, value in report.items()
+                if key
+                not in {
+                    "sequence",
+                    "connection_admission_id",
+                    "runtime_incarnation",
+                    "journal_id",
+                    "epoch_ordinal",
+                    "native_epoch",
+                    "ingress_sequence",
+                    "source_id",
+                    "kind",
+                }
+            }
+            try:
+                canonical_data = json.dumps(
+                    report_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            except (TypeError, ValueError) as exc:
+                raise OmnigentError(
+                    "external_acp_session_report is not finite JSON.",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
+            payload_hash = hashlib.sha256(
+                json.dumps(
+                    {
+                        "journal_id": journal_id,
+                        "epoch_ordinal": epoch_ordinal,
+                        "journal_sequence": sequence,
+                        "native_epoch": native_epoch,
+                        "ingress_sequence": ingress_sequence,
+                        "source_id": source_id,
+                        "kind": kind,
+                        "data": report_payload,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            if len(canonical_data) > 512 * 1024:
+                raise OmnigentError(
+                    "external_acp_session_report exceeds its per-record limit.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+
+            # Authenticate action ownership before minting a child session. Child
+            # creation is a durable write, so a rejected origin must not leave
+            # behind a visible but unassociated child.
+            action_runner_id: str | None = None
+            action_origin_record: dict[str, Any] | None = None
+            if action_origin is not None and not explicit_root_tool_references:
+                from omnigent.server.session_action_origins import (
+                    bind_action_origin_request,
+                    validate_action_origin_request,
+                )
+
+                token = action_origin["token"]
+                origin_generation = action_origin["generation"]
+                origin = await asyncio.to_thread(
+                    conversation_store.get_session_action_origin, root_id, token
+                )
+                action_origin_record = validate_action_origin_request(
+                    request,
+                    conversation=conv,
+                    origin=origin,
+                    token=token,
+                    generation=origin_generation,
+                    credential_principal=user_id,
+                )
+                if action_origin_record.get("bound_context_generation") != context_generation:
+                    raise OmnigentError(
+                        "ACP report context does not match its bound action origin.",
+                        code=ErrorCode.FORBIDDEN,
+                    )
+                action_runner_id = bind_action_origin_request(
+                    request,
+                    conversation=conv,
+                    credential_principal=user_id,
+                )
+
+            if not explicit_root_tool_references:
+                active_origins = await asyncio.to_thread(
+                    conversation_store.list_session_action_origins, root_id
+                )
+                trusted_context_generations = {
+                    origin_record.get("bound_context_generation")
+                    for origin_record in active_origins.values()
+                    if origin_record.get("bound_runner_id") == conv.runner_id
+                    and origin_record.get("bound_credential_principal") == user_id
+                    and isinstance(origin_record.get("bound_context_generation"), str)
+                }
+                if (
+                    trusted_context_generations
+                    and context_generation not in trusted_context_generations
+                ):
+                    raise OmnigentError(
+                        "ACP report context does not match a bound action origin.",
+                        code=ErrorCode.FORBIDDEN,
+                    )
+
+            child_key: str | None = None
+            child_id: str | None = None
+            if kind == "association.patch":
+                if (
+                    operation.get("session_id") != target_session_id
+                    or operation.get("parent_session_id") != parent_session_id
+                    or not isinstance(operation.get("patch"), dict)
+                    or target_session_id in (root_native_session_id, parent_session_id)
+                    or not isinstance(parent_session_id, str)
+                ):
+                    raise OmnigentError(
+                        "ACP association patch identity does not match its envelope.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                try:
+                    validate_acp_association_patch(operation["patch"])
+                    json.dumps(
+                        operation["patch"],
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise OmnigentError(
+                        f"ACP association patch is invalid: {exc}",
+                        code=ErrorCode.INVALID_INPUT,
+                    ) from exc
+                if parent_session_id == root_native_session_id:
+                    parent_conversation_id = root_id
+                    parent_conversation = conv
+                else:
+                    parent_association = await asyncio.to_thread(
+                        conversation_store.get_acp_session_association,
+                        root_id,
+                        native_epoch,
+                        parent_session_id,
+                    )
+                    if (
+                        parent_association is None
+                        or parent_association.get("context_generation") != context_generation
+                    ):
+                        raise OmnigentError(
+                            "ACP child association has no validated immediate parent.",
+                            code=ErrorCode.CONFLICT,
+                        )
+                    parent_conversation_id = parent_association["conversation_id"]
+                    parent_conversation = await asyncio.to_thread(
+                        conversation_store.get_conversation, parent_conversation_id
+                    )
+                    if parent_conversation is None:
+                        raise OmnigentError(
+                            "ACP child association parent conversation is missing.",
+                            code=ErrorCode.CONFLICT,
+                        )
+                child_key = acp_standard_child_key(root_id, native_epoch, target_session_id)
+                existing_association = await asyncio.to_thread(
+                    conversation_store.get_acp_session_association,
+                    root_id,
+                    native_epoch,
+                    target_session_id,
+                )
+                if existing_association is not None:
+                    if (
+                        existing_association.get("parent_native_session_id") != parent_session_id
+                        or existing_association.get("context_generation") != context_generation
+                    ):
+                        raise OmnigentError(
+                            "ACP child association attempted to change its owner.",
+                            code=ErrorCode.CONFLICT,
+                        )
+                    child_id = existing_association.get("conversation_id")
+                try:
+                    await asyncio.to_thread(
+                        conversation_store.reserve_acp_session_report,
+                        root_conversation_id=root_id,
+                        connection_admission_id=connection_admission_id,
+                        runtime_incarnation=runtime_incarnation,
+                        journal_id=journal_id,
+                        journal_sequence=sequence,
+                        epoch_ordinal=epoch_ordinal,
+                        native_epoch=native_epoch,
+                        ingress_sequence=ingress_sequence,
+                        source_id=source_id,
+                        payload_hash=payload_hash,
+                        context_generation=context_generation,
+                        root_native_session_id=root_native_session_id,
+                        target_session_id=target_session_id,
+                        parent_session_id=parent_session_id,
+                        action_origin=action_origin,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise OmnigentError(
+                        f"ACP session report was rejected: {exc}", code=ErrorCode.CONFLICT
+                    ) from exc
+                if existing_association is None:
+                    patch = operation["patch"]
+                    initial_title = patch.get("title")
+                    initial_description = patch.get("description")
+                    start = SessionEventInput(
+                        type=_EXTERNAL_ACP_SUBAGENT_START_TYPE,
+                        data={
+                            "subagent_id": child_key,
+                            "title": (
+                                initial_title
+                                if isinstance(initial_title, str) and initial_title
+                                else "ACP sub-agent"
+                            ),
+                            "description": (
+                                initial_description if isinstance(initial_description, str) else ""
+                            ),
+                        },
+                    )
+                    child_id = await _persist_external_acp_subagent_start(
+                        parent_conversation_id,
+                        parent_conversation,
+                        start,
+                        conversation_store,
+                        publish_if_adopted=False,
+                    )
+                if not isinstance(child_id, str) or not child_id:
+                    raise OmnigentError(
+                        "ACP association did not resolve to a child conversation.",
+                        code=ErrorCode.CONFLICT,
+                    )
+            elif target_session_id == root_native_session_id:
+                if parent_session_id is not None:
+                    raise OmnigentError(
+                        "ACP root report has an unexpected parent session.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                child_id = root_id
+            else:
+                target_association = await asyncio.to_thread(
+                    conversation_store.get_acp_session_association,
+                    root_id,
+                    native_epoch,
+                    target_session_id,
+                )
+                if (
+                    target_association is None
+                    or target_association.get("context_generation") != context_generation
+                    or target_association.get("parent_native_session_id") != parent_session_id
+                ):
+                    raise OmnigentError(
+                        "ACP report target has no matching validated association.",
+                        code=ErrorCode.CONFLICT,
+                    )
+                child_id = target_association.get("conversation_id")
+                if not isinstance(child_id, str) or not child_id:
+                    raise OmnigentError(
+                        "ACP report target has no Omnigent conversation.",
+                        code=ErrorCode.CONFLICT,
+                    )
+
+            try:
+                result = await asyncio.to_thread(
+                    conversation_store.apply_acp_session_report,
+                    root_conversation_id=root_id,
+                    connection_admission_id=connection_admission_id,
+                    runtime_incarnation=runtime_incarnation,
+                    journal_id=journal_id,
+                    journal_sequence=sequence,
+                    epoch_ordinal=epoch_ordinal,
+                    native_epoch=native_epoch,
+                    ingress_sequence=ingress_sequence,
+                    source_id=source_id,
+                    payload_hash=payload_hash,
+                    context_generation=context_generation,
+                    root_native_session_id=root_native_session_id,
+                    target_session_id=target_session_id,
+                    parent_session_id=parent_session_id,
+                    conversation_id=child_id,
+                    kind=kind,
+                    operation=operation,
+                    action_origin=action_origin,
+                )
+            except (TypeError, ValueError) as exc:
+                raise OmnigentError(
+                    f"ACP session report was rejected: {exc}", code=ErrorCode.CONFLICT
+                ) from exc
+
+            if child_key is not None and child_id is not None and action_origin is not None:
+                token = action_origin["token"]
+                origin_generation = action_origin["generation"]
+                if action_runner_id is None:
+                    raise OmnigentError(
+                        "ACP child origin is not bound to the session runner.",
+                        code=ErrorCode.FORBIDDEN,
+                    )
+                if not isinstance(user_id, str) or not user_id:
+                    raise OmnigentError(
+                        "ACP child origin has no authenticated principal.",
+                        code=ErrorCode.FORBIDDEN,
+                    )
+                bound = await asyncio.to_thread(
+                    conversation_store.bind_session_action_origin_child,
+                    root_id,
+                    token,
+                    action_runner_id,
+                    origin_generation,
+                    user_id,
+                    child_key,
+                    child_id,
+                    native_epoch=native_epoch,
+                    native_session_id=target_session_id,
+                    parent_native_session_id=parent_session_id,
+                    context_generation=context_generation,
+                )
+                if not bound:
+                    raise OmnigentError(
+                        "ACP child origin could not be bound to its association.",
+                        code=ErrorCode.CONFLICT,
+                    )
+
+            association = result.get("association")
+            if kind == "association.patch" and isinstance(association, dict):
+                current_values = association.get("association")
+                current_values = current_values if isinstance(current_values, dict) else {}
+                updates: dict[str, Any] = {}
+                if "title" in current_values:
+                    title = current_values["title"]
+                    display_title = title if isinstance(title, str) and title else "ACP sub-agent"
+                    updates["title"] = f"{display_title}:{child_key}"
+                if updates:
+                    await asyncio.to_thread(
+                        conversation_store.update_conversation, child_id, **updates
+                    )
+                if "description" in current_values:
+                    description = current_values["description"]
+                    if isinstance(description, str) and description:
+                        await asyncio.to_thread(
+                            conversation_store.set_labels,
+                            child_id,
+                            {_ACP_SUBAGENT_DESCRIPTION_LABEL_KEY: description[:256]},
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            conversation_store.delete_label,
+                            child_id,
+                            _ACP_SUBAGENT_DESCRIPTION_LABEL_KEY,
+                        )
+
+            if result.get("duplicate"):
+                return {
+                    "queued": False,
+                    "durable": True,
+                    "duplicate": True,
+                    **({"child_session_id": child_id} if child_id is not None else {}),
+                }
+
+            persisted_item = result.get("item")
+            if persisted_item is not None:
+                _publish_external_conversation_item(child_id, persisted_item)
+            observation = None
+            if child_id is not None:
+                try:
+                    observation_data = await asyncio.to_thread(
+                        conversation_store.get_acp_session_observation,
+                        child_id,
+                    )
+                    if isinstance(observation_data, dict):
+                        observation = AcpSessionObservation.model_validate(observation_data)
+                except Exception:
+                    _logger.exception(
+                        "Could not project ACP child observation for session %s",
+                        child_id,
+                    )
+            operation_observation = operation.get("observation")
+            association_patch = operation.get("patch")
+            state_was_reported = (
+                kind == "observation.patch"
+                and isinstance(operation_observation, dict)
+                and "state" in operation_observation
+            ) or (
+                kind == "association.patch"
+                and isinstance(association_patch, dict)
+                and "state" in association_patch
+            )
+            observed_state = observation.state if observation is not None else None
+            state_value = (
+                observed_state.get("value")
+                if isinstance(observed_state, dict) and observed_state.get("present") is True
+                else None
+            )
+            state_name = (
+                state_value.get("state", state_value.get("kind"))
+                if isinstance(state_value, dict)
+                else state_value
+            )
+            transport_state = (
+                observation.transport.get("state")
+                if observation is not None and isinstance(observation.transport, dict)
+                else None
+            )
+            transport_is_eligible = (
+                (
+                    not isinstance(observation.transport, dict)
+                    or "state" not in observation.transport
+                    or transport_state == "connected"
+                )
+                if observation is not None
+                else False
+            )
+            status_to_publish = (
+                "running"
+                if state_name == "running"
+                else "waiting"
+                if state_name == "requires_action"
+                else "idle"
+                if state_name == "idle"
+                else None
+            )
+            if (
+                state_was_reported
+                and observation is not None
+                and observation.source_current
+                and isinstance(observed_state, dict)
+                and observed_state.get("present") is True
+                and status_to_publish is not None
+                and transport_is_eligible
+                and child_id != root_id
+            ):
+                _publish_status(
+                    child_id,
+                    status_to_publish,
+                    failure_origin="acp_session_report",
+                )
+            if (
+                child_id is not None
+                and child_id != root_id
+                and kind in {"association.patch", "observation.patch"}
+            ):
+                _publish_child_status_to_parent(
+                    child_id,
+                    _session_status_cache.get(child_id, "idle"),
+                )
+            return {
+                "queued": False,
+                "durable": True,
+                "duplicate": bool(result.get("duplicate")),
+                **({"child_session_id": child_id} if child_id is not None else {}),
+            }
         if body.type == _EXTERNAL_ACP_SUBAGENT_START_TYPE:
+            require_durable = body.data.get("require_durable", False)
+            if not isinstance(require_durable, bool):
+                raise OmnigentError(
+                    "external_acp_subagent_start data.require_durable must be a boolean",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            action_token: str | None = None
+            action_generation: str | None = None
+            action_runner_id: str | None = None
+            action_principal: str | None = None
+            child_key: str | None = None
+            from omnigent.server.session_action_origins import (
+                action_context_fields,
+                bind_action_origin_request,
+                validate_action_origin_request,
+            )
+
+            action_token, action_generation = action_context_fields(body.data)
+            if action_token is not None:
+                if action_token is None or action_generation is None or not require_durable:
+                    raise OmnigentError(
+                        "ACP action child binding requires a durable start and complete origin context.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                child_key = body.data.get("subagent_id")
+                if not isinstance(child_key, str) or not child_key or len(child_key) > 512:
+                    raise OmnigentError(
+                        "ACP action child binding requires a valid data.subagent_id.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                action_principal = user_id
+                action_runner_id = bind_action_origin_request(
+                    request,
+                    conversation=conv,
+                    credential_principal=action_principal,
+                )
+                origin = await asyncio.to_thread(
+                    conversation_store.get_session_action_origin,
+                    session_id,
+                    action_token,
+                )
+                origin = validate_action_origin_request(
+                    request,
+                    conversation=conv,
+                    origin=origin,
+                    token=action_token,
+                    generation=action_generation,
+                    credential_principal=action_principal,
+                )
+                origin_actor = origin.get("actor")
+                if not isinstance(origin_actor, str) or not origin_actor:
+                    raise OmnigentError(
+                        "Detached child origin actor is malformed.",
+                        code=ErrorCode.FORBIDDEN,
+                    )
+                await _require_access(
+                    origin_actor,
+                    session_id,
+                    LEVEL_EDIT,
+                    permission_store,
+                    conversation_store,
+                )
             child_id = await _persist_external_acp_subagent_start(
                 session_id,
                 conv,
                 body,
                 conversation_store,
+                require_durable=require_durable,
             )
+            if action_token is not None and action_generation is not None:
+                assert action_runner_id is not None and action_principal is not None
+                assert child_key is not None
+                bound = await asyncio.to_thread(
+                    conversation_store.bind_session_action_origin_child,
+                    session_id,
+                    action_token,
+                    action_runner_id,
+                    action_generation,
+                    action_principal,
+                    child_key,
+                    child_id,
+                )
+                if not bound:
+                    raise OmnigentError(
+                        "Detached child origin could not be bound to this ACP child.",
+                        code=ErrorCode.CONFLICT,
+                    )
             # Returned to the runner so it can address the sub-agent's transcript
             # items and its completion status to the child id.
-            return {"queued": False, "child_session_id": child_id}
+            return {
+                "queued": False,
+                "child_session_id": child_id,
+                **({"durable": True} if require_durable else {}),
+            }
         if body.type == "function_call_output":
             # A client-side tool's result tunneling back to a parked turn.
             # The harness scaffold resolves the parked tool Future on a
@@ -3947,7 +5052,11 @@ def register_events_routes(
             _runner_needs_session_init
             or (
                 conv.runner_id is not None
-                and _is_native_terminal_session(conv)
+                and conv.agent_id is not None
+                # A runner reconnect loses its in-memory session binding for every
+                # root harness. Initialize it before forwarding the first turn;
+                # non-native sub-agents remain owned by their parent runner.
+                and (conv.kind != "sub_agent" or _is_native_terminal_session(conv))
                 and initializer is not None
                 and not initializer.is_initialized(conv, runner_client)
             )
@@ -3978,6 +5087,8 @@ def register_events_routes(
         # asyncio.to_thread wrapper covers the rare cold-cache path
         # where the bundle is extracted from disk for the first time.
         _has_mcp_servers = False
+        _action_origin_eligible = False
+        _loaded_agent = None
         _legacy_skill_names: dict[str, str] = {}
         if _agent is not None and agent_cache is not None and _agent.bundle_location:
             try:
@@ -3989,6 +5100,11 @@ def register_events_routes(
                 _has_mcp_servers = bool(
                     selected_mcp_spec(_loaded_agent.spec, conv.labels).mcp_servers
                 )
+                from omnigent.server.session_action_origins import (
+                    action_origin_eligible_from_spec,
+                )
+
+                _action_origin_eligible = action_origin_eligible_from_spec(_loaded_agent.spec)
                 # A declared sub-agent session resolves skills from its own child spec.
                 _skill_spec = _loaded_agent.spec
                 if conv.sub_agent_name:
@@ -4081,6 +5197,16 @@ def register_events_routes(
             agent_revision=mcp_selection_revision(_agent.bundle_location, conv.labels)
             if _agent
             else None,
+            agent_store=agent_store,
+            agent_cache=agent_cache,
+            action_origin_eligible=_action_origin_eligible,
+            action_origin_actor=(
+                user_id
+                if user_id is not None
+                else RESERVED_USER_LOCAL
+                if auth_provider is None or local_single_user_enabled()
+                else None
+            ),
             background_titles_enabled=background_session_titles_enabled(request.headers),
             # Read only for the gateway-backing check that decides which router
             # serves this turn; absent, routing keeps its default posture.
@@ -4211,6 +5337,12 @@ def register_events_routes(
             stay in this async hook.
             """
             events: list[dict[str, Any]] = []
+            events.append(
+                {
+                    "type": "session.child_sessions.invalidated",
+                    "conversation_id": session_id,
+                }
+            )
             try:
                 page = await asyncio.to_thread(
                     conversation_store.list_conversations,

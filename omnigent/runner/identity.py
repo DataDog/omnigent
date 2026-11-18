@@ -60,6 +60,15 @@ RUNNER_INTERACTIVE_SHELLS_ENV_VAR = "OMNIGENT_RUNNER_INTERACTIVE_SHELLS"
 # Comma-separated names of the variables the launching CLI forwarded to this
 # runner, so env filters further down admit them to harness processes.
 RUNNER_SESSION_ENV_NAMES_ENV_VAR = "OMNIGENT_RUNNER_SESSION_ENV_NAMES"
+HARNESS_AUTH_TOKEN_ENV_VAR = "OMNIGENT_HARNESS_AUTH_TOKEN"
+HARNESS_SESSION_REPORT_ENV_VARS: frozenset[str] = frozenset(
+    {
+        "OMNIGENT_ACP_SESSION_REPORT_PROTOCOL",
+        "OMNIGENT_ACP_SESSION_REPORT_SERVER_IDENTITY",
+        "OMNIGENT_ACP_SESSION_REPORT_SUBSCRIBER_GENERATION",
+        "OMNIGENT_ACP_SESSION_REPORT_ROOT",
+    }
+)
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
 # Sentinel ``Origin`` header that the project's own non-browser WebSocket
 # clients (runner -> server tunnel, host/daemon -> server tunnel,
@@ -92,16 +101,21 @@ RUNNER_SIGN_IN_PENDING_WAIT_S = 150.0
 OMNIGENT_SESSION_ENV_VAR = "OMNIGENT"
 OMNIGENT_SESSION_ENV_VALUE = "1"
 
-# Env vars carrying the runner's control-plane auth secret. The tunnel
-# binding token is seeded into the runner process by the launcher and
-# reused as the runner-side request auth token, but must never reach a
-# spawned child: the agent payload there could use it to impersonate the
-# runner. Stripped at every runner→child spawn boundary via
-# :func:`strip_runner_auth_secrets`.
+# Env vars carrying runner control-plane auth secrets or private harness
+# report scope. They must not reach an untrusted spawned child: auth secrets
+# could impersonate the runner, while the harness bearer and report scope are
+# private to the runner↔harness boundary. Stripped at every runner→child spawn
+# boundary via :func:`strip_runner_auth_secrets`.
 RUNNER_AUTH_SECRET_ENV_VARS: frozenset[str] = frozenset(
     {
         RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
+        # The harness bearer authenticates the private runner↔harness control
+        # channel and the report-subscriber scope is runner-private. Neither
+        # belongs in the vendor agent's environment, even when explicitly
+        # listed in an env-passthrough allowlist.
+        HARNESS_AUTH_TOKEN_ENV_VAR,
+        *HARNESS_SESSION_REPORT_ENV_VARS,
     }
 )
 
@@ -184,7 +198,7 @@ def runner_sign_in_is_pending(connect_marker: Path, runner_id: str) -> bool:
 
 
 def strip_runner_auth_secrets(env: Mapping[str, str]) -> dict[str, str]:
-    """Return a copy of *env* with runner-auth secrets removed.
+    """Return a copy of *env* with runner auth and harness-private values removed.
 
     Applied at every boundary where the runner spawns a child it does
     not fully trust with its control-plane credentials — harness

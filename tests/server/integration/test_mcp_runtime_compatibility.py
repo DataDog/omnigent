@@ -153,6 +153,8 @@ async def test_cli_rebind_and_initialization_reject_old_runner_then_recover(
     response = await client.patch(f"/v1/sessions/{sid}", json={"runner_id": "old-runner"})
     assert response.status_code == 503, response.text
     assert get_conversation_store().get_conversation(sid).runner_id is None
+    # Report admission checks the stored binding, so persist the runner too.
+    get_conversation_store().replace_runner_id(sid, "old-runner")
     conv = dataclasses.replace(
         get_conversation_store().get_conversation(sid), runner_id="old-runner"
     )

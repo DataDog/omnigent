@@ -84,7 +84,13 @@ from omnigent.native.permission_modes import (
     APPROVAL_SKIPPING_PERMISSION_MODES,
     PERMISSION_LAUNCH_ARGS,
 )
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.server.auth import (
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_LOCAL,
+    RESERVED_USER_PUBLIC,
+    local_single_user_enabled,
+)
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
 from omnigent.server.managed_hosts import (
@@ -2410,6 +2416,12 @@ async def _send_prompt(
         log_delivery(
             "scheduled_run_prompt_dispatch_started", session_id=conv.id, dispatch_id=dispatch_id
         )
+        actor = task.user_id or (RESERVED_USER_LOCAL if local_single_user_enabled() else None)
+        agent = await asyncio.to_thread(deps.agent_store.get, conv.agent_id or task.agent_id)
+        harness = await scheduled_agent_harness(agent, deps.agent_cache)
+        action_origin_eligible = (conv.harness_override or "").startswith("acp") or (
+            isinstance(harness, str) and harness.startswith("acp")
+        )
         result = await _dispatch_session_event_to_runner(
             conv.id,
             conv,
@@ -2419,9 +2431,11 @@ async def _send_prompt(
             agent_name=None,
             file_store=deps.file_store,
             artifact_store=deps.artifact_store,
-            created_by=task.user_id or RESERVED_USER_LOCAL,
+            created_by=actor,
             runner_router=deps.runner_router,
             agent_revision=agent_revision,
+            action_origin_eligible=action_origin_eligible,
+            action_origin_actor=actor,
         )
         if result.accepted:
             log_prompt_sent(conv.id, dispatch_id=dispatch_id)
@@ -2453,7 +2467,7 @@ def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
         await deps.startup_inputs.enqueue(
             conv.id,
             _prompt_event(run_prompt_text(task)),
-            user_id=task.user_id or RESERVED_USER_LOCAL,
+            user_id=task.user_id or (RESERVED_USER_LOCAL if local_single_user_enabled() else None),
             headers=Headers({BACKGROUND_SESSION_TITLES_HEADER: "on"}),
         )
 

@@ -241,6 +241,7 @@ describe("createSession", () => {
       sandboxProfile: null,
       mcpStartup: null,
       activeResponseId: null,
+      acpSessionObservation: null,
       workspace: null,
       gitBranch: null,
     });

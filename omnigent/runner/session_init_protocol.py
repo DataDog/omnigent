@@ -57,6 +57,8 @@ class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pyd
     # The relay lets a pane-inferred status only annotate a running turn; an older
     # server would let it reopen one a hook just closed.
     accepts_inferred_status: bool = False
+    # Server-owned report-source attempt for this harness session and tunnel.
+    acp_report_connection_attempt_id: str | None = None
 
 
 def build_runner_session_init_payload(
@@ -66,6 +68,7 @@ def build_runner_session_init_payload(
     suppress_recovery_turn: bool = False,
     resume_interrupted_turn: bool = False,
     recovery_id: str | None = None,
+    acp_report_connection_attempt_id: str | None = None,
 ) -> dict[str, object]:
     """Build the versioned initialization fields appended to the legacy body."""
     from omnigent.inference_config import snapshot_runtime_config
@@ -82,6 +85,7 @@ def build_runner_session_init_payload(
         resume_interrupted_turn=resume_interrupted_turn,
         recovery_id=(recovery_id or uuid4().hex) if resume_interrupted_turn else None,
         accepts_inferred_status=True,
+        acp_report_connection_attempt_id=acp_report_connection_attempt_id,
         snapshot=RunnerSessionInitSnapshot(
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,

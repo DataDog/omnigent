@@ -9,6 +9,10 @@ drift.
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from omnigent import harness_plugins as hp
 from omnigent.harness_availability import CODEX_CANONICAL_HARNESSES
 from omnigent.harness_capabilities import (
@@ -30,12 +34,14 @@ from omnigent.harness_plugins import (
     native_agents,
     valid_harnesses,
 )
+from omnigent.inner.acp_standard_subagents import REPORT_FEATURES
 from omnigent.models.model_override import (
     _ANTIGRAVITY_FAMILY_HARNESSES,
     _CLAUDE_FAMILY_HARNESSES,
 )
 
 _NATIVE_MODES = frozenset({IntegrationMode.NATIVE_TUI, IntegrationMode.NATIVE_SERVER})
+_STANDARD_ACP_SUBAGENT_FEATURE = "standard-acp-subagents-v1"
 
 
 def test_every_builtin_harness_declares_capabilities() -> None:
@@ -77,17 +83,27 @@ def test_subagents_matches_its_implementing_mechanism() -> None:
 
     1. A **native** agent with a ``subagent_wrapper_label``: Omnigent intercepts
        the vendor's own spawn and mints the child session.
-    2. An **ACP vendor extension** carrying a sub-agent dialect: the agent
-       reports its sub-agent lifecycle in its own ``_meta`` and the runner mints
-       the child from that. No built-in row uses this today — the mechanism
-       stays for a community ACP plugin — so nothing is added below.
+    2. A **generic ACP** harness that advertises session reports: the standard
+       ``standard-acp-subagents-v1`` protocol carries association and entity
+       operations, and the runner/server persist them as child sessions. The
+       feature is live only after private report and action channels negotiate.
 
     Keeping the derivation here means a harness cannot publish a ``subagents``
     capability on ``/v1/harnesses`` that nothing implements, or implement one it
     does not publish.
     """
-    subagent_capable = {agent.harness for agent in native_agents() if agent.subagent_wrapper_label}
-    for harness, capability in harness_capabilities().items():
+    capabilities = harness_capabilities()
+    native_subagents = {agent.harness for agent in native_agents() if agent.subagent_wrapper_label}
+    standard_acp_reports = {
+        harness
+        for harness, capability in capabilities.items()
+        if capability.integration_mode is IntegrationMode.ACP_SUBPROCESS
+        and capability.session_reports
+        and _STANDARD_ACP_SUBAGENT_FEATURE in REPORT_FEATURES
+    }
+    assert _STANDARD_ACP_SUBAGENT_FEATURE in REPORT_FEATURES
+    subagent_capable = native_subagents | standard_acp_reports
+    for harness, capability in capabilities.items():
         expected = harness in subagent_capable
         assert capability.subagents == expected, harness
 
@@ -150,6 +166,7 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
         "model_family": "multi",
         "auth": "own-auth",
         "subagents": False,
+        "session_reports": False,
         "interrupt": True,
         "streaming": True,
         "steering": None,
@@ -199,6 +216,37 @@ def test_catalog_rows_include_capabilities() -> None:
             # JSON-serializable: values are primitives, not enums.
             for value in row["capabilities"].values():
                 assert value is None or isinstance(value, (str, bool))
+
+
+def test_configured_acp_rows_use_standard_capabilities_with_legacy_selector(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved vendor selector does not change generic ACP capabilities."""
+    import yaml
+
+    config_home = tmp_path / "omnigent-config"
+    config_home.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    config_path = config_home / "config.yaml"
+
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {
+                            "name": "Gemini CLI",
+                            "command": "gemini --experimental-acp",
+                            "extension": "legacy-vendor-selector",
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    row = next(row for row in harness_catalog() if row["id"] == "acp:gemini-cli")
+    assert row["capabilities"]["subagents"] is True
+    assert row["capabilities"]["session_reports"] is True
 
 
 def test_catalog_includes_hermes() -> None:

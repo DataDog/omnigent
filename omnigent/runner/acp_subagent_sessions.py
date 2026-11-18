@@ -86,6 +86,151 @@ async def _mint_acp_subagent_child(
         )
 
 
+async def _mint_acp_subagent_child_strict(
+    client: httpx.AsyncClient,
+    *,
+    parent_id: str,
+    child_key: str,
+    title: str,
+    task: str,
+    task_source_id: str,
+    action_origin_token: str,
+    action_origin_generation: str,
+    set_running: bool = True,
+) -> str:
+    """Persist a report start and return its child id, raising on every failure."""
+    response = await client.post(
+        f"/v1/sessions/{parent_id}/events",
+        json={
+            "type": "external_acp_subagent_start",
+            "data": {
+                "subagent_id": child_key,
+                "title": title or child_key,
+                "description": task,
+                "require_durable": True,
+                "_omnigent_action_context_token": action_origin_token,
+                "_omnigent_action_context_generation": action_origin_generation,
+            },
+        },
+        timeout=30.0,
+    )
+    response.raise_for_status()
+    payload = response.json() if response.content else {}
+    if not isinstance(payload, dict) or payload.get("durable") is not True:
+        raise RuntimeError("ACP child start was not durably acknowledged")
+    child_id = payload.get("child_session_id")
+    if not isinstance(child_id, str) or not child_id:
+        raise ValueError("external_acp_subagent_start returned no child_session_id")
+    if task:
+        await _post_acp_subagent_item_strict(
+            client,
+            child_id=child_id,
+            response_id=_stable_acp_subagent_response_id(child_key),
+            source_id=task_source_id,
+            item_type="message",
+            item_data={
+                "role": "user",
+                "content": [{"type": "input_text", "text": task}],
+            },
+        )
+    if set_running:
+        from omnigent.native._native_post_delivery import post_external_session_status
+
+        await post_external_session_status(
+            client,
+            session_id=child_id,
+            status="running",
+            response_id=_stable_acp_subagent_response_id(child_key),
+            require_durable=True,
+        )
+    return child_id
+
+
+async def _post_acp_subagent_item_strict(
+    client: httpx.AsyncClient,
+    *,
+    child_id: str,
+    response_id: str,
+    source_id: str,
+    item_type: str,
+    item_data: dict[str, object],
+) -> None:
+    """Append one idempotent child transcript item and raise on failure."""
+    if not source_id or len(source_id) > 256:
+        raise ValueError("ACP transcript source_id must contain 1 to 256 characters")
+    response = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": item_type,
+                "item_data": item_data,
+                "response_id": response_id,
+                "source_id": source_id,
+            },
+        },
+        timeout=30.0,
+    )
+    response.raise_for_status()
+
+
+async def _complete_acp_subagent_child_strict(
+    client: httpx.AsyncClient,
+    *,
+    child_key: str,
+    child_id: str,
+    outcome: str,
+    reason: str,
+    summary: str,
+    summary_source_id: str,
+    title: str,
+) -> None:
+    """Persist the final summary before the terminal state, raising on failure."""
+    if outcome not in {"succeeded", "failed", "cancelled"}:
+        raise ValueError(f"unsupported ACP child outcome {outcome!r}")
+    if summary:
+        await _post_acp_subagent_item_strict(
+            client,
+            child_id=child_id,
+            response_id=_stable_acp_subagent_response_id(child_key),
+            source_id=summary_source_id,
+            item_type="message",
+            item_data={
+                "role": "assistant",
+                "agent": title or child_key,
+                "content": [{"type": "output_text", "text": summary}],
+            },
+        )
+    from omnigent.native._native_post_delivery import post_external_session_status
+
+    ok = outcome == "succeeded"
+    failure_detail = reason or outcome
+    if outcome == "cancelled":
+        failure_detail = f"Cancelled: {failure_detail}"
+    turn_outcome = {
+        "succeeded": "completed",
+        "failed": "failed",
+        "cancelled": "cancelled",
+    }[outcome]
+    await post_external_session_status(
+        client,
+        session_id=child_id,
+        status="idle" if ok else "failed",
+        output=summary or (None if ok else failure_detail),
+        failure_detail=None if ok else failure_detail,
+        response_id=_stable_acp_subagent_response_id(child_key),
+        turn_outcome=turn_outcome,
+        turn_completed=ok,
+        require_durable=True,
+    )
+
+
+def _stable_acp_subagent_response_id(child_key: str) -> str:
+    import hashlib
+
+    return "resp_acpsub_" + hashlib.sha256(child_key.encode("utf-8")).hexdigest()[:48]
+
+
 async def _post_acp_subagent_message(
     client: httpx.AsyncClient,
     *,

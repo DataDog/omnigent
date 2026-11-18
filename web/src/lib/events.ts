@@ -1,4 +1,8 @@
-import type { AssistantMessagePhase } from "./conversationItems";
+import type {
+  AcpSessionMessage,
+  AcpToolSessionReference,
+  AssistantMessagePhase,
+} from "./conversationItems";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_events.py.
 //
@@ -145,15 +149,21 @@ export interface ToolCall {
   itemId: string;
   /** Server-assigned response id (`event.item.response_id`). */
   responseId: string;
+  /** Explicit provenance when ACP did not report the child model. */
+  acpAgentIdentity?: "unknown";
+  /** Native ACP session references with separately resolved conversation links. */
+  acpSessionReferences?: AcpToolSessionReference[] | null;
 }
 
 /** A tool result from `output_item.done` (type `function_call_output`). */
 export interface ToolResult {
   type: "tool_result";
   callId: string;
-  output: string;
+  output: string | null;
   itemId: string;
   responseId: string;
+  /** Explicit provenance when ACP did not report the child model. */
+  acpAgentIdentity?: "unknown";
 }
 
 /** `response.function_call_output.delta` — live output from a running tool. */
@@ -339,6 +349,10 @@ export interface MessageDone {
   messageId?: string;
   /** Harness label for the message, when the harness reports one (Codex). */
   phase?: AssistantMessagePhase;
+  /** Structured ACP directed-message participants and validated conversation links. */
+  acpSessionMessage?: AcpSessionMessage | null;
+  /** Explicit provenance when ACP did not report the child model. */
+  acpAgentIdentity?: "unknown";
 }
 
 /**
@@ -355,6 +369,8 @@ export interface ReasoningDone {
   summary: string;
   itemId: string;
   responseId: string;
+  /** Explicit provenance when ACP did not report the child model. */
+  acpAgentIdentity?: "unknown";
 }
 
 /**
@@ -908,6 +924,13 @@ export interface SessionChildSessionUpdatedEvent {
   child: Record<string, unknown>;
 }
 
+/** `session.child_sessions.invalidated` — refresh child rosters from the server. */
+export interface SessionChildSessionsInvalidatedEvent {
+  type: "session_child_sessions_invalidated";
+  /** Stream carrying the invalidation. */
+  conversationId: string;
+}
+
 /**
  * `session.changed_files.invalidated` — the session's changed-files list
  * may have changed; the consumer should refetch it. Coarse signal (no
@@ -1076,6 +1099,7 @@ export type StreamEvent =
   | SessionResourceCreatedEvent
   | SessionResourceDeletedEvent
   | SessionChildSessionUpdatedEvent
+  | SessionChildSessionsInvalidatedEvent
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
   | SessionModelOptionsEvent

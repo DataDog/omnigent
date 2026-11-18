@@ -28,6 +28,7 @@ from sqlalchemy import (
     true,
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
+from sqlalchemy.dialects.mysql import VARBINARY as MySQLVarBinary
 from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -88,6 +89,78 @@ class Uuid16(TypeDecorator[str]):
         if isinstance(value, str):
             return value
         return bytes(value).hex()
+
+
+class BoundedUtf8Identity(TypeDecorator[str]):
+    """Store bounded opaque UTF-8 identities with bytewise MySQL semantics."""
+
+    impl = String
+    cache_ok = True
+
+    def __init__(self, max_characters: int, max_utf8_bytes: int) -> None:
+        if (
+            isinstance(max_characters, bool)
+            or not isinstance(max_characters, int)
+            or max_characters < 1
+            or isinstance(max_utf8_bytes, bool)
+            or not isinstance(max_utf8_bytes, int)
+            or max_utf8_bytes < 1
+        ):
+            raise ValueError("bounded UTF-8 identity limits must be positive integers")
+        self._max_characters = max_characters
+        self._max_utf8_bytes = max_utf8_bytes
+        # TypeDecorator's built-in cache key reads constructor arguments from
+        # __dict__; the properties keep the public limits read-only.
+        self.__dict__["max_characters"] = max_characters
+        self.__dict__["max_utf8_bytes"] = max_utf8_bytes
+        super().__init__()
+
+    @property
+    def max_characters(self) -> int:
+        return self._max_characters
+
+    @property
+    def max_utf8_bytes(self) -> int:
+        return self._max_utf8_bytes
+
+    def load_dialect_impl(self, dialect: Any) -> Any:
+        if dialect.name == "mysql":
+            return dialect.type_descriptor(MySQLVarBinary(self.max_utf8_bytes))
+        return dialect.type_descriptor(String(self.max_characters))
+
+    def process_bind_param(self, value: object, dialect: Any) -> str | bytes | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise TypeError("bounded UTF-8 identity must be a non-empty string")
+        encoded = self._encode_identity(value)
+        return encoded if dialect.name == "mysql" else value
+
+    def process_result_value(self, value: object, dialect: Any) -> str | None:
+        if value is None:
+            return None
+        if dialect.name == "mysql" and isinstance(value, (bytes, bytearray, memoryview)):
+            try:
+                value = bytes(value).decode("utf-8", "strict")
+            except UnicodeDecodeError as exc:
+                raise ValueError("stored bounded UTF-8 identity is malformed") from exc
+        if not isinstance(value, str):
+            raise TypeError("stored bounded UTF-8 identity must be text or UTF-8 bytes")
+        self._encode_identity(value)
+        return value
+
+    def _encode_identity(self, value: object) -> bytes:
+        if not isinstance(value, str) or not value:
+            raise TypeError("bounded UTF-8 identity must be a non-empty string")
+        if len(value) > self.max_characters:
+            raise ValueError("bounded UTF-8 identity exceeds its character limit")
+        try:
+            encoded = value.encode("utf-8", "strict")
+        except UnicodeEncodeError as exc:
+            raise ValueError("bounded UTF-8 identity is not valid Unicode") from exc
+        if len(encoded) > self.max_utf8_bytes:
+            raise ValueError("bounded UTF-8 identity exceeds its byte limit")
+        return encoded
 
 
 class OmnigentBase(DeclarativeBase):
@@ -898,6 +971,11 @@ class SqlConversation(ConversationBase):
     )
     # Monotonic allocator for the next item position in this conversation.
     next_position: Mapped[int | None] = mapped_column(Integer, nullable=True, default=0)
+    # Exact count of canonical ACP tool-call bindings owned by this root.
+    # Older conversations initialize it on their first binding under the row lock.
+    acp_tool_call_binding_count: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=0
+    )
     # Agent bound to this conversation at creation time. NULL for conversations
     # created without an agent binding. Indexed for the agent→conversation
     # reverse lookup and the list filters (agent_id / has_agent_id / agent_name).
@@ -1063,6 +1141,298 @@ class SqlConversationItem(ConversationBase):
             name="ck_conversation_items_type",
         ),
         CheckConstraint("status IN (1, 2, 3, 4)", name="ck_conversation_items_status"),
+    )
+
+
+class SqlAcpSessionReportReceipt(ConversationBase):
+    """Durable immutable-origin fence for normalized standard ACP reports."""
+
+    __tablename__ = "acp_session_report_receipts"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+    )
+    root_conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    journal_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    journal_sequence: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    epoch_ordinal: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    native_epoch: Mapped[str] = mapped_column(
+        BoundedUtf8Identity(max_characters=128, max_utf8_bytes=512), nullable=False
+    )
+    ingress_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    connection_admission_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    runtime_incarnation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_id: Mapped[str] = mapped_column(String(69), nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    applied: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "root_conversation_id",
+            "journal_id",
+            "native_epoch",
+            "ingress_sequence",
+            name="uq_acp_report_journal_epoch_ingress",
+        ),
+        UniqueConstraint(
+            "workspace_id",
+            "root_conversation_id",
+            "source_id",
+            name="uq_acp_report_receipt_source",
+        ),
+    )
+
+
+class SqlAcpReportRootState(ConversationBase):
+    """Current durable ACP report source selector for one root conversation."""
+
+    __tablename__ = "acp_report_root_state"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+    )
+    root_conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    runner_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    authenticated_principal: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    principal_bound: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    source_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    current_connection_admission_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    current_runtime_incarnation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    current_journal_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    current_epoch_ordinal: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    current_native_epoch: Mapped[str | None] = mapped_column(
+        BoundedUtf8Identity(max_characters=128, max_utf8_bytes=512), nullable=True
+    )
+
+
+class SqlAcpReportConnectionAttempt(ConversationBase):
+    """Immutable per-server-connection predecessor and admission tombstone."""
+
+    __tablename__ = "acp_report_connection_attempts"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+    )
+    attempt_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    root_conversation_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    server_connection_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    authenticated_runner_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    authenticated_principal: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    expected_source_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    admission_revision: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "root_conversation_id",
+            "server_connection_id",
+            name="uq_acp_report_attempt_connection",
+        ),
+        UniqueConstraint(
+            "workspace_id",
+            "root_conversation_id",
+            "attempt_id",
+            name="uq_acp_report_attempt_root_id",
+        ),
+        CheckConstraint(
+            "state IN ('prepared', 'admitted', 'rejected')",
+            name="ck_acp_report_attempt_state",
+        ),
+    )
+
+
+class SqlAcpReportJournal(ConversationBase):
+    """Durable root ownership and ordinal high-water for one journal lineage."""
+
+    __tablename__ = "acp_report_journals"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+    )
+    root_conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    journal_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    highest_epoch_ordinal: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "journal_id", name="uq_acp_report_journal_global_id"),
+    )
+
+
+class SqlAcpReportOwner(ConversationBase):
+    """Authorized delivery owner tuple retained for report replay history."""
+
+    __tablename__ = "acp_report_owners"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+    )
+    root_conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    connection_admission_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    runtime_incarnation: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    journal_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+
+
+class SqlAcpReportEpoch(ConversationBase):
+    """Immutable journal ordinal/native-epoch binding admitted by activation."""
+
+    __tablename__ = "acp_report_epochs"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+    )
+    root_conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    journal_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    epoch_ordinal: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    native_epoch: Mapped[str] = mapped_column(
+        BoundedUtf8Identity(max_characters=128, max_utf8_bytes=512), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "root_conversation_id",
+            "native_epoch",
+            name="uq_acp_report_epoch_root_native_id",
+        ),
+        UniqueConstraint(
+            "workspace_id",
+            "root_conversation_id",
+            "journal_id",
+            "native_epoch",
+            name="uq_acp_report_epoch_native_id",
+        ),
+    )
+
+
+class SqlAcpSessionAssociation(ConversationBase):
+    """Native ACP session ownership mapped to a durable Omnigent conversation."""
+
+    __tablename__ = "acp_session_associations"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+    )
+    root_conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    native_epoch: Mapped[str] = mapped_column(
+        BoundedUtf8Identity(max_characters=128, max_utf8_bytes=512), primary_key=True
+    )
+    native_session_id: Mapped[str] = mapped_column(
+        BoundedUtf8Identity(max_characters=512, max_utf8_bytes=512), primary_key=True
+    )
+    context_generation: Mapped[str] = mapped_column(String(256), nullable=False)
+    parent_native_session_id: Mapped[str | None] = mapped_column(
+        BoundedUtf8Identity(max_characters=512, max_utf8_bytes=512), nullable=True
+    )
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    association_source_id: Mapped[str | None] = mapped_column(String(69), nullable=True)
+    association_json: Mapped[str] = mapped_column(String(1_024), nullable=False)
+    observation_json: Mapped[str] = mapped_column(String(1_024), nullable=False)
+    state_ingress_sequence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    state_observed_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    last_reported_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    action_origin_json: Mapped[str | None] = mapped_column(String(1_024), nullable=True)
+    last_ingress_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_acp_session_associations_conversation",
+            "workspace_id",
+            "conversation_id",
+            "root_conversation_id",
+            "native_epoch",
+            "native_session_id",
+        ),
+        Index(
+            "ix_acp_session_associations_root_epoch_parent",
+            "workspace_id",
+            "root_conversation_id",
+            "native_epoch",
+            "parent_native_session_id",
+            "native_session_id",
+        ),
+    )
+
+
+class SqlAcpSessionEntity(ConversationBase):
+    """Current materialized value and replay state for one native transcript entity."""
+
+    __tablename__ = "acp_session_entities"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+    )
+    root_conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    native_epoch: Mapped[str] = mapped_column(
+        BoundedUtf8Identity(max_characters=128, max_utf8_bytes=512), primary_key=True
+    )
+    native_session_id: Mapped[str] = mapped_column(
+        BoundedUtf8Identity(max_characters=512, max_utf8_bytes=512), primary_key=True
+    )
+    entity_type: Mapped[str] = mapped_column(String(16), primary_key=True)
+    entity_id: Mapped[str] = mapped_column(
+        BoundedUtf8Identity(max_characters=512, max_utf8_bytes=512), primary_key=True
+    )
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    item_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    response_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    item_data_json: Mapped[str] = mapped_column(String(1_024), nullable=False)
+    pending_json: Mapped[str] = mapped_column(String(1_024), nullable=False)
+    references_json: Mapped[str | None] = mapped_column(String(1_024), nullable=True)
+    stable_item_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    last_ingress_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = ()
+
+
+class SqlAcpToolCallItemBinding(ConversationBase):
+    """Immutable ACP report anchor for one canonical root tool-call item."""
+
+    __tablename__ = "acp_tool_call_item_bindings"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, nullable=False)
+    root_conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    source_id: Mapped[str] = mapped_column(String(69), primary_key=True)
+    native_epoch: Mapped[str | None] = mapped_column(
+        BoundedUtf8Identity(max_characters=128, max_utf8_bytes=512), nullable=True
+    )
+    journal_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    epoch_ordinal: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    context_generation: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    native_call_id: Mapped[str] = mapped_column(
+        BoundedUtf8Identity(max_characters=512, max_utf8_bytes=512), nullable=False
+    )
+    action_origin_token: Mapped[str] = mapped_column(String(256), nullable=False)
+    action_origin_generation: Mapped[str] = mapped_column(String(256), nullable=False)
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    canonical_item_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    response_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "root_conversation_id",
+            "native_epoch",
+            "native_call_id",
+            name="uq_acp_tool_call_item_epoch_call",
+        ),
     )
 
 

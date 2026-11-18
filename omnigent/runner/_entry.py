@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
     from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
     from omnigent.runner.native import ResolvedSpec
+    from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
     from omnigent.spec.types import AgentSpec
 
@@ -1446,6 +1447,10 @@ def _load_agent_spec_bundle(
     from omnigent.automations_availability import AUTOMATIONS_HEADER, without_scheduled_task_tools
     from omnigent.mcp_selection import MCP_SELECTION_HEADER, selected_mcp_spec
     from omnigent.runner.native import ResolvedSpec
+    from omnigent.session_action_origin import (
+        effective_spec_digest,
+        operator_environment_digest,
+    )
     from omnigent.spec import load
 
     # Only operator-authored bundles may expand the runner's environment.
@@ -1475,12 +1480,31 @@ def _load_agent_spec_bundle(
                 )
             staging.rename(dest)
         spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
-    spec = selected_mcp_spec(spec, json.loads(resp.headers.get(MCP_SELECTION_HEADER, "{}")))
+    base_spec = spec
+    raw_selection = json.loads(resp.headers.get(MCP_SELECTION_HEADER, "{}"))
+    if not isinstance(raw_selection, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in raw_selection.items()
+    ):
+        raise ValueError("server returned an invalid MCP selection snapshot")
+    selection_snapshot = dict(raw_selection)
+    spec = selected_mcp_spec(spec, selection_snapshot)
+    pinned_spec_digest = effective_spec_digest(base_spec)
+    pinned_environment_digest = operator_environment_digest(
+        base_spec, operator_authored=expand_env
+    )
     # Older servers send no header; keep the tools there, as before.
     if resp.headers.get(AUTOMATIONS_HEADER) == "0":
         spec = without_scheduled_task_tools(spec)
     _apply_host_interactive_shells(spec)
-    return ResolvedSpec(spec=spec, workdir=dest)
+    return ResolvedSpec(
+        spec=spec,
+        workdir=dest,
+        bundle_location=resp.headers.get("X-Agent-Bundle-Location"),
+        operator_authored=expand_env,
+        effective_spec_digest=pinned_spec_digest,
+        operator_environment_digest=pinned_environment_digest,
+        mcp_selection_snapshot=selection_snapshot,
+    )
 
 
 async def _resolve_agent_spec_from_server(
@@ -1541,6 +1565,7 @@ def create_app(
     auth_token_factory: Callable[[], str | None] | None = None,
     *,
     auth_resolved: bool = False,
+    event_dispatcher: RunnerEventDispatcher | None = None,
 ) -> FastAPI:
     """Factory for the runner FastAPI app exposing the harness-contract subset.
 
@@ -1551,6 +1576,9 @@ def create_app(
     :param auth_resolved: Whether *auth_token_factory* is the caller's
         finished credential resolution, so ``None`` means "no credentials"
         rather than "resolve again" (which would re-probe the same endpoints).
+    :param event_dispatcher: Existing authenticated runner tunnel dispatcher.
+        When supplied, the server client routes supported native event posts
+        through the tunnel and keeps its HTTP fallback for other requests.
     :returns: A runner FastAPI app exposing the harness-contract subset.
     """
     from omnigent.cli_auth import open_server_client
@@ -1617,6 +1645,7 @@ def create_app(
             **({RUNNER_TUNNEL_TOKEN_HEADER: binding_token} if binding_token is not None else {}),
         },
         timeout=httpx.Timeout(5.0, read=None),
+        event_dispatcher=event_dispatcher,
         # NOTE: ``follow_redirects`` deliberately stays False.
         # ``_RunnerDatabricksAuth.auth_flow`` needs to *see* the
         # Databricks Apps OAuth login redirect (302 →
@@ -1718,6 +1747,7 @@ def create_app(
         mcp_manager=mcp_manager,
         auth_token=runner_auth_token,
         auth_token_factory=auth_token_factory,
+        event_dispatcher=event_dispatcher,
         native_pane_idle_timeout_s=resolve_native_pane_idle_timeout_s(
             _load_runner_idle_timeout_s_from_config()
         ),
@@ -1919,16 +1949,20 @@ async def _run_tunnel_from_env() -> None:
             extra={"session_id": runner_primary_session_id()},
         )
 
-    # Reuse the tunnel's token factory for the app's httpx client so the
-    # runner resolves Databricks auth once at boot, not twice.
-    app = create_app(auth_token_factory=auth_token_factory, auth_resolved=True)
-    from omnigent.native._native_forwarder_health import (
-        last_post_at as native_forwarder_last_post_at,
-    )
     from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 
     event_dispatcher = RunnerEventDispatcher()
-    app.state.runner_event_dispatcher = event_dispatcher
+    # Reuse the tunnel's token factory and dispatcher so ACP report controls
+    # use the authenticated tunnel from the moment the app starts.
+    app = create_app(
+        auth_token_factory=auth_token_factory,
+        auth_resolved=True,
+        event_dispatcher=event_dispatcher,
+    )
+    from omnigent.native._native_forwarder_health import (
+        last_post_at as native_forwarder_last_post_at,
+    )
+
     idle_timeout_s = _load_runner_idle_timeout_s_from_config()
     # starlette 1.x removed Router.startup/shutdown; drive the lifespan manually.
     _lifespan_cm = app.router.lifespan_context(app)

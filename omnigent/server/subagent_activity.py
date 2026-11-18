@@ -167,6 +167,7 @@ async def record_subagent_activity(
     turn_id: str | None = None,
     status: str | None = None,
     from_runner: bool = False,
+    require_durable: bool = False,
 ) -> None:
     """Persist and publish a child lifecycle edge once, including across retries."""
     try:
@@ -177,8 +178,12 @@ async def record_subagent_activity(
             or is_side_chat_child(child.labels)
         ):
             # A side chat lives in its own rail tab; it is not delegated work.
+            if require_durable:
+                raise RuntimeError(f"required sub-agent activity child {child_id!r} is missing")
             return
         if parent_id is not None and child.parent_conversation_id != parent_id:
+            if require_durable:
+                raise RuntimeError(f"sub-agent child {child_id!r} has a different parent")
             return
         parent_id = child.parent_conversation_id
         native_completion = False
@@ -262,6 +267,8 @@ async def record_subagent_activity(
                     status=completion_status,
                 )
     except Exception:  # display metadata must not interrupt child delivery
+        if require_durable:
+            raise
         _logger.warning("Could not record subagent activity for %s", child_id, exc_info=True)
 
 

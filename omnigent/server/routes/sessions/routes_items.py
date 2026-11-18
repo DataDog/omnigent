@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 from fastapi import (
     APIRouter,
@@ -52,6 +53,7 @@ from omnigent.server.schemas import (
     SideChatList,
     SideChatSummary,
 )
+from omnigent.server.session_action_origins import bound_runner_for_request
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
@@ -237,6 +239,43 @@ def register_items_routes(
         )
         return PaginatedList(
             data=data,
+            first_id=page.first_id,
+            last_id=page.last_id,
+            has_more=page.has_more,
+        )
+
+    @router.get(
+        "/sessions/{session_id}/acp_session_associations",
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def list_acp_session_associations(
+        request: Request,
+        session_id: str,
+        after: str | None = Query(default=None),
+        limit: int = Query(default=128, ge=1, le=128),
+    ) -> PaginatedList:
+        """Return the private ACP association inventory to its bound runner."""
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conversation = access.conversation
+        if conversation is None:
+            conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conversation is None:
+            raise _session_not_found()
+        # The inventory contains private action-origin tokens. Ordinary session
+        # access is necessary but only the runner bound to this session may read it.
+        bound_runner_for_request(request, conversation=conversation)
+        page = await asyncio.to_thread(
+            conversation_store.list_acp_session_associations,
+            session_id,
+            after=after,
+            limit=limit,
+        )
+        return PaginatedList(
+            data=page.data,
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,

@@ -18,9 +18,11 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     RootModel,
     SerializerFunctionWrapHandler,
     Strict,
+    field_serializer,
     field_validator,
     model_serializer,
     model_validator,
@@ -41,7 +43,7 @@ from omnigent.entities import (
     SlashCommandData,
     TerminalCommandData,
 )
-from omnigent.entities.conversation import StartupInputOptions
+from omnigent.entities.conversation import AcpSessionMessage, StartupInputOptions
 from omnigent.inner.native_attachments import reject_authored_framework_notices
 from omnigent.onboarding.sandboxes.profiles import SandboxProfileSummary
 
@@ -951,7 +953,9 @@ class ChildSessionSummary(BaseModel):
         ``None`` if no tasks exist.
     :param current_task_status: Status of the latest task,
         e.g. ``"completed"``, ``"in_progress"``, ``"failed"``.
-        ``None`` if no tasks exist.
+        ``None`` if no tasks exist. Standard ACP children keep exact reusable
+        work state in ``acp_session_observation`` and do not map idle to
+        completed.
     :param busy: ``True`` when the child's session loop is live.
         Mirrors the algorithm used by ``GET /v1/sessions/{id}`` to
         compute ``status``: read the live in-memory cache first
@@ -960,6 +964,8 @@ class ChildSessionSummary(BaseModel):
         ``"in_progress"`` → busy). For NO_DBOS sessions the tasks
         table is not populated during active runs, so the cache
         consult is what keeps the rail's "Working" badge correct.
+        Standard ACP children use only their selected structured
+        observation for this projection.
     :param labels: Session-scoped guardrails labels on the child
         conversation (mirrors :class:`ConversationObject.labels`).
     :param last_task_error: Error details from the child's most recent
@@ -988,6 +994,8 @@ class ChildSessionSummary(BaseModel):
         child's ``model_override`` — the field intelligent routing writes
         when it picks a model for a spawned child. ``None`` when the child
         inherits the parent/spec model.
+    :param acp_session_observation: Exact latest standard ACP observation
+        for a mirrored child, including whether its source is still selected.
     :param routing_decision_id: Identifier of the routing decision that
         produced :attr:`routed_model`, mirroring
         ``RoutingDecisionData.decision_id``. Read from the child's
@@ -1020,6 +1028,7 @@ class ChildSessionSummary(BaseModel):
     routed_model: str | None = None
     routing_decision_id: str | None = None
     depth: int | None = None
+    acp_session_observation: AcpSessionObservation | None = None
 
 
 # ── Responses ───────────────────────────────────────────────────
@@ -1275,6 +1284,13 @@ class CreateResponseRequest(BaseModel):
     parallel_tool_calls: bool | None = None
     max_tool_calls: int | None = None
     top_logprobs: int | None = None
+    # Runner-only opaque origin for detached ACP child actions. It is private
+    # so it never enters a public request schema or serialized response body.
+    _session_action_origin_token: str | None = PrivateAttr(default=None)
+    _session_action_origin_generation: str | None = PrivateAttr(default=None)
+    _session_action_context_generation: str | None = PrivateAttr(default=None)
+    _standard_acp_report_features: tuple[str, ...] | None = PrivateAttr(default=None)
+    _standard_acp_action_features: tuple[str, ...] | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _require_model_for_new_conversations(self) -> CreateResponseRequest:
@@ -2301,6 +2317,51 @@ class SessionFamily(BaseModel):
     pinned_at: str | None = None
 
 
+class AcpSessionObservation(BaseModel):
+    """Persisted ACP session observations with explicit transport uncertainty.
+
+    :param state: Latest state observation with its explicit presence bit.
+    :param state_ingress_sequence: Ingress sequence of the latest state patch.
+    :param state_observed_at: Time the latest state patch was accepted.
+    :param last_ingress_sequence: Latest accepted ingress sequence for the session.
+    :param last_reported_at: Time of the latest accepted report.
+    :param session_info: Sparse ``session_info_update`` snapshot.
+    :param usage: Sparse usage snapshot.
+    :param config_options: Sparse config-option snapshot.
+    :param mode: Sparse current-mode snapshot.
+    :param plan: Sparse plan snapshot.
+    :param transport: Sparse transport diagnostic.
+    :param transport_unconfirmed: Whether ACP transport cannot confirm current activity.
+    :param source_current: Whether this observation belongs to the root's selected ACP source.
+    """
+
+    state: dict[str, Any] | None = None
+    source_current: bool = False
+    state_ingress_sequence: int | None = None
+    state_observed_at: int | None = None
+    last_ingress_sequence: int
+    last_reported_at: int | None = None
+    session_info: Any | None = None
+    usage: Any | None = None
+    config_options: Any | None = None
+    mode: Any | None = None
+    plan: Any | None = None
+    transport: Any | None = None
+    transport_unconfirmed: Literal[True] = True
+
+    @model_serializer(mode="wrap")
+    def _omit_unobserved_snapshots(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Preserve sparse snapshots while retaining explicit JSON nulls."""
+        data = handler(self)
+        for name in ("session_info", "usage", "config_options", "mode", "plan", "transport"):
+            if name not in self.model_fields_set:
+                data.pop(name, None)
+        return data
+
+
+ChildSessionSummary.model_rebuild()
+
+
 class SessionResponse(BaseModel):
     """
     API representation of a session.
@@ -2583,6 +2644,11 @@ class SessionResponse(BaseModel):
         therefore resets the clock, so an orchestrator treating this as a pure
         item-append heartbeat should account for that. Can be compared across
         snapshots independently of lifecycle status.
+    :param acp_session_observation: The latest persisted standard ACP session
+        state observation. It retains the producer's explicit ``present`` bit,
+        state-specific ingress sequence/time, and the last report time. The
+        transport is always marked unconfirmed because ACP v1 has no report
+        heartbeat or terminal acknowledgment.
     """
 
     family: SessionFamily | None = None
@@ -2661,6 +2727,7 @@ class SessionResponse(BaseModel):
     # Whether the viewer may start side chats here: only the owner of the
     # session's root can. ``None`` where the response doesn't compute it.
     side_chat_allowed: bool | None = None
+    acp_session_observation: AcpSessionObservation | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -3482,11 +3549,15 @@ class SessionMessageItem(_SessionItemCommon):
         omitted when unset.
     :param startup_options: Request options kept while a startup input
         awaits delivery; omitted when unset.
+    :param metadata: Opaque ACP whole-message metadata; omitted when unset.
+    :param acp_session_message: Structured ACP directed-message participants.
+    :param acp_agent_identity: ``"unknown"`` when ACP supplied no child model
+        identity; omitted otherwise.
     """
 
     type: Literal["message"]
     role: Literal["user", "assistant"]
-    content: list[SessionContentBlock]
+    content: list[SessionContentBlock] = Field(default_factory=list)
     model: str | None = None
     is_meta: bool = False
     user_authored: bool = False
@@ -3494,7 +3565,19 @@ class SessionMessageItem(_SessionItemCommon):
     interrupted: bool = False
     stream_message_id: str | None = None
     phase: str | None = None
+    metadata: dict[str, Any] | None = None
+    acp_session_message: AcpSessionMessage | None = None
+    acp_agent_identity: Literal["unknown"] | None = None
     startup_options: StartupInputOptions | None = None
+
+    @field_serializer("acp_session_message")
+    def preserve_explicit_acp_participants(
+        self, value: AcpSessionMessage | None
+    ) -> dict[str, Any] | None:
+        """Serialize participants exactly as ``MessageData`` does."""
+        if value is None:
+            return None
+        return value.model_dump(exclude_unset=True)
 
 
 class SessionFunctionCallItem(_SessionItemCommon, FunctionCallData):
@@ -3523,7 +3606,9 @@ class SessionReasoningItem(_SessionItemCommon):
     as ``SessionContentBlock`` like message content.
 
     :param type: Always ``"reasoning"``.
-    :param model: Agent name.
+    :param model: Agent name; absent when ACP did not identify the child model.
+    :param acp_agent_identity: ``"unknown"`` when ACP did not identify the
+        child model; omitted otherwise.
     :param summary: Summary text blocks,
         e.g. ``[{"type": "summary_text", "text": "..."}]``.
     :param content: Raw reasoning text blocks; absent when redacted.
@@ -3531,7 +3616,8 @@ class SessionReasoningItem(_SessionItemCommon):
     """
 
     type: Literal["reasoning"]
-    model: str
+    model: str | None = None
+    acp_agent_identity: Literal["unknown"] | None = None
     summary: list[SessionContentBlock]
     content: list[SessionContentBlock] | None = None
     encrypted_content: str | None = None
@@ -5439,6 +5525,13 @@ class SessionChildSessionUpdatedEvent(_SSEEventBase):
     child: dict[str, Any]
 
 
+class SessionChildSessionsInvalidatedEvent(_SSEEventBase):
+    """The server-selected child-session observation projection may have changed."""
+
+    type: Literal["session.child_sessions.invalidated"]
+    conversation_id: str
+
+
 class SessionChangedFilesInvalidatedEvent(_SSEEventBase):
     """
     The session's changed-files list may have changed — refetch it.
@@ -5583,6 +5676,7 @@ ServerStreamEvent = Annotated[
     | SessionResourceCreatedEvent
     | SessionResourceDeletedEvent
     | SessionChildSessionUpdatedEvent
+    | SessionChildSessionsInvalidatedEvent
     | SessionChangedFilesInvalidatedEvent
     | SessionTerminalActivityEvent
     # ── Transient (SSE-only) — incremental token deltas ────────

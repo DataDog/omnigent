@@ -1408,17 +1408,17 @@ async def test_saved_delivery_identifies_failed_boundary(
             Mock(side_effect=RuntimeError("bookkeeping failed after acceptance")),
         )
     elif reported_stage == "post_delivery":
-        monkeypatch.setattr(
-            env.conv_store,
-            "set_labels",
-            Mock(
-                side_effect=(
-                    asyncio.CancelledError("bookkeeping cancelled")
-                    if cancelled
-                    else RuntimeError("bookkeeping failed")
-                )
-            ),
-        )
+        original_set_labels = env.conv_store.set_labels
+
+        def fail_after_delivery(*args, **kwargs):
+            # Labels written before the prompt reaches the runner still succeed.
+            if not any(event.get("type") == "message" for event in forwarded):
+                return original_set_labels(*args, **kwargs)
+            if cancelled:
+                raise asyncio.CancelledError("bookkeeping cancelled")
+            raise RuntimeError("bookkeeping failed")
+
+        monkeypatch.setattr(env.conv_store, "set_labels", Mock(side_effect=fail_after_delivery))
     try:
         startup = env.app.state.startup_inputs
         if cancelled:

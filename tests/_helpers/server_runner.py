@@ -61,6 +61,10 @@ class ServerRunner:
         self._poll_interval = poll_interval
         self._server_bootstrap = server_bootstrap
         self._server_env = dict(server_env)
+        self._runner_bootstrap: str | None = None
+        self._runner_env: dict[str, str | None] = {}
+        self._runner_cwd: Path | None = None
+        self._runner_python_args: tuple[str, ...] = ()
         self._base_env = dict(base_env) if base_env is not None else None
         self._server_cwd = server_cwd
         self.server: subprocess.Popen[bytes] | None = None
@@ -202,6 +206,10 @@ class ServerRunner:
     ) -> None:
         """Start the runner; callers may observe startup themselves with wait_ready=False."""
         assert self.runner is None, "runner already started"
+        self._runner_bootstrap = bootstrap
+        self._runner_env = dict(env or {})
+        self._runner_cwd = cwd
+        self._runner_python_args = tuple(python_args)
         args = ["-c", bootstrap] if bootstrap else ["-m", "omnigent.runner._entry"]
         self.runner = self._spawn(
             "runner",
@@ -219,6 +227,38 @@ class ServerRunner:
         )
         if wait_ready:
             self._wait_ready(runner=True)
+
+    def restart_runner(
+        self,
+        *,
+        env: Mapping[str, str | None] | None = None,
+        cwd: Path | None = None,
+        python_args: Sequence[str] | None = None,
+        wait_ready: bool = True,
+    ) -> None:
+        """Replace the runner while preserving its identity, home, and launch config.
+
+        Optional environment values update the saved overrides; ``None`` removes
+        an inherited variable through the normal isolated process environment.
+        The same server binding token, runner ID, workspace, and home are reused.
+        """
+        assert self.runner is not None, "runner is not started"
+        old_runner = self.runner
+        terminate_process(old_runner)
+        self.runner = None
+        if env is not None:
+            self._runner_env.update(env)
+        if cwd is not None:
+            self._runner_cwd = cwd
+        if python_args is not None:
+            self._runner_python_args = tuple(python_args)
+        self.start_runner(
+            bootstrap=self._runner_bootstrap,
+            env=self._runner_env,
+            cwd=self._runner_cwd,
+            python_args=self._runner_python_args,
+            wait_ready=wait_ready,
+        )
 
 
 def _reap(scope: Path) -> None:

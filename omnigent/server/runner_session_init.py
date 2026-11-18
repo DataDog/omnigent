@@ -25,6 +25,56 @@ if TYPE_CHECKING:
     from omnigent.stores.file_store import FileStore
 
 
+async def prepare_acp_report_connection_attempt(
+    conversation: Conversation,
+    *,
+    conversation_store: ConversationStore,
+    registry: TunnelRegistry,
+) -> str | None:
+    """Prepare the immutable report-source attempt for the current tunnel."""
+    if not conversation_store.acp_session_reporting_ready:
+        return None
+    runner_id = conversation.runner_id
+    if runner_id is None:
+        return None
+    connection = registry.get(runner_id)
+    if connection is None:
+        # Without a live tunnel there is no report source to admit; the runner
+        # then stays parent-only, as for a non-tunnel client.
+        return None
+    if connection.superseded:
+        raise ConnectionError("runner tunnel is unavailable while preparing ACP report admission")
+    root_id = conversation.id
+    attempt_id = await asyncio.to_thread(
+        conversation_store.prepare_acp_report_connection_attempt,
+        root_id,
+        runner_id,
+        connection.owner,
+        connection.server_connection_id,
+    )
+    if registry.get(runner_id) is not connection or connection.superseded:
+        raise ConnectionError("runner tunnel changed while preparing ACP report admission")
+    return attempt_id
+
+
+async def prepare_acp_report_connection_attempt_for_client(
+    conversation: Conversation,
+    *,
+    conversation_store: ConversationStore,
+    runner_client: httpx.AsyncClient,
+) -> str | None:
+    """Prepare an attempt when a caller only has the router's tunnel client."""
+    transport = getattr(runner_client, "_transport", None)
+    registry = getattr(transport, "_registry", None)
+    if registry is None or not callable(getattr(registry, "get", None)):
+        return None
+    return await prepare_acp_report_connection_attempt(
+        conversation,
+        conversation_store=conversation_store,
+        registry=registry,
+    )
+
+
 def runner_inference_verified(conversation: Conversation, response: httpx.Response) -> bool:
     """Configured sessions require a runner that accepted their saved routing."""
     if conversation.inference_snapshot is None:
@@ -113,6 +163,16 @@ class RunnerSessionInitializer:
             asyncio.Task[httpx.Response],
         ] = {}
         self._recovery_ids: dict[tuple[str, int, str, str, str | None, bool], str] = {}
+
+    async def prepare_report_connection_attempt(self, conversation: Conversation) -> str | None:
+        """Prepare or recover this session's attempt for the current tunnel."""
+        if self._conversation_store is None:
+            return None
+        return await prepare_acp_report_connection_attempt(
+            conversation,
+            conversation_store=self._conversation_store,
+            registry=self._registry,
+        )
 
     def log_decision(
         self,
@@ -216,6 +276,14 @@ class RunnerSessionInitializer:
                     agent_cache=self._agent_cache,
                 )
             self.require_generation(runner_id, runner_client, generation)
+        report_connection_attempt_id = None
+        if connection is not None and self._conversation_store is not None:
+            # The admission write shares the recovery store-concurrency budget.
+            async with store_slots or nullcontext():
+                report_connection_attempt_id = await self.prepare_report_connection_attempt(
+                    conversation
+                )
+            self.require_generation(runner_id, runner_client, generation)
         key = (
             runner_id,
             generation,
@@ -265,6 +333,7 @@ class RunnerSessionInitializer:
                 suppress_recovery_turn=suppress_recovery_turn,
                 resume_interrupted_turn=resume_interrupted_turn,
                 recovery_id=recovery_id,
+                acp_report_connection_attempt_id=report_connection_attempt_id,
             )
 
             async def post_session_init() -> httpx.Response:

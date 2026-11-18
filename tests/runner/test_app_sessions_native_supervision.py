@@ -944,9 +944,11 @@ class _WakeRecordingServerClient(NullServerClient):
         """
         if url == self._parent_events_path:
             body = kwargs.get("json")
-            if isinstance(body, dict):
+            # Background-work reports share the parent's /events path; only
+            # message bodies are wake notices.
+            if isinstance(body, dict) and body.get("type") == "message":
                 self.wake_posts.append(body)
-            self.wake_seen.set()
+                self.wake_seen.set()
         return await super().post(url, **kwargs)
 
 
