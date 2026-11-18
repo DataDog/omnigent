@@ -221,7 +221,14 @@ def test_unverified_dependabot_cannot_use_ci_exception(tmp_path, workflow, ident
 
 @pytest.mark.parametrize("workflow", ["security-gate.yml", "security-scan.yml"])
 def test_external_contributor_still_requires_scanning(tmp_path, workflow):
-    outputs = _trust_gate(tmp_path, workflow, PR_AUTHOR="contributor", PR_AUTHOR_TYPE="User")
+    outputs = _trust_gate(
+        tmp_path,
+        workflow,
+        PR_AUTHOR="contributor",
+        PR_AUTHOR_TYPE="User",
+        HEAD_REPO="outsider/fork",
+        PR_HEAD_REPO="outsider/fork",
+    )
     assert outputs["scan"] == "true"
 
 
@@ -524,7 +531,12 @@ def test_action_ci_access_preserves_manual_exceptions(tmp_path, expanded_update,
         {},
         {"PR_AUTHOR_TYPE": "User"},
         {"PR_HEAD_REPO": "outsider/fork"},
-        {"PR_AUTHOR": "contributor", "PR_AUTHOR_TYPE": "User"},
+        {
+            "PR_AUTHOR": "contributor",
+            "PR_AUTHOR_TYPE": "User",
+            "HEAD_REPO": "outsider/fork",
+            "PR_HEAD_REPO": "outsider/fork",
+        },
     ],
 )
 def test_explicit_scan_waiver_preserves_manual_handling(tmp_path, api, identity):
