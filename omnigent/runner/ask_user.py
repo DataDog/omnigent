@@ -149,7 +149,7 @@ async def _post_harness_event(
             timeout=15.0,
         )
         resp.raise_for_status()
-    except Exception:  # noqa: BLE001 — watchdog suspension is best-effort
+    except Exception:
         _logger.warning(
             "sys_ask_user harness event failed (%s)", payload.get("type"), exc_info=True
         )

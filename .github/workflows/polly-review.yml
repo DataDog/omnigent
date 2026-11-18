@@ -299,13 +299,13 @@ jobs:
 
       - name: Install Claude Code CLI
         if: steps.creds.outputs.available == 'true'
-        uses: DataDog/omnigent/.github/actions/setup-harness-cli@d312c2f9600f43e0784902d7c4c27d89a5c2d389
+        uses: DataDog/omnigent/.github/actions/setup-harness-cli@d14dff2752dd339e8ecce2803cc63c69e766c8f4
         with:
           harness: claude
 
       - name: Install Codex CLI
         if: steps.creds.outputs.available == 'true'
-        uses: DataDog/omnigent/.github/actions/setup-harness-cli@d312c2f9600f43e0784902d7c4c27d89a5c2d389
+        uses: DataDog/omnigent/.github/actions/setup-harness-cli@d14dff2752dd339e8ecce2803cc63c69e766c8f4
         with:
           harness: codex
 

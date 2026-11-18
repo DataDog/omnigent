@@ -99,7 +99,7 @@ runs:
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
     - name: Install Claude Code CLI
-      uses: DataDog/omnigent/.github/actions/setup-harness-cli@d312c2f9600f43e0784902d7c4c27d89a5c2d389
+      uses: DataDog/omnigent/.github/actions/setup-harness-cli@d14dff2752dd339e8ecce2803cc63c69e766c8f4
       with:
         harness: claude
 
@@ -118,12 +118,12 @@ runs:
         echo "OMNIGENT_E2E_CLAUDE_BILLING_NOTICE_BIN=$billing_cli_dir/node_modules/.bin/claude" >> "$GITHUB_ENV"
 
     - name: Install Codex CLI
-      uses: DataDog/omnigent/.github/actions/setup-harness-cli@d312c2f9600f43e0784902d7c4c27d89a5c2d389
+      uses: DataDog/omnigent/.github/actions/setup-harness-cli@d14dff2752dd339e8ecce2803cc63c69e766c8f4
       with:
         harness: codex
 
     - name: Install Pi CLI
-      uses: DataDog/omnigent/.github/actions/setup-harness-cli@d312c2f9600f43e0784902d7c4c27d89a5c2d389
+      uses: DataDog/omnigent/.github/actions/setup-harness-cli@d14dff2752dd339e8ecce2803cc63c69e766c8f4
       with:
         harness: pi
 
