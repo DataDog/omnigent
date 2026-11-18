@@ -4627,8 +4627,12 @@ async def _mark_runner_sessions_offline_once(
             continue
         if binding is None or binding[0] != conv.runner_id:
             continue
+        # Our queued heartbeat can reach storage after the sweep snapshot.
+        own_stamp = (
+            session_live_state.last_liveness_stamp(conv.runner_id) if conv.runner_id else None
+        )
         if _runner_stamp_is_live_elsewhere(
-            stamp=binding[1], reference_stamp=conv.runner_last_seen
+            stamp=binding[1], reference_stamp=max(conv.runner_last_seen or 0, own_stamp or 0)
         ):
             _relinquish_session_live_state(conv.id)
             _logger.info(
