@@ -1083,6 +1083,121 @@ async def test_session_snapshot_skips_runner_status_probe_when_excluded(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("runner_status", ["idle", "failed"])
+async def test_session_snapshot_corrects_stale_running_from_runner_answer(
+    monkeypatch: pytest.MonkeyPatch, runner_status: str
+) -> None:
+    """A cached running status past the grace is corrected from the runner's live answer.
+
+    A native child whose terminal edge never landed (a lost forwarder POST)
+    otherwise stays busy forever: the cache is only probed on a cold miss.
+    """
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "7c1e9a2b4d6f8a0b3c5d7e9f1a3b5c7d"
+    _mod._session_status_cache[session_id] = "running"
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_stale_running_since", {})
+    monkeypatch.setattr(orchestration, "_STALE_RUNNING_GRACE_S", 0.0)
+
+    class _IdleRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=200, json=lambda: {"status": runner_status})
+
+    runner_client = _IdleRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert snapshot.status == runner_status
+    assert _mod._session_status_cache[session_id] == runner_status
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_stale_running_within_grace_is_not_probed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A running status younger than the grace is left alone — no probe, no settle.
+
+    Freshly bound sessions answer 404 or a false idle before session-init
+    lands; the grace keeps the correction away from them.
+    """
+    import time as _time
+
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "8d2f0b3c5e7a9b1c4d6f8a0b2c4d6f8a"
+    _mod._session_status_cache[session_id] = "running"
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(
+        orchestration,
+        "_stale_running_since",
+        {session_id: _time.monotonic()},
+    )
+
+    class _RecordingRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "idle"})
+
+    runner_client = _RecordingRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert runner_client.get_calls == []
+    assert snapshot.status == "running"
+    assert _mod._session_status_cache[session_id] == "running"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_settles_stale_running_on_prompt_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prompt 404 from a responsive runner settles a stale running status idle.
+
+    Past the grace, a 404 means the runner no longer holds the session
+    (a finished child whose runner state was dropped), not "session init
+    has not landed yet".
+    """
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "9e3a1c4d6f8b0c2d5e7a9b1c3d5e7a9b"
+    _mod._session_status_cache[session_id] = "running"
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_stale_running_since", {})
+    monkeypatch.setattr(orchestration, "_STALE_RUNNING_GRACE_S", 0.0)
+
+    class _GoneRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=404, json=lambda: {"error": "not_found"})
+
+    runner_client = _GoneRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert snapshot.status == "idle"
+    assert _mod._session_status_cache[session_id] == "idle"
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_status_probe_is_bounded_and_backed_off(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

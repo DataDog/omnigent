@@ -2421,14 +2421,21 @@ async def _forward_one_subagent(
         decision = status_retry_tracker.record_failure(
             retry_key, exc, session_id=entry.child_conversation_id
         )
-        _logger.warning(
+        log = _logger.error if decision.exhausted and decision.permanent else _logger.warning
+        log(
             "Failed to forward claude-native sub-agent status; child=%s status=%s "
-            "attempt=%s next_retry_s=%.3f http_status=%s",
+            "attempt=%s next_retry_s=%.3f http_status=%s%s",
             entry.child_conversation_id,
             desired_status,
             decision.attempts,
             decision.delay_s,
             _http_status_for_log(exc),
+            (
+                " — permanently rejected; the child stays busy and its result "
+                "undelivered until the credential/server issue is fixed"
+                if decision.exhausted and decision.permanent
+                else ""
+            ),
             exc_info=True,
             extra={"session_id": parent_session_id},
         )
