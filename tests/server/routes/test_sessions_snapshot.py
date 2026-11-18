@@ -1083,7 +1083,7 @@ async def test_session_snapshot_skips_runner_status_probe_when_excluded(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("runner_status", ["idle", "failed"])
+@pytest.mark.parametrize("runner_status", ["idle", "running", "failed"])
 async def test_session_snapshot_corrects_stale_running_from_runner_answer(
     monkeypatch: pytest.MonkeyPatch, runner_status: str
 ) -> None:
@@ -1195,6 +1195,70 @@ async def test_session_snapshot_settles_stale_running_on_prompt_404(
     assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
     assert snapshot.status == "idle"
     assert _mod._session_status_cache[session_id] == "idle"
+
+
+def test_note_stale_running_status_arms_and_clears(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A mid-turn status arms the stale-running clock; leaving the set clears it.
+
+    The next turn must start a fresh grace: a first-seen time inherited from a
+    finished turn would let its first snapshot probe — and potentially settle
+    a live turn idle — immediately.
+    """
+    from omnigent.server.routes._sessions import common
+
+    monkeypatch.setattr(common, "_stale_running_since", {})
+    common.note_stale_running_status("conv_clock", "running")
+    assert "conv_clock" in common._stale_running_since
+    first_seen = common._stale_running_since["conv_clock"]
+    common.note_stale_running_status("conv_clock", "running")
+    assert common._stale_running_since["conv_clock"] == first_seen
+    common.note_stale_running_status("conv_clock", "idle")
+    assert "conv_clock" not in common._stale_running_since
+    common.note_stale_running_status("conv_clock", "running")
+    assert "conv_clock" in common._stale_running_since
+
+
+@pytest.mark.asyncio
+async def test_stale_running_clock_clears_when_status_leaves_mid_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A snapshot of a settled session clears its leftover stale-running clock.
+
+    Regression: the entry used to survive once the status left the mid-turn
+    set, so it leaked one dict entry per session ever seen running and let the
+    session's NEXT turn be probed (and settled idle while live) within its own
+    grace.
+    """
+    import time as _time
+
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "bf4c2d5e7a9b0c3d6e8f9a1b3c5d7e9f"
+    _mod._session_status_cache[session_id] = "failed"
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(
+        orchestration,
+        "_stale_running_since",
+        {session_id: _time.monotonic() - 10_000},
+    )
+
+    class _RecordingRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+
+    runner_client = _RecordingRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert snapshot.status == "failed"
+    assert runner_client.get_calls == []
+    assert session_id not in orchestration._stale_running_since
 
 
 @pytest.mark.asyncio

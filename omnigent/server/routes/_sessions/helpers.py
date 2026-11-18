@@ -241,6 +241,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     get_caps,
     get_server_host_registry,
     get_server_runner_router,
+    note_stale_running_status,
     session_stream,
     set_server_runner_router,
     user_session_stream,
@@ -4927,6 +4928,7 @@ def _publish_status(
         return
     previous_status = _session_status_cache.get(session_id)
     _session_status_cache[session_id] = status
+    note_stale_running_status(session_id, status)
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
     # Mirror the transition onto the conversation row (best-effort,

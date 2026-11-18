@@ -599,6 +599,36 @@ _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 _session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
+# Monotonic first-seen time per session of a continuously cached running/waiting
+# status, feeding the snapshot stale-running correction. Written by every
+# ``_publish_status`` edge (a non-mid-turn status clears the entry, so a new
+# turn always starts a fresh clock) and read on snapshot builds.
+_stale_running_since: dict[str, float] = {}
+# A cached running/waiting status older than this grace may be corrected from
+# the bound runner's live answer on snapshot reads. Short enough to unstick a
+# child whose terminal edge was lost; long enough that a freshly bound session
+# (whose runner answers 404 or a false idle before session-init lands) is never
+# stamped idle while genuinely in flight.
+_STALE_RUNNING_GRACE_S: float = 180.0
+
+
+def note_stale_running_status(session_id: str, status: str) -> None:
+    """
+    Track how long a session has been continuously cached ``running``/``waiting``.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param status: The newly cached status. A mid-turn status arms (or keeps)
+        the clock; any other status — idle, failed, or a stop — clears it so
+        the session's NEXT turn cannot inherit a stale first-seen time and get
+        probed (or settled idle) within its own grace.
+    :returns: None.
+    """
+    if status in ("running", "waiting"):
+        _stale_running_since.setdefault(session_id, time.monotonic())
+    else:
+        _stale_running_since.pop(session_id, None)
+
+
 @dataclass
 class _RunnerStatusProbeBackoff:
     """
@@ -1250,9 +1280,11 @@ __all__ = [
     "_session_sandbox_status_cache",
     "_session_status_cache",
     "_session_terminal_pending_cache",
+    "_stale_running_since",
     "get_server_host_registry",
     "get_server_runner_router",
     "host_interactive_shells_for_request",
+    "note_stale_running_status",
     "set_server_host_registry",
     "set_server_runner_router",
 ]
