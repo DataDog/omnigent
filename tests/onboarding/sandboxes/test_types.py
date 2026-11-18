@@ -65,6 +65,9 @@ def test_capabilities_defaults() -> None:
     assert caps.managed_create_identity is ManagedIdentityRequirement.NONE
     assert caps.managed_resume_identity is ManagedIdentityRequirement.NONE
     assert caps.managed_relaunch_identity is ManagedIdentityRequirement.NONE
+    # Off by default: a wake rotates the token and restarts the host unless the
+    # provider's resume brings the running host back.
+    assert caps.resume_preserves_host is False
 
 
 def test_capabilities_custom() -> None:

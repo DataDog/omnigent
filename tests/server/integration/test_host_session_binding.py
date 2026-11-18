@@ -6,10 +6,12 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -31,6 +33,7 @@ from omnigent.onboarding.sandboxes.base import render_host_config_write_command
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.managed_hosts import (
     ManagedHostLaunch,
@@ -41,6 +44,7 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
+from omnigent.server.startup_inputs import STARTUP_LABEL
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -49,6 +53,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
@@ -86,13 +91,19 @@ def _make_hello(
 @pytest.fixture()
 def binding_app(
     db_uri: str,
+    request: pytest.FixtureRequest,
 ) -> tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore]:
     """App with host tunnel + REST routes for binding tests.
 
     :param db_uri: SQLite URI.
     :returns: Tuple of (app, registry, host_store, conv_store).
     """
-    registry = HostRegistry()
+    registry = HostRegistry(
+        mcp_disabled_servers=bool(getattr(request, "param", None)),
+        feature_flags=FeatureFlags(
+            frozenset({Feature.MCP_DISABLED_SERVERS_CLAUDE, Feature.MCP_DISABLED_SERVERS_CODEX})
+        ),
+    )
     host_store = HostStore(db_uri)
     registry.launch_authorizer = host_store.admit_launch
     conv_store = SqlAlchemyConversationStore(db_uri)
@@ -138,8 +149,10 @@ async def _connect_host(
     return comm
 
 
+@pytest.mark.parametrize("binding_app", [None, ["claude", "codex"]], indirect=True)
 async def test_launch_runner_writes_host_id_and_runner_id(
     binding_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    request: pytest.FixtureRequest,
 ) -> None:
     """
     Verify that POST /hosts/{id}/runners writes both runner_id and
@@ -150,17 +163,23 @@ async def test_launch_runner_writes_host_id_and_runner_id(
     won't be able to find the session on host reconnect.
     """
     app, registry, _hs, conv_store = binding_app
+    activation = request.node.callspec.params["binding_app"]
     comm = await _connect_host(app, registry)
     conv = conv_store.create_conversation(agent_id=None)
 
     async def _respond_launched() -> None:
         """Respond to the launch frame from the host."""
         for _ in range(20):
-            output = await comm.receive_output(timeout=2.0)
+            # Binding writes finish before the launch frame; allow for CI database latency.
+            output = await comm.receive_output(timeout=10.0)
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
             if isinstance(frame, HostLaunchRunnerFrame):
+                assert frame.mcp_disabled_servers_active_harnesses == activation
+                assert ("mcp_disabled_servers_active_harnesses" in json.loads(output["text"])) is (
+                    activation is not None
+                )
                 await comm.send_input(
                     {
                         "type": "websocket.receive",
@@ -192,6 +211,116 @@ async def test_launch_runner_writes_host_id_and_runner_id(
     assert updated.runner_id is not None, "runner_id should be written to session row"
     assert updated.runner_id.startswith("runner_token_"), "runner_id should be a token-bound id"
     assert updated.host_id == _HOST_ID, "host_id should be written to session row"
+
+
+async def _launch_and_capture_launch_args(
+    app: FastAPI,
+    comm: ApplicationCommunicator,
+    conv_store: SqlAlchemyConversationStore,
+    session_id: str,
+    host_path_id: str = _HOST_ID,
+) -> list[str] | None:
+    """Launch a runner for ``session_id`` and return its stored args as the launch arrives.
+
+    The runner reads the args as it starts, so that is the moment they must be right.
+    """
+    at_launch: list[list[str] | None] = []
+
+    async def _respond_launched() -> None:
+        for _ in range(20):
+            output = await comm.receive_output(timeout=10.0)
+            if output["type"] != "websocket.send":
+                continue
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostLaunchRunnerFrame):
+                row = conv_store.get_conversation(session_id)
+                assert row is not None
+                at_launch.append(row.terminal_launch_args)
+                await comm.send_input(
+                    {
+                        "type": "websocket.receive",
+                        "text": encode_host_frame(
+                            HostLaunchRunnerResultFrame(
+                                request_id=frame.request_id,
+                                status="launched",
+                                runner_id="runner_token_test",
+                            )
+                        ),
+                    }
+                )
+                return
+
+    responder = asyncio.create_task(_respond_launched())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/v1/hosts/{host_path_id}/runners",
+            json={"session_id": session_id, "workspace": "/tmp"},
+        )
+    assert resp.status_code == 200, resp.text
+    await responder
+    assert len(at_launch) == 1
+    return at_launch[0]
+
+
+def _claude_source(conv_store: SqlAlchemyConversationStore, host_id: str) -> Conversation:
+    """A Claude Code session on ``host_id`` started with openui's laptop-local args."""
+    return conv_store.create_conversation(
+        agent_id=None,
+        host_id=host_id,
+        workspace="/Users/someone/repo",
+        terminal_launch_args=[
+            "--mcp-config",
+            "/Users/someone/.openui/mcp-inject.json",
+            "--permission-mode",
+            "plan",
+        ],
+        labels={
+            "omnigent.wrapper": "claude-code-native-ui",
+            "omnigent.claude_native.permission_mode": "plan",
+        },
+    )
+
+
+async def test_launch_runner_drops_launch_args_a_fork_copied_from_another_host(
+    binding_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A first cross-host launch drops copied extras; later args are the fork's own and stay."""
+    app, registry, _hs, conv_store = binding_app
+    comm = await _connect_host(app, registry)
+    source = _claude_source(conv_store, "1a2b3c4d5e6f40718293a4b5c6d7e8f9")
+    fork = conv_store.fork_conversation(source_conversation_id=source.id)
+
+    first = await _launch_and_capture_launch_args(app, comm, conv_store, fork.id)
+    assert first == ["--permission-mode", "plan"]
+    kept = conv_store.get_conversation(source.id)
+    assert kept is not None
+    assert kept.terminal_launch_args == source.terminal_launch_args
+
+    # A resume saves this host's own args; its launch fails and the rollback
+    # clears the binding, then the user retries on the same host.
+    conv_store.clear_runner_id(fork.id)
+    own_args = ["--mcp-config", "/home/me/servers.json", "--permission-mode", "acceptEdits"]
+    conv_store.update_conversation(fork.id, terminal_launch_args=own_args)
+    conv_store.clear_host_binding(fork.id)
+    retry = await _launch_and_capture_launch_args(app, comm, conv_store, fork.id)
+    assert retry == own_args
+
+
+async def test_launch_runner_keeps_launch_args_of_a_fork_on_its_source_host(
+    binding_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """A fork launched on its source's host keeps every arg, whatever host-id spelling is used."""
+    app, registry, _hs, conv_store = binding_app
+    comm = await _connect_host(app, registry)
+    source = _claude_source(conv_store, _HOST_ID)
+    fork = conv_store.fork_conversation(source_conversation_id=source.id)
+    dashed_host_id = str(uuid.UUID(_HOST_ID))
+
+    launched = await _launch_and_capture_launch_args(
+        app, comm, conv_store, fork.id, host_path_id=dashed_host_id
+    )
+
+    assert launched == source.terminal_launch_args
 
 
 async def test_sandbox_fork_cannot_launch_on_ordinary_host(
@@ -571,6 +700,61 @@ async def test_managed_session_create_end_to_end(
     del tunnels
 
 
+async def test_deleting_one_session_keeps_a_shared_sandbox_host(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Several sessions can be bound to one sandbox host (a runner launch on
+    the host binds its session there). Deleting one keeps the sandbox for
+    the others; deleting the last tears it down.
+    """
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+    )
+    loop = asyncio.get_running_loop()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            _fake_sandbox_host(
+                env.app, invocation.host_id, invocation.host_name, invocation.token
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    fake = FakeSandboxLauncher(on_host_start=_start_fake_sandbox_host)
+    install_fake_modal_launcher(monkeypatch, fake)
+
+    agent = await create_test_agent(env.client, name="shared-host-agent")
+    resp = await env.client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "host_type": "managed"}
+    )
+    assert resp.status_code == 201, resp.text
+    first = await _wait_for_managed_binding(env, resp.json()["id"])
+    tunnels = [await future for future in host_futures]
+    assert first.host_id is not None
+
+    resp = await env.client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert resp.status_code == 201, resp.text
+    second_id = resp.json()["id"]
+    env.conv_store.set_host_id(second_id, first.host_id, "/root/workspace")
+
+    delete_resp = await env.client.delete(f"/v1/sessions/{first.id}")
+    assert delete_resp.status_code == 200, delete_resp.text
+    assert fake.terminated == []
+    assert env.host_store.get_host(first.host_id) is not None
+
+    delete_resp = await env.client.delete(f"/v1/sessions/{second_id}")
+    assert delete_resp.status_code == 200, delete_resp.text
+    assert set(fake.terminated) == {"sb-fake-1"}
+    assert env.host_store.get_host(first.host_id) is None
+    del tunnels
+
+
 async def test_managed_session_create_with_repo_workspace_binds_cloned_dir(
     managed_session_env: ManagedSessionEnv,
     monkeypatch: pytest.MonkeyPatch,
@@ -891,6 +1075,7 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
         "stage": "provisioning",
         "error": None,
         "provider": "modal",
+        "details": None,
     }
 
     message_resp = await env.client.post(
@@ -1028,6 +1213,7 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
         "stage": "provisioning",
         "error": None,
         "provider": "modal",
+        "details": None,
     }
 
     # Tail live progress at the layer the SSE endpoint reads it from.
@@ -1083,6 +1269,89 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
     assert snapshot_after.status_code == 200, snapshot_after.text
     assert snapshot_after.json()["sandbox_status"] is None
     del tunnels
+
+
+async def test_managed_launch_action_required_reaches_snapshot_and_stream(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launch that needs the user to act reports ``action_required`` with
+    what to do: the live stream and the snapshot carry those details until
+    the launch moves on.
+    """
+    from fastapi import HTTPException
+
+    from omnigent.runtime import session_stream
+    from omnigent.server.managed_hosts import SandboxStageObserver
+
+    env = managed_session_env
+    details = "Refresh your dbcert on your laptop."
+    subscribed = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def _launch_needing_action(*, on_stage: SandboxStageObserver, **_: object) -> None:
+        """Stand in for a deployment's launch that finds the user has to act."""
+        await subscribed.wait()
+        # Details only belong to action_required; the publisher drops them elsewhere.
+        on_stage("provisioning", "Not shown for this stage.")
+        on_stage("action_required", details)
+        await finish.wait()
+        raise HTTPException(status_code=502, detail="managed sandbox launch failed: test over")
+
+    monkeypatch.setattr(
+        "omnigent.server.managed_hosts.launch_managed_host", _launch_needing_action
+    )
+    agent = await create_test_agent(env.client, name="managed-action-required-agent")
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed"},
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+
+    reports: list[dict[str, Any]] = []
+
+    async def _tail_reports() -> None:
+        """Collect sandbox_status events after subscribing, through the first action_required."""
+        async for event in session_stream.subscribe(
+            session_id, ready_event={"type": "_test_subscribed"}
+        ):
+            if event.get("type") == "_test_subscribed":
+                subscribed.set()
+            elif event.get("type") == "session.sandbox_status":
+                reports.append(event)
+                if event["stage"] == "action_required":
+                    return
+
+    try:
+        await asyncio.wait_for(_tail_reports(), timeout=10.0)
+        snapshot = await env.client.get(f"/v1/sessions/{session_id}")
+        assert snapshot.status_code == 200, snapshot.text
+        assert snapshot.json()["sandbox_status"] == {
+            "stage": "action_required",
+            "error": None,
+            "provider": "modal",
+            "details": details,
+        }
+    finally:
+        finish.set()
+    assert [(r["stage"], r["details"]) for r in reports] == [
+        ("provisioning", None),
+        ("action_required", details),
+    ]
+
+    # Let the stand-in launch settle as failed so no launch task outlives the test.
+    deadline = asyncio.get_running_loop().time() + 10.0
+    while asyncio.get_running_loop().time() < deadline:
+        settled = await env.client.get(f"/v1/sessions/{session_id}")
+        if (settled.json()["sandbox_status"] or {}).get("stage") == "failed":
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("the stand-in launch never settled as failed")
+    # Each report replaces the last, so the failure no longer carries the details.
+    assert settled.json()["sandbox_status"]["details"] is None
 
 
 async def test_subagent_session_reuses_managed_sandbox_runner(
@@ -1350,8 +1619,8 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
     calls: list[str] = []
 
     def _finish_wake(**kwargs: object) -> None:
-        del kwargs
-        calls.append("wake")
+        # The wake gets the host's provider, which its seeded launch status names.
+        calls.append(f"wake {kwargs['provider']}")
         tracker.begin(conv.id)
         tracker.finish(conv.id)
 
@@ -1372,7 +1641,7 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
             conversation_store=conv_store,
         )
     assert exc.value.code == ErrorCode.WRONG_REPLICA
-    assert calls == ["wake"]
+    assert calls == ["wake islo"]
 
 
 async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_paused(
@@ -1508,7 +1777,7 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
     monkeypatch.setattr(
         sessions_module,
         "_publish_sandbox_status",
-        lambda _sid, stage, error=None: stages.append((stage, error)),
+        lambda _sid, stage, error=None, details=None: stages.append((stage, error)),
     )
 
     await sessions_module._run_managed_wake(
@@ -1535,31 +1804,53 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
     assert stages[-1] == ("failed", "managed runner did not connect after launch")
 
 
+@pytest.mark.parametrize("replaced", [False, True])
+@pytest.mark.parametrize("started_sandbox_id", [None, "microvm-real"])
 async def test_managed_launch_fails_when_runner_never_connects(
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    replaced: bool,
+    started_sandbox_id: str | None,
 ) -> None:
-    """Initial managed launch settlement also depends on the runner tunnel.
-
-    A launch that fails here — after the host is already online — must tear
-    the fresh sandbox down, not just settle the tracker and leave the Job
-    running with a live launch token and no one who will ever use it.
-    """
+    """Runner failure releases the launched generation, preserving any replacement."""
+    from omnigent.server.managed_hosts import launch_managed_host
     from omnigent.server.routes import sessions as sessions_module
 
-    session_id = "1a41e11887aca4570e42c0be40f24833"
-    host_id = "3c8cdcdb61903904849174c864620a5c"
-    conv = SimpleNamespace(id=session_id)
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conv = conversations.create_conversation()
+    fake = FakeSandboxLauncher(
+        started_sandbox_id=started_sandbox_id,
+        on_host_start=lambda invocation: host_store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=RESERVED_USER_LOCAL,
+        ),
+    )
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=lambda: fake,
+            token_ttl_s=3600,
+        )
+    )
+    managed = await launch_managed_host(
+        config=config, owner=RESERVED_USER_LOCAL, host_store=host_store
+    )
+    actual_id = started_sandbox_id or "sb-fake-1"
+    if replaced:
+        host_store.update_sandbox_id(
+            managed.host_id,
+            expected_sandbox_id=actual_id,
+            expected_token=fake.host_starts[0].token,
+            sandbox_id="replacement",
+        )
     tracker = ManagedLaunchTracker()
-    tracker.begin(session_id)
+    tracker.begin(conv.id)
     stages: list[tuple[str, str | None]] = []
-    terminated: list[object] = []
-    sentinel_host = object()
 
     async def _launch_runner(*_args: object, **_kwargs: object) -> object:
         return sessions_module._HostLaunchAttempt(runner_id="runner_never_connects")
-
-    async def _fake_terminate(host: object, *_args: object, **_kwargs: object) -> None:
-        terminated.append(host)
 
     class _HostRegistry:
         def get(self, _host_id: str) -> object:
@@ -1569,47 +1860,41 @@ async def test_managed_launch_fails_when_runner_never_connects(
         async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> None:
             del timeout_s
 
-    class _HostStore:
-        def get_host(self, requested_id: str) -> object:
-            assert requested_id == host_id
-            return sentinel_host
-
     monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
     monkeypatch.setattr(
         sessions_module,
         "_publish_sandbox_status",
-        lambda _sid, stage, error=None: stages.append((stage, error)),
+        lambda _sid, stage, error=None, details=None: stages.append((stage, error)),
     )
-    monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", _fake_terminate)
 
     await sessions_module._bind_and_launch_managed_runner(
-        session_id=session_id,
-        managed=ManagedHostLaunch(
-            host_id=host_id,
-            workspace="/root/workspace",
-        ),
-        sandbox_config=ManagedSandboxDeployment.single(
-            ManagedSandboxConfig(
-                server_url="https://managed-test.example.com",
-                launcher_factory=lambda: FakeSandboxLauncher(),
-                token_ttl_s=3600,
-            )
-        ),
+        session_id=conv.id,
+        managed=managed,
+        sandbox_config=config,
         tracker=tracker,
-        conversation_store=SimpleNamespace(
-            set_host_id=lambda _sid, _host_id, _workspace: conv,
-        ),
-        host_store=_HostStore(),  # type: ignore[arg-type]
+        conversation_store=conversations,
+        host_store=host_store,
         host_registry=_HostRegistry(),  # type: ignore[arg-type]
         tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
     )
 
-    launch = tracker.get(session_id)
+    launch = tracker.get(conv.id)
     assert launch is not None
     assert launch.settled.is_set()
     assert launch.error == "managed runner did not connect after launch"
     assert stages[-1] == ("failed", "managed runner did not connect after launch")
-    assert terminated == [sentinel_host]
+    remaining = conversations.get_conversation(conv.id)
+    assert remaining is not None
+    host = host_store.get_host(managed.host_id)
+    if replaced:
+        assert remaining.host_id == managed.host_id
+        assert host is not None and host.sandbox_id == "replacement"
+        assert fake.terminated == []
+    else:
+        assert remaining.host_id is None
+        assert remaining.workspace is None
+        assert host is None
+        assert fake.terminated == [actual_id]
 
 
 async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
@@ -1623,7 +1908,7 @@ async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
 
     session_id = "3f3aa440b7274531a889fa4c25f4bb1b"
     host_id = "b4e372ad19634c62966a2c56aab8cfab"
-    conv = SimpleNamespace(id=session_id)
+    conv = SimpleNamespace(id=session_id, labels={}, terminal_launch_args=None)
     tracker = ManagedLaunchTracker()
     tracker.begin(session_id)
     stages: list[tuple[str, str | None]] = []
@@ -1653,7 +1938,7 @@ async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
     monkeypatch.setattr(
         sessions_module,
         "_publish_sandbox_status",
-        lambda _sid, stage, error=None: stages.append((stage, error)),
+        lambda _sid, stage, error=None, details=None: stages.append((stage, error)),
     )
     monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", _fake_terminate)
 
@@ -1673,6 +1958,7 @@ async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
         tracker=tracker,
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
+            clear_host_binding=lambda _sid, **_kwargs: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
         host_registry=_HostRegistry(),  # type: ignore[arg-type]
@@ -1700,7 +1986,7 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
 
     session_id = "d3a6e13f0dbf4b6ea4b6e37f4a76f2a9"
     host_id = "9e6cf6f52ebb4a2c9c9a1a5f8e8f5f42"
-    conv = SimpleNamespace(id=session_id)
+    conv = SimpleNamespace(id=session_id, labels={}, terminal_launch_args=None)
     tracker = ManagedLaunchTracker()
     tracker.begin(session_id)
     terminated: list[object] = []
@@ -1742,6 +2028,7 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
         tracker=tracker,
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
+            clear_host_binding=lambda _sid, **_kwargs: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
         host_registry=_HostRegistry(),  # type: ignore[arg-type]
@@ -1763,12 +2050,10 @@ async def test_cancel_managed_launch_tasks_returns_while_provision_parked(
     """
     Shutdown teardown does not hang on an in-flight managed provision.
 
-    The lifespan teardown calls ``cancel_managed_launch_tasks`` to
-    stop background launches; with a provision parked on the fake's
-    gate (a slow provider call), the cancel must settle the task and
-    return promptly rather than waiting the provision out — a rolling
-    deploy must not block on Modal. Without the cancellation hook,
-    this test fails at the ``wait_for`` (nothing settles the task).
+    With a provision parked on the fake's gate (a slow provider call),
+    the default teardown does not wait for the launch to bind: it
+    cancels the task and returns promptly rather than waiting the
+    provision out.
     """
     import threading
 
@@ -1786,13 +2071,169 @@ async def test_cancel_managed_launch_tasks_returns_while_provision_parked(
     )
     assert resp.status_code == 201, resp.text
 
-    # The launch is gate-held mid-provision. The teardown hook must
-    # return well inside the provision's duration (the gate would hold
-    # it 30s) — 5s is the generosity bound, not an expectation.
+    # The gate would hold the provision 30s; 5s is the generosity bound.
     await asyncio.wait_for(cancel_managed_launch_tasks(), timeout=5.0)
 
     # Release the gate so the provision worker thread exits cleanly.
     gate.set()
+
+
+async def test_lifespan_shutdown_drains_for_the_configured_time(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deployment's ``sandbox.shutdown_drain_s`` is what server shutdown waits."""
+    drains: list[float] = []
+
+    async def record_drain(drain_s: float = 0.0) -> None:
+        drains.append(drain_s)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.cancel_managed_launch_tasks", record_drain
+    )
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        host_store=HostStore(db_uri),
+        sandbox_config=parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://managed-test.example.com",
+                "modal": {"image": "docker.io/test/omnigent-host:latest"},
+                "shutdown_drain_s": 7,
+            }
+        ),
+    )
+    async with app.router.lifespan_context(app):
+        assert drains == []
+    assert drains == [7.0]
+
+
+async def test_shutdown_waits_for_an_in_flight_launch_to_bind_its_host(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Shutdown lets a mid-provision launch bind its session to the host.
+
+    Once bound, whichever replica the host tunnels to starts the runner
+    and delivers the session's saved messages; cancelled before the
+    bind, the session would belong to no host and never start.
+    """
+    import threading
+
+    from omnigent.server.routes.sessions import cancel_managed_launch_tasks
+
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    loop = asyncio.get_running_loop()
+    gate = threading.Event()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        """Spawn the fake sandbox host when the launcher 'starts' it."""
+        future = asyncio.run_coroutine_threadsafe(
+            _fake_sandbox_host(
+                env.app, invocation.host_id, invocation.host_name, invocation.token
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    fake = FakeSandboxLauncher(provision_gate=gate, on_host_start=_start_fake_sandbox_host)
+    install_fake_modal_launcher(monkeypatch, fake)
+
+    agent = await create_test_agent(env.client, name="managed-shutdown-drain-agent")
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed"},
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+
+    shutdown = asyncio.create_task(cancel_managed_launch_tasks(drain_s=15.0))
+    await asyncio.sleep(0.3)
+    assert not shutdown.done()
+    gate.set()
+    await asyncio.wait_for(shutdown, timeout=15.0)
+
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and conv.host_id is not None
+    assert conv.labels.get(STARTUP_LABEL) != "failed"
+    for future in host_futures:
+        future.cancel()
+
+
+async def test_shutdown_cancelling_the_bind_write_keeps_the_session_startable(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A drain that ends while the bind is being written does not fail the session.
+
+    The write still lands, so the host's replica must still find the
+    session's startup pending; a "failed" startup would never be resumed.
+    """
+    import threading
+
+    from omnigent.server.routes.sessions import cancel_managed_launch_tasks
+
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    loop = asyncio.get_running_loop()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        """Spawn the fake sandbox host when the launcher 'starts' it."""
+        future = asyncio.run_coroutine_threadsafe(
+            _fake_sandbox_host(
+                env.app, invocation.host_id, invocation.host_name, invocation.token
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    install_fake_modal_launcher(
+        monkeypatch, FakeSandboxLauncher(on_host_start=_start_fake_sandbox_host)
+    )
+    writing = threading.Event()
+    release = threading.Event()
+    set_host_id = env.conv_store.set_host_id
+
+    def slow_set_host_id(*args: Any, **kwargs: Any) -> Any:
+        writing.set()
+        release.wait(timeout=10)
+        return set_host_id(*args, **kwargs)
+
+    monkeypatch.setattr(env.conv_store, "set_host_id", slow_set_host_id)
+
+    agent = await create_test_agent(env.client, name="managed-shutdown-bind-race-agent")
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed"},
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+    await asyncio.wait_for(asyncio.to_thread(writing.wait, 10), timeout=15)
+
+    shutdown = asyncio.create_task(cancel_managed_launch_tasks(drain_s=0.2))
+    await asyncio.sleep(0.5)
+    # Past the drain, shutdown still waits for the bind write to land.
+    assert not shutdown.done()
+    release.set()
+    await asyncio.wait_for(shutdown, timeout=15)
+
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and conv.host_id is not None
+    assert conv.labels.get(STARTUP_LABEL) == "pending"
+    for future in host_futures:
+        future.cancel()
 
 
 async def test_managed_session_deleted_during_provision_terminates_sandbox(
@@ -1900,6 +2341,54 @@ async def test_delete_reaped_managed_session_removes_durable_host(
     assert env.host_store.get_host(host.host_id) is None
 
 
+@pytest.mark.parametrize(
+    ("query", "expected_capture"), [("?capture_logs=true", True), ("", False)]
+)
+async def test_delete_managed_session_forwards_capture_logs(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    query: str,
+    expected_capture: bool,
+) -> None:
+    """``DELETE ?capture_logs=true`` asks managed teardown for the sandbox logs."""
+    from omnigent.server import managed_hosts
+
+    env = managed_session_env
+    host = env.host_store.register_managed_host(
+        host_id="3c4d5e6f7a8b49203a15c6d7e8f9a0b1",
+        name="managed-capture-delete",
+        user_id=RESERVED_USER_LOCAL,
+        token="managed-capture-delete-token",
+        provider="modal",
+        sandbox_id="sb-capture-delete",
+        token_expires_at=int(time.time()) + 3600,
+    )
+    agent = await create_test_agent(env.client, name="managed-capture-delete-agent")
+    conversation = env.conv_store.create_conversation(
+        agent_id=agent["id"],
+        host_id=host.host_id,
+        workspace="/tmp/managed-capture-delete",
+    )
+    teardowns: list[bool] = []
+
+    async def record_teardown(
+        *args: object,
+        keep_if_bound: bool = False,
+        capture_logs: bool = False,
+        use_reaper_identity: bool = True,
+    ) -> None:
+        assert keep_if_bound
+        assert use_reaper_identity is False
+        teardowns.append(capture_logs)
+
+    monkeypatch.setattr(managed_hosts, "terminate_managed_host", record_teardown)
+
+    response = await env.client.delete(f"/v1/sessions/{conversation.id}{query}")
+
+    assert response.status_code == 200, response.text
+    assert teardowns == [expected_capture]
+
+
 def _runner_exited_app(db_uri: str, tmp_path: Path) -> tuple[FastAPI, SqlAlchemyConversationStore]:
     """Build the full server app so ``host.runner_exited`` hits ``_on_runner_exited``.
 
@@ -1974,9 +2463,7 @@ async def test_runner_exited_logs_one_event_per_bound_session(
 
     caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     _comm = await _report_runner_exited(app, "runner_crashed")
-    async with asyncio.timeout(5.0):
-        while len(_runner_exited_events(caplog)) < 2:
-            await asyncio.sleep(0.01)
+    await poll_until_async(lambda: len(_runner_exited_events(caplog)) >= 2)
 
     events = _runner_exited_events(caplog)
     assert sorted(getattr(r, "session_id", None) for r in events) == sorted([parent.id, child.id])
@@ -1996,9 +2483,7 @@ async def test_runner_exited_without_bound_sessions_logs_sessionless_event(
 
     caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     _comm = await _report_runner_exited(app, "runner_orphan")
-    async with asyncio.timeout(5.0):
-        while not _runner_exited_events(caplog):
-            await asyncio.sleep(0.01)
+    await poll_until_async(lambda: _runner_exited_events(caplog))
     # Let any (incorrect) extra rows from the same frame land before counting.
     await asyncio.sleep(0.05)
 
@@ -2034,9 +2519,7 @@ async def test_runner_exited_lookup_failure_logs_event_and_keeps_tunnel(
     def _callback_failures() -> list[logging.LogRecord]:
         return [r for r in caplog.records if "on_runner_exited callback failed" in r.getMessage()]
 
-    async with asyncio.timeout(5.0):
-        while not _callback_failures():
-            await asyncio.sleep(0.01)
+    await poll_until_async(_callback_failures)
 
     events = _runner_exited_events(caplog)
     assert len(events) == 1
@@ -2203,7 +2686,7 @@ async def test_runner_exited_after_connect_fails_mid_turn_session(
 
     error = _persisted_task_error(conv_store, conv.id)
     assert error is not None
-    assert error["code"] == "runner_failed_to_start"
+    assert error["code"] == "runner_process_crash"
     decision = _disconnect_decisions(caplog, conv.id)[0]
     attributes = getattr(decision, "attributes", {})
     assert attributes["decision"] == "failed_mid_turn"

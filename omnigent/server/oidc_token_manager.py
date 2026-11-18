@@ -20,7 +20,7 @@ import httpx
 
 from omnigent.server.oidc import OIDCConfig
 from omnigent.server.oidc_session_store import OidcSessionCredentials, OidcSessionStore
-from omnigent.server.routes.auth import _extract_verified_email, _validate_oidc_id_token
+from omnigent.server.routes.auth import _resolve_oidc_email, _validate_id_token
 
 _logger = logging.getLogger(__name__)
 
@@ -229,7 +229,7 @@ class OidcTokenManager:
             raise ReauthenticationError("Token refresh returned invalid response")
 
         # Validate the refreshed ID token.
-        claims = _validate_oidc_id_token(token_json, self._config)
+        claims = _validate_id_token(token_json, self._config)
         if claims is None:
             self._revoke_owned_refresh(
                 oidc_session_id,
@@ -240,7 +240,7 @@ class OidcTokenManager:
             raise ReauthenticationError("Refreshed ID token validation failed")
 
         # Verify the identity hasn't changed.
-        email = _extract_verified_email(claims, self._config)
+        email = _resolve_oidc_email(claims, self._config)
         if email is None or email.lower() != expected_user_id.lower():
             _logger.warning("Refreshed ID token identity mismatch")
             self._revoke_owned_refresh(
@@ -339,8 +339,8 @@ class OidcTokenManager:
         """
         if self._has_stable_provider_binding(credentials):
             return credentials
-        claims = _validate_oidc_id_token({"id_token": credentials.id_token}, self._config)
-        email = _extract_verified_email(claims, self._config) if claims is not None else None
+        claims = _validate_id_token({"id_token": credentials.id_token}, self._config)
+        email = _resolve_oidc_email(claims, self._config) if claims is not None else None
         subject = claims.get("sub") if claims is not None else None
         token_expiry = claims.get("exp") if claims is not None else None
         if (
