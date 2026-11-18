@@ -10,7 +10,7 @@ Before calling prod, a local check confirmed the token's `expires_at` (179506630
 
 | # | Call | Result |
 |---|------|--------|
-| 1 | WS tunnel + hello | **upgrade accepted (open)**; hello sent; no inbound non-ping frames in 3s, so the server sends **no hello response** |
+| 1 | WS tunnel + hello | **upgrade accepted (open)**; hello sent; **no hello reply observed within the 3 s window**. This matches the server code, which reads the hello and starts the session without replying (`omnigent/server/routes/runner_tunnel.py:573-610`) |
 | 2 | `GET /v1/runners/{id}/status` | **200** `{"runner_id":"runner_token_1d478dbf9c4e196ef978633cb9c315e8","online":true}` |
 | 3 | `GET /v1/agents` | **200**, 20 agents; used `bff16b9fe359057d7766c82ef2db80e7` |
 | 4 | `POST /v1/sessions` | **201** id `598c454cebee4f6694ea26a1c4a18561`, `host_id:null`, labels `{"vitrine.mirror.spike":"s3","omnigent.client_surface":"web"}` |
@@ -30,19 +30,20 @@ Notes:
 
 ### Go / no-go (final)
 - **B1: GO.** Prod accepts a self-minted binding token with a real user bearer and no runner allow-list (consistent with the token var being unset in omnigent-ops). The runner shows online to its owner and goes offline on a graceful close.
-- **B8: GO, with a caveat.** No `__public__` READ grant was added to a hostless session created this way, so mirrored sessions start private under prod's current default-public policy. That policy is server config (`new_session_starts_public`) and could change.
+- **B8: GO, with a caveat.** No `__public__` READ grant was added to a hostless session created this way, so mirrored sessions start private. The setting is `default_public_sessions` (values `OFF`, `SANDBOX`, `ALL`; default `OFF`; see `omnigent/server/sharing_settings.py:135-143,376-380,399-420` and `omnigent/server/routes/_sessions/helpers.py:697-732`). No `__public__` grant means prod is on `OFF` or `SANDBOX`. Under `ALL`, a hostless session would start public.
 
-## Run 1 (history): expired token
-
-## Approval
-Nick approved the 9 calls below through the Lead, with bearer source (b): the omnigent CLI login,
-`~/.omnigent/auth_tokens.json["https://omnigent.us1.ddbuild.io"].token`, read into memory only.
-The run was `S3_PROD_APPROVED=1 S3_BEARER_FROM_OMNIGENT_CLI=1 npm run probe:prod`, executed exactly once, with no retries.
+## Approval (both runs)
+- **Run 1:** Nick approved the 9 calls below through the Lead, with bearer source (b): the omnigent CLI login,
+  `~/.omnigent/auth_tokens.json["https://omnigent.us1.ddbuild.io"].token`, read into memory only.
+- **Run 2:** after run 1 failed on an expired token, Nick re-logged in and re-approved exactly one more run, with the same 9 calls and the same bearer source.
+- Each run was `S3_PROD_APPROVED=1 S3_BEARER_FROM_OMNIGENT_CLI=1 npm run probe:prod`, executed once, with no retries.
 
 Prod base URL: `https://omnigent.us1.ddbuild.io`. Source: `omnigent-ops/k8s/omnigent-server/deploy.yaml:59` (`auth.baseUrl`).
 
-## Approved call list (and what ran)
-| # | Call | Ran? | Result |
+## Approved call list (same for both runs) and run 1 results
+Run 1 used the same 9 approved calls as run 2, in the same order. See the run 2 table above for its results. The **Ran?** and **Result** columns below are **run 1 only**.
+
+| # | Call | Run 1 ran? | Run 1 result |
 |---|------|------|--------|
 | 1 | WS `GET /v1/runners/{runner_token_…}/tunnel` + hello | yes | **HTTP 403** on upgrade; no frames exchanged |
 | 2 | `GET /v1/runners/{id}/status` | yes | **401** `unauthorized: Authentication required` |
@@ -54,7 +55,9 @@ Prod base URL: `https://omnigent.us1.ddbuild.io`. Source: `omnigent-ops/k8s/omni
 | 8 | `GET /v1/sessions/{id}` read-back | no | no session |
 | 9 | `GET /v1/runners/{id}/status` read-back | yes | **401**, so offline state couldn't be read with this bearer |
 
-## Evidence (redacted, UTC 2026-11-18)
+## Run 1 (history): expired token
+
+### Run 1 evidence (redacted, UTC 2026-11-18)
 ```
 20:34:15.254Z B1.connect   runnerId=runner_token_18d1cc4d572ef1b14583220d41afb9a3
 20:34:15.527Z B1.handshake opened=error:HTTP 403
@@ -68,7 +71,7 @@ Root cause: the stored token's `expires_at` is 1794879749 (about 2026-11-17 00:2
 The probe deliberately has no token refresh. The REST 401s show that the bearer itself was rejected, so the tunnel 403 is
 the same auth failure. It is not evidence of a runner allow-list.
 
-## Cleanup proof
+### Run 1 cleanup proof
 - Step 4 never ran, so no session was created. The tunnel never opened (the upgrade was refused), so no runner was ever registered.
 - Read-back 9 returned 401, so the server has no authenticated view to confirm offline state. But a refused upgrade cannot leave a runner online.
 
@@ -78,8 +81,9 @@ the same auth failure. It is not evidence of a runner allow-list.
 - **B8 (a `__public__` READ grant is added automatically to a hostless session):** **no verdict.** No session was created.
 
 ## Caveats
-- **Auth type:** the CLI token may be an Omnigent session token issued after OIDC login, not the raw OIDC id_token.
-  In this run the server accepted neither form, because the token had expired. A re-run should note which form a fresh token is.
+- **Auth type:** in run 2, prod accepted the omnigent CLI bearer for both REST and the tunnel. Run 1's rejection was caused only by expiry.
+  Whether that bearer is a raw OIDC id_token or an Omnigent session token issued after OIDC login is still undetermined.
+- **Cleanup gap (advisory):** if the create call throws after the server has already created the session (for example, a network error on the response), `sessionId` is never captured and the session would be left undeleted. This happened in neither run: run 2's DELETE returned 200 and its read-back returned 404.
 - **S1 contrast:** S1 authenticated with an accounts JWT on a local server, not real OIDC. Its allow-list refusal was simulated with
   `X-Forwarded-For`, because loopback bypasses the allow-list. A live S3 handshake with a real prod bearer is still the remaining auth check, and it is now **covered by run 2**.
 - **Scope:** the probe has no reconnect/backoff, token refresh or `event.batch`. S1's no-op handling of non-message requests is
