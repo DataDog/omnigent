@@ -57,6 +57,7 @@ export interface TunnelOptions {
   bindingToken?: string;
   runnerId?: string;
   origin?: string | null;
+  extraHeaders?: Record<string, string>;
   harnesses?: string[];
   capabilities?: string[];
   handler: TunnelHandler;
@@ -79,7 +80,7 @@ export function connectRunnerTunnel(options: TunnelOptions): RunnerTunnel {
   const runnerId = options.runnerId ?? tokenBoundRunnerId(options.bindingToken ?? "");
   const connectionId = randomUUID();
   const wsUrl = options.baseUrl.replace(/^http/, "ws") + `/v1/runners/${runnerId}/tunnel`;
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = { ...options.extraHeaders };
   if (options.bearer) headers.Authorization = `Bearer ${options.bearer}`;
   if (options.bindingToken !== undefined) headers[RUNNER_TUNNEL_TOKEN_HEADER] = options.bindingToken;
   const origin = options.origin === undefined ? OMNIGENT_INTERNAL_WS_ORIGIN : options.origin;
