@@ -18,6 +18,7 @@ import pytest
 
 from omnigent.runner import ask_user, pending_approvals
 from omnigent.tools.builtins.sys_ask_user import format_tool_result
+from tests._helpers.polling import poll_until_async
 
 hexid = lambda c: ((c * 33)[:32]).replace("p", "a").replace("q", "b")  # noqa: E731
 
@@ -146,7 +147,10 @@ async def test_reconnect_adopts_answer_submitted_while_offline(
     task = asyncio.create_task(
         _run(fake_server, {"question": "Env?", "options": ["staging", "prod"]})
     )
-    await asyncio.sleep(0.02)
+    await poll_until_async(
+        lambda: any(key in pending_approvals._pending for key in fake_server.questions),
+        timeout_s=5,
+    )
     (elicitation_id,) = fake_server.questions.keys()
     # The verdict is committed server-side while the runner is not parked on
     # a live Future path (simulate: resolve fired ServerReconnected instead).

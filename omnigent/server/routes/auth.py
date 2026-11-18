@@ -73,6 +73,10 @@ _AUTH_STATE_COOKIE_SECURE = "__Host-ap_auth_state"
 _AUTH_STATE_COOKIE_PLAIN = "ap_auth_state"
 _AUTH_STATE_TTL_SECONDS = 300  # 5 minutes
 _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
+# Clock-skew tolerance for id_token ``exp``/``iat``/``nbf``. Microsoft Entra ID
+# caps ``exp`` at ``auth_time + max_age``, so a short re-auth ``max_age`` leaves
+# a token little margin by the time it arrives.
+_ID_TOKEN_LEEWAY_SECONDS = 60
 # An upgrade notice, never a key in the login-ticket store.
 _CLI_UPGRADE_TICKET = "upgrade-required"
 _CLI_UPGRADE_MESSAGE = (
@@ -368,7 +372,7 @@ def create_auth_router(
             # Ask the IdP to force the user to re-enter credentials
             # rather than silently reusing an existing IdP session.
             params["prompt"] = "login"
-            params["max_age"] = "0"
+            params["max_age"] = str(config.reauth_max_age_seconds)
         endpoint = urlsplit(config.authorization_endpoint)
         query = [
             (name, value)
@@ -495,6 +499,7 @@ def create_auth_router(
                 return fail(400, "Token exchange returned an invalid response", "server_error")
 
             # Extract user email.
+            claims: dict[str, object] | None = None
             if config.provider_type == "github":
                 access_token = token_json.get("access_token")
                 email = await _resolve_github_email(
@@ -502,26 +507,39 @@ def create_auth_router(
                     access_token if isinstance(access_token, str) else "",
                 )
             else:
-                # Keep the established wrapper as the single email admission
-                # path. Credential-backed sessions validate once more below to
-                # persist the verified identity claims needed for refresh.
-                email = _resolve_oidc_email(token_json, config)
+                # Report a missing or invalid id_token separately from a missing
+                # or unverified email claim.
+                id_token = token_json.get("id_token")
+                if not isinstance(id_token, str) or not id_token:
+                    _logger.error(
+                        "Rejecting login: the IdP's token response has no id_token "
+                        "(is the openid scope requested?)"
+                    )
+                    return fail(400, "IdP returned no id_token", "server_error")
+                claims = _validate_id_token(token_json, config)
+                if claims is None:
+                    _logger.error(
+                        "Rejecting login: the IdP's id_token did not validate "
+                        "(see the id_token validation warning above for the reason)"
+                    )
+                    return fail(400, "IdP id_token failed validation", "server_error")
+                email = _resolve_oidc_email(claims, config)
 
         if not email:
             return fail(400, "Could not determine user email from IdP", "server_error")
 
-        # Forced re-auth verification (anti-phishing device-consent gate).
-        # /login stamped reauth_at when it sent prompt=login + max_age=0.
-        # A conformant IdP must then set the id_token's auth_time to the
-        # actual (re-)authentication instant; if it silently reused its
-        # session, auth_time predates our demand and we must refuse rather
-        # than mint a fresh session that would pass the freshness gate.
-        # GitHub has no id_token / auth_time, so reauth is never set for it.
+        # Forced re-auth gate (device consent, CLI tickets): /login sent prompt=login and max_age
+        # and stamped reauth_at, so a missing or older auth_time means re-auth is unproven.
+        # Refuse it unless OMNIGENT_OIDC_REQUIRE_REAUTH is off; GitHub never stamps reauth_at.
         reauth_at = state_payload.get("reauth_at")
-        if isinstance(reauth_at, int):
-            auth_time = _resolve_oidc_auth_time(token_json, config)
+        if isinstance(reauth_at, int) and not config.require_reauth:
+            _logger.info(
+                "Accepting reauth login without verifying auth_time "
+                "(OMNIGENT_OIDC_REQUIRE_REAUTH is disabled)"
+            )
+        elif isinstance(reauth_at, int):
+            auth_time = _resolve_oidc_auth_time(claims)
             if auth_time is None:
-                claims = _validate_oidc_id_token(token_json, config)
                 if not (
                     config.allow_missing_auth_time
                     and claims is not None
@@ -539,7 +557,8 @@ def create_auth_router(
             elif auth_time < reauth_at:
                 _logger.warning(
                     "Rejecting reauth login: id_token auth_time %d predates the "
-                    "re-authentication demand at %d (IdP reused its session)",
+                    "re-authentication demand at %d (IdP reused its session; "
+                    "set OMNIGENT_OIDC_REQUIRE_REAUTH=0 if it ignores max_age)",
                     auth_time,
                     reauth_at,
                 )
@@ -555,7 +574,7 @@ def create_auth_router(
         provider_id_token_expiry = 0
         oidc_session_id: str | None = None
         if oidc_session_store is not None and config.provider_type == "oidc":
-            oidc_claims = _validate_oidc_id_token(token_json, config)
+            oidc_claims = claims
             provider_subject_value = oidc_claims.get("sub") if oidc_claims is not None else None
             if not isinstance(provider_subject_value, str) or not provider_subject_value:
                 return JSONResponse(
@@ -1630,15 +1649,27 @@ def _validate_id_token(
             algorithms=["RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "ES512"],
             audience=config.client_id,
             issuer=config.issuer,
+            leeway=_ID_TOKEN_LEEWAY_SECONDS,
         )
     except jwt.InvalidTokenError as exc:
         _logger.warning("id_token validation failed: %s", exc)
         return None
 
 
-def _resolve_oidc_auth_time(token_json: dict[str, object], config: OIDCConfig) -> int | None:
-    """Return a validated id token's authentication timestamp."""
-    claims = _validate_id_token(token_json, config)
+def _resolve_oidc_auth_time(claims: dict[str, object] | None) -> int | None:
+    """Return the id_token's ``auth_time`` (last authentication instant).
+
+    ``auth_time`` is the epoch second at which the IdP actually
+    authenticated the end user. It is REQUIRED in the id_token when the
+    request carried ``max_age`` (OIDC Core §3.1.3.7), which is exactly
+    the forced-re-auth case. Used to verify the IdP honored
+    ``prompt=login`` rather than silently reusing its session.
+
+    :param claims: Validated id_token claims, or ``None`` when there are none
+        (a GitHub login).
+    :returns: ``auth_time`` as an int, or ``None`` when there are no claims or
+        the claim is absent/non-numeric.
+    """
     if claims is None:
         return None
     auth_time = claims.get("auth_time")
@@ -1651,34 +1682,14 @@ def _resolve_oidc_auth_time(token_json: dict[str, object], config: OIDCConfig) -
     return None
 
 
-def _validate_oidc_id_token(
-    token_json: dict[str, object],
-    config: OIDCConfig,
-) -> dict[str, object] | None:
-    """Validate the OIDC ``id_token`` signature, issuer, and audience.
-
-    Returns the decoded claims when the token is valid, or ``None``
-    when the token is missing, the JWKS URI is unset, or signature /
-    issuer / audience verification fails.
-
-    :param token_json: The token endpoint response JSON containing
-        ``id_token``.
-    :param config: The OIDC configuration with JWKS URI and
-        expected issuer/audience.
-    :returns: Decoded claims dict, or ``None``.
-    """
-    claims = _validate_id_token(token_json, config)
-    if claims is None:
-        return None
-
-    return claims
-
-
-def _extract_verified_email(
+def _resolve_oidc_email(
     claims: dict[str, object],
     config: OIDCConfig,
 ) -> str | None:
-    """Extract the verified email from validated OIDC claims.
+    """Extract the verified email from validated OIDC ``id_token`` claims.
+
+    Returns the ``email`` claim **only when the IdP marked it verified** via
+    ``email_verified``.
 
     A valid signature proves the token came from the IdP; it does
     *not* prove the user controls the email address. Without the
@@ -1698,9 +1709,12 @@ def _extract_verified_email(
     ``preferred_username``). ``email_verified`` refers to the ``email``
     claim, so a custom claim always needs the verification opt-out too.
 
-    :param claims: Decoded JWT claims from :func:`_validate_oidc_id_token`.
-    :param config: The OIDC configuration.
-    :returns: The user's email, or ``None`` if absent or not verified.
+    :param claims: Claims from :func:`_validate_id_token`.
+    :param config: The OIDC configuration (email claim and verification opt-out).
+    :returns: The user's email when present and marked verified; ``None`` if
+        the email claim is absent or not a non-empty string, or
+        ``email_verified`` is not truthy (and verification is not skipped via
+        config).
     """
     email = claims.get(config.email_claim)
     if not isinstance(email, str) or not email.strip():
@@ -1758,29 +1772,6 @@ def _extract_verified_email(
         return None
 
     return email
-
-
-def _resolve_oidc_email(
-    token_json: dict[str, object],
-    config: OIDCConfig,
-) -> str | None:
-    """Extract the verified email from the OIDC ``id_token``.
-
-    Convenience wrapper around :func:`_validate_oidc_id_token` and
-    :func:`_extract_verified_email` for callers that do not need the
-    decoded claims.
-
-    :param token_json: The token endpoint response JSON containing
-        ``id_token``.
-    :param config: The OIDC configuration with JWKS URI and
-        expected issuer/audience.
-    :returns: The user's email from the ``id_token`` when present and
-        marked verified; ``None`` otherwise.
-    """
-    claims = _validate_oidc_id_token(token_json, config)
-    if claims is None:
-        return None
-    return _extract_verified_email(claims, config)
 
 
 def _json_object(value: object) -> dict[str, object] | None:

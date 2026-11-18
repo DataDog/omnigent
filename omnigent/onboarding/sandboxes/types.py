@@ -112,6 +112,11 @@ class SandboxCapabilities:
         managed sandbox generation. Providers that authorize deletion as the
         resource owner must declare it so request-time cleanup preserves the
         owner's renewable identity.
+    :param resume_preserves_host: Resuming a stopped sandbox brings back the
+        running ``omnigent host`` process itself, still holding its launch
+        token, so the wake path keeps that token and does not restart the host
+        (a second host would race the thawed one). Only meaningful alongside
+        ``resume_stopped``.
     """
 
     cli_bootstrap: bool = False
@@ -132,6 +137,7 @@ class SandboxCapabilities:
     managed_resume_identity: ManagedIdentityRequirement = ManagedIdentityRequirement.NONE
     managed_relaunch_identity: ManagedIdentityRequirement = ManagedIdentityRequirement.NONE
     managed_terminate_identity: ManagedIdentityRequirement = ManagedIdentityRequirement.NONE
+    resume_preserves_host: bool = False
 
 
 @dataclass(frozen=True)
