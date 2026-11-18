@@ -12564,6 +12564,7 @@ async def _run_runner_status_probe(
                 if isinstance(payload, dict):
                     raw = str(payload.get("status", "idle"))
                     _session_status_cache[session_id] = raw
+                    note_stale_running_status(session_id, raw)
                     if raw in ("idle", "running", "waiting", "failed"):
                         session_live_state.persist_live_status(session_id, raw)
                     _runner_status_probe_backoff.pop(session_id, None)
@@ -12578,6 +12579,7 @@ async def _run_runner_status_probe(
                     # init has not landed yet" — settle idle so the child cannot
                     # stay busy forever after its terminal edge was lost.
                     _session_status_cache[session_id] = "idle"
+                    note_stale_running_status(session_id, "idle")
                     session_live_state.persist_live_status(session_id, "idle")
                     _logger.info(
                         "Runner status probe for session=%s answered 404; "

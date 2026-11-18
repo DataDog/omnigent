@@ -1262,6 +1262,47 @@ async def test_stale_running_clock_clears_when_status_leaves_mid_turn(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("answer", "clock_survives"), [("idle", False), ("running", True)])
+async def test_runner_status_probe_updates_stale_running_clock(
+    monkeypatch: pytest.MonkeyPatch,
+    answer: str,
+    clock_survives: bool,
+) -> None:
+    """The probe's direct cache writes update the stale-running clock immediately.
+
+    Otherwise a settled session's entry survives until the NEXT snapshot
+    read, and a new turn's running publish landing before any further read
+    inherits the stale first-seen — probed (and potentially settled idle
+    while live) within its own grace.
+    """
+    import time as _time
+
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import common, orchestration
+
+    session_id = "cf5d3e6f8b9a1d4e7f9a0b2c4d6e8f9a"
+    monkeypatch.setattr(
+        common,
+        "_stale_running_since",
+        {session_id: _time.monotonic() - 10_000},
+    )
+    monkeypatch.setattr(orchestration, "_stale_running_since", common._stale_running_since)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+
+    class _AnsweringRunnerClient:
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            return SimpleNamespace(status_code=200, json=lambda: {"status": answer})
+
+    probed = await orchestration._probe_runner_live_status(
+        _AnsweringRunnerClient(),  # type: ignore[arg-type]
+        session_id,
+    )
+    assert probed == answer
+    assert _mod._session_status_cache[session_id] == answer
+    assert (session_id in common._stale_running_since) is clock_survives
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_status_probe_is_bounded_and_backed_off(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
