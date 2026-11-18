@@ -9856,8 +9856,8 @@ async def _auto_create_claude_terminal(
     # appended above, so the ``--`` stays first). Identity by default. This is
     # the same resolver the local-CLI native launch uses (see cli_native.py), so
     # both terminal-creation paths honour one config surface.
-    from omnigent.config import load_effective_config  # noqa: FlagLocalImports
-    from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
+    from omnigent.config import load_effective_config
+    from omnigent.harness_startup_config import (
         resolve_harness_args,
         resolve_harness_command,
     )
@@ -11334,6 +11334,11 @@ async def _session_labels_for_runner_spawn(
 class ResolvedSpec:
     spec: AgentSpec
     workdir: Path | None
+    bundle_location: str | None = None
+    operator_authored: bool = False
+    effective_spec_digest: str | None = None
+    operator_environment_digest: str | None = None
+    mcp_selection_snapshot: dict[str, str] | None = None
 
     def __getattr__(self, name: str) -> Any:  # type: ignore[explicit-any]
         """Delegate compatibility attributes to the wrapped agent spec."""
@@ -11470,14 +11475,30 @@ def _resolved_workdir_for_spec(
 
 
 def _rewrap_like(previous: object, spec: AgentSpec, workdir: Path | None) -> Any:  # type: ignore[explicit-any]
-    """Re-wrap *spec* iff *previous* was wrapped, preserving a ``None`` workdir.
+    """Re-wrap *spec* iff *previous* was wrapped, preserving its origin metadata.
 
     A wrapped entry has a verdict on its bundle dir — including a sub-agent's
     ``None`` — and re-widening that to the runner workspace is the leak. A spec
     that never carried bundle information stays bare so it keeps the workspace
-    fallback ordinary top-level sessions rely on.
+    fallback ordinary top-level sessions rely on. Immutable provenance fields
+    identify the server-resolved bundle and must survive local rewrites to the
+    same spec, such as resolving workdir-relative tool paths.
     """
-    return ResolvedSpec(spec=spec, workdir=workdir) if isinstance(previous, ResolvedSpec) else spec
+    if not isinstance(previous, ResolvedSpec):
+        return spec
+    return ResolvedSpec(
+        spec=spec,
+        workdir=workdir,
+        bundle_location=previous.bundle_location,
+        operator_authored=previous.operator_authored,
+        effective_spec_digest=previous.effective_spec_digest,
+        operator_environment_digest=previous.operator_environment_digest,
+        mcp_selection_snapshot=(
+            dict(previous.mcp_selection_snapshot)
+            if previous.mcp_selection_snapshot is not None
+            else None
+        ),
+    )
 
 
 def _is_spec_local_native_python_tool(

@@ -23,6 +23,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
+from urllib.parse import quote
 
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
     from omnigent.runner.mcp_manager import RunnerMcpManager
+    from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
     from omnigent.terminals.registry import TerminalRegistry
 
 import httpx
@@ -79,11 +81,20 @@ from omnigent.native.native_coding_agents import (
 from omnigent.runner import native as _native
 from omnigent.runner import pending_approvals, pr_reports
 from omnigent.runner import subagent_work as _subagent_work
+from omnigent.runner.acp_session_actions import (
+    AcpSessionActionChannelUnsupported,
+    AcpSessionActionSubscriber,
+)
+from omnigent.runner.acp_session_reports import (
+    AcpSessionReportSubscriber,
+    ensure_session_report_capability,
+)
 from omnigent.runner.acp_subagent_sessions import (
     _chain_acp_subagent_post,
     _complete_acp_subagent_child,
     _mint_acp_subagent_child,
     _post_acp_subagent_tool_call,
+    _stable_acp_subagent_response_id,
 )
 from omnigent.runner.app_support import (
     SpecResolver,
@@ -116,7 +127,7 @@ from omnigent.runner.live_mcp_routes import register_live_mcp_routes
 from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
-from omnigent.runner.mcp_routes import register_mcp_routes
+from omnigent.runner.mcp_routes import SessionActionMcpContext, register_mcp_routes
 from omnigent.runner.model_option_routes import register_model_option_routes
 from omnigent.runner.native import (
     _REPL_TERMINAL_NAME,
@@ -208,6 +219,7 @@ from omnigent.runner.subagent_work import (
     wrapper_label_from_labels,
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
+from omnigent.runtime.harnesses.session_reports import SESSION_REPORT_MAX_RECORDS
 from omnigent.runtime.prompt import (
     build_instructions,
     build_instructions_nullable,
@@ -659,6 +671,19 @@ class _SessionInitContext:
 # than imported to avoid pulling the heavy translator module in for one
 # string — same rationale as omnigent/tools/local_callable.py.
 _OMNIGENT_CALLABLE_LANGUAGE = "omnigent-python-callable"
+_ACP_SESSION_REPORTING_REQUIRED_ENV = "OMNIGENT_ACP_SESSION_REPORTING_REQUIRED"
+
+
+def _acp_session_reporting_required() -> bool:
+    """Read the operator's explicit full-reporting requirement, if configured."""
+    raw = os.environ.get(_ACP_SESSION_REPORTING_REQUIRED_ENV, "").strip().lower()
+    if raw in {"", "0", "false", "no", "off"}:
+        return False
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    raise RuntimeError(
+        f"{_ACP_SESSION_REPORTING_REQUIRED_ENV} must be one of 0/1, true/false, yes/no, or on/off"
+    )
 
 
 def _looks_like_file_path(path: str) -> bool:
@@ -1251,6 +1276,7 @@ def create_runner_app(
     mcp_manager: RunnerMcpManager | None = None,
     auth_token: str | None = None,
     auth_token_factory: Callable[[], str | None] | None = None,
+    event_dispatcher: RunnerEventDispatcher | None = None,
     native_pane_idle_timeout_s: float | None = None,
 ) -> FastAPI:
     """Build a fresh runner FastAPI app.
@@ -1287,6 +1313,9 @@ def create_runner_app(
     :param auth_token_factory: Refresh-capable server bearer factory owned by
         the runner process. Native terminal helpers reuse it instead of
         resolving host credentials again for every terminal launch.
+    :param event_dispatcher: Existing authenticated runner tunnel dispatcher.
+        Stored on app state for native event callers; the matching server client
+        is constructed with this dispatcher by the runner entry point.
     :param native_pane_idle_timeout_s: Resolved native-pane idle timeout. ``0``
         disables reaping; ``None`` uses the pane environment override or default.
         Sub-agent panes are capped at the native-pane default window.
@@ -1294,6 +1323,7 @@ def create_runner_app(
     import hmac
 
     app = FastAPI(title="omnigent-runner")
+    app.state.runner_event_dispatcher = event_dispatcher
 
     from omnigent.runner.logging_context import RunnerLogContextMiddleware
 
@@ -1370,6 +1400,7 @@ def create_runner_app(
     _session_reasoning_effort: dict[str, str] = {}
     _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
+    app.state.session_workspace_cache = _session_workspace_cache
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
     _session_claude_launch_config_tasks: dict[
@@ -1626,6 +1657,57 @@ def create_runner_app(
     # while that session's native pane exists, so a lost "stopped" edge cannot
     # pin either.
     _sessions_with_background_shell: set[str] = set()
+    _sessions_with_background_acp: set[str] = set()
+    _acp_session_report_subscribers: dict[str, AcpSessionReportSubscriber] = {}
+    _acp_report_connection_admissions: dict[str, str] = {}
+    _acp_session_report_init_locks: dict[str, asyncio.Lock] = {}
+    _acp_server_report_support: bool | None = None
+    _acp_session_action_subscribers: dict[str, AcpSessionActionSubscriber] = {}
+    _acp_session_action_init_locks: dict[str, asyncio.Lock] = {}
+    _acp_session_action_contexts: dict[str, dict[str, SessionActionMcpContext]] = {}
+    _acp_action_origin_generations: dict[str, dict[str, tuple[str, bool]]] = {}
+    _acp_action_origin_inventory_generations: dict[str, str] = {}
+    _acp_action_origin_inventory_retry_tasks: dict[str, asyncio.Task[None]] = {}
+    _acp_active_action_origin: dict[str, tuple[str, str]] = {}
+    _acp_origin_cleanup_tasks: dict[str, asyncio.Task[None]] = {}
+    _acp_action_origin_retry_tasks: dict[str, dict[tuple[str, str], asyncio.Task[None]]] = {}
+    _acp_action_approval_ids: dict[str, OrderedDict[str, None]] = {}
+    _acp_process_exit_recovery_locks: dict[str, asyncio.Lock] = {}
+    _acp_report_recovery_tasks: dict[str, tuple[str, asyncio.Task[None]]] = {}
+    _acp_report_readiness_barriers: dict[str, asyncio.Task[None]] = {}
+    _ACP_REPORT_RECOVERY_WAIT_SECONDS = 60.0
+
+    class _AcpReportRecoveryPending(RuntimeError):
+        def __init__(self, task: asyncio.Task[None]) -> None:
+            super().__init__("ACP report recovery is still establishing readiness")
+            self.task = task
+
+    _acp_report_spawn_specs: dict[str, tuple[str, dict[str, str]]] = {}
+    app.state.acp_session_action_subscribers = _acp_session_action_subscribers
+    app.state.acp_session_action_contexts = _acp_session_action_contexts
+
+    async def _server_supports_acp_session_reporting() -> bool:
+        """Probe optional v3 report support once, defaulting to parent-only."""
+        nonlocal _acp_server_report_support
+        if _acp_server_report_support is not None:
+            return _acp_server_report_support
+        try:
+            response = await server_client.get("/v1/info", timeout=10.0)
+            response.raise_for_status()
+            info = response.json()
+        except Exception:
+            _logger.info(
+                "ACP session reporting capability is unavailable; using parent-only ACP",
+                exc_info=True,
+            )
+            _acp_server_report_support = False
+            return False
+        _acp_server_report_support = bool(
+            isinstance(info, dict)
+            and info.get("background_work_reporting") is True
+            and info.get("acp_session_reporting_version") == 3
+        )
+        return _acp_server_report_support
 
     def _has_active_work(*, include_pane_activity: bool = True) -> bool:
         if _active_turns:
@@ -1633,6 +1715,8 @@ def create_runner_app(
         if _claude_prompt_waiters:
             return True
         if _has_live_async_tasks(_session_async_tasks):
+            return True
+        if any(subscriber.is_busy for subscriber in _acp_session_report_subscribers.values()):
             return True
         for timers in _session_timers.values():
             for timer_task in timers.values():
@@ -1653,7 +1737,10 @@ def create_runner_app(
                 ):
                     continue
                 session_ids.add(session_id)
-                if session_id in _sessions_with_background_shell:
+                if (
+                    session_id in _sessions_with_background_shell
+                    or session_id in _sessions_with_background_acp
+                ):
                     return True
                 if _native_pane_shows_live_work(
                     terminals, session_id, name, include_pane_activity=include_pane_activity
@@ -1940,13 +2027,1486 @@ def create_runner_app(
     background_reports = BackgroundWorkReporter(
         lambda *args, **kwargs: server_client.post(*args, **kwargs)
     )
+    # Expose the reporter's existing single-writer reassert path for reconnect
+    # coordination and runner-level observability.
+    app.state.reassert_background_work_reports = background_reports.reassert
+    app.state.acp_report_recovery_wait = asyncio.sleep
+    app.state.acp_action_origin_retry_wait = asyncio.sleep
+    app.state.acp_action_origin_settlement_deadline_s = 2.0
+
+    def _report_combined_background_state(session_id: str) -> None:
+        running = (
+            session_id in _sessions_with_background_shell
+            or session_id in _sessions_with_background_acp
+        )
+        background_reports.report(session_id, running)
 
     def _publish_session_background(session_id: str, running: bool) -> None:
         if running:
             _sessions_with_background_shell.add(session_id)
         else:
             _sessions_with_background_shell.discard(session_id)
-        background_reports.report(session_id, running)
+        _report_combined_background_state(session_id)
+
+    async def _publish_acp_background(session_id: str, running: bool) -> None:
+        if running:
+            _sessions_with_background_acp.add(session_id)
+        else:
+            _sessions_with_background_acp.discard(session_id)
+        combined = (
+            session_id in _sessions_with_background_shell
+            or session_id in _sessions_with_background_acp
+        )
+        await background_reports.report_and_wait(session_id, combined)
+
+    # Stable in-process seams for reconnect recovery and combined-source tests.
+    app.state.publish_session_background = _publish_session_background
+    app.state.publish_acp_background = _publish_acp_background
+
+    async def _set_acp_child_lease(session_id: str, child_key: str, running: bool) -> None:
+        if process_manager is None:
+            return
+        if running:
+            registered = await process_manager.register_background_activity(session_id, child_key)
+            if registered is False:
+                raise RuntimeError("parent harness is no longer available for ACP child reporting")
+        else:
+            await process_manager.clear_background_activity(session_id, child_key)
+
+    async def _lookup_acp_children(session_id: str) -> dict[str, dict[str, Any]]:
+        found: dict[str, dict[str, Any]] = {}
+        after: str | None = None
+        while True:
+            params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
+            if after is not None:
+                params["after"] = after
+            response = await server_client.get(
+                f"/v1/sessions/{quote(session_id, safe='')}/child_sessions",
+                params=params,
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            page = response.json()
+            if not isinstance(page, dict) or not isinstance(page.get("data"), list):
+                raise RuntimeError("server returned a malformed ACP child-session page")
+            for child in page["data"]:
+                if not isinstance(child, dict):
+                    continue
+                labels = child.get("labels")
+                child_key = (
+                    labels.get("omnigent.acp.subagent_id") if isinstance(labels, dict) else None
+                )
+                child_id = child.get("id")
+                if (
+                    isinstance(child_key, str)
+                    and child_key
+                    and isinstance(child_id, str)
+                    and child_id
+                ):
+                    # ChildSessionSummary deliberately exposes task state as
+                    # ``current_task_status``/``busy``. The global session list
+                    # can lag that cache across runner reconnects, so recovery
+                    # must consume this parent-scoped summary directly.
+                    task_status = child.get("current_task_status")
+                    if task_status == "failed":
+                        status = "failed"
+                    elif task_status == "completed":
+                        status = "idle"
+                    elif task_status == "in_progress" or child.get("busy") is True:
+                        status = "running"
+                    else:
+                        status = child.get("status")
+                    found[child_key] = {
+                        "id": child_id,
+                        "status": status,
+                        "title": child.get("title"),
+                        "lease_id": child_key,
+                    }
+            if page.get("has_more") is not True:
+                break
+            next_after = page.get("last_id")
+            if not isinstance(next_after, str) or not next_after or next_after == after:
+                raise RuntimeError("server returned an invalid ACP child-session cursor")
+            after = next_after
+        return found
+
+    async def _lookup_acp_associations(session_id: str) -> list[dict[str, Any]]:
+        after: str | None = None
+        seen_cursors: set[str] = set()
+        seen_bindings: set[tuple[str, str]] = set()
+        validated: list[dict[str, Any]] = []
+        while True:
+            params: dict[str, Any] = {"limit": 128}
+            if after is not None:
+                params["after"] = after
+            response = await server_client.get(
+                f"/v1/sessions/{quote(session_id, safe='')}/acp_session_associations",
+                params=params,
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            page = response.json()
+            if (
+                not isinstance(page, dict)
+                or not isinstance(page.get("data"), list)
+                or len(page["data"]) > 128
+                or not isinstance(page.get("has_more"), bool)
+            ):
+                raise RuntimeError("server returned a malformed ACP association page")
+            rows = page["data"]
+            if not rows:
+                if (
+                    page["has_more"]
+                    or page.get("first_id") is not None
+                    or page.get("last_id") is not None
+                ):
+                    raise RuntimeError("server returned an invalid empty ACP association page")
+                break
+            first = rows[0]
+            last = rows[-1]
+            for association in rows:
+                if (
+                    not isinstance(association, dict)
+                    or association.get("root_conversation_id") != session_id
+                    or not isinstance(association.get("native_epoch"), str)
+                    or not association["native_epoch"]
+                    or not isinstance(association.get("native_session_id"), str)
+                    or not association["native_session_id"]
+                ):
+                    raise RuntimeError("server returned an invalid ACP association inventory row")
+                identity = (association["native_epoch"], association["native_session_id"])
+                if identity in seen_bindings:
+                    raise RuntimeError("server repeated an ACP association inventory row")
+                seen_bindings.add(identity)
+                validated.append(association)
+            expected_first = json.dumps(
+                [first["native_epoch"], first["native_session_id"]], separators=(",", ":")
+            )
+            expected_last = json.dumps(
+                [last["native_epoch"], last["native_session_id"]], separators=(",", ":")
+            )
+            if page.get("first_id") != expected_first or page.get("last_id") != expected_last:
+                raise RuntimeError("server returned invalid ACP association page cursors")
+            if len(validated) > SESSION_REPORT_MAX_RECORDS:
+                raise RuntimeError("ACP association inventory exceeds its recovery capacity")
+            if not page["has_more"]:
+                break
+            next_after = page.get("last_id")
+            if (
+                not isinstance(next_after, str)
+                or not next_after
+                or next_after == after
+                or next_after in seen_cursors
+                or len(rows) != 128
+            ):
+                raise RuntimeError("server returned a malformed or stalled ACP association cursor")
+            seen_cursors.add(next_after)
+            after = next_after
+        return validated
+
+    async def _recover_open_acp_child(child_key: str, child_id: str, reason: str) -> None:
+        from omnigent.native._native_post_delivery import post_external_session_status
+
+        await post_external_session_status(
+            server_client,
+            session_id=child_id,
+            status="failed",
+            output=reason,
+            failure_detail=reason,
+            response_id=_stable_acp_subagent_response_id(child_key),
+            turn_outcome="failed",
+            require_durable=True,
+        )
+
+    async def _cancel_acp_child_actions(session_id: str, child_key: str) -> None:
+        action_subscriber = _acp_session_action_subscribers.get(session_id)
+        if action_subscriber is not None:
+            await action_subscriber.cancel_child_key(child_key)
+
+    async def _acp_child_report_acked(session_id: str, child_key: str) -> None:
+        await _cancel_acp_child_actions(session_id, child_key)
+        _schedule_finished_origin_cleanup(session_id)
+
+    async def _stop_acp_action_subscriber(session_id: str) -> None:
+        action_subscriber = _acp_session_action_subscribers.pop(session_id, None)
+        if action_subscriber is None:
+            _acp_session_action_contexts.pop(session_id, None)
+            return
+        try:
+            await asyncio.wait_for(action_subscriber.drain_and_stop(timeout_s=10.0), timeout=12.0)
+        except Exception:
+            _logger.warning(
+                "ACP action subscriber teardown did not settle cleanly",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        _acp_session_action_contexts.pop(session_id, None)
+
+    async def _settle_acp_action_origin(
+        session_id: str,
+        token: str,
+        generation: str,
+        *,
+        handlers_drained: bool = False,
+    ) -> bool:
+        """Release one origin with bounded retries after its generation drains."""
+        delays = (0.0, 0.2, 0.5, 1.0)
+        for attempt, delay in enumerate(delays, start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                response = await server_client.post(
+                    f"/v1/sessions/{quote(session_id, safe='')}/action-origins/"
+                    f"{quote(token, safe='')}/settle",
+                    json={"generation": generation},
+                    timeout=10.0,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict) or payload.get("settled") is not True:
+                    raise RuntimeError("server did not confirm ACP action-origin settlement")
+                if handlers_drained:
+                    action_subscriber = _acp_session_action_subscribers.get(session_id)
+                    if (
+                        action_subscriber is not None
+                        and action_subscriber.generation == generation
+                    ):
+                        action_subscriber.forget_origin(token)
+                    contexts = _acp_session_action_contexts.get(session_id)
+                    if contexts is not None:
+                        context = contexts.get(token)
+                        if context is not None and context.generation == generation:
+                            contexts.pop(token, None)
+                        if not contexts:
+                            _acp_session_action_contexts.pop(session_id, None)
+                states = _acp_action_origin_generations.get(session_id)
+                if states is not None and states.get(token, (None, False))[0] == generation:
+                    states.pop(token, None)
+                    if not states:
+                        _acp_action_origin_generations.pop(session_id, None)
+                if _acp_active_action_origin.get(session_id) == (token, generation):
+                    _acp_active_action_origin.pop(session_id, None)
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if attempt == len(delays):
+                    _logger.error(
+                        "ACP action-origin settlement failed after bounded retries",
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
+                    return False
+                _logger.warning(
+                    "ACP action-origin settlement failed; retrying",
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+        return False
+
+    async def _settle_generation_action_origins(
+        session_id: str,
+        generation: str | None = None,
+        *,
+        finish_generation: bool = False,
+        finished_only: bool = False,
+        schedule_retries: bool = True,
+        handlers_drained: bool = False,
+        origin_tokens: set[str] | None = None,
+    ) -> None:
+        """Settle origins within one deadline after reports and actions drain."""
+        states = _acp_action_origin_generations.get(session_id, {})
+        if finish_generation and generation is not None:
+            for token, (origin_generation, _turn_finished) in tuple(states.items()):
+                if origin_generation == generation:
+                    states[token] = (origin_generation, True)
+        pending = [
+            (token, origin_generation)
+            for token, (origin_generation, _turn_finished) in tuple(states.items())
+            if (generation is None or origin_generation == generation)
+            and (not finished_only or _turn_finished or finish_generation)
+            and (origin_tokens is None or token in origin_tokens)
+        ]
+        if not pending:
+            return
+
+        # A generation can have accumulated many origins (including turns that
+        # never created a child). Bound the whole pass so a slow settle endpoint
+        # cannot hold harness release behind one timeout per origin.
+        semaphore = asyncio.Semaphore(8)
+
+        async def settle_one(token: str, origin_generation: str) -> bool:
+            async with semaphore:
+                return await _settle_acp_action_origin(
+                    session_id,
+                    token,
+                    origin_generation,
+                    handlers_drained=handlers_drained,
+                )
+
+        tasks = {
+            asyncio.create_task(settle_one(token, origin_generation)): (token, origin_generation)
+            for token, origin_generation in pending
+        }
+        deadline = max(
+            0.05,
+            float(getattr(app.state, "acp_action_origin_settlement_deadline_s", 2.0)),
+        )
+        done, unfinished = await asyncio.wait(tasks, timeout=deadline)
+        for task in unfinished:
+            task.cancel()
+        if unfinished:
+            await asyncio.gather(*unfinished, return_exceptions=True)
+        for task in done:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                task.result()
+        if schedule_retries:
+            for token, origin_generation in pending:
+                states = _acp_action_origin_generations.get(session_id, {})
+                if states.get(token, (None, False))[0] == origin_generation:
+                    _schedule_acp_action_origin_retry(
+                        session_id,
+                        token,
+                        origin_generation,
+                        handlers_drained=handlers_drained,
+                    )
+
+    def _schedule_acp_action_origin_retry(
+        session_id: str,
+        token: str,
+        generation: str,
+        *,
+        handlers_drained: bool = False,
+    ) -> None:
+        retries = _acp_action_origin_retry_tasks.setdefault(session_id, {})
+        key = (token, generation)
+        current = retries.get(key)
+        if current is not None and not current.done():
+            return
+
+        async def retry_until_settled() -> None:
+            delay = 0.5
+            while True:
+                states = _acp_action_origin_generations.get(session_id, {})
+                if states.get(token, (None, False))[0] != generation:
+                    return
+                retry_wait = getattr(app.state, "acp_action_origin_retry_wait", asyncio.sleep)
+                await retry_wait(delay)
+                states = _acp_action_origin_generations.get(session_id, {})
+                if states.get(token, (None, False))[0] != generation:
+                    return
+                if await _settle_acp_action_origin(
+                    session_id,
+                    token,
+                    generation,
+                    handlers_drained=handlers_drained,
+                ):
+                    return
+                delay = min(delay * 2, 30.0)
+
+        task = asyncio.create_task(
+            retry_until_settled(),
+            name=f"acp-action-origin-retry:{session_id}:{token}",
+        )
+        retries[key] = task
+
+        def forget_retry(done: asyncio.Task[None]) -> None:
+            if retries.get(key) is done:
+                retries.pop(key, None)
+                if not retries:
+                    _acp_action_origin_retry_tasks.pop(session_id, None)
+            if not done.cancelled() and (error := done.exception()) is not None:
+                _logger.warning(
+                    "ACP action-origin background settlement retry failed",
+                    exc_info=(type(error), error, error.__traceback__),
+                    extra={"session_id": session_id},
+                )
+
+        task.add_done_callback(forget_retry)
+
+    def _schedule_generation_action_origin_retries(session_id: str, generation: str) -> None:
+        states = _acp_action_origin_generations.get(session_id, {})
+        for token, (origin_generation, _turn_finished) in tuple(states.items()):
+            if origin_generation == generation:
+                _schedule_acp_action_origin_retry(
+                    session_id,
+                    token,
+                    origin_generation,
+                    handlers_drained=True,
+                )
+
+    def _finish_retired_action_origins(session_id: str, live_generation: str) -> None:
+        states = _acp_action_origin_generations.get(session_id, {})
+        for token, (origin_generation, _turn_finished) in tuple(states.items()):
+            if origin_generation != live_generation:
+                states[token] = (origin_generation, True)
+
+    async def _reclaim_retired_action_origins(session_id: str, live_generation: str) -> None:
+        """Settle origins from older harness generations after report replay is ready."""
+        if _acp_action_origin_inventory_generations.get(session_id) == live_generation:
+            return
+        reporter = _acp_session_report_subscribers.get(session_id)
+        if reporter is None or reporter.generation != live_generation or not reporter.is_ready:
+            return
+        response = await server_client.get(
+            f"/v1/sessions/{quote(session_id, safe='')}/action-origins",
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        origins = payload.get("origins") if isinstance(payload, dict) else None
+        if not isinstance(origins, list):
+            raise RuntimeError("server returned a malformed ACP action-origin inventory")
+        if (
+            process_manager is None
+            or process_manager.get_session_report_subscriber_generation(session_id)
+            != live_generation
+            or _acp_session_report_subscribers.get(session_id) is not reporter
+            or not reporter.is_ready
+        ):
+            return
+
+        stale: dict[str, str] = {}
+        for origin in origins:
+            if not isinstance(origin, dict):
+                raise RuntimeError("server returned a malformed ACP action-origin entry")
+            token = origin.get("token")
+            generation = origin.get("generation")
+            if (
+                not isinstance(token, str)
+                or re.fullmatch(r"[0-9a-f]{32}", token) is None
+                or not isinstance(generation, str)
+                or not generation
+                or len(generation) > 256
+            ):
+                raise RuntimeError("server returned an invalid ACP action-origin entry")
+            if generation != live_generation:
+                previous = stale.get(token)
+                if previous is not None and previous != generation:
+                    raise RuntimeError("server returned conflicting ACP action-origin generations")
+                stale[token] = generation
+
+        # Import every retired server origin into the local retry ledger first,
+        # preserving any conflicting local identity fence. The shared settle
+        # helper bounds the whole pass to its aggregate deadline and keeps
+        # unfinished origins on the background retry path, so readiness never
+        # waits for a per-origin timeout multiplied by the inventory size.
+        states = _acp_action_origin_generations.setdefault(session_id, {})
+        stale_tokens: set[str] = set()
+        for token, generation in stale.items():
+            prior = states.get(token)
+            if prior is not None and prior[0] != generation:
+                # Tokens are immutable identities. Keep an unexpected local
+                # generation fenced instead of settling a possibly reused token.
+                continue
+            states[token] = (generation, True)
+            stale_tokens.add(token)
+        if stale_tokens:
+            await _settle_generation_action_origins(
+                session_id,
+                finished_only=True,
+                handlers_drained=True,
+                origin_tokens=stale_tokens,
+            )
+        if (
+            process_manager.get_session_report_subscriber_generation(session_id) == live_generation
+            and _acp_session_report_subscribers.get(session_id) is reporter
+            and reporter.is_ready
+        ):
+            _acp_action_origin_inventory_generations[session_id] = live_generation
+
+    def _schedule_action_origin_inventory_retry(session_id: str, live_generation: str) -> None:
+        current = _acp_action_origin_inventory_retry_tasks.get(session_id)
+        if current is not None and not current.done():
+            return
+
+        async def retry_inventory() -> None:
+            delay = 0.5
+            for _attempt in range(8):
+                retry_wait = getattr(app.state, "acp_action_origin_retry_wait", asyncio.sleep)
+                await retry_wait(delay)
+                if (
+                    process_manager is None
+                    or process_manager.get_session_report_subscriber_generation(session_id)
+                    != live_generation
+                ):
+                    return
+                reporter = _acp_session_report_subscribers.get(session_id)
+                if (
+                    reporter is None
+                    or reporter.generation != live_generation
+                    or not reporter.is_ready
+                ):
+                    return
+                try:
+                    await _reclaim_retired_action_origins(session_id, live_generation)
+                    if _acp_action_origin_inventory_generations.get(session_id) == live_generation:
+                        return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _logger.warning(
+                        "Retrying retired ACP action-origin inventory after failure",
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
+                delay = min(delay * 2, 30.0)
+
+        task = asyncio.create_task(
+            retry_inventory(),
+            name=f"acp-action-origin-inventory:{session_id}",
+        )
+        _acp_action_origin_inventory_retry_tasks[session_id] = task
+
+        def forget_retry(done: asyncio.Task[None]) -> None:
+            if _acp_action_origin_inventory_retry_tasks.get(session_id) is done:
+                _acp_action_origin_inventory_retry_tasks.pop(session_id, None)
+            if not done.cancelled() and (error := done.exception()) is not None:
+                _logger.warning(
+                    "ACP action-origin inventory retry stopped unexpectedly",
+                    exc_info=(type(error), error, error.__traceback__),
+                    extra={"session_id": session_id},
+                )
+
+        task.add_done_callback(forget_retry)
+
+    # Keep an inspectable runner-local state seam for deterministic lifecycle
+    # tests. The mapping itself remains private to this app instance in runtime.
+    app.state.acp_action_origin_generations = _acp_action_origin_generations
+
+    async def _settle_finished_action_origins(session_id: str) -> None:
+        """Clean no-child turns after the source high-water and actions settle."""
+        process_generation = (
+            process_manager.get_session_report_subscriber_generation(session_id)
+            if process_manager is not None
+            else None
+        )
+        reporter = _acp_session_report_subscribers.get(session_id)
+        if reporter is not None and reporter.generation == process_generation:
+            if not reporter.is_ready or reporter.source_failed:
+                return
+            try:
+                if await reporter.refresh_source_status():
+                    await _recover_acp_failed_report_source(
+                        session_id,
+                        reporter.generation,
+                        reporter.source_failure_reason or "ACP report source failed.",
+                    )
+                    return
+                if not await reporter.drain_to_high_water(timeout_s=10.0):
+                    if reporter.source_failed:
+                        await _recover_acp_failed_report_source(
+                            session_id,
+                            reporter.generation,
+                            reporter.source_failure_reason or "ACP report source failed.",
+                        )
+                    return
+            except Exception:
+                _logger.warning(
+                    "ACP report high-water drain failed before origin cleanup",
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+                return
+            if reporter.source_failed:
+                return
+        live_child_origins = reporter.active_origin_tokens if reporter is not None else set()
+        eligible_origins = {
+            token
+            for token, (_origin_generation, turn_finished) in tuple(
+                _acp_action_origin_generations.get(session_id, {}).items()
+            )
+            if turn_finished and token not in live_child_origins
+        }
+        action_subscriber = _acp_session_action_subscribers.get(session_id)
+        if action_subscriber is not None and action_subscriber.generation == process_generation:
+            try:
+                if not await action_subscriber.drain_origins(eligible_origins, timeout_s=10.0):
+                    return
+            except Exception:
+                _logger.warning(
+                    "ACP action drain failed before origin cleanup",
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+                return
+        # Retired generations are safe to clean once their subscribers were
+        # stopped; include them here so they cannot be stranded by the current
+        # generation filter.
+        await _settle_generation_action_origins(
+            session_id,
+            finished_only=True,
+            handlers_drained=True,
+            origin_tokens=eligible_origins,
+        )
+
+    def _schedule_finished_origin_cleanup(session_id: str) -> None:
+        current = _acp_origin_cleanup_tasks.get(session_id)
+        if current is not None and not current.done():
+            return
+        task = asyncio.create_task(
+            _settle_finished_action_origins(session_id),
+            name=f"acp-action-origin-cleanup:{session_id}",
+        )
+        _acp_origin_cleanup_tasks[session_id] = task
+
+        def _forget_origin_cleanup(done: asyncio.Task[None]) -> None:
+            if _acp_origin_cleanup_tasks.get(session_id) is done:
+                _acp_origin_cleanup_tasks.pop(session_id, None)
+            if not done.cancelled() and (error := done.exception()) is not None:
+                _logger.warning(
+                    "ACP action-origin cleanup failed",
+                    exc_info=(type(error), error, error.__traceback__),
+                    extra={"session_id": session_id},
+                )
+
+        task.add_done_callback(_forget_origin_cleanup)
+
+    def _remember_acp_action_approval(session_id: str, elicitation_id: str) -> None:
+        ids = _acp_action_approval_ids.setdefault(session_id, OrderedDict())
+        ids[elicitation_id] = None
+        ids.move_to_end(elicitation_id)
+        while len(ids) > 4096:
+            ids.popitem(last=False)
+
+    async def _ensure_acp_action_subscriber(
+        session_id: str,
+        harness_client: httpx.AsyncClient,
+        generation: str,
+        origin_token: str,
+        dispatch_tool: Callable[..., Awaitable[None]],
+        evaluate_policy: Callable[..., Awaitable[None]],
+        *,
+        ask_timeout_s: float,
+    ) -> bool:
+        async def _resolve_approval_target(_action: dict[str, Any]) -> str:
+            _child = _action.get("child")
+            if not isinstance(_child, dict):
+                raise RuntimeError("ACP child approval has no child identity")
+            _native_epoch = _child.get("native_epoch")
+            _native_session_id = _child.get("native_session_id")
+            _run_id = _child.get("run_id")
+            _association_source_id = _child.get("association_source_id")
+            _context_generation = _child.get("context_generation")
+            _origin_token = _child.get("origin_token")
+            if (
+                not isinstance(_native_epoch, str)
+                or not _native_epoch
+                or not isinstance(_native_session_id, str)
+                or not _native_session_id
+                or not isinstance(_run_id, str)
+                or not _run_id
+                or not isinstance(_association_source_id, str)
+                or not _association_source_id
+                or not isinstance(_context_generation, str)
+                or not _context_generation
+                or not isinstance(_origin_token, str)
+                or not _origin_token
+            ):
+                raise RuntimeError("ACP child approval has an incomplete association binding")
+            from omnigent.inner.acp_standard_subagents import acp_standard_child_key
+
+            _child_key = acp_standard_child_key(
+                session_id,
+                cast(str, _native_epoch),
+                cast(str, _native_session_id),
+            )
+            _reporter = _acp_session_report_subscribers.get(session_id)
+            if (
+                _reporter is None
+                or _reporter.generation != generation
+                or not _reporter.is_ready
+                or _reporter.active_native_epoch != _native_epoch
+            ):
+                raise RuntimeError("ACP child reporter is unavailable for approval routing")
+            _child_session_id = await _reporter.wait_for_association_source(
+                _association_source_id,
+                native_epoch=_native_epoch,
+                target_session_id=_native_session_id,
+                context_generation=_context_generation,
+                origin_token=_origin_token,
+            )
+            if (
+                _acp_session_report_subscribers.get(session_id) is not _reporter
+                or _reporter.generation != generation
+                or not _reporter.is_ready
+                or _reporter.active_native_epoch != _native_epoch
+                or not _reporter.has_active_origin(_child_key, _origin_token)
+            ):
+                raise RuntimeError("ACP child reporter changed during approval routing")
+            return _child_session_id
+
+        lock = _acp_session_action_init_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            current = _acp_session_action_subscribers.get(session_id)
+            if current is not None and current.generation == generation:
+                current.register_origin(
+                    origin_token,
+                    dispatch_tool,
+                    evaluate_policy,
+                    ask_timeout_s=ask_timeout_s,
+                )
+                return True
+            if current is not None:
+                await _stop_acp_action_subscriber(session_id)
+            subscriber = AcpSessionActionSubscriber(
+                parent_id=session_id,
+                harness_client=harness_client,
+                generation=generation,
+                publish_event=_publish_event,
+                remember_approval=functools.partial(_remember_acp_action_approval, session_id),
+                dispatch_tool=dispatch_tool,
+                evaluate_policy=evaluate_policy,
+                resolve_approval_target=_resolve_approval_target,
+                on_fatal_generation=_recover_acp_failed_report_source,
+            )
+            subscriber.register_origin(
+                origin_token,
+                dispatch_tool,
+                evaluate_policy,
+                ask_timeout_s=ask_timeout_s,
+            )
+            try:
+                await subscriber.start()
+            except AcpSessionActionChannelUnsupported:
+                await subscriber.stop()
+                return False
+            except Exception:
+                await subscriber.stop()
+                raise
+            _acp_session_action_subscribers[session_id] = subscriber
+            return True
+
+    async def _ensure_acp_report_subscriber_once(
+        session_id: str,
+        harness_client: httpx.AsyncClient,
+        spawn_env: Mapping[str, str],
+        harness_name: str,
+        *,
+        expected_generation: str | None = None,
+    ) -> httpx.AsyncClient:
+        if process_manager is None:
+            return harness_client
+        generation = process_manager.get_session_report_subscriber_generation(session_id)
+        current = _acp_session_report_subscribers.get(session_id)
+        connection_admission_id = _acp_report_connection_admissions.get(session_id)
+        runtime_incarnation = process_manager.get_session_report_runtime_incarnation(session_id)
+        if (
+            current is not None
+            and current.generation == generation
+            and connection_admission_id is not None
+            and runtime_incarnation is not None
+        ):
+            await current.refresh_delivery_owner(connection_admission_id, runtime_incarnation)
+        if current is not None and current.generation == generation and not current.source_failed:
+            if await current.refresh_source_status():
+                await _recover_acp_failed_report_source(
+                    session_id,
+                    current.generation,
+                    current.source_failure_reason or "ACP report source failed.",
+                )
+                harness_client = await process_manager.get_client(
+                    session_id, harness_name, env=dict(spawn_env)
+                )
+                generation = process_manager.get_session_report_subscriber_generation(session_id)
+        if (
+            current is not None
+            and current.generation == generation
+            and current.source_failed
+            and generation is not None
+        ):
+            await _recover_acp_failed_report_source(
+                session_id,
+                generation,
+                current.source_failure_reason or "ACP report source failed.",
+            )
+            harness_client = await process_manager.get_client(
+                session_id, harness_name, env=dict(spawn_env)
+            )
+            generation = process_manager.get_session_report_subscriber_generation(session_id)
+            if expected_generation is not None and generation != expected_generation:
+                raise RuntimeError("ACP report recovery replaced an unexpected generation")
+        lock = _acp_session_report_init_locks.setdefault(session_id, asyncio.Lock())
+        failed_generation: tuple[str, str] | None = None
+        async with lock:
+            generation = process_manager.get_session_report_subscriber_generation(session_id)
+            recovery = _acp_report_recovery_tasks.get(session_id)
+            current_task = asyncio.current_task()
+            barrier = _acp_report_readiness_barriers.get(session_id)
+            if barrier is not None and barrier is not current_task and not barrier.done():
+                raise _AcpReportRecoveryPending(barrier)
+            if recovery is not None and recovery[1] is not current_task and not recovery[1].done():
+                raise _AcpReportRecoveryPending(recovery[1])
+            if expected_generation is not None and generation != expected_generation:
+                raise RuntimeError(
+                    "ACP report recovery lost ownership of the replacement generation"
+                )
+            if generation is None:
+                harness_client = await process_manager.get_client(
+                    session_id, harness_name, env=dict(spawn_env)
+                )
+                if (
+                    process_manager.get_session_report_subscriber_generation(session_id)
+                    is not None
+                ):
+                    raise RuntimeError(
+                        "ACP report generation changed during session initialization"
+                    )
+                return harness_client
+            # Resolve the client while holding the same lock that installs the
+            # reporter. A vendor-kill recovery may have closed the client that
+            # the caller obtained before it waited for this lock.
+            harness_client = await process_manager.get_client(
+                session_id, harness_name, env=dict(spawn_env)
+            )
+            if process_manager.get_session_report_subscriber_generation(session_id) != generation:
+                raise RuntimeError(
+                    "ACP report generation changed while resolving its harness client"
+                )
+            if process_manager.get_session_report_subscriber_generation(session_id) != generation:
+                raise RuntimeError("ACP report generation changed during capability negotiation")
+            current = _acp_session_report_subscribers.get(session_id)
+            had_prior_report_subscriber = current is not None
+            if current is not None and current.generation == generation:
+                if not current.is_ready:
+                    raise RuntimeError("ACP report subscriber is not capability-ready")
+                connection_admission_id = _acp_report_connection_admissions.get(session_id)
+                runtime_incarnation = process_manager.get_session_report_runtime_incarnation(
+                    session_id
+                )
+                if connection_admission_id is not None and runtime_incarnation is not None:
+                    await current.refresh_delivery_owner(
+                        connection_admission_id, runtime_incarnation
+                    )
+                try:
+                    await _reclaim_retired_action_origins(session_id, generation)
+                except Exception:
+                    _schedule_action_origin_inventory_retry(session_id, generation)
+                    _logger.warning(
+                        "Could not reclaim retired ACP action origins after report readiness",
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
+                if (
+                    process_manager.get_session_report_subscriber_generation(session_id)
+                    != generation
+                ):
+                    raise RuntimeError("ACP report generation changed during origin recovery")
+                return harness_client
+            if current is not None:
+                await _stop_acp_action_subscriber(session_id)
+                if (
+                    process_manager.get_session_report_subscriber_generation(session_id)
+                    != generation
+                ):
+                    raise RuntimeError("ACP report generation changed while draining old actions")
+                await current.stop(settle=False)
+                _acp_session_report_subscribers.pop(session_id, None)
+                if (
+                    process_manager.get_session_report_subscriber_generation(session_id)
+                    != generation
+                ):
+                    raise RuntimeError("ACP report generation changed while stopping old reports")
+                harness_client = await process_manager.get_client(
+                    session_id, harness_name, env=dict(spawn_env)
+                )
+                if (
+                    process_manager.get_session_report_subscriber_generation(session_id)
+                    != generation
+                ):
+                    raise RuntimeError(
+                        "ACP report generation changed while refreshing its harness client"
+                    )
+            reporting_required = _acp_session_reporting_required()
+            report_channel_supported = await ensure_session_report_capability(
+                parent_id=session_id,
+                harness_client=harness_client,
+                generation=generation,
+                require_full_reporting=reporting_required,
+            )
+            if not report_channel_supported:
+                if expected_generation is not None or had_prior_report_subscriber:
+                    raise RuntimeError(
+                        "ACP report protocol v3 disappeared after this session had opted in"
+                    )
+                if process_manager is None:
+                    raise RuntimeError("ACP report fallback has no process manager")
+                await process_manager.set_session_report_opt_in(session_id, False)
+                harness_client = await process_manager.get_client(
+                    session_id, harness_name, env=dict(spawn_env)
+                )
+                if (
+                    process_manager.get_session_report_subscriber_generation(session_id)
+                    is not None
+                ):
+                    raise RuntimeError("ACP report opt-out did not retire the private generation")
+                return harness_client
+            self_spawn_env = dict(spawn_env)
+            _acp_report_spawn_specs[session_id] = (harness_name, self_spawn_env)
+            subscriber = AcpSessionReportSubscriber(
+                parent_id=session_id,
+                harness_client=harness_client,
+                server_client=server_client,
+                generation=generation,
+                connection_admission_id=connection_admission_id,
+                runtime_incarnation=runtime_incarnation,
+                activity_callback=_publish_acp_background,
+                lease_callback=_set_acp_child_lease,
+                note_activity=process_manager.note_activity,
+                lookup_children=_lookup_acp_children,
+                lookup_associations=_lookup_acp_associations,
+                recover_open_child=_recover_open_acp_child,
+                child_terminal_callback=functools.partial(_acp_child_report_acked, session_id),
+                source_failure_callback=_recover_acp_failed_report_source,
+            )
+            try:
+                await subscriber.start()
+            except Exception:
+                await subscriber.stop(settle=False)
+                raise
+            if process_manager.get_session_report_subscriber_generation(session_id) != generation:
+                await subscriber.stop(settle=False)
+                raise RuntimeError("ACP report generation changed before subscriber readiness")
+            _acp_session_report_subscribers[session_id] = subscriber
+            if subscriber.source_failed:
+                failed_generation = (
+                    generation,
+                    subscriber.source_failure_reason
+                    or "ACP report source failed before readiness.",
+                )
+            else:
+                try:
+                    await _reclaim_retired_action_origins(session_id, generation)
+                except Exception:
+                    _schedule_action_origin_inventory_retry(session_id, generation)
+                    _logger.warning(
+                        "Could not reclaim retired ACP action origins after report readiness",
+                        exc_info=True,
+                        extra={"session_id": session_id},
+                    )
+                if (
+                    process_manager.get_session_report_subscriber_generation(session_id)
+                    != generation
+                ):
+                    raise RuntimeError("ACP report generation changed during origin recovery")
+                return harness_client
+        if failed_generation is not None:
+            failed_gen, reason = failed_generation
+            await _recover_acp_failed_report_source(session_id, failed_gen, reason)
+            return await process_manager.get_client(session_id, harness_name, env=dict(spawn_env))
+        return harness_client
+
+    async def _ensure_acp_report_subscriber(
+        session_id: str,
+        harness_client: httpx.AsyncClient,
+        spawn_env: Mapping[str, str],
+        harness_name: str,
+        *,
+        expected_generation: str | None = None,
+    ) -> httpx.AsyncClient:
+        """Wait for replacement readiness and retry benign generation races.
+
+        Normal prompt paths may have obtained a client immediately before a
+        vendor-killed process is replaced. They wait for the registered
+        recovery task, then retry against the current generation. Recovery
+        tasks pass ``expected_generation`` and remain fenced to their owner.
+        """
+        if process_manager is None:
+            return harness_client
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _ACP_REPORT_RECOVERY_WAIT_SECONDS
+
+        async def _wait_for_recovery(task: asyncio.Task[None]) -> None:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise RuntimeError("Timed out waiting for ACP report readiness recovery")
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                # A superseded recovery task can be cancelled while another
+                # task takes ownership. Re-check the registry below.
+            except TimeoutError as exc:
+                raise RuntimeError("Timed out waiting for ACP report readiness recovery") from exc
+            except Exception:
+                # A failed recovery task must not permanently block a normal
+                # prompt. It can retry initialization against the live
+                # generation below.
+                _logger.warning(
+                    "ACP report recovery task failed before readiness; retrying initialization",
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+
+        while True:
+            if loop.time() >= deadline:
+                raise RuntimeError("Timed out waiting for ACP report subscriber readiness")
+            generation_before = process_manager.get_session_report_subscriber_generation(
+                session_id
+            )
+            if expected_generation is not None and generation_before != expected_generation:
+                raise RuntimeError(
+                    "ACP report recovery lost ownership of the replacement generation"
+                )
+
+            recovery = _acp_report_recovery_tasks.get(session_id)
+            current_task = asyncio.current_task()
+            barrier = _acp_report_readiness_barriers.get(session_id)
+            if barrier is not None and barrier is not current_task and not barrier.done():
+                await _wait_for_recovery(barrier)
+                continue
+            if recovery is not None and recovery[1] is not current_task and not recovery[1].done():
+                await _wait_for_recovery(recovery[1])
+                continue
+
+            try:
+                result = await _ensure_acp_report_subscriber_once(
+                    session_id,
+                    harness_client,
+                    spawn_env,
+                    harness_name,
+                    expected_generation=expected_generation,
+                )
+            except _AcpReportRecoveryPending as pending:
+                await _wait_for_recovery(pending.task)
+                continue
+            except RuntimeError:
+                generation_after = process_manager.get_session_report_subscriber_generation(
+                    session_id
+                )
+                if expected_generation is not None:
+                    raise
+                if generation_after != generation_before:
+                    harness_client = await process_manager.get_client(
+                        session_id, harness_name, env=dict(spawn_env)
+                    )
+                    continue
+                raise
+
+            generation_after = process_manager.get_session_report_subscriber_generation(session_id)
+            if expected_generation is not None and generation_after != expected_generation:
+                raise RuntimeError(
+                    "ACP report recovery lost ownership of the replacement generation"
+                )
+            if generation_after is None:
+                return result
+            reporter = _acp_session_report_subscribers.get(session_id)
+            if (
+                reporter is not None
+                and reporter.generation == generation_after
+                and reporter.is_ready
+            ):
+                return result
+            if expected_generation is None and generation_after != generation_before:
+                harness_client = await process_manager.get_client(
+                    session_id, harness_name, env=dict(spawn_env)
+                )
+                continue
+            raise RuntimeError("ACP report subscriber did not become capability-ready")
+
+    async def _recover_acp_failed_report_source(
+        session_id: str,
+        generation: str | None = None,
+        reason: str = "ACP report/action generation failed.",
+    ) -> None:
+        """Retire a failed generation and await a capability-ready replacement.
+
+        Report-source callbacks arrive only after their durable prefix has been
+        forwarded and acknowledged. Action-channel overflow instead asks the
+        current report subscriber to drain that prefix and fail unfinished
+        children before the harness generation is retired.
+        """
+        if process_manager is None:
+            return
+        expected = generation or process_manager.get_session_report_subscriber_generation(
+            session_id
+        )
+        if expected is None:
+            raise RuntimeError("ACP recovery has no live harness generation")
+        current_task = asyncio.current_task()
+        recovery = _acp_report_recovery_tasks.get(session_id)
+        if recovery is not None and recovery[1] is not current_task and not recovery[1].done():
+            await recovery[1]
+            reporter = _acp_session_report_subscribers.get(session_id)
+            live_generation = process_manager.get_session_report_subscriber_generation(session_id)
+            if (
+                reporter is not None
+                and reporter.generation == live_generation
+                and reporter.is_ready
+            ):
+                return
+
+        lock = _acp_process_exit_recovery_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            live_generation = process_manager.get_session_report_subscriber_generation(session_id)
+            reporter = _acp_session_report_subscribers.get(session_id)
+            if live_generation != expected:
+                if (
+                    reporter is not None
+                    and reporter.generation == live_generation
+                    and reporter.is_ready
+                ):
+                    return
+                later_recovery = _acp_report_recovery_tasks.get(session_id)
+                if (
+                    later_recovery is not None
+                    and later_recovery[1] is not current_task
+                    and not later_recovery[1].done()
+                ):
+                    await later_recovery[1]
+                    reporter = _acp_session_report_subscribers.get(session_id)
+                    live_generation = process_manager.get_session_report_subscriber_generation(
+                        session_id
+                    )
+                    if (
+                        reporter is not None
+                        and reporter.generation == live_generation
+                        and reporter.is_ready
+                    ):
+                        return
+                raise RuntimeError("ACP recovery lost ownership of its failed generation")
+
+            spec = _acp_report_spawn_specs.get(session_id)
+            if spec is None:
+                raise RuntimeError("ACP report recovery has no recorded harness spawn spec")
+            harness_name, spawn_env = spec
+            if reporter is not None and reporter.generation == expected:
+                # The source-failure path has already drained reports and
+                # settled children. Action overflow has not, so drain here.
+                await reporter.stop(
+                    settle=not reporter.source_failure_settled,
+                    reason=reason,
+                )
+                _acp_session_report_subscribers.pop(session_id, None)
+            await _stop_acp_action_subscriber(session_id)
+            await _settle_generation_action_origins(
+                session_id,
+                expected,
+                finish_generation=True,
+                schedule_retries=False,
+                handlers_drained=True,
+            )
+
+            recovery_entry = _acp_report_recovery_tasks.get(session_id)
+            if recovery_entry is not None and recovery_entry[1] is not current_task:
+                recovery_entry[1].cancel()
+                _acp_report_recovery_tasks.pop(session_id, None)
+            if current_task is not None:
+                _acp_report_recovery_tasks[session_id] = (expected, current_task)
+            try:
+                await process_manager.release(
+                    session_id,
+                    can_release=lambda: (
+                        process_manager.get_session_report_subscriber_generation(session_id)
+                        == expected
+                    ),
+                )
+                for attempt, delay in enumerate((0.0, 0.25, 1.0), start=1):
+                    if delay:
+                        await asyncio.sleep(delay)
+                    try:
+                        client = await process_manager.get_client(
+                            session_id, harness_name, env=spawn_env
+                        )
+                        replacement_generation = (
+                            process_manager.get_session_report_subscriber_generation(session_id)
+                        )
+                        if replacement_generation is None:
+                            raise RuntimeError("replacement ACP harness has no report generation")
+                        await _ensure_acp_report_subscriber(
+                            session_id,
+                            client,
+                            spawn_env,
+                            harness_name,
+                            expected_generation=replacement_generation,
+                        )
+                        replacement = _acp_session_report_subscribers.get(session_id)
+                        if (
+                            replacement is None
+                            or replacement.generation != replacement_generation
+                            or not replacement.is_ready
+                        ):
+                            raise RuntimeError(
+                                "replacement ACP report subscriber did not become ready"
+                            )
+                        _schedule_generation_action_origin_retries(session_id, expected)
+                        _logger.warning(
+                            "Recovered failed ACP report/action generation",
+                            extra={"session_id": session_id},
+                        )
+                        return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        if attempt == 3:
+                            raise
+                        _logger.warning(
+                            "ACP replacement generation is not ready; retrying",
+                            exc_info=True,
+                            extra={"session_id": session_id},
+                        )
+                        replacement_generation = (
+                            process_manager.get_session_report_subscriber_generation(session_id)
+                        )
+                        if replacement_generation is not None:
+                            await process_manager.release(
+                                session_id,
+                                can_release=lambda generation=replacement_generation: (
+                                    process_manager.get_session_report_subscriber_generation(
+                                        session_id
+                                    )
+                                    == generation
+                                ),
+                            )
+                raise RuntimeError("ACP replacement recovery exhausted its readiness retries")
+            finally:
+                entry = _acp_report_recovery_tasks.get(session_id)
+                if entry is not None and entry[1] is current_task:
+                    _acp_report_recovery_tasks.pop(session_id, None)
+
+    app.state.recover_acp_failed_report_source = _recover_acp_failed_report_source
+
+    async def _retry_acp_report_subscriber(
+        session_id: str,
+        expected_generation: str,
+        harness_name: str,
+        spawn_env: dict[str, str],
+    ) -> None:
+        delay = 0.5
+        try:
+            while process_manager is not None:
+                if (
+                    process_manager.get_session_report_subscriber_generation(session_id)
+                    != expected_generation
+                ):
+                    return
+                try:
+                    client = await process_manager.get_client(
+                        session_id, harness_name, env=spawn_env
+                    )
+                    if (
+                        process_manager.get_session_report_subscriber_generation(session_id)
+                        != expected_generation
+                    ):
+                        return
+                    await _ensure_acp_report_subscriber(
+                        session_id,
+                        client,
+                        spawn_env,
+                        harness_name,
+                        expected_generation=expected_generation,
+                    )
+                    reporter = _acp_session_report_subscribers.get(session_id)
+                    if (
+                        reporter is None
+                        or reporter.generation != expected_generation
+                        or not reporter.is_ready
+                    ):
+                        raise RuntimeError(
+                            "replacement ACP report subscriber did not become ready"
+                        )
+                    _finish_retired_action_origins(session_id, expected_generation)
+                    await _settle_generation_action_origins(
+                        session_id,
+                        finished_only=True,
+                        handlers_drained=True,
+                    )
+                    _logger.warning(
+                        "Recovered ACP child-report subscriber for replacement generation",
+                        extra={"session_id": session_id},
+                    )
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _logger.exception(
+                        "ACP replacement reporter initialization failed; retrying",
+                        extra={"session_id": session_id},
+                    )
+                retry_wait = getattr(app.state, "acp_report_recovery_wait", asyncio.sleep)
+                await retry_wait(delay)
+                delay = min(delay * 2, 30.0)
+        finally:
+            entry = _acp_report_recovery_tasks.get(session_id)
+            if entry is not None and entry[1] is asyncio.current_task():
+                _acp_report_recovery_tasks.pop(session_id, None)
+            if _acp_report_readiness_barriers.get(session_id) is asyncio.current_task():
+                _acp_report_readiness_barriers.pop(session_id, None)
+
+    def _schedule_acp_report_recovery(
+        session_id: str,
+        expected_generation: str,
+        harness_name: str,
+        spawn_env: Mapping[str, str],
+    ) -> None:
+        previous = _acp_report_recovery_tasks.get(session_id)
+        if previous is not None:
+            if previous[0] == expected_generation and not previous[1].done():
+                return
+            previous[1].cancel()
+        task = asyncio.create_task(
+            _retry_acp_report_subscriber(
+                session_id, expected_generation, harness_name, dict(spawn_env)
+            ),
+            name=f"acp-report-recovery:{session_id}:{expected_generation}",
+        )
+        _acp_report_recovery_tasks[session_id] = (expected_generation, task)
+        _acp_report_readiness_barriers[session_id] = task
+
+    # Expose the hook when the app is built; stop paths must not be the first
+    # place it becomes available to process-manager exit watchers.
+    app.state.schedule_acp_report_recovery = _schedule_acp_report_recovery
+
+    async def _recover_acp_harness_exit_task(
+        session_id: str,
+        failed_generation: str,
+        returncode: int | None,
+    ) -> None:
+        if process_manager is None:
+            return
+        lock = _acp_process_exit_recovery_locks.setdefault(session_id, asyncio.Lock())
+        try:
+            async with lock:
+                current_generation = process_manager.get_session_report_subscriber_generation(
+                    session_id
+                )
+                if current_generation is None:
+                    return
+                current = _acp_session_report_subscribers.get(session_id)
+                if current_generation == failed_generation and current is not None:
+                    await _stop_acp_action_subscriber(session_id)
+                    await current.stop(settle=False)
+                    _acp_session_report_subscribers.pop(session_id, None)
+                elif (
+                    current is not None
+                    and current.generation == current_generation
+                    and current.is_ready
+                ):
+                    return
+                spec = _acp_report_spawn_specs.get(session_id)
+                if spec is None:
+                    raise RuntimeError(
+                        "ACP harness exited before its recovery spawn spec was recorded"
+                    )
+                harness_name, spawn_env = spec
+
+            delay = 0.5
+            while True:
+                try:
+                    client = await process_manager.get_client(
+                        session_id, harness_name, env=spawn_env
+                    )
+                    replacement_generation = (
+                        process_manager.get_session_report_subscriber_generation(session_id)
+                    )
+                    if replacement_generation is None:
+                        raise RuntimeError("replacement ACP harness has no report generation")
+                    await _ensure_acp_report_subscriber(
+                        session_id,
+                        client,
+                        spawn_env,
+                        harness_name,
+                        expected_generation=replacement_generation,
+                    )
+                    replacement = _acp_session_report_subscribers.get(session_id)
+                    if (
+                        replacement is None
+                        or replacement.generation != replacement_generation
+                        or not replacement.is_ready
+                    ):
+                        raise RuntimeError(
+                            "replacement ACP report subscriber did not become ready"
+                        )
+                    _finish_retired_action_origins(session_id, replacement_generation)
+                    await _settle_generation_action_origins(
+                        session_id,
+                        finished_only=True,
+                        handlers_drained=True,
+                    )
+                    _logger.info(
+                        "Recovered ACP child-report subscriber for replacement generation "
+                        "after harness exit (returncode=%s)",
+                        returncode,
+                        extra={"session_id": session_id},
+                    )
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _logger.exception(
+                        "ACP exit recovery has not reached report readiness; retrying",
+                        extra={"session_id": session_id},
+                    )
+                retry_wait = getattr(app.state, "acp_report_recovery_wait", asyncio.sleep)
+                await retry_wait(delay)
+                delay = min(delay * 2, 30.0)
+        finally:
+            entry = _acp_report_recovery_tasks.get(session_id)
+            if entry is not None and entry[1] is asyncio.current_task():
+                _acp_report_recovery_tasks.pop(session_id, None)
+            if _acp_report_readiness_barriers.get(session_id) is asyncio.current_task():
+                _acp_report_readiness_barriers.pop(session_id, None)
+
+    async def _recover_acp_harness_exit(
+        session_id: str, generation: str, returncode: int | None
+    ) -> None:
+        if process_manager is None:
+            return
+        # Install the readiness barrier before any await. The process manager
+        # may cancel its exit watcher as soon as the replacement is spawned,
+        # so the recovery must own an independent task from the outset.
+        previous = _acp_report_recovery_tasks.get(session_id)
+        if previous is not None:
+            if previous[0] == generation and not previous[1].done():
+                return
+            previous[1].cancel()
+        task = asyncio.create_task(
+            _recover_acp_harness_exit_task(session_id, generation, returncode),
+            name=f"acp-report-exit-recovery:{session_id}:{generation}",
+        )
+        _acp_report_recovery_tasks[session_id] = (generation, task)
+        _acp_report_readiness_barriers[session_id] = task
+
+    async def _stop_acp_report_subscriber(session_id: str, *, settle: bool = True) -> None:
+        inventory_retry = _acp_action_origin_inventory_retry_tasks.pop(session_id, None)
+        if inventory_retry is not None and inventory_retry is not asyncio.current_task():
+            inventory_retry.cancel()
+            await asyncio.gather(inventory_retry, return_exceptions=True)
+        recovery = _acp_report_recovery_tasks.pop(session_id, None)
+        barrier = _acp_report_readiness_barriers.pop(session_id, None)
+        current_task = asyncio.current_task()
+        recovery_task = recovery[1] if recovery is not None else None
+        tasks_to_cancel = {
+            task
+            for task in (recovery_task, barrier)
+            if task is not None and task is not current_task
+        }
+        for task in tasks_to_cancel:
+            task.cancel()
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+        subscriber = _acp_session_report_subscribers.pop(session_id, None)
+        if subscriber is not None:
+            try:
+                await asyncio.wait_for(subscriber.stop(settle=settle), timeout=15.0)
+            except Exception:
+                _logger.warning(
+                    "ACP report subscriber teardown did not settle cleanly",
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+        await _stop_acp_action_subscriber(session_id)
+        _acp_action_origin_inventory_generations.pop(session_id, None)
+        if settle:
+            await _settle_generation_action_origins(
+                session_id,
+                subscriber.generation if subscriber is not None else None,
+                handlers_drained=True,
+            )
+            _sessions_with_background_acp.discard(session_id)
+            _report_combined_background_state(session_id)
 
     resource_registry.set_session_background_publisher(_publish_session_background)
 
@@ -2125,6 +3685,7 @@ def create_runner_app(
             if not _still_owns_session():
                 return
             try:
+                await _stop_acp_report_subscriber(session_id, settle=True)
                 await process_manager.release(
                     session_id,
                     expected_client=expected_client,
@@ -2522,6 +4083,7 @@ def create_runner_app(
             cached[1].snapshot.labels[BRIDGE_ID_LABEL_KEY] = bridge_id
         # The next turn respawns the harness with the new bridge dir.
         if process_manager is not None:
+            await _stop_acp_report_subscriber(session_id, settle=True)
             await process_manager.release(session_id)
 
     async def _load_session_init_context(
@@ -2798,6 +4360,15 @@ def create_runner_app(
             )
         session_id = cast(str, session_id)
         agent_id = cast(str, agent_id)
+        # Report-subscriber startup can replay durable child completions and
+        # recover children from a prior runner generation before init reaches
+        # harness creation below. Provision the parent's local inbox before the
+        # first await so those callbacks have a delivery target; this does not
+        # start a parent turn or prompt the harness.
+        if session_id not in _session_event_queues:
+            _session_event_queues[session_id] = asyncio.Queue()
+        if session_id not in _session_inboxes:
+            _session_inboxes[session_id] = asyncio.Queue()
         initial_turn_epoch = _turn_bind_epoch.get(session_id)
         initial_native_activity = resource_registry.session_activity_epoch(session_id)
         initially_active = session_id in _active_turns or resource_registry.session_turn_is_active(
@@ -2827,6 +4398,7 @@ def create_runner_app(
                     ),
                 },
             )
+
         except ValueError:
             _logger.error(
                 "Runner session initialization failed",
@@ -2844,6 +4416,21 @@ def create_runner_app(
                     "detail": "Invalid session initialization envelope.",
                 },
             )
+
+        report_attempt_id = getattr(
+            init_context.envelope, "acp_report_connection_attempt_id", None
+        )
+        if isinstance(report_attempt_id, str) and report_attempt_id:
+            response = await server_client.post(
+                f"/v1/sessions/{quote(session_id, safe='')}/events",
+                json={
+                    "type": "external_acp_report_connection_admit",
+                    "data": {"attempt_id": report_attempt_id},
+                },
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            _acp_report_connection_admissions[session_id] = report_attempt_id
 
         # Stamp the session's Smart Routing class before anything reads it: the
         # spawn env is rebuilt on every harness respawn, long after this
@@ -3017,10 +4604,20 @@ def create_runner_app(
             spawn_env = None
 
         try:
-            await process_manager.get_client(
+            if await _server_supports_acp_session_reporting():
+                await process_manager.set_session_report_opt_in(session_id, True)
+            else:
+                await process_manager.set_session_report_opt_in(session_id, False)
+            harness_client = await process_manager.get_client(
                 session_id,
                 harness_name,
                 env=spawn_env,
+            )
+            await _ensure_acp_report_subscriber(
+                session_id,
+                harness_client,
+                spawn_env if isinstance(spawn_env, Mapping) else {},
+                harness_name,
             )
         except RuntimeError as exc:
             _logger.error(
@@ -3063,10 +4660,6 @@ def create_runner_app(
             # never torn down out from under it; the entry init itself just
             # registered predates the cutoff and is released.
             await process_manager.release(session_id, only_if_idle_cutoff=time.monotonic())
-        if session_id not in _session_event_queues:
-            _session_event_queues[session_id] = asyncio.Queue()
-        if session_id not in _session_inboxes:
-            _session_inboxes[session_id] = asyncio.Queue()
         # A fresh queue can mean a fresh runner process rather than a fresh
         # session: re-queue results the previous process never drained. Start
         # the durable server scan now, but overlap it with terminal creation;
@@ -3817,6 +5410,7 @@ def create_runner_app(
             queue.put_nowait(None)
 
         if process_manager is not None:
+            await _stop_acp_report_subscriber(session_id, settle=True)
             await process_manager.release(session_id)
 
         await resource_registry.cleanup_session(session_id)
@@ -4331,6 +5925,18 @@ def create_runner_app(
             )
             return
 
+        active_origin = _acp_active_action_origin.pop(conv_id, None)
+        if active_origin is not None:
+            origin_token, origin_generation = active_origin
+            origin_states = _acp_action_origin_generations.get(conv_id)
+            if origin_states is not None:
+                bound_generation, _turn_finished = origin_states.get(
+                    origin_token, (origin_generation, False)
+                )
+                if bound_generation == origin_generation:
+                    origin_states[origin_token] = (origin_generation, True)
+            _schedule_finished_origin_cleanup(conv_id)
+
         _active_turns.pop(conv_id, None)
         _turn_pending_ids.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
@@ -4729,6 +6335,8 @@ def create_runner_app(
     # — they simply fall back to the orphan-callback backstop.
     if process_manager is not None and hasattr(process_manager, "set_respawn_hook"):
         process_manager.set_respawn_hook(_resync_turn_state_on_harness_respawn)
+    if process_manager is not None and hasattr(process_manager, "set_process_exit_hook"):
+        process_manager.set_process_exit_hook(_recover_acp_harness_exit)
 
     async def _claude_prompt_bridge_dir(session_id: str) -> Path:
         """Resolve the bridge label before inspecting a native prompt."""
@@ -5914,6 +7522,14 @@ def create_runner_app(
             "role": "user",
             "model": msg_body.get("model", ""),
         }
+        # Detached ACP actions outlive this parent prompt. Keep the server-issued
+        # origin handle and authenticated actor when narrowing the runner event
+        # into the harness request; `_stream_message_to_harness` binds the handle
+        # to this harness generation before it sends the prompt.
+        for _field in ("_omnigent_action_origin_token", "caller_user_id"):
+            _value = msg_body.get(_field)
+            if _value is not None:
+                harness_body[_field] = _value
         _authorized_shell = msg_body.get("authorized_native_shell_command")
         if isinstance(_authorized_shell, str):
             harness_body["authorized_native_shell_command"] = _authorized_shell
@@ -6336,6 +7952,7 @@ def create_runner_app(
         )
         if agent_version is not None and conv_id in _version_cache:
             if agent_version > _version_cache[conv_id]:
+                await _stop_acp_report_subscriber(conv_id, settle=True)
                 await manager.release(conv_id)
         if agent_version is not None:
             _version_cache[conv_id] = agent_version
@@ -6376,7 +7993,26 @@ def create_runner_app(
         # earlier stream; only exits observed from here on can end this one.
         _required_terminal_exit_errors.pop(conv_id, None)
         _clean_terminal_exit_responses.pop(conv_id, None)
+        _require_full_acp_reporting = False
         try:
+            _require_full_acp_reporting = _acp_session_reporting_required()
+            if harness_name == "acp" or harness_name.startswith("acp:"):
+                _server_reporting_supported = await _server_supports_acp_session_reporting()
+                if _require_full_acp_reporting and not _server_reporting_supported:
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "error": "acp_session_reporting_required",
+                            "detail": (
+                                f"{_ACP_SESSION_REPORTING_REQUIRED_ENV}=true, but the configured "
+                                "server does not advertise ACP report protocol v3."
+                            ),
+                        },
+                    )
+                await manager.set_session_report_opt_in(
+                    conv_id,
+                    _server_reporting_supported,
+                )
             client = await manager.get_client(conv_id, harness_name, env=spawn_env)
         except RuntimeError as exc:
             return JSONResponse(
@@ -6384,6 +8020,27 @@ def create_runner_app(
                 content={
                     "error": "harness_spawn_failed",
                     "detail": _client_safe_error_detail(exc, context="harness spawn"),
+                },
+            )
+        try:
+            client = await _ensure_acp_report_subscriber(
+                conv_id,
+                client,
+                spawn_env if isinstance(spawn_env, Mapping) else {},
+                harness_name,
+            )
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            _logger.error(
+                "ACP session-report channel is unavailable for %s",
+                conv_id,
+                exc_info=True,
+                extra={"session_id": conv_id},
+            )
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "acp_session_reports_unavailable",
+                    "detail": _client_safe_error_detail(exc, context="ACP session reporting"),
                 },
             )
 
@@ -6506,6 +8163,10 @@ def create_runner_app(
                 should_dispatch_locally,
             )
 
+            # If origin cleanup replaces the harness, use the capability-ready
+            # return value for this prompt stream and its action handlers.
+            stream_client = client
+
             turn_input_identity = _input_identity(body)
 
             if _eager_spec_error is not None:
@@ -6590,7 +8251,609 @@ def create_runner_app(
             _ds_sa = _session_sub_agent_names.get(conv_id)
             if _ds_sa and _session_sub_agent_resolved.get(conv_id) is False:
                 _warn_unresolved_sub_agent(conv_id, _ds_sa)
+            # A detached ACP child request outlives this proxy stream. Bind its
+            # action dispatcher to this turn's resolved execution context once;
+            # later parent turns cannot replace its spec, caller, agent, cwd, or
+            # MCP credentials. Action polling is independent of durable reports.
+            if isinstance(body.get("_omnigent_action_origin_token"), str):
+                await _settle_finished_action_origins(conv_id)
+                stream_client = await manager.get_client(conv_id, harness_name, env=spawn_env)
+                stream_client = await _ensure_acp_report_subscriber(
+                    conv_id,
+                    stream_client,
+                    spawn_env if isinstance(spawn_env, Mapping) else {},
+                    harness_name,
+                )
+            _action_generation = (
+                process_manager.get_session_report_subscriber_generation(conv_id)
+                if process_manager is not None
+                else None
+            )
+            _action_context_generation: str | None = None
+            _raw_action_origin_token = body.get("_omnigent_action_origin_token")
+            if _raw_action_origin_token is not None and (
+                not isinstance(_raw_action_origin_token, str)
+                or re.fullmatch(r"[0-9a-f]{32}", _raw_action_origin_token) is None
+            ):
+                raise RuntimeError("server supplied a malformed ACP action origin handle")
+            _action_origin_token = cast(str | None, _raw_action_origin_token)
+            _action_origin_snapshot: dict[str, Any] | None = None
+
+            async def _settle_action_origin() -> None:
+                if _action_origin_token is None or _action_generation is None:
+                    return
+                await _settle_acp_action_origin(
+                    conv_id,
+                    _action_origin_token,
+                    _action_generation,
+                    handlers_drained=True,
+                )
+
+            if _action_origin_token is not None and _action_generation is None:
+                try:
+                    _discard_resp = await server_client.post(
+                        f"/v1/sessions/{conv_id}/action-origins/{_action_origin_token}/discard",
+                        json={},
+                        timeout=10.0,
+                    )
+                    _discard_resp.raise_for_status()
+                except Exception:
+                    _logger.warning(
+                        "ACP action origin discard failed",
+                        exc_info=True,
+                        extra={"session_id": conv_id},
+                    )
+                _action_origin_token = None
+
+            if _action_generation is not None and _action_origin_token is not None:
+                try:
+                    _bind_resp = await server_client.post(
+                        f"/v1/sessions/{conv_id}/action-origins/{_action_origin_token}/bind",
+                        json={"generation": _action_generation},
+                        timeout=10.0,
+                    )
+                    _bind_resp.raise_for_status()
+                    _bind_result = _bind_resp.json()
+                    if not isinstance(_bind_result, dict) or _bind_result.get("bound") is not True:
+                        raise RuntimeError("server did not bind the ACP action origin")
+                    _action_origin_snapshot = _bind_result
+                    _acp_action_origin_generations.setdefault(conv_id, {})[
+                        _action_origin_token
+                    ] = (_action_generation, False)
+                    _acp_active_action_origin[conv_id] = (
+                        _action_origin_token,
+                        _action_generation,
+                    )
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        _discard_resp = await server_client.post(
+                            f"/v1/sessions/{conv_id}/action-origins/"
+                            f"{_action_origin_token}/discard",
+                            json={},
+                            timeout=10.0,
+                        )
+                        _discard_resp.raise_for_status()
+                    raise
+
+            if _action_generation is not None and _action_origin_token is not None:
+                _action_harness_client_live = stream_client
+                if not _turn_spec_resolved:
+                    await _resolve_turn_spec_lazy()
+                import copy as _copy
+
+                _action_spec_entry = (
+                    _turn_spec_entry if _turn_spec_entry is not None else _turn_spec
+                )
+                try:
+                    # ResolvedSpec delegates missing attributes through
+                    # __getattr__; deepcopy's reconstruction probes those
+                    # attributes before ``spec`` is restored and can recurse
+                    # indefinitely. Clone the actual parsed AgentSpec, then
+                    # rebuild the small wrapper explicitly so detached child
+                    # work owns an immutable turn snapshot.
+                    if isinstance(_action_spec_entry, ResolvedSpec):
+                        _action_spec_entry = ResolvedSpec(
+                            spec=_copy.deepcopy(_action_spec_entry.spec),
+                            workdir=_action_spec_entry.workdir,
+                            bundle_location=_action_spec_entry.bundle_location,
+                            operator_authored=_action_spec_entry.operator_authored,
+                            effective_spec_digest=_action_spec_entry.effective_spec_digest,
+                            operator_environment_digest=(
+                                _action_spec_entry.operator_environment_digest
+                            ),
+                            mcp_selection_snapshot=(
+                                _copy.deepcopy(_action_spec_entry.mcp_selection_snapshot)
+                            ),
+                        )
+                    else:
+                        _action_spec_entry = _copy.deepcopy(_action_spec_entry)
+                except Exception as _action_snapshot_error:
+                    _logger.exception(
+                        "Could not freeze ACP action spec for detached child work",
+                        exc_info=True,
+                        extra={"session_id": conv_id},
+                    )
+                    _error = {
+                        "message": "ACP child execution context could not be frozen safely.",
+                        "type": type(_action_snapshot_error).__name__,
+                        "undelivered": True,
+                    }
+                    _publish_event(
+                        conv_id,
+                        _response_failed_payload(_error, input_identity=turn_input_identity),
+                    )
+                    _on_proxy_stream_end(conv_id, error=_error)
+                    await _settle_action_origin()
+                    yield _response_failed_event(_error, input_identity=turn_input_identity)
+                    return
+                _action_agent_id = _turn_agent_id or cast(str | None, body.get("agent_id"))
+                _action_caller_user_id = body.get("caller_user_id")
+                _origin_mismatch_fields: list[str] = []
+                if _action_origin_snapshot is None:
+                    _origin_mismatch_fields.append("origin_snapshot")
+                elif not isinstance(_action_spec_entry, ResolvedSpec):
+                    _origin_mismatch_fields.append("resolved_spec")
+                else:
+                    for _field, _actual in (
+                        ("bundle_location", _action_spec_entry.bundle_location),
+                        ("operator_authored", _action_spec_entry.operator_authored),
+                        ("effective_spec_digest", _action_spec_entry.effective_spec_digest),
+                        (
+                            "operator_environment_digest",
+                            _action_spec_entry.operator_environment_digest,
+                        ),
+                        ("mcp_selection_snapshot", _action_spec_entry.mcp_selection_snapshot),
+                    ):
+                        if _actual != _action_origin_snapshot.get(_field):
+                            _origin_mismatch_fields.append(_field)
+                    _expected_provenance = (
+                        "operator" if _action_spec_entry.operator_authored else "tenant"
+                    )
+                    if _action_origin_snapshot.get("agent_provenance") != _expected_provenance:
+                        _origin_mismatch_fields.append("agent_provenance")
+                if _action_agent_id != (
+                    _action_origin_snapshot.get("agent_id")
+                    if _action_origin_snapshot is not None
+                    else None
+                ):
+                    _origin_mismatch_fields.append("agent_id")
+                if _action_caller_user_id != (
+                    _action_origin_snapshot.get("actor")
+                    if _action_origin_snapshot is not None
+                    else None
+                ):
+                    _origin_mismatch_fields.append("actor")
+                if _action_origin_snapshot is not None and isinstance(
+                    _action_spec_entry, ResolvedSpec
+                ):
+                    from omnigent.session_action_origin import (
+                        effective_policy_scope_digest,
+                        session_action_context_generation,
+                    )
+
+                    try:
+                        _policy_scope_digest = effective_policy_scope_digest(
+                            _action_spec_entry.spec
+                        )
+                        if (
+                            _action_origin_snapshot.get("session_id") != conv_id
+                            or _action_origin_snapshot.get("policy_scope_digest")
+                            != _policy_scope_digest
+                        ):
+                            _origin_mismatch_fields.append("policy_scope")
+                        _access_scope = _action_origin_snapshot.get("access_scope")
+                        _credential_identity_refs = _action_origin_snapshot.get(
+                            "credential_identity_refs"
+                        )
+                        _workspace_id = _action_origin_snapshot.get("workspace_id")
+                        _runner_id = _action_origin_snapshot.get("runner_id")
+                        _actor = _action_origin_snapshot.get("actor")
+                        _credential_principal = _action_origin_snapshot.get("credential_principal")
+                        _origin_agent_id = _action_origin_snapshot.get("agent_id")
+                        _bundle_location = _action_origin_snapshot.get("bundle_location")
+                        _agent_provenance = _action_origin_snapshot.get("agent_provenance")
+                        _operator_authored = _action_origin_snapshot.get("operator_authored")
+                        _effective_spec_digest = _action_origin_snapshot.get(
+                            "effective_spec_digest"
+                        )
+                        _operator_environment_digest = _action_origin_snapshot.get(
+                            "operator_environment_digest"
+                        )
+                        _mcp_selection_raw = _action_origin_snapshot.get("mcp_selection_snapshot")
+                        if (
+                            isinstance(_workspace_id, bool)
+                            or not isinstance(_workspace_id, int)
+                            or not isinstance(_runner_id, str)
+                            or not _runner_id
+                            or not isinstance(_actor, str)
+                            or not _actor
+                            or not isinstance(_credential_principal, str)
+                            or not _credential_principal
+                            or not isinstance(_origin_agent_id, str)
+                            or not _origin_agent_id
+                            or not isinstance(_bundle_location, str)
+                            or not _bundle_location
+                            or _agent_provenance not in {"operator", "tenant"}
+                            or not isinstance(_operator_authored, bool)
+                            or not isinstance(_effective_spec_digest, str)
+                            or not _effective_spec_digest
+                            or not isinstance(_operator_environment_digest, str)
+                            or not _operator_environment_digest
+                            or not isinstance(_mcp_selection_raw, dict)
+                            or not isinstance(_access_scope, dict)
+                            or not isinstance(_credential_identity_refs, dict)
+                        ):
+                            raise ValueError("action origin security scope is incomplete")
+                        _mcp_selection_snapshot: dict[str, str] = {}
+                        for key, value in _mcp_selection_raw.items():
+                            if not isinstance(key, str) or not isinstance(value, str):
+                                raise ValueError("action origin MCP selection is malformed")
+                            _mcp_selection_snapshot[key] = value
+                        _validated_access_scope: dict[str, object] = {}
+                        for key, value in _access_scope.items():
+                            if not isinstance(key, str):
+                                raise ValueError("action origin access scope is malformed")
+                            _validated_access_scope[key] = value
+                        _validated_credential_refs: dict[str, object] = {}
+                        for key, value in _credential_identity_refs.items():
+                            if not isinstance(key, str):
+                                raise ValueError(
+                                    "action origin credential references are malformed"
+                                )
+                            _validated_credential_refs[key] = value
+                        _action_context_generation = session_action_context_generation(
+                            workspace_id=_workspace_id,
+                            root_conversation_id=conv_id,
+                            runner_id=_runner_id,
+                            actor=_actor,
+                            credential_principal=_credential_principal,
+                            agent_id=_origin_agent_id,
+                            bundle_location=_bundle_location,
+                            agent_provenance=_agent_provenance,
+                            operator_authored=_operator_authored,
+                            effective_spec_digest=_effective_spec_digest,
+                            operator_environment_digest=_operator_environment_digest,
+                            policy_scope_digest=_policy_scope_digest,
+                            mcp_selection_snapshot=_mcp_selection_snapshot,
+                            access_scope=_validated_access_scope,
+                            credential_identity_refs=_validated_credential_refs,
+                        )
+                        if (
+                            _action_origin_snapshot.get("context_generation")
+                            != _action_context_generation
+                        ):
+                            _origin_mismatch_fields.append("context_generation")
+                    except (TypeError, ValueError):
+                        _origin_mismatch_fields.append("context_fingerprint")
+                        _action_context_generation = None
+                if _origin_mismatch_fields:
+                    _logger.error(
+                        "ACP action origin no longer matches the resolved turn context; "
+                        "mismatched fields: %s",
+                        ", ".join(_origin_mismatch_fields),
+                        extra={
+                            "session_id": conv_id,
+                            "mismatch_fields": tuple(_origin_mismatch_fields),
+                        },
+                    )
+                    _error = {
+                        "message": (
+                            "The turn's agent configuration changed before the runner "
+                            "could start it. Please retry the message."
+                        ),
+                        "type": "action_origin_spec_mismatch",
+                        "undelivered": True,
+                    }
+                    _publish_event(
+                        conv_id,
+                        _response_failed_payload(_error, input_identity=turn_input_identity),
+                    )
+                    _on_proxy_stream_end(conv_id, error=_error)
+                    await _settle_action_origin()
+                    yield _response_failed_event(_error, input_identity=turn_input_identity)
+                    return
+                _action_spec = _unwrap_resolved_spec(_action_spec_entry)
+                if not isinstance(_action_caller_user_id, str):
+                    _action_caller_user_id = None
+                _action_agent_name = body.get("model")
+                if not isinstance(_action_agent_name, str):
+                    _action_agent_name = None
+                _action_workspace = await _session_runtime_cwd(conv_id)
+                _action_workdir = _resolved_workdir_for_spec(_action_spec_entry, _action_workspace)
+                _action_task_id = body.get("task_id")
+                if not isinstance(_action_task_id, str) or not _action_task_id:
+                    _action_task_id = conv_id
+                if isinstance(_action_spec, AgentSpec) and _action_origin_token is not None:
+                    _acp_session_action_contexts.setdefault(conv_id, {})[_action_origin_token] = (
+                        SessionActionMcpContext(
+                            spec=_action_spec,
+                            workdir=_action_workdir,
+                            runner_workspace=_action_workspace,
+                            agent_id=_action_agent_id,
+                            caller_user_id=_action_caller_user_id,
+                            generation=_action_generation,
+                        )
+                    )
+                _action_mcp = ProxyMcpManager(
+                    conv_id,
+                    server_client,
+                    publish_event=_publish_event,
+                    execution_registry=mcp_execution_registry,
+                    action_context_token=_action_origin_token,
+                    action_context_generation=_action_generation,
+                    action_caller_user_id=_action_caller_user_id,
+                    on_approval_registered=functools.partial(
+                        _remember_acp_action_approval, conv_id
+                    ),
+                )
+                _action_mcp_names: set[str] = set()
+                if _action_spec is not None and getattr(_action_spec, "mcp_servers", None):
+                    try:
+                        _action_mcp_result = await _action_mcp.schemas_for(
+                            cast(AgentSpec, _action_spec)
+                        )
+                        _action_mcp_names = set(_action_mcp_result.tool_names)
+                        for _action_server, _action_error in _action_mcp_result.failures.items():
+                            _logger.warning(
+                                "ACP action MCP server %r unavailable: %s",
+                                _action_server,
+                                _action_error,
+                                extra={"session_id": conv_id},
+                            )
+                    except Exception:
+                        _logger.exception(
+                            "ACP action MCP schema resolution failed",
+                            extra={"session_id": conv_id},
+                        )
+
+                async def _validated_acp_action_child(
+                    _action: dict[str, Any],
+                ) -> tuple[str, str]:
+                    if (
+                        not isinstance(_action_origin_token, str)
+                        or not _action_origin_token
+                        or not isinstance(_action_generation, str)
+                        or not _action_generation
+                        or not isinstance(_action_context_generation, str)
+                        or not _action_context_generation
+                    ):
+                        raise RuntimeError("ACP child action has no active trusted origin")
+                    _child = _action.get("child")
+                    if (
+                        not isinstance(_child, dict)
+                        or _child.get("origin_token") != _action_origin_token
+                        or _child.get("origin_generation") != _action_generation
+                        or _child.get("context_generation") != _action_context_generation
+                    ):
+                        raise RuntimeError("ACP child action has a stale or mismatched origin")
+                    _native_epoch = _child.get("native_epoch")
+                    _native_session_id = _child.get("native_session_id")
+                    _run_id = _child.get("run_id")
+                    _association_source_id = _child.get("association_source_id")
+                    _child_context_generation = _child.get("context_generation")
+                    if not all(
+                        isinstance(_value, str) and _value
+                        for _value in (
+                            _native_epoch,
+                            _native_session_id,
+                            _run_id,
+                            _association_source_id,
+                            _child_context_generation,
+                        )
+                    ):
+                        raise RuntimeError(
+                            "ACP child action has an incomplete association binding"
+                        )
+                    _reporter = _acp_session_report_subscribers.get(conv_id)
+                    if (
+                        _reporter is None
+                        or _reporter.generation != _action_generation
+                        or not _reporter.is_ready
+                        or _reporter.active_native_epoch != _native_epoch
+                    ):
+                        raise RuntimeError("ACP child action origin is no longer active")
+                    from omnigent.inner.acp_standard_subagents import acp_standard_child_key
+
+                    _child_key = acp_standard_child_key(
+                        conv_id,
+                        cast(str, _native_epoch),
+                        cast(str, _native_session_id),
+                    )
+                    _child_session_id = await _reporter.wait_for_association_source(
+                        cast(str, _association_source_id),
+                        native_epoch=cast(str, _native_epoch),
+                        target_session_id=cast(str, _native_session_id),
+                        context_generation=cast(str, _child_context_generation),
+                        origin_token=_action_origin_token,
+                    )
+                    if (
+                        _acp_session_report_subscribers.get(conv_id) is not _reporter
+                        or _reporter.generation != _action_generation
+                        or not _reporter.is_ready
+                        or _reporter.active_native_epoch != _native_epoch
+                        or not _reporter.has_active_origin(_child_key, _action_origin_token)
+                        or process_manager is None
+                        or process_manager.get_session_report_subscriber_generation(conv_id)
+                        != _action_generation
+                    ):
+                        raise RuntimeError("ACP child action generation changed during routing")
+                    return _child_key, _child_session_id
+
+                async def _dispatch_acp_action(
+                    _action: dict[str, Any],
+                    _deliver_result: Callable[[dict[str, Any]], Awaitable[None]],
+                ) -> None:
+                    from omnigent.runner.tool_dispatch import dispatch_tool_locally
+
+                    await _validated_acp_action_child(_action)
+                    _event = _action["event"]
+                    _item = _event["item"]
+                    _tool_name = _item.get("name")
+                    _call_id = _item.get("call_id")
+                    _arguments = _item.get("arguments")
+                    if not all(
+                        isinstance(_value, str) and _value
+                        for _value in (_tool_name, _call_id, _arguments)
+                    ):
+                        raise ValueError("ACP action tool call is missing name, id, or arguments")
+                    _reported_agent = _item.get("agent")
+                    await dispatch_tool_locally(
+                        tool_name=_tool_name,
+                        call_id=_call_id,
+                        arguments=_arguments,
+                        response_id=_action["action_id"],
+                        harness_client=_action_harness_client_live,
+                        server_client=server_client,
+                        terminal_registry=terminal_registry,
+                        resource_registry=resource_registry,
+                        agent_spec=cast(AgentSpec | None, _action_spec),
+                        conversation_id=conv_id,
+                        task_id=_action_task_id,
+                        agent_id=_action_agent_id,
+                        agent_name=(
+                            _reported_agent
+                            if isinstance(_reported_agent, str) and _reported_agent
+                            else _action_agent_name
+                        ),
+                        runner_workspace=_action_workspace,
+                        local_tool_workdir=_action_workdir,
+                        mcp_manager=(
+                            cast("RunnerMcpManager", _action_mcp)
+                            if _tool_name in _action_mcp_names
+                            else None
+                        ),
+                        session_inbox=_session_inboxes.get(conv_id),
+                        session_async_tasks=_session_async_tasks.get(conv_id),
+                        publish_event=_publish_event,
+                        filesystem_registry=filesystem_registry,
+                        effective_harness=_session_harness_name(conv_id),
+                        wake_on_async_result=_wake_on_async_result,
+                        caller_user_id=_action_caller_user_id,
+                        on_result_delivery=_deliver_result,
+                    )
+
+                async def _evaluate_acp_action_policy(
+                    _action: dict[str, Any],
+                    _deliver_result: Callable[[dict[str, Any]], Awaitable[None]],
+                ) -> None:
+                    _event = _action["event"]
+                    _child_key, _child_session_id = await _validated_acp_action_child(_action)
+                    await _evaluate_policy_via_omnigent(
+                        server_client=server_client,
+                        harness_client=_action_harness_client_live,
+                        conversation_id=conv_id,
+                        evaluation_id=_event["evaluation_id"],
+                        phase=_event["phase"],
+                        data=_event.get("data") or {},
+                        action_context_token=_action_origin_token,
+                        action_context_generation=_action_generation,
+                        action_child_key=_child_key,
+                        action_child_session_id=_child_session_id,
+                        on_result_delivery=_deliver_result,
+                    )
+
+                try:
+                    from omnigent.spec.types import DEFAULT_ASK_TIMEOUT
+
+                    _trusted_guardrails = (
+                        _action_spec.guardrails if isinstance(_action_spec, AgentSpec) else None
+                    )
+                    _approval_timeout_s = (
+                        DEFAULT_ASK_TIMEOUT
+                        if _trusted_guardrails is None
+                        else _trusted_guardrails.ask_timeout
+                    )
+                    _action_channel_supported = await _ensure_acp_action_subscriber(
+                        conv_id,
+                        _action_harness_client_live,
+                        _action_generation,
+                        _action_origin_token or "",
+                        _dispatch_acp_action,
+                        _evaluate_acp_action_policy,
+                        ask_timeout_s=_approval_timeout_s,
+                    )
+                    if not _action_channel_supported:
+                        _acp_session_action_contexts.get(conv_id, {}).pop(
+                            _action_origin_token or "", None
+                        )
+                        _settled = await _settle_action_origin()
+                        if not _settled:
+                            raise RuntimeError(
+                                "ACP action origin could not be retired after capability fallback"
+                            )
+                        if _require_full_acp_reporting:
+                            _error = {
+                                "message": (
+                                    f"{_ACP_SESSION_REPORTING_REQUIRED_ENV}=true, but the "
+                                    "configured harness does not provide private action "
+                                    "protocol v2."
+                                ),
+                                "type": "acp_session_reporting_required",
+                                "undelivered": True,
+                            }
+                            _publish_event(
+                                conv_id,
+                                _response_failed_payload(
+                                    _error, input_identity=turn_input_identity
+                                ),
+                            )
+                            _on_proxy_stream_end(conv_id, error=_error)
+                            yield _response_failed_event(
+                                _error, input_identity=turn_input_identity
+                            )
+                            return
+                        # This is a pre-initialize compatibility fallback. Once the
+                        # executor has opted in, its own latch rejects a lost channel.
+                        _action_origin_token = None
+                        _action_generation = None
+                        _action_context_generation = None
+                except Exception as _action_setup_error:
+                    _acp_session_action_contexts.get(conv_id, {}).pop(
+                        _action_origin_token or "", None
+                    )
+                    _logger.error(
+                        "ACP session-action channel is unavailable for %s",
+                        conv_id,
+                        exc_info=True,
+                        extra={"session_id": conv_id},
+                    )
+                    await _settle_action_origin()
+                    _error = {
+                        "message": "ACP session-action channel is unavailable.",
+                        "type": type(_action_setup_error).__name__,
+                        "undelivered": True,
+                    }
+                    _publish_event(
+                        conv_id,
+                        _response_failed_payload(_error, input_identity=turn_input_identity),
+                    )
+                    _on_proxy_stream_end(conv_id, error=_error)
+                    yield _response_failed_event(_error, input_identity=turn_input_identity)
+                    return
+
             event_body = _wrap_as_message_event(_instr_body)
+            # Capability hints are runner-private. Discard any user-supplied
+            # values, then attach only features proven by both live channels.
+            event_body.pop("_omnigent_acp_report_features", None)
+            event_body.pop("_omnigent_acp_action_features", None)
+            reporter = _acp_session_report_subscribers.get(conv_id)
+            action_subscriber = _acp_session_action_subscribers.get(conv_id)
+            if (
+                _acp_server_report_support is True
+                and _action_origin_token is not None
+                and reporter is not None
+                and reporter.is_ready
+                and action_subscriber is not None
+                and action_subscriber.generation == _action_generation
+            ):
+                event_body["_omnigent_acp_report_features"] = list(reporter.features)
+                event_body["_omnigent_acp_action_features"] = list(action_subscriber.features)
+            if _action_origin_token is not None:
+                event_body["_omnigent_action_origin_token"] = _action_origin_token
+                event_body["_omnigent_action_context_generation"] = _action_generation
+                if _action_context_generation is None:
+                    raise RuntimeError("validated ACP action context fingerprint is missing")
+                event_body["_omnigent_action_context_fingerprint"] = _action_context_generation
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
             _response_data: _JsonObject = {}
@@ -6669,10 +8932,11 @@ def create_runner_app(
                     sign_in_hold=holding,
                     cancelled=cancelled,
                 )
+                await _settle_finished_action_origins(conv_id)
                 return lifecycle_event
 
             try:
-                async with client.stream(
+                async with stream_client.stream(
                     "POST",
                     f"/v1/sessions/{conv_id}/events",
                     json=event_body,
@@ -6990,6 +9254,8 @@ def create_runner_app(
                                             server_client,
                                             publish_event=_publish_event,
                                             execution_registry=mcp_execution_registry,
+                                            action_context_token=_action_origin_token,
+                                            action_context_generation=_action_generation,
                                         )
                                         _dispatch_tasks.append(
                                             _asyncio.create_task(
@@ -6998,7 +9264,7 @@ def create_runner_app(
                                                     call_id=get_call_id(event),
                                                     arguments=get_arguments(event),
                                                     response_id=_response_id,
-                                                    harness_client=client,
+                                                    harness_client=stream_client,
                                                     server_client=server_client,
                                                     terminal_registry=terminal_registry,
                                                     resource_registry=resource_registry,
@@ -7041,11 +9307,13 @@ def create_runner_app(
                                         _asyncio.create_task(
                                             _evaluate_policy_via_omnigent(
                                                 server_client=server_client,
-                                                harness_client=client,
+                                                harness_client=stream_client,
                                                 conversation_id=conv_id,
                                                 evaluation_id=_eval_id,
                                                 phase=_eval_phase,
                                                 data=_eval_data,
+                                                action_context_token=_action_origin_token,
+                                                action_context_generation=_action_generation,
                                                 # A dead verdict-delivery channel
                                                 # parks the harness turn forever;
                                                 # route it to the recovery entry,
@@ -8120,6 +10388,17 @@ def create_runner_app(
 
         if body_type == "approval":
             _data = body.get("data") or body
+            if isinstance(_data, Mapping):
+                _elicitation_id = _data.get("elicitation_id")
+                if isinstance(
+                    _elicitation_id, str
+                ) and _elicitation_id in _acp_action_approval_ids.get(conversation_id, {}):
+                    # Known ACP identities never fall through to a parent or
+                    # pending-approval handler after their child waiter settles.
+                    action_subscriber = _acp_session_action_subscribers.get(conversation_id)
+                    if action_subscriber is not None:
+                        action_subscriber.resolve_approval(_data)
+                    return Response(status_code=204)
             _elicit_action = _data.get("action", "")
             # ``content`` is the person's answer when the prompt asked for
             # more than consent (an MCP ``requestedSchema``). Dropping it here
@@ -8343,6 +10622,7 @@ def create_runner_app(
 
     async def _release_session_harness(session_id: str) -> None:
         if process_manager is not None:
+            await _stop_acp_report_subscriber(session_id, settle=True)
             await process_manager.release(session_id)
 
     _native_controls = build_native_controls(
@@ -8547,6 +10827,7 @@ def create_runner_app(
         """
         _clear_session_agent_caches(session_id)
         if process_manager is not None:
+            await _stop_acp_report_subscriber(session_id, settle=True)
             await process_manager.release(session_id)
 
     async def _sync_session_agent(
@@ -8613,6 +10894,7 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         if process_manager is not None:
+            await _stop_acp_report_subscriber(session_id, settle=True)
             await process_manager.release(session_id)
         await resource_registry.cleanup_session(session_id)
         await _delete_native_bridge_dirs(
@@ -8645,6 +10927,7 @@ def create_runner_app(
         _repl_terminal_ensure_locks.pop(session_id, None)
         await _teardown_session_terminals(session_id)
         if process_manager is not None:
+            await _stop_acp_report_subscriber(session_id, settle=True)
             await process_manager.release(session_id)
         await resource_registry.cleanup_session(session_id)
         _clear_session_agent_caches(session_id)
@@ -8696,6 +10979,7 @@ def create_runner_app(
         _session_inboxes=_session_inboxes,
         _session_runtime_cwd=_session_runtime_cwd,
         _session_spec_cache=_session_spec_cache,
+        session_action_contexts=_acp_session_action_contexts,
         filesystem_registry=filesystem_registry,
         mcp_execution_registry=mcp_execution_registry,
         mcp_manager=mcp_manager,

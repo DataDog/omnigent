@@ -54,7 +54,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.host_store import HostStore
 from omnigent.tools.builtins.load_skill import format_skill_meta_text
 from tests.debug_log_helpers import capture_debug_rows
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import create_test_agent, register_test_runner
 
 pytestmark = pytest.mark.asyncio
 
@@ -1932,6 +1932,12 @@ async def test_runner_ingest_requires_bound_runner_and_replays_source_key(
     session = await _create_session(client, agent["id"])
     store = SqlAlchemyConversationStore(db_uri)
     assert store.set_runner_id(session["id"], "runner-owning-session")
+    register_test_runner(app, "runner-owning-session")
+    runner_connection = app.state.tunnel_registry.get("runner-owning-session")
+    assert runner_connection is not None
+    register_test_runner(app, "another-runner")
+    superseded_connection = app.state.tunnel_registry.get("another-runner")
+    assert superseded_connection is not None
     event = {
         "type": "external_conversation_item",
         "data": {
@@ -1949,15 +1955,30 @@ async def test_runner_ingest_requires_bound_runner_and_replays_source_key(
     batch = EventBatchFrame(id="b1", session_id=session["id"], events=[event])
     # A runner the session moved off gets its late events acknowledged but not written.
     superseded = await ingest(
-        app=app, headers=Headers({}), owner=None, runner_id="another-runner", batch=batch
+        app=app,
+        headers=Headers({}),
+        owner=None,
+        runner_id="another-runner",
+        server_connection=superseded_connection,
+        batch=batch,
     )
     assert superseded == EventAckFrame("b1", 1)
     assert (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"] == []
     first = await ingest(
-        app=app, headers=Headers({}), owner=None, runner_id="runner-owning-session", batch=batch
+        app=app,
+        headers=Headers({}),
+        owner=None,
+        runner_id="runner-owning-session",
+        server_connection=runner_connection,
+        batch=batch,
     )
     second = await ingest(
-        app=app, headers=Headers({}), owner=None, runner_id="runner-owning-session", batch=batch
+        app=app,
+        headers=Headers({}),
+        owner=None,
+        runner_id="runner-owning-session",
+        server_connection=runner_connection,
+        batch=batch,
     )
     assert first.applied == second.applied == 1
     items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
@@ -1967,6 +1988,7 @@ async def test_runner_ingest_requires_bound_runner_and_replays_source_key(
         headers=Headers({}),
         owner=None,
         runner_id="runner-owning-session",
+        server_connection=runner_connection,
         batch=EventBatchFrame(
             id="b2", session_id=session["id"], events=[{"type": "message", "data": {}}]
         ),
@@ -1977,6 +1999,7 @@ async def test_runner_ingest_requires_bound_runner_and_replays_source_key(
         headers=Headers({}),
         owner=None,
         runner_id="runner-owning-session",
+        server_connection=runner_connection,
         batch=EventBatchFrame(
             id="b3", session_id=session["id"], events=[event, {"type": "message", "data": {}}]
         ),
@@ -1998,6 +2021,9 @@ async def test_runner_batch_reports_prefix_after_unexpected_failure(
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     assert SqlAlchemyConversationStore(db_uri).set_runner_id(session["id"], "runner-a")
+    register_test_runner(app, "runner-a")
+    runner_connection = app.state.tunnel_registry.get("runner-a")
+    assert runner_connection is not None
     published: list[dict[str, Any]] = []
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.session_stream.publish",
@@ -2037,7 +2063,12 @@ async def test_runner_batch_reports_prefix_after_unexpected_failure(
     )
     ingest = app.state.runner_event_ingest
     first = await ingest(
-        app=app, headers=Headers({}), owner=None, runner_id="runner-a", batch=batch
+        app=app,
+        headers=Headers({}),
+        owner=None,
+        runner_id="runner-a",
+        server_connection=runner_connection,
+        batch=batch,
     )
     assert first.applied == 1 and first.retryable
     (failure,) = [
@@ -2061,6 +2092,7 @@ async def test_runner_batch_reports_prefix_after_unexpected_failure(
         headers=Headers({}),
         owner=None,
         runner_id="runner-a",
+        server_connection=runner_connection,
         batch=EventBatchFrame(id="retry", session_id=session["id"], events=[item]),
     )
     assert retry.applied == 1
@@ -2085,6 +2117,9 @@ async def test_runner_ingest_retries_internal_server_failures(
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     assert SqlAlchemyConversationStore(db_uri).set_runner_id(session["id"], "runner-a")
+    register_test_runner(app, "runner-a")
+    runner_connection = app.state.tunnel_registry.get("runner-a")
+    assert runner_connection is not None
 
     async def fail_persist(*_args: Any, **_kwargs: Any) -> None:
         raise OmnigentError("temporary store failure", code=ErrorCode.INTERNAL_ERROR)
@@ -2098,6 +2133,7 @@ async def test_runner_ingest_retries_internal_server_failures(
         headers=Headers({}),
         owner=None,
         runner_id="runner-a",
+        server_connection=runner_connection,
         batch=EventBatchFrame(
             id="b-fail",
             session_id=session["id"],
@@ -2264,6 +2300,550 @@ async def test_external_acp_subagent_start_is_idempotent_on_subagent_id(
 
     children = (await client.get(f"/v1/sessions/{parent['id']}/child_sessions")).json()["data"]
     assert len([c for c in children if c["labels"].get("omnigent.acp.subagent_id") == "dup1"]) == 1
+
+
+async def test_external_acp_durable_start_retries_delegation_without_duplicate_child(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partially committed durable start retries lifecycle without reminting or republishing."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+
+    append = SqlAlchemyConversationStore.append
+    failed = False
+
+    def fail_first_delegation(
+        store: SqlAlchemyConversationStore,
+        conversation_id: str,
+        items: list[NewConversationItem],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        nonlocal failed
+        if (
+            conversation_id == parent["id"]
+            and not failed
+            and any(
+                getattr(item.data, "event_type", None) == "session.subagent.delegated"
+                for item in items
+            )
+        ):
+            failed = True
+            raise OmnigentError("temporary lifecycle write failure", code=ErrorCode.INTERNAL_ERROR)
+        return append(store, conversation_id, items, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "append", fail_first_delegation)
+    payload = {
+        "type": "external_acp_subagent_start",
+        "data": {
+            "subagent_id": "durable-start-child",
+            "title": "worker",
+            "description": "check the fixture",
+            "require_durable": True,
+        },
+    }
+
+    first = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
+    assert first.status_code == 500, first.text
+    assert "durable" not in first.json()
+    store = SqlAlchemyConversationStore(db_uri)
+    children = store.list_conversations(
+        kind="sub_agent", parent_conversation_id=parent["id"], limit=20
+    ).data
+    assert len(children) == 1
+    child_id = children[0].id
+    assert children[0].labels["omnigent.acp.subagent_id"] == "durable-start-child"
+    assert not any(
+        item.get("event_type") == "session.subagent.delegated"
+        for item in (await client.get(f"/v1/sessions/{parent['id']}/items")).json()["data"]
+    )
+
+    retry = await client.post(f"/v1/sessions/{parent['id']}/events", json=payload)
+    assert retry.status_code == 202, retry.text
+    assert retry.json() == {"queued": False, "child_session_id": child_id, "durable": True}
+
+    reloaded = SqlAlchemyConversationStore(db_uri)
+    children_after_retry = reloaded.list_conversations(
+        kind="sub_agent", parent_conversation_id=parent["id"], limit=20
+    ).data
+    assert [child.id for child in children_after_retry] == [child_id]
+    parent_items = (await client.get(f"/v1/sessions/{parent['id']}/items")).json()["data"]
+    delegated = [
+        item for item in parent_items if item.get("event_type") == "session.subagent.delegated"
+    ]
+    assert len(delegated) == 1
+    assert delegated[0]["resource_id"] == child_id
+    assert sum(event.get("type") == "session.created" for _, event in published) == 1
+
+
+async def _start_durable_acp_child(
+    client: httpx.AsyncClient,
+    parent_id: str,
+    *,
+    subagent_id: str,
+) -> str:
+    """Create one child through the durable ACP event contract."""
+    response = await client.post(
+        f"/v1/sessions/{parent_id}/events",
+        json={
+            "type": "external_acp_subagent_start",
+            "data": {
+                "subagent_id": subagent_id,
+                "title": "worker",
+                "description": "produce a result",
+                "require_durable": True,
+            },
+        },
+    )
+    assert response.status_code == 202, response.text
+    assert response.json().get("durable") is True
+    return response.json()["child_session_id"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Continue this task"}],
+            },
+        },
+        {"type": "session_message", "data": {"message": "Continue this task"}},
+        {
+            "type": "slash_command",
+            "data": {"kind": "skill", "name": "review", "arguments": ""},
+        },
+        {"type": "retry_session"},
+        {"type": "compact"},
+        {"type": "clear"},
+        {"type": "interrupt"},
+        {"type": "stop_session"},
+        [
+            {
+                "type": "external_conversation_item",
+                "data": {
+                    "source_id": "acp-reject:assistant-message",
+                    "item_type": "message",
+                    "response_id": "batch-before-reject",
+                    "item_data": {
+                        "role": "assistant",
+                        "agent": "acp-test",
+                        "content": [{"type": "output_text", "text": "must not persist"}],
+                    },
+                },
+            },
+            {
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Continue this task"}],
+                },
+            },
+        ],
+    ],
+    ids=[
+        "message",
+        "session-message",
+        "slash-command",
+        "retry-session",
+        "compact",
+        "clear",
+        "interrupt",
+        "stop-session",
+        "batch-preflight",
+    ],
+)
+async def test_acp_mirror_rejects_independent_events_without_side_effects(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, Any] | list[dict[str, Any]],
+) -> None:
+    """Independent commands cannot start, mutate, interrupt, or stop an ACP child."""
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    child_id = await _start_durable_acp_child(
+        client, parent["id"], subagent_id=f"mirror-guard-{uuid.uuid4().hex[:8]}"
+    )
+    before_session = (await client.get(f"/v1/sessions/{child_id}")).json()
+    before_items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+
+    async def unexpected_effect(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("a rejected ACP mirror action reached runner or startup work")
+
+    with monkeypatch.context() as effects:
+        for function_name in (
+            "_get_runner_client",
+            "_dispatch_session_event_to_runner",
+            "_launch_runner_on_host",
+            "ensure_runner_connected",
+            "_retry_session_single_flight",
+            "_stop_session_via_runner",
+        ):
+            effects.setattr(routes_events, function_name, unexpected_effect)
+        startup_inputs = getattr(app.state, "startup_inputs", None)
+        if startup_inputs is not None:
+            for method_name in ("accepts", "enqueue", "retry", "cancel"):
+                effects.setattr(startup_inputs, method_name, unexpected_effect)
+
+        response = await client.post(f"/v1/sessions/{child_id}/events", json=payload)
+    assert response.status_code == 409, response.text
+    assert "ACP sub-agent sessions mirror work" in response.text
+
+    after_session = (await client.get(f"/v1/sessions/{child_id}")).json()
+    after_items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert after_session["status"] == before_session["status"]
+    assert after_items == before_items
+
+
+async def test_acp_mirror_allows_reports_and_targeted_parent_approval(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ACP reports and a parent approval targeted at the child still reach their owners."""
+    from omnigent.runtime import pending_elicitations
+    from omnigent.server.routes._sessions import orchestration
+
+    pending_elicitations.reset_for_tests()
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    child_id = await _start_durable_acp_child(
+        client, parent["id"], subagent_id=f"mirror-report-{uuid.uuid4().hex[:8]}"
+    )
+
+    running = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "running",
+                "response_id": "mirror-report-running",
+                "require_durable": True,
+            },
+        },
+    )
+    assert running.status_code == 202, running.text
+    transcript = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "source_id": "acp-mirror-report:assistant-message",
+                "item_type": "message",
+                "response_id": "mirror-report-running",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "acp-test",
+                    "content": [{"type": "output_text", "text": "reported result"}],
+                },
+            },
+        },
+    )
+    assert transcript.status_code == 202, transcript.text
+
+    elicitation_id = f"elicit_mirror_{uuid.uuid4().hex}"
+    pending_elicitations.record_publish(
+        parent["id"],
+        {
+            "type": "response.elicitation_request",
+            "elicitation_id": elicitation_id,
+            "params": {"target_session_id": child_id, "message": "Approve this action?"},
+        },
+    )
+    forwarded: list[tuple[str, dict[str, Any]]] = []
+
+    async def capture_approval(session_id: str, data: dict[str, Any], _runner_router: Any) -> None:
+        forwarded.append((session_id, data))
+
+    monkeypatch.setattr(orchestration, "_forward_approval_to_runner", capture_approval)
+    approval = await client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "approval",
+            "data": {"elicitation_id": elicitation_id, "action": "accept"},
+        },
+    )
+    assert approval.status_code == 202, approval.text
+    assert forwarded == [(parent["id"], {"elicitation_id": elicitation_id, "action": "accept"})]
+    assert pending_elicitations.lookup(elicitation_id, conversation_id=parent["id"]) is None
+    child_items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert any("reported result" in json.dumps(item) for item in child_items)
+    assert (await client.get(f"/v1/sessions/{child_id}")).json()["status"] == "running"
+    pending_elicitations.reset_for_tests()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "terminal_status", "expected_outcome", "failure_output"),
+    [
+        ("completed", "idle", "completed", None),
+        ("failed", "failed", "failed", "synthetic worker failure"),
+        ("cancelled", "failed", "cancelled", None),
+    ],
+    ids=["success", "failure", "cancellation"],
+)
+async def test_external_acp_durable_status_persists_transcript_and_terminal_outcome(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    outcome: str,
+    terminal_status: str,
+    expected_outcome: str,
+    failure_output: str | None,
+) -> None:
+    """Durable ACP reports deduplicate transcript items and reload terminal state."""
+    async with _runtime_runner(
+        lambda request: httpx.Response(404 if request.method == "GET" else 200)
+    ):
+        agent = await create_test_agent(client)
+        parent = await _create_session(client, agent["id"])
+        child_id = await _start_durable_acp_child(
+            client, parent["id"], subagent_id=f"durable-status-{outcome}"
+        )
+
+        running = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {
+                    "status": "running",
+                    "response_id": f"response-{outcome}-running",
+                    "require_durable": True,
+                },
+            },
+        )
+        assert running.status_code == 202, running.text
+        assert running.json().get("durable") is True
+
+        response_id = f"response-{outcome}-terminal"
+        transcript = {
+            "type": "external_conversation_item",
+            "data": {
+                "source_id": f"acp-{outcome}:assistant-message",
+                "item_type": "message",
+                "response_id": response_id,
+                "item_data": {
+                    "role": "assistant",
+                    "agent": "acp-test",
+                    "content": [{"type": "output_text", "text": f"result for {outcome}"}],
+                },
+            },
+        }
+        first_transcript = await client.post(f"/v1/sessions/{child_id}/events", json=[transcript])
+        second_transcript = await client.post(f"/v1/sessions/{child_id}/events", json=[transcript])
+        assert first_transcript.status_code == second_transcript.status_code == 202
+        assert first_transcript.json()[0]["item_id"] == second_transcript.json()[0]["item_id"]
+
+        terminal_data: dict[str, Any] = {
+            "status": terminal_status,
+            "response_id": response_id,
+            "require_durable": True,
+            "turn_outcome": outcome,
+        }
+        if failure_output is not None:
+            terminal_data["output"] = failure_output
+        terminal_payload = {"type": "external_session_status", "data": terminal_data}
+        terminal = await client.post(f"/v1/sessions/{child_id}/events", json=terminal_payload)
+        assert terminal.status_code == 202, terminal.text
+        assert terminal.json().get("durable") is True
+        parent_items_after_first_terminal = (
+            await client.get(f"/v1/sessions/{parent['id']}/items")
+        ).json()["data"]
+        first_returned = next(
+            item
+            for item in parent_items_after_first_terminal
+            if item.get("event_type") == "session.subagent.returned"
+        )
+        replay = await client.post(f"/v1/sessions/{child_id}/events", json=terminal_payload)
+        assert replay.status_code == 202, replay.text
+        assert replay.json().get("durable") is True
+
+    fresh_store = SqlAlchemyConversationStore(db_uri)
+    child = fresh_store.get_conversation(child_id)
+    assert child is not None and child.live_status == terminal_status
+    persisted_transcript = fresh_store.list_items(child_id, limit=20).data
+    assistant_items = [
+        item
+        for item in persisted_transcript
+        if isinstance(item.data, MessageData) and item.data.role == "assistant"
+    ]
+    assert len(assistant_items) == 1
+    assert assistant_items[0].response_id == response_id
+
+    public_snapshot = (await client.get(f"/v1/sessions/{child_id}")).json()
+    assert public_snapshot["status"] == terminal_status
+    if expected_outcome == "failed":
+        assert public_snapshot["last_task_error"] is not None
+        assert "synthetic worker failure" in public_snapshot["last_task_error"]["message"]
+    elif expected_outcome == "completed":
+        assert public_snapshot.get("last_task_error") is None
+    public_items = (await client.get(f"/v1/sessions/{child_id}/items")).json()["data"]
+    assert (
+        sum(
+            item.get("content", [{}])[0].get("text") == f"result for {outcome}"
+            for item in public_items
+        )
+        == 1
+    )
+
+    parent_items = (await client.get(f"/v1/sessions/{parent['id']}/items")).json()["data"]
+    returned = [
+        item for item in parent_items if item.get("event_type") == "session.subagent.returned"
+    ]
+    assert len(returned) == 1
+    assert returned[0]["resource_id"] == child_id
+    assert returned[0]["resource"]["status"] == expected_outcome
+    assert returned[0]["response_id"].startswith("subagent_")
+    assert returned[0]["response_id"] == first_returned["response_id"]
+
+
+async def test_external_acp_durable_status_withholds_ack_until_labels_and_return_commit(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal ACK waits for error labels, live status, and returned lifecycle storage."""
+    async with _runtime_runner(
+        lambda request: httpx.Response(404 if request.method == "GET" else 200)
+    ):
+        agent = await create_test_agent(client)
+        parent = await _create_session(client, agent["id"])
+        child_id = await _start_durable_acp_child(
+            client, parent["id"], subagent_id="durable-status-retry"
+        )
+        running = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {
+                    "status": "running",
+                    "response_id": "response-retry-running",
+                    "require_durable": True,
+                },
+            },
+        )
+        assert running.status_code == 202 and running.json().get("durable") is True
+
+        set_labels = SqlAlchemyConversationStore.set_labels
+        append = SqlAlchemyConversationStore.append
+        label_failure_remaining = 1
+        lifecycle_failure_remaining = 1
+
+        def fail_one_reason_label_write(
+            store: SqlAlchemyConversationStore,
+            session_id: str,
+            labels: dict[str, str],
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            nonlocal label_failure_remaining
+            if (
+                session_id == child_id
+                and label_failure_remaining
+                and any(
+                    key.startswith("omnigent.last_task_error_") and value
+                    for key, value in labels.items()
+                )
+            ):
+                label_failure_remaining -= 1
+                raise OmnigentError(
+                    "temporary reason label failure", code=ErrorCode.INTERNAL_ERROR
+                )
+            return set_labels(store, session_id, labels, *args, **kwargs)
+
+        def fail_one_returned_lifecycle_write(
+            store: SqlAlchemyConversationStore,
+            session_id: str,
+            items: list[NewConversationItem],
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            nonlocal lifecycle_failure_remaining
+            if (
+                session_id == parent["id"]
+                and lifecycle_failure_remaining
+                and any(
+                    getattr(item.data, "event_type", None) == "session.subagent.returned"
+                    for item in items
+                )
+            ):
+                lifecycle_failure_remaining -= 1
+                raise OmnigentError(
+                    "temporary returned lifecycle failure", code=ErrorCode.INTERNAL_ERROR
+                )
+            return append(store, session_id, items, *args, **kwargs)
+
+        monkeypatch.setattr(SqlAlchemyConversationStore, "set_labels", fail_one_reason_label_write)
+        monkeypatch.setattr(
+            SqlAlchemyConversationStore, "append", fail_one_returned_lifecycle_write
+        )
+        terminal_payload = {
+            "type": "external_session_status",
+            "data": {
+                "status": "failed",
+                "turn_outcome": "failed",
+                "response_id": "response-retry-terminal",
+                "output": "synthetic failure whose reason must survive reload",
+                "require_durable": True,
+            },
+        }
+
+        label_failure = await client.post(f"/v1/sessions/{child_id}/events", json=terminal_payload)
+        assert label_failure.status_code == 500, label_failure.text
+        assert "durable" not in label_failure.json()
+        after_label_failure = SqlAlchemyConversationStore(db_uri).get_conversation(child_id)
+        assert after_label_failure is not None and after_label_failure.live_status == "running"
+        assert after_label_failure.labels.get("omnigent.last_task_error_message") in (None, "")
+
+        lifecycle_failure = await client.post(
+            f"/v1/sessions/{child_id}/events", json=terminal_payload
+        )
+        assert lifecycle_failure.status_code == 500, lifecycle_failure.text
+        assert "durable" not in lifecycle_failure.json()
+        after_lifecycle_failure = SqlAlchemyConversationStore(db_uri).get_conversation(child_id)
+        assert (
+            after_lifecycle_failure is not None and after_lifecycle_failure.live_status == "failed"
+        )
+        assert (
+            "synthetic failure"
+            in after_lifecycle_failure.labels["omnigent.last_task_error_message"]
+        )
+        parent_items_before_retry = (
+            await client.get(f"/v1/sessions/{parent['id']}/items")
+        ).json()["data"]
+        assert not any(
+            item.get("event_type") == "session.subagent.returned"
+            for item in parent_items_before_retry
+        )
+
+        retry = await client.post(f"/v1/sessions/{child_id}/events", json=terminal_payload)
+        assert retry.status_code == 202, retry.text
+        assert retry.json().get("durable") is True
+
+    snapshot = (await client.get(f"/v1/sessions/{child_id}")).json()
+    assert snapshot["status"] == "failed"
+    assert "synthetic failure" in snapshot["last_task_error"]["message"]
+    parent_items = (await client.get(f"/v1/sessions/{parent['id']}/items")).json()["data"]
+    returned = [
+        item for item in parent_items if item.get("event_type") == "session.subagent.returned"
+    ]
+    assert len(returned) == 1
+    assert returned[0]["resource"]["status"] == "failed"
+
+
+async def test_info_advertises_acp_session_reporting_version_3(
+    client: httpx.AsyncClient,
+) -> None:
+    """A server advertises the negotiated ACP session-reporting capability."""
+    response = await client.get("/v1/info")
+    assert response.status_code == 200, response.text
+    assert response.json()["acp_session_reporting_version"] == 3
 
 
 async def test_external_devin_subagent_start_mints_child(
@@ -5726,6 +6306,7 @@ async def test_publish_status_tracks_in_flight_response_id(
 @pytest.mark.parametrize("child_lookup_fails", [False, True])
 async def test_patch_runner_rebind_clears_stale_failed_status(
     client: httpx.AsyncClient,
+    app: FastAPI,
     monkeypatch: pytest.MonkeyPatch,
     child_lookup_fails: bool,
 ) -> None:
@@ -5830,6 +6411,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
     sid = session["id"]
+    register_test_runner(app, "runner_recovered")
     # The monkeypatched runner client can see setup work during session
     # creation. This test targets the later PATCH rebind path only.
     runner_client.posts.clear()
@@ -10702,6 +11284,73 @@ async def test_retry_session_reports_live_runner_noop_without_mutating_history(
     get_runner.assert_awaited()
     after = await client.get(f"/v1/sessions/{session['id']}")
     assert after.json()["items"] == before_items
+
+
+async def test_generic_acp_message_waits_for_session_init_and_reuses_readiness(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An uninitialized generic ACP session is ready before its first message POST."""
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "acp"}},
+    )
+    session = await _create_session(client, agent["id"])
+    conversation = SqlAlchemyConversationStore(db_uri).replace_runner_id(
+        session["id"], "runner-generic-acp-init"
+    )
+    requests: list[tuple[str, dict[str, Any]]] = []
+
+    def runner_handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content) if request.content else {}
+        requests.append((request.url.path, payload))
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(
+                201,
+                json={"session_init_protocol_version": 2, "inference_config_verified": True},
+            )
+        if request.url.path.endswith("/events"):
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(404, request=request)
+
+    relay_ready = AsyncMock(return_value=None)
+    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", relay_ready)
+    monkeypatch.setattr("omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock())
+    initializer = app.state.runner_session_initializer
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_handler), base_url="http://runner"
+    ) as runner:
+        _route_to_runner(monkeypatch, runner)
+        assert not initializer.is_initialized(conversation, runner)
+
+        for text in ("first generic ACP turn", "second generic ACP turn"):
+            response = await client.post(
+                f"/v1/sessions/{session['id']}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                },
+            )
+            assert response.status_code == 202, response.text
+
+        assert initializer.is_initialized(conversation, runner)
+
+    event_path = f"/v1/sessions/{session['id']}/events"
+    assert [path for path, _payload in requests] == [
+        "/v1/sessions",
+        event_path,
+        event_path,
+    ]
+    assert requests[0][1]["session_init"]["suppress_recovery_turn"] is True
+    relay_ready.assert_awaited()
 
 
 async def test_retry_session_ensures_dead_required_native_terminal_once(

@@ -41,7 +41,7 @@ import pytest
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.harnesses import _HARNESS_MODULES
-from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
+from omnigent.runtime.harnesses._scaffold import HarnessApp, SessionActionChild, TurnContext
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.schemas import (
@@ -301,6 +301,200 @@ async def test_elicit_emits_resolved_on_every_exit(cancel: bool) -> None:
     assert resolved.reason == ("unanswered" if cancel else None)
     assert ctx._pending_elicitations == {}
     assert queue.empty()
+
+
+class _SessionActionTestApp(HarnessApp):
+    """A harness with a deterministic, generation-bound private action channel."""
+
+    async def session_action_generation(self, conversation_id: str) -> str | None:
+        return "action-generation" if conversation_id == "parent-session" else None
+
+    async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
+        raise NotImplementedError
+
+
+def _session_action_child(request_id: str) -> SessionActionChild:
+    return SessionActionChild(
+        native_epoch="epoch-one",
+        native_session_id="native-session",
+        run_id="run-one",
+        parent_tool_call_id="parent-call",
+        background=True,
+        request_id=request_id,
+    )
+
+
+async def test_session_action_http_round_trip_is_authenticated_fenced_and_idempotent() -> None:
+    app = _SessionActionTestApp()
+    app._bound_conversation_id = "parent-session"
+    asgi_app = app.build()
+    asgi_app.state.conversation_id = "parent-session"
+    asgi_app.state.harness_auth_token = "test-harness-token"
+    transport = httpx.ASGITransport(app=asgi_app)
+    headers = {"Authorization": "Bearer test-harness-token"}
+    child_ctx = app.make_session_action_context(_session_action_child("request-one"))
+    parked = asyncio.create_task(
+        child_ctx.elicit(
+            "child-approval",
+            ElicitationRequestParams(mode="form", message="Allow the child tool?"),
+        )
+    )
+
+    try:
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while not app._session_actions:
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://harness.local"
+        ) as client:
+            pending = await client.get(
+                "/v1/sessions/parent-session/actions?generation=action-generation"
+            )
+            assert pending.status_code == 401
+            stale = await client.get(
+                "/v1/sessions/parent-session/actions?generation=old-generation",
+                headers=headers,
+            )
+            assert stale.status_code == 409
+            assert stale.json()["error"] == "stale_generation"
+
+            ready = await client.get(
+                "/v1/sessions/parent-session/actions?generation=action-generation",
+                headers=headers,
+            )
+            assert ready.status_code == 200
+            action = ready.json()["actions"][0]
+            assert action["child"] == _session_action_child("request-one").to_wire()
+            assert action["event"]["type"] == "response.elicitation_request"
+            assert action["event"]["elicitation_id"] == "child-approval"
+
+            repeated = await client.get(
+                "/v1/sessions/parent-session/actions?generation=action-generation",
+                headers=headers,
+            )
+            assert repeated.json()["actions"] == [action]
+            foreign_parent = await client.get(
+                "/v1/sessions/another-session/actions?generation=action-generation",
+                headers=headers,
+            )
+            assert foreign_parent.status_code == 404
+
+            result_url = f"/v1/sessions/parent-session/actions/{action['action_id']}/result"
+            valid_result = {
+                "type": "approval",
+                "elicitation_id": "child-approval",
+                "action": "accept",
+            }
+            wrong_event = await client.post(
+                result_url,
+                headers=headers,
+                json={
+                    "generation": "action-generation",
+                    "event_id": "another-event",
+                    "result": valid_result,
+                },
+            )
+            assert wrong_event.status_code == 409
+            wrong_result = await client.post(
+                result_url,
+                headers=headers,
+                json={
+                    "generation": "action-generation",
+                    "event_id": action["event_id"],
+                    "result": {**valid_result, "elicitation_id": "another-approval"},
+                },
+            )
+            assert wrong_result.status_code == 409
+            assert wrong_result.json()["error"] == "result_mismatch"
+
+            accepted = await client.post(
+                result_url,
+                headers=headers,
+                json={
+                    "generation": "action-generation",
+                    "event_id": action["event_id"],
+                    "result": valid_result,
+                },
+            )
+            assert accepted.status_code == 200
+            assert accepted.json() == {"accepted": True, "duplicate": False}
+            assert (await parked).action == "accept"
+
+            retry = await client.post(
+                result_url,
+                headers=headers,
+                json={
+                    "generation": "action-generation",
+                    "event_id": action["event_id"],
+                    "result": valid_result,
+                },
+            )
+            assert retry.status_code == 200
+            assert retry.json() == {"accepted": True, "duplicate": True}
+            conflict = await client.post(
+                result_url,
+                headers=headers,
+                json={
+                    "generation": "action-generation",
+                    "event_id": action["event_id"],
+                    "result": {**valid_result, "action": "decline"},
+                },
+            )
+            assert conflict.status_code == 409
+            assert conflict.json()["error"] == "conflicting_result"
+            empty = await client.get(
+                "/v1/sessions/parent-session/actions?generation=action-generation",
+                headers=headers,
+            )
+            assert empty.json()["actions"] == []
+    finally:
+        if not parked.done():
+            parked.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await parked
+
+
+async def test_session_action_pending_and_retry_records_are_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runtime.harnesses import _scaffold
+
+    monkeypatch.setattr(_scaffold, "_MAX_PENDING_SESSION_ACTIONS", 1)
+    monkeypatch.setattr(_scaffold, "_MAX_SESSION_ACTION_TOMBSTONES", 1)
+    app = _SessionActionTestApp()
+    app._bound_conversation_id = "parent-session"
+    first_ctx = app.make_session_action_context(_session_action_child("request-one"))
+    first = asyncio.create_task(
+        first_ctx.elicit("approval-one", ElicitationRequestParams(mode="form", message="first"))
+    )
+    try:
+        while not app._session_actions:
+            await asyncio.sleep(0)
+        second_ctx = app.make_session_action_context(_session_action_child("request-two"))
+        second = asyncio.create_task(
+            second_ctx.elicit(
+                "approval-two", ElicitationRequestParams(mode="form", message="second")
+            )
+        )
+        with pytest.raises(RuntimeError, match="pending session action capacity"):
+            await second
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert len(app._session_action_tombstones) == 1
+
+        third_ctx = app.make_session_action_context(_session_action_child("request-three"))
+        with pytest.raises(RuntimeError, match="retry-record capacity"):
+            await third_ctx.elicit(
+                "approval-three", ElicitationRequestParams(mode="form", message="third")
+            )
+    finally:
+        if not first.done():
+            first.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first
 
 
 @pytest.mark.asyncio

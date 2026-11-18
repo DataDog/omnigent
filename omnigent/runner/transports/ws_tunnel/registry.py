@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from itertools import count
 from typing import Protocol
+from uuid import uuid4
 from weakref import WeakValueDictionary
 
 import httpx
@@ -117,6 +118,7 @@ class RunnerSession:
         ownership: only the owner (or an admin) may bind sessions
         to this runner.
     :param generation: Process-unique connection generation for initialization readiness.
+    :param server_connection_id: Random identity for this exact server-owned tunnel connection.
     :param superseded: Whether a newer tunnel replaced this connection, retained
         after that replacement disconnects so delayed cleanup cannot own its outage.
     :param in_flight: Per-req_id reassembly state. Each entry holds
@@ -142,6 +144,7 @@ class RunnerSession:
     owner: str | None
     last_frame_monotonic: float = field(default_factory=time.monotonic, kw_only=True)
     generation: int = field(default_factory=lambda: next(_connection_generations))
+    _server_connection_id: str = field(default_factory=lambda: uuid4().hex, init=False, repr=False)
     superseded: bool = field(default=False, init=False)
     in_flight: dict[str, RequestState] = field(default_factory=dict)
     # Per-channel state for tunneled WebSocket attaches.  Keys are
@@ -153,6 +156,11 @@ class RunnerSession:
     peer_close_reason: str | None = None
     ended: TunnelEnd | None = None
     diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
+
+    @property
+    def server_connection_id(self) -> str:
+        """Return this connection's server-minted identity."""
+        return self._server_connection_id
 
 
 @dataclass

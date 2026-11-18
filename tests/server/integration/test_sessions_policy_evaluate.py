@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -801,6 +802,20 @@ def _patch_default_policies(monkeypatch: pytest.MonkeyPatch, fn_path: str) -> No
     )
 
 
+def _capture_runner_approval_forwards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, dict[str, Any], Any]]:
+    from omnigent.server.routes._sessions import orchestration
+
+    forwarded: list[tuple[str, dict[str, Any], Any]] = []
+
+    async def record_forward(session_id: str, data: dict[str, Any], runner_router: Any) -> None:
+        forwarded.append((session_id, data, runner_router))
+
+    monkeypatch.setattr(orchestration, "_forward_approval_to_runner", record_forward)
+    return forwarded
+
+
 @pytest.mark.parametrize("tool_name", ["sys_scheduled_task_create", "sys_scheduled_task_update"])
 @pytest.mark.parametrize("legacy", [False, True], ids=["complete-review", "legacy"])
 async def test_scheduled_changes_require_explicit_approval_without_custom_policies(
@@ -884,6 +899,7 @@ async def test_tool_call_ask_holds_gate_and_returns_allow_on_accept(
     _patch_default_policies(monkeypatch, f"{__name__}._ask_for_bash")
     agent = await create_test_agent(client)
     session_id = await _create_session(client, agent["id"])
+    forwarded = _capture_runner_approval_forwards(monkeypatch)
 
     # The evaluate POST parks until the verdict arrives — run it
     # concurrently and learn the elicitation id from the stream.
@@ -906,6 +922,7 @@ async def test_tool_call_ask_holds_gate_and_returns_allow_on_accept(
     resp = await evaluate
     assert resp.status_code == 200, resp.text
     assert resp.json()["result"] == "POLICY_ACTION_ALLOW"
+    assert forwarded == []
 
 
 async def test_tool_call_ask_returns_deny_on_decline(
@@ -920,6 +937,7 @@ async def test_tool_call_ask_returns_deny_on_decline(
     _patch_default_policies(monkeypatch, f"{__name__}._ask_for_bash")
     agent = await create_test_agent(client)
     session_id = await _create_session(client, agent["id"])
+    forwarded = _capture_runner_approval_forwards(monkeypatch)
 
     drain = asyncio.create_task(_drain_elicitation_id(session_id))
     await asyncio.sleep(0.05)
@@ -940,6 +958,30 @@ async def test_tool_call_ask_returns_deny_on_decline(
     resp = await evaluate
     assert resp.status_code == 200, resp.text
     assert resp.json()["result"] == "POLICY_ACTION_DENY"
+    assert forwarded == []
+
+
+async def test_runner_owned_elicitation_resolution_still_forwards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = f"conv_runner_owned_{uuid.uuid4().hex}"
+    elicitation_id = f"elicit_runner_owned_{uuid.uuid4().hex}"
+    approval = {"elicitation_id": elicitation_id, "action": "accept"}
+    forwarded: list[tuple[str, dict[str, Any], Any]] = []
+
+    async def record_forward(
+        forwarded_session_id: str, data: dict[str, Any], runner_router: Any
+    ) -> None:
+        forwarded.append((forwarded_session_id, data, runner_router))
+
+    monkeypatch.setattr(orchestration, "_forward_approval_to_runner", record_forward)
+    try:
+        await orchestration._resolve_elicitation(session_id, approval, runner_router=None)
+        assert forwarded == [(session_id, approval, None)]
+    finally:
+        orchestration._harness_pre_resolved_elicitations.pop(elicitation_id, None)
 
 
 async def test_tool_call_ask_forwards_popup_event_to_runner(
@@ -1101,6 +1143,7 @@ async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
         result: Any,
         conversation_store: Any,
         elicitation_id: str | None = None,
+        target_session_id: str | None = None,
     ) -> bool:
         """
         Stand-in for ``_hold_native_ask_gate`` that simulates accept.
@@ -1122,6 +1165,7 @@ async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
         :returns: ``True`` (accept) for every entrant.
         """
         nonlocal entries
+        assert target_session_id is None
         entries += 1
         if entries == 1:
             first_in_gate.set()

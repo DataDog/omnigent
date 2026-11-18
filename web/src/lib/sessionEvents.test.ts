@@ -1724,6 +1724,12 @@ describe("session.child_session.updated (FLAT envelope)", () => {
         current_task_status: "in_progress",
         busy: true,
         last_message_preview: "looking…",
+        acp_session_observation: {
+          source_current: false,
+          state: { present: true, value: { state: "future_state" } },
+          state_ingress_sequence: 23,
+          transport: { state: "disconnected", reason: "stdout closed" },
+        },
       },
     });
     expect(out).toHaveLength(1);
@@ -1733,6 +1739,12 @@ describe("session.child_session.updated (FLAT envelope)", () => {
     expect(ev.childSessionId).toBe("conv_child1");
     expect(ev.child.busy).toBe(true);
     expect(ev.child.current_task_status).toBe("in_progress");
+    expect(ev.child.acp_session_observation).toEqual({
+      source_current: false,
+      state: { present: true, value: { state: "future_state" } },
+      state_ingress_sequence: 23,
+      transport: { state: "disconnected", reason: "stdout closed" },
+    });
   });
 
   it("rejects when child is absent or not an object", () => {

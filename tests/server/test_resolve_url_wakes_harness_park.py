@@ -13,6 +13,7 @@ import asyncio
 
 import pytest
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.routes import sessions as S
 
 
@@ -72,9 +73,11 @@ async def test_resolve_elicitation_wrong_session_does_not_wake():
     S._harness_parked_elicitations[eid] = parked
     S._harness_elicitation_owners[eid] = sid
     try:
-        await S._resolve_elicitation(
-            "conv_other", {"elicitation_id": eid, "action": "accept"}, None
-        )
+        with pytest.raises(OmnigentError) as error:
+            await S._resolve_elicitation(
+                "conv_other", {"elicitation_id": eid, "action": "accept"}, None
+            )
+        assert error.value.code == ErrorCode.FORBIDDEN
         assert not parked.resolved_elsewhere.is_set()
     finally:
         S._harness_parked_elicitations.pop(eid, None)

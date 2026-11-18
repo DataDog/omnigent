@@ -57,7 +57,12 @@ async def _evaluate_policy_via_omnigent(
     evaluation_id: str,
     phase: str,
     data: dict[str, Any],
+    action_context_token: str | None = None,
+    action_context_generation: str | None = None,
+    action_child_key: str | None = None,
+    action_child_session_id: str | None = None,
     on_delivery_failure: Callable[[str], Awaitable[None]] | None = None,
+    on_result_delivery: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> None:
     """
     Proxy a policy evaluation request from the harness to the Omnigent server.
@@ -95,6 +100,8 @@ async def _evaluate_policy_via_omnigent(
     :param data: Event data dict for the policy engine.
     :param on_delivery_failure: Called with *conversation_id* when the verdict
         cannot be delivered after retry; wired by callers to cancel the wedged turn.
+    :param on_result_delivery: Optional result sink for detached session actions.
+        It receives the computed verdict once and owns idempotent delivery retries.
     """
     # Default verdict on error / non-200 / timeout. Phase-aware: TOOL_CALL
     # fails CLOSED (this round-trip is the authoritative gate for
@@ -112,14 +119,28 @@ async def _evaluate_policy_via_omnigent(
     verdict_data: _JsonObject | None = None
 
     try:
+        evaluate_body: dict[str, Any] = {
+            "event": {
+                "type": phase,
+                "data": data,
+            },
+        }
+        if action_context_token is not None:
+            evaluate_body["_omnigent_action_context_token"] = action_context_token
+            evaluate_body["_omnigent_action_context_generation"] = action_context_generation
+        if action_child_key is not None or action_child_session_id is not None:
+            if (
+                not isinstance(action_child_key, str)
+                or not action_child_key
+                or not isinstance(action_child_session_id, str)
+                or not action_child_session_id
+            ):
+                raise ValueError("ACP child policy target requires a complete key and session id")
+            evaluate_body["_omnigent_action_child_key"] = action_child_key
+            evaluate_body["_omnigent_action_child_session_id"] = action_child_session_id
         ap_resp = await server_client.post(
             f"/v1/sessions/{conversation_id}/policies/evaluate",
-            json={
-                "event": {
-                    "type": phase,
-                    "data": data,
-                },
-            },
+            json=evaluate_body,
             # A TOOL_CALL/LLM_REQUEST/REQUEST ASK parks server-side in
             # ``_hold_native_ask_gate`` until a human resolves it (up to the
             # deciding policy's ``ask_timeout``, default one day). A 30s read
@@ -169,6 +190,12 @@ async def _evaluate_policy_via_omnigent(
         verdict_body["reason"] = verdict_reason
     if verdict_data is not None:
         verdict_body["data"] = verdict_data
+
+    if on_result_delivery is not None:
+        # The action channel caches this verdict before attempting delivery and
+        # retries only its result POST. Never repeat the policy evaluation here.
+        await on_result_delivery(verdict_body)
+        return
 
     # Retry once on dead-channel / timeout / non-2xx; any unacknowledged verdict
     # eventually calls on_delivery_failure to cancel the wedged turn. Track the

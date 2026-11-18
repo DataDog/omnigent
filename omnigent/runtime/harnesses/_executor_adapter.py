@@ -11,14 +11,15 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import re
-import secrets
 import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
 from fastapi import Response
@@ -26,7 +27,19 @@ from fastapi import Response
 from omnigent.debug_logging import phase_scope
 from omnigent.errors import ElicitationDeclinedError, ErrorPhase
 from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
+from omnigent.inner.acp_standard_subagents import (
+    ACP_TOOL_CALL_SCOPE_METADATA_KEY,
+    ACP_TOOL_OUTPUT_METADATA_KEY,
+    AcpSessionActionBinding,
+)
+from omnigent.inner.acp_standard_subagents import (
+    ACTION_FEATURES as _STANDARD_ACP_ACTION_FEATURES,
+)
+from omnigent.inner.acp_standard_subagents import (
+    REPORT_FEATURES as _STANDARD_ACP_REPORT_FEATURES,
+)
 from omnigent.inner.executor import (
+    SESSION_REPORT_FEATURES,
     CompactionComplete,
     CompactionStarted,
     Executor,
@@ -38,6 +51,8 @@ from omnigent.inner.executor import (
     LiveMcpServerStatus,
     Message,
     ReasoningChunk,
+    SessionReportPage,
+    SessionReportStatus,
     SubAgentCompleted,
     SubAgentStarted,
     SubAgentToolCall,
@@ -55,7 +70,13 @@ from omnigent.native.input_diagnostics import (
     log_input_event,
 )
 from omnigent.policies.types import FAIL_CLOSED_PHASES
-from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
+from omnigent.runtime.harnesses._scaffold import (
+    HarnessApp,
+    PolicyVerdictPayload,
+    SessionActionChild,
+    TurnContext,
+)
+from omnigent.runtime.harnesses.session_reports import SessionReportJournal
 from omnigent.runtime.prompt import dedupe_tool_output_images
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.ask_user_question import structured_ask_user_question
@@ -76,6 +97,8 @@ _logger = logging.getLogger(__name__)
 # Observed tool calls use "in_progress" (distinct from "action_required" for server-dispatched).
 _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 _COMPLETED_TOOL_CALL_STATUS = "completed"
+_SESSION_REPORT_PROTOCOL = "acp-session-reports/3"
+_MAX_OBSERVED_TOOL_CALLS = 50_000
 
 
 # Prefix for Claude SDK MCP-registered tool names (e.g. ``mcp__omnigent__sys_terminal_launch``).
@@ -198,9 +221,30 @@ class ExecutorAdapter(HarnessApp):
         executor_factory: Callable[[], Executor],
         session_key: str | None = None,
         harness_label: str = "Claude",
+        session_report_protocol: str | None = None,
+        session_report_server_identity: str | None = None,
+        session_report_subscriber_generation: str | None = None,
+        session_report_root: str | Path | None = None,
     ) -> None:
         super().__init__()
         self._executor_factory = executor_factory
+        self._session_report_protocol = session_report_protocol
+        self._session_report_server_identity = session_report_server_identity
+        self._session_report_subscriber_generation = session_report_subscriber_generation
+        self._session_report_root = session_report_root
+        self._session_report_journal: SessionReportJournal | None = None
+        self._session_report_conversation_id: str | None = None
+        self._session_report_source_status: SessionReportStatus | None = None
+        self._standard_subagents_negotiated = False
+        if session_report_protocol is None and any(
+            value is not None
+            for value in (
+                session_report_server_identity,
+                session_report_subscriber_generation,
+                session_report_root,
+            )
+        ):
+            raise ValueError("session-report scope requires an explicit protocol")
         self._session_key = session_key or uuid.uuid4().hex
         # Harness label used in elicitation messages, e.g. "Claude wants to call **Bash**".
         self._harness_label = harness_label
@@ -210,7 +254,13 @@ class ExecutorAdapter(HarnessApp):
         # time so MCP handlers that closure-captured the bridge on turn 1 dispatch into the
         # current turn's ctx, not turn 1's dead ctx.
         self._current_ctx: TurnContext | None = None
+        # A detached native child request must keep its child context even if a
+        # later parent turn replaces _current_ctx while the request is parked.
+        self._callback_ctx: contextvars.ContextVar[TurnContext | None] = contextvars.ContextVar(
+            f"omnigent_acp_callback_ctx_{id(self)}", default=None
+        )
         self._current_agent: str | None = None
+        self._session_agent: str | None = None
         # FIFO queue of inner-SDK tool-use ids from ToolCallRequest events. Drained by
         # _stable_tool_executor so each dispatch reuses the same call_id as the inline
         # observed event, letting BlockStream dedupe the two renders into one.
@@ -219,7 +269,7 @@ class ExecutorAdapter(HarnessApp):
         self._tracing_ctx: TracingContext | None = None
         # Detached bounded background tasks (abnormal-exit _safe_interrupt). Strongly referenced
         # until completion; drained before recovery and on shutdown.
-        self._bg_tasks: set[asyncio.Task[bool]] = set()
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
         self._abandoned_executor_cleanup: asyncio.Task[bool] | None = None
         # Consecutive orphaned-callback counter and reset guard for the Tier-1 SDK watchdog.
         self._orphan_callback_count = 0
@@ -235,8 +285,217 @@ class ExecutorAdapter(HarnessApp):
         # without the re-emission an observed tool card renders live but vanishes on
         # reload. Dispatched calls never reach this — their ToolCallComplete
         # short-circuits — so it is observed-only.
-        self._observed_tool_calls: dict[str, tuple[str, str]] = {}
+        self._observed_tool_calls: dict[str, tuple[str, str, dict[str, str] | None]] = {}
         self._pr_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
+
+    async def on_startup(self, conversation_id: str | None) -> None:
+        """Prepare a report journal without opting the native client in yet."""
+        if self._session_report_protocol is None:
+            return
+        if self._session_report_protocol != _SESSION_REPORT_PROTOCOL:
+            # Optional reporting scope may come from a mixed-version runner.
+            # Without explicit v3 scope, keep ordinary ACP parent-only.
+            return
+        if not self._session_report_server_identity:
+            raise ValueError("session-report protocol requires a trusted server identity")
+        if not self._session_report_subscriber_generation:
+            raise ValueError("session-report protocol requires a subscriber generation")
+        if not conversation_id:
+            raise RuntimeError("session-report protocol requires a bound conversation")
+
+        executor = self._ensure_executor()
+        if not self._supports_standard_report_source(executor):
+            # This runner may be newer than its configured executor. The private
+            # capability endpoint will report unsupported, allowing parent-only ACP
+            # behavior before the native initialize handshake.
+            return
+        journal = SessionReportJournal(
+            conversation_id,
+            server_identity=self._session_report_server_identity,
+            subscriber_generation=self._session_report_subscriber_generation,
+            root=self._session_report_root,
+        )
+        await asyncio.to_thread(journal.acquire_owner)
+        self._session_report_journal = journal
+        self._session_report_conversation_id = conversation_id
+        self._session_report_source_status = SessionReportStatus(
+            state="starting",
+            prompt_started=False,
+        )
+
+    @staticmethod
+    def _supports_standard_report_source(executor: Executor) -> bool:
+        """Check the live executor's report and standard-action bridge contract."""
+        try:
+            supports_reports = executor.supports_session_reports()
+        except Exception:
+            return False
+        return bool(
+            supports_reports
+            and callable(getattr(executor, "enable_standard_subagents", None))
+            and callable(getattr(executor, "bind_session_action_origin", None))
+            and callable(getattr(executor, "set_session_report_sink", None))
+            and type(executor).set_session_report_sink is not Executor.set_session_report_sink
+        )
+
+    def _session_report_status(self) -> SessionReportStatus | None:
+        if self._executor is not None:
+            current = self._executor.session_report_status()
+            if current is not None:
+                self._session_report_source_status = current
+        return self._session_report_source_status
+
+    @staticmethod
+    def _session_report_status_payload(
+        source_status: SessionReportStatus | None,
+    ) -> dict[str, object] | None:
+        if source_status is None:
+            return None
+        payload: dict[str, object] = {"state": source_status.state}
+        if source_status.error is not None:
+            payload["error"] = source_status.error
+        if source_status.prompt_started is not None:
+            payload["prompt_started"] = source_status.prompt_started
+        return payload
+
+    def _report_journal_for(self, conversation_id: str) -> SessionReportJournal | None:
+        journal = self._session_report_journal
+        if journal is None:
+            return None
+        if conversation_id != self._session_report_conversation_id:
+            raise ValueError("report request does not match the bound conversation")
+        return journal
+
+    async def session_action_generation(self, conversation_id: str) -> str | None:
+        """Bind the ephemeral action channel to this harness reporter generation."""
+        if self._report_journal_for(conversation_id) is None:
+            return None
+        return self._session_report_subscriber_generation
+
+    def _callback_context(self) -> TurnContext | None:
+        """Prefer a task-local child context over the mutable parent turn pointer."""
+        return self._callback_ctx.get() or self._current_ctx
+
+    async def _handle_detached_session_request(
+        self,
+        request: dict[str, Any],
+        binding: AcpSessionActionBinding,
+    ) -> None:
+        """Answer one validated child request in a task-local action context."""
+        child = SessionActionChild(
+            native_epoch=binding.native_epoch,
+            native_session_id=binding.target_session_id,
+            run_id="session",
+            parent_tool_call_id=binding.association_source_id,
+            background=True,
+            request_id=binding.request_id,
+            request_invocation_id=binding.request_invocation_id,
+            origin_token=binding.origin_token,
+            origin_agent=binding.origin_agent,
+            origin_generation=binding.origin_generation,
+            root_native_session_id=binding.root_native_session_id,
+            parent_native_session_id=binding.parent_session_id,
+            association_source_id=binding.association_source_id,
+            context_generation=binding.context_generation,
+            cwd_present=binding.cwd_present,
+            cwd=binding.cwd,
+            additional_directories_present=binding.additional_directories_present,
+            additional_directories=binding.additional_directories,
+        )
+        ctx = self.make_session_action_context(
+            child,
+            agent=binding.origin_agent,
+            origin_generation=binding.origin_generation,
+        )
+        token = self._callback_ctx.set(ctx)
+        try:
+            executor = self._executor
+            if executor is None:
+                raise RuntimeError("ACP session ended before its child request was handled")
+            await executor._respond_to_agent_request(  # type: ignore[attr-defined]
+                request,
+                child_cwd=binding.cwd,
+                child_additional_directories=binding.additional_directories,
+                detached_child_action=True,
+            )
+        finally:
+            self._callback_ctx.reset(token)
+
+    async def session_report_capabilities(self, conversation_id: str) -> dict[str, object] | None:
+        """Return live executor report support before native subagent opt-in."""
+        journal = self._report_journal_for(conversation_id)
+        executor = self._executor
+        if (
+            journal is None
+            or executor is None
+            or not self._supports_standard_report_source(executor)
+        ):
+            return None
+        assert self._session_report_subscriber_generation is not None
+        highest, acknowledged = await asyncio.to_thread(
+            journal.snapshot,
+            subscriber_generation=self._session_report_subscriber_generation,
+        )
+        source_status = self._session_report_status_payload(self._session_report_status())
+        native_epoch = getattr(executor, "_native_epoch", None)
+        journal_id, epoch_ordinal = await asyncio.to_thread(
+            journal.identity_for_epoch, native_epoch
+        )
+        return {
+            "protocol": "acp-session-reports",
+            "version": 3,
+            "features": list(SESSION_REPORT_FEATURES),
+            "subscriber_generation": self._session_report_subscriber_generation,
+            "journal_id": journal_id,
+            "native_epoch": native_epoch,
+            "epoch_ordinal": epoch_ordinal,
+            "highest_sequence": highest,
+            "acknowledged_sequence": acknowledged,
+            "source_status": source_status,
+        }
+
+    async def read_session_reports(
+        self,
+        conversation_id: str,
+        *,
+        after_sequence: int,
+        subscriber_generation: str,
+        limit: int,
+    ) -> SessionReportPage | None:
+        """Read one persisted report page for the bound conversation."""
+        journal = self._report_journal_for(conversation_id)
+        if journal is None:
+            return None
+        page = await asyncio.to_thread(
+            journal.get_after,
+            after_sequence,
+            subscriber_generation=subscriber_generation,
+            limit=limit,
+        )
+        return SessionReportPage(
+            records=page.records,
+            highest_sequence=page.highest_sequence,
+            exposed_through=page.exposed_through,
+            more=page.more,
+            source_status=self._session_report_status(),
+        )
+
+    async def acknowledge_session_reports(
+        self,
+        conversation_id: str,
+        *,
+        through_sequence: int,
+        subscriber_generation: str,
+    ) -> int | None:
+        """Acknowledge reports after the caller has durably forwarded the prefix."""
+        journal = self._report_journal_for(conversation_id)
+        if journal is None:
+            return None
+        return await asyncio.to_thread(
+            journal.ack,
+            through_sequence,
+            subscriber_generation=subscriber_generation,
+        )
 
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         """Drive the inner executor for one turn, translating its events to Omnigent SSE.
@@ -245,6 +504,49 @@ class ExecutorAdapter(HarnessApp):
         instance. Installs stable tool/elicitation/policy bridges once on first use.
         """
         executor = self._ensure_executor()
+        report_features = request._standard_acp_report_features
+        action_features = request._standard_acp_action_features
+        report_features_proven = (
+            report_features is not None and _STANDARD_ACP_REPORT_FEATURES.issubset(report_features)
+        )
+        action_features_proven = (
+            action_features is not None and _STANDARD_ACP_ACTION_FEATURES.issubset(action_features)
+        )
+        already_enabled = bool(getattr(executor, "_standard_subagents_enabled", False))
+        if already_enabled or self._standard_subagents_negotiated:
+            if not (report_features_proven and action_features_proven):
+                raise RuntimeError(
+                    "ACP report/action channels became unavailable after standard subagents "
+                    "were enabled; refusing to continue with child traffic unobserved"
+                )
+            if self._session_report_journal is None:
+                raise RuntimeError("enabled standard ACP subagents have no durable report journal")
+            if getattr(executor, "_session_report_sink", None) is not self._session_report_journal:
+                executor.set_session_report_sink(self._session_report_journal)
+            self._standard_subagents_negotiated = True
+        elif (
+            self._session_report_journal is not None
+            and report_features_proven
+            and action_features_proven
+        ):
+            enable_standard_subagents = getattr(executor, "enable_standard_subagents", None)
+            if not callable(enable_standard_subagents):
+                raise RuntimeError("executor advertised ACP reporting without an opt-in method")
+            enable_standard_subagents(report_features, action_features)
+            # The private channel and action binding have both been proven by the
+            # runner. Attach durability before any code can send `initialize`.
+            executor.set_session_report_sink(self._session_report_journal)
+            self._standard_subagents_negotiated = True
+        action_origin_token = ctx._session_action_origin_token
+        bind_action_origin = getattr(executor, "bind_session_action_origin", None)
+        if callable(bind_action_origin):
+            bind_action_origin(
+                action_origin_token,
+                request.model,
+                ctx._session_action_origin_generation,
+                ctx._session_action_context_generation,
+                response_id=ctx.response_id,
+            )
         messages = _translate_input_to_messages(
             request.input,
             include_tool_history=executor.replays_tool_history(),
@@ -301,6 +603,14 @@ class ExecutorAdapter(HarnessApp):
             )
         if getattr(executor, "_policy_evaluator", None) is None:
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
+        if hasattr(executor, "_session_action_request_handler"):
+            if executor._session_action_request_handler is None:  # type: ignore[attr-defined]
+                executor._session_action_request_handler = (  # type: ignore[attr-defined]
+                    self._handle_detached_session_request
+                )
+            executor._session_action_failure_handler = self.cancel_session_actions  # type: ignore[attr-defined]
+        if self._session_agent is None:
+            self._session_agent = request.model
         self._current_ctx = ctx
         self._current_agent = request.model
         # Clear per-turn state so stale entries from an errored prior turn don't bleed through.
@@ -570,6 +880,9 @@ class ExecutorAdapter(HarnessApp):
                 agent_span = None
             raise
         finally:
+            clear_action_origin = getattr(executor, "clear_session_action_origin", None)
+            if callable(clear_action_origin):
+                clear_action_origin(action_origin_token)
             # Cancel the injection watcher (long-polls a queue; cancellation is the only way out).
             injection_watcher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -601,14 +914,23 @@ class ExecutorAdapter(HarnessApp):
                 self._current_agent = None
             # Detach before background cleanup so a continuation cannot reuse this executor.
             if not clean_exit:
-                abandoned_executor = self._executor
-                self._executor = None
-                interrupt_task = asyncio.create_task(
-                    self._safe_interrupt(abandoned_executor, self._session_key)
-                )
-                self._abandoned_executor_cleanup = interrupt_task
-                self._bg_tasks.add(interrupt_task)
-                interrupt_task.add_done_callback(self._bg_tasks.discard)
+                self._abandon_executor(executor)
+
+    def _abandon_executor(self, executor: Executor) -> None:
+        """Detach *executor* and reap it in the background so no later turn can reuse it.
+
+        No-op once *executor* is detached so a late-ending turn cannot reap its replacement.
+        """
+        if self._executor is not executor:
+            return
+        status = executor.session_report_status()
+        if status is not None:
+            self._session_report_source_status = status
+        self._executor = None
+        cleanup = asyncio.create_task(self._safe_interrupt(executor, self._session_key))
+        self._abandoned_executor_cleanup = cleanup
+        self._bg_tasks.add(cleanup)
+        cleanup.add_done_callback(self._bg_tasks.discard)
 
     async def _handle_interrupt_event(self) -> Response:
         """Cancel the turn and drop the inner executor session synchronously.
@@ -625,6 +947,30 @@ class ExecutorAdapter(HarnessApp):
         """Wait for confirmed teardown without cancelling the background reap."""
         cleanup = self._abandoned_executor_cleanup
         return cleanup is not None and await asyncio.shield(cleanup)
+
+    def _schedule_unpublished_executor_cleanup(self, executor: Executor) -> None:
+        """Close a newly built executor that failed report-sink setup."""
+        cleanup = asyncio.create_task(self._close_unpublished_executor(executor))
+        self._bg_tasks.add(cleanup)
+        cleanup.add_done_callback(self._bg_tasks.discard)
+
+    async def _close_unpublished_executor(self, executor: Executor) -> None:
+        """Best-effort close without interrupting an executor that never ran."""
+
+        async def _close() -> None:
+            try:
+                await executor.close_session(self._session_key)
+            except Exception:
+                _logger.exception("unpublished executor close_session failed")
+            try:
+                await executor.close()
+            except Exception:
+                _logger.exception("unpublished executor close failed")
+
+        try:
+            await asyncio.wait_for(_close(), timeout=executor.close_timeout())
+        except Exception:
+            _logger.exception("unpublished executor teardown failed or timed out")
 
     async def _safe_interrupt(self, executor: Executor | None, session_key: str) -> bool:
         """Best-effort bounded interrupt + close of a detached abandoned executor.
@@ -818,9 +1164,8 @@ class ExecutorAdapter(HarnessApp):
 
         Reads ``_current_ctx`` at call time. Returns a structured error for orphaned callbacks.
         """
-        ctx = self._current_ctx
-        agent = self._current_agent
-        if ctx is None or agent is None:
+        ctx = self._callback_context()
+        if ctx is None:
             # Orphaned callback — safe-fail to avoid parking a Future on a dead ctx.
             # Host-tool orphans are the deterministic respawn-desync signature, so force
             # Tier-1 reset immediately (only when the scaffold also has no live turn).
@@ -839,19 +1184,58 @@ class ExecutorAdapter(HarnessApp):
                 "error": "no active turn context for tool dispatch",
                 "code": "runner_turn_context_desync",
             }
+        # Older embedders and lightweight callback contexts may not expose the
+        # optional session-action fields. Treat them as an ordinary turn context.
+        session_action_child = getattr(ctx, "_session_action_child", None)
+        is_child_action = session_action_child is not None
+        agent = (
+            getattr(ctx, "_session_action_agent", None)
+            if is_child_action
+            else self._current_agent or self._session_agent
+        )
+        if agent is None:
+            self._orphan_callback_count += 1
+            _logger.error(
+                "runner_turn_context_desync: tool callback has no bound agent "
+                "(tool=%s, child_action=%s, consecutive_orphans=%d); returning error",
+                tool_name,
+                is_child_action,
+                self._orphan_callback_count,
+            )
+            await self._maybe_resync_on_orphan()
+            return {
+                "error": "no bound agent for tool dispatch",
+                "code": "runner_turn_context_desync",
+            }
+        # Standard ACP native observations own the canonical completed item.
+        # Their dispatch callbacks use an independent internal ID and never
+        # carry ACP scope, regardless of callback timing or supplied ID.
+        if self._standard_subagents_negotiated and not is_child_action:
+            dispatch_call_id = ctx.session_action_correlation("call")
+            return await _bridge_one_dispatch(
+                ctx,
+                agent,
+                tool_name,
+                args,
+                call_id=dispatch_call_id,
+                suppress_completed_mirror=True,
+            )
+
         # Explicit IDs survive callbacks arriving before, or out of order with,
         # stdout observations. SDKs without callback IDs retain FIFO correlation.
         correlated_call_id = call_id
-        if call_id:
-            with contextlib.suppress(ValueError):
-                self._pending_mcp_call_ids.remove(call_id)
-        elif self._pending_mcp_call_ids:
-            correlated_call_id = self._pending_mcp_call_ids.popleft()
+        if not is_child_action:
+            if call_id:
+                with contextlib.suppress(ValueError):
+                    self._pending_mcp_call_ids.remove(call_id)
+            elif self._pending_mcp_call_ids:
+                correlated_call_id = self._pending_mcp_call_ids.popleft()
         # Allocate id here to record in _dispatched_call_ids; matching ToolCallComplete
         # is suppressed in _translate_event (dispatch_tool already emits its output).
 
-        dispatch_call_id = correlated_call_id or f"call_{uuid.uuid4().hex[:12]}"
-        self._dispatched_call_ids.add(dispatch_call_id)
+        dispatch_call_id = correlated_call_id or ctx.session_action_correlation("call")
+        if not is_child_action:
+            self._dispatched_call_ids.add(dispatch_call_id)
         return await _bridge_one_dispatch(
             ctx,
             agent,
@@ -859,6 +1243,73 @@ class ExecutorAdapter(HarnessApp):
             args,
             call_id=dispatch_call_id,
         )
+
+    def _trusted_acp_tool_call_scope(
+        self,
+        call_id: str,
+        _ctx: TurnContext,
+        event_metadata: dict[str, Any] | None,
+    ) -> dict[str, str] | None:
+        """Validate native event scope against the executor's persisted call anchor."""
+        supplied = (
+            event_metadata is not None and ACP_TOOL_CALL_SCOPE_METADATA_KEY in event_metadata
+        )
+        raw_scope = (
+            event_metadata.get(ACP_TOOL_CALL_SCOPE_METADATA_KEY)
+            if supplied and event_metadata is not None
+            else None
+        )
+        if not self._standard_subagents_negotiated:
+            if supplied:
+                raise RuntimeError("private ACP tool-call scope arrived without negotiation")
+            return None
+        scope_lookup = getattr(self._executor, "_root_tool_call_scope_metadata", None)
+        trusted_scope = scope_lookup(call_id) if callable(scope_lookup) else None
+        if supplied and raw_scope != trusted_scope:
+            raise RuntimeError("ACP tool-call metadata does not match its trusted anchor")
+        if not supplied:
+            raw_scope = trusted_scope
+        if not isinstance(raw_scope, dict) or set(raw_scope) != {
+            "source_id",
+            "native_call_id",
+            "action_origin_token",
+            "action_origin_generation",
+            "response_id",
+        }:
+            raise RuntimeError("negotiated ACP tool call is missing its trusted identity anchor")
+        source_id = raw_scope.get("source_id")
+        native_call_id = raw_scope.get("native_call_id")
+        origin_token = raw_scope.get("action_origin_token")
+        origin_generation = raw_scope.get("action_origin_generation")
+        response_id = raw_scope.get("response_id")
+        if (
+            not isinstance(source_id, str)
+            or len(source_id) != 69
+            or not source_id.startswith("acp2:")
+            or any(char not in "0123456789abcdef" for char in source_id[5:])
+            or not isinstance(call_id, str)
+            or not call_id
+            or len(call_id) > 512
+            or not isinstance(native_call_id, str)
+            or native_call_id != call_id
+            or not isinstance(origin_token, str)
+            or not origin_token
+            or len(origin_token) > 256
+            or not isinstance(origin_generation, str)
+            or not origin_generation
+            or len(origin_generation) > 256
+            or not isinstance(response_id, str)
+            or not response_id
+            or len(response_id) > 64
+        ):
+            raise RuntimeError("ACP tool-call anchor does not match the trusted turn context")
+        return {
+            "source_id": source_id,
+            "native_call_id": native_call_id,
+            "action_origin_token": origin_token,
+            "action_origin_generation": origin_generation,
+            "response_id": response_id,
+        }
 
     async def _stable_elicitation_handler(
         self,
@@ -869,7 +1320,7 @@ class ExecutorAdapter(HarnessApp):
 
         Reads ``_current_ctx`` at call time; denies by default when no turn is active.
         """
-        ctx = self._current_ctx
+        ctx = self._callback_context()
         if ctx is None:
             # No active turn — deny by default (fail safe, never grant unreviewed permission).
             _logger.error(
@@ -879,7 +1330,7 @@ class ExecutorAdapter(HarnessApp):
             )
             return False
 
-        elicitation_id = f"elicit_{secrets.token_hex(16)}"
+        elicitation_id = ctx.session_action_correlation("elicit")
         params = self._permission_card(tool_name, tool_input)
         result = await ctx.elicit(elicitation_id, params)
         if result.action == "decline":
@@ -942,7 +1393,7 @@ class ExecutorAdapter(HarnessApp):
         :returns: The chosen label, or ``None`` when declined, cancelled, or the
             reply carried no readable answer.
         """
-        ctx = self._current_ctx
+        ctx = self._callback_context()
         if ctx is None:
             # No active turn — decline by default, as the binary card does.
             _logger.error(
@@ -952,7 +1403,7 @@ class ExecutorAdapter(HarnessApp):
             )
             return None
 
-        elicitation_id = f"elicit_{secrets.token_hex(16)}"
+        elicitation_id = ctx.session_action_correlation("elicit")
         # An ``answer`` enum is what the approval card renders as one button per
         # option, and the reply names the chosen label in ``content["answer"]``.
         params = self._permission_card(
@@ -978,7 +1429,7 @@ class ExecutorAdapter(HarnessApp):
         params: ElicitationRequestParams,
     ) -> ElicitationResult:
         """Forward a form without treating a decline as turn cancellation."""
-        ctx = self._current_ctx
+        ctx = self._callback_context()
         if ctx is None:
             _logger.error(
                 "form elicitation callback fired with no active turn context; cancelling"
@@ -1002,7 +1453,7 @@ class ExecutorAdapter(HarnessApp):
         Reads ``_current_ctx`` at call time, mirroring
         :meth:`_stable_elicitation_handler`.
         """
-        ctx = self._current_ctx
+        ctx = self._callback_context()
         if ctx is None:
             _logger.error("ask-question callback fired with no active turn context; denying")
             return "AskUserQuestion is unavailable outside an active Omnigent turn."
@@ -1012,7 +1463,7 @@ class ExecutorAdapter(HarnessApp):
                 "AskUserQuestion input had no question with selectable options, so "
                 "nothing was shown to the user. Fix the input or ask in plain text."
             )
-        elicitation_id = f"elicit_{secrets.token_hex(16)}"
+        elicitation_id = ctx.session_action_correlation("elicit")
         # Own phase so the REPL's "approve always" cache for tool calls never
         # auto-accepts a question (an accept with no answers).
         params = self._permission_card(
@@ -1042,7 +1493,7 @@ class ExecutorAdapter(HarnessApp):
 
         Fails closed (DENY) for tool-call phases when no turn context is active.
         """
-        ctx = self._current_ctx
+        ctx = self._callback_context()
         if ctx is None:
             # Orphaned callback — fail closed for tool-call phases; ALLOW for advisory ones.
             fail_closed = phase in FAIL_CLOSED_PHASES
@@ -1062,7 +1513,7 @@ class ExecutorAdapter(HarnessApp):
                     f"No active turn context; failing closed for {phase}." if fail_closed else None
                 ),
             )
-        evaluation_id = f"poleval_{secrets.token_hex(16)}"
+        evaluation_id = ctx.session_action_correlation("poleval")
         return await ctx.evaluate_policy(evaluation_id, phase, data)
 
     def supports_live_mcp_control(self) -> bool:
@@ -1093,7 +1544,8 @@ class ExecutorAdapter(HarnessApp):
         :returns: The per-conversation inner :class:`Executor`.
         """
         if self._executor is None:
-            self._executor = self._executor_factory()
+            executor = self._executor_factory()
+            self._executor = executor
         return self._executor
 
     def _translate_event(self, event: ExecutorEvent, ctx: TurnContext) -> None:
@@ -1130,13 +1582,18 @@ class ExecutorAdapter(HarnessApp):
             # so the post-stream dispatch reuses the same call_id for deduplication.
             # Emit bare names (strip MCP prefix) to match the Omnigent wire shape.
             tool_use_id = _call_id_from_metadata(event.metadata)
+            scope = self._trusted_acp_tool_call_scope(tool_use_id or "", ctx, event.metadata)
             if tool_use_id in self._dispatched_call_ids:
                 # Dispatch already owns this card; a late observation must not
                 # downgrade it or queue an ID for a different tool.
                 return
             # Observed native tools already ran inside their harness. They must
             # never enter the queue consumed by Omnigent's dispatch bridge.
-            if tool_use_id is not None and event.metadata.get("internally_executed") is not True:
+            if (
+                tool_use_id is not None
+                and event.metadata.get("internally_executed") is not True
+                and not self._standard_subagents_negotiated
+            ):
                 self._pending_mcp_call_ids.append(tool_use_id)
             call_id = tool_use_id or f"call_{uuid.uuid4().hex[:12]}"
             self._pr_tool_calls[call_id] = (event.name, event.args or {})
@@ -1156,19 +1613,27 @@ class ExecutorAdapter(HarnessApp):
                 # a durable completed function_call (see that branch) — which is what
                 # keeps an observed card from vanishing on reload.
                 status = _OBSERVED_TOOL_CALL_STATUS
-                self._observed_tool_calls[call_id] = (bare_name, arguments_json)
+                if len(self._observed_tool_calls) >= _MAX_OBSERVED_TOOL_CALLS:
+                    raise RuntimeError("observed tool-call correlation limit reached")
+                self._observed_tool_calls[call_id] = (bare_name, arguments_json, scope)
+            item = {
+                "id": f"fc_{uuid.uuid4().hex[:12]}",
+                "type": "function_call",
+                "status": status,
+                "name": bare_name,
+                "arguments": arguments_json,
+                "call_id": call_id,
+                "agent": scope["response_id"] if scope is not None else ctx.response_id,
+            }
+            native_tool_status = event.metadata.get("tool_status")
+            if isinstance(native_tool_status, str):
+                item["tool_status"] = native_tool_status
+            if scope is not None and event.metadata.get("observed_call_completed") is True:
+                item[ACP_TOOL_CALL_SCOPE_METADATA_KEY] = scope
             ctx.emit(
                 OutputItemDoneEvent(
                     type="response.output_item.done",
-                    item={
-                        "id": f"fc_{uuid.uuid4().hex[:12]}",
-                        "type": "function_call",
-                        "status": status,
-                        "name": bare_name,
-                        "arguments": arguments_json,
-                        "call_id": call_id,
-                        "agent": ctx.response_id,
-                    },
+                    item=item,
                 )
             )
         elif isinstance(event, ToolCallComplete):
@@ -1182,6 +1647,10 @@ class ExecutorAdapter(HarnessApp):
                 self._observed_tool_calls.pop(call_id, None)
                 self._pr_tool_calls.pop(call_id, None)
                 return
+            terminal_scope = self._trusted_acp_tool_call_scope(
+                call_id, ctx, getattr(event, "metadata", None)
+            )
+            event_metadata = getattr(event, "metadata", {}) or {}
             # A live observed call cached at ToolCallRequest is re-emitted here as a
             # durable COMPLETED function_call so it survives reload — the in_progress
             # one is dropped by the turn-persist filter. Same call_id → the web dedupes
@@ -1190,6 +1659,12 @@ class ExecutorAdapter(HarnessApp):
             # is what prevents a duplicate card. This mirrors how a dispatched call
             # re-emits completed once its dispatch resolves.
             observed = self._observed_tool_calls.pop(call_id, None)
+            if observed is not None:
+                observed_name, observed_args, observed_scope = observed
+                if terminal_scope is not None and observed_scope != terminal_scope:
+                    raise RuntimeError("ACP tool-call anchor changed before completion")
+                if observed_scope is not None:
+                    terminal_scope = observed_scope
             pr_call = self._pr_tool_calls.pop(call_id, None)
             if pr_call is not None:
                 from omnigent.runner.pr_observer import observe_tool_completion
@@ -1206,31 +1681,72 @@ class ExecutorAdapter(HarnessApp):
                         source="sdk",
                     )
             if observed is not None:
-                observed_name, observed_args = observed
+                observed_name, observed_args, _ = observed
+                completed_item: dict[str, Any] = {
+                    "id": f"fc_{uuid.uuid4().hex[:12]}",
+                    "type": "function_call",
+                    "status": _COMPLETED_TOOL_CALL_STATUS,
+                    "name": observed_name,
+                    "arguments": observed_args,
+                    "call_id": call_id,
+                    "agent": (
+                        terminal_scope["response_id"]
+                        if terminal_scope is not None
+                        else ctx.response_id
+                    ),
+                }
+                native_tool_status = event_metadata.get("tool_status")
+                if isinstance(native_tool_status, str):
+                    completed_item["tool_status"] = native_tool_status
+                if terminal_scope is not None:
+                    completed_item[ACP_TOOL_CALL_SCOPE_METADATA_KEY] = terminal_scope
                 ctx.emit(
                     OutputItemDoneEvent(
                         type="response.output_item.done",
-                        item={
-                            "id": f"fc_{uuid.uuid4().hex[:12]}",
-                            "type": "function_call",
-                            "status": _COMPLETED_TOOL_CALL_STATUS,
-                            "name": observed_name,
-                            "arguments": observed_args,
-                            "call_id": call_id,
-                            "agent": ctx.response_id,
-                        },
+                        item=completed_item,
                     )
                 )
-            raw_args = getattr(event, "metadata", {}).get("arguments")
+            native_output = event_metadata.get(ACP_TOOL_OUTPUT_METADATA_KEY)
+            if self._standard_subagents_negotiated and terminal_scope is not None:
+                if isinstance(native_output, dict) and native_output.get("present") is not True:
+                    return
+                if (
+                    not isinstance(native_output, dict)
+                    and event.result is None
+                    and event.error is None
+                ):
+                    return
+            raw_args = event_metadata.get("arguments")
             item: dict[str, Any] = {
                 "id": f"fco_{uuid.uuid4().hex[:12]}",
                 "type": "function_call_output",
+                "status": "completed",
                 "call_id": call_id,
-                # Cap the mirror; the inner SDK already consumed the full result.
-                "output": cap_tool_output(_serialize_tool_result(event)),
             }
+            if (
+                self._standard_subagents_negotiated
+                and terminal_scope is not None
+                and isinstance(native_output, dict)
+            ):
+                item["acp_agent_identity"] = "unknown"
+                if native_output.get("cleared") is True:
+                    item["output"] = None
+                else:
+                    output_text = native_output.get("text")
+                    if not isinstance(output_text, str):
+                        raise RuntimeError("standard ACP tool output text is malformed")
+                    item["output"] = cap_tool_output(output_text)
+                if native_output.get("content_present") is True:
+                    item["content"] = native_output.get("content")
+                if native_output.get("raw_output_present") is True:
+                    item["raw_output"] = native_output.get("raw_output")
+            else:
+                # Cap the mirror; the inner SDK already consumed the full result.
+                item["output"] = cap_tool_output(_serialize_tool_result(event))
             if isinstance(raw_args, dict):
                 item["arguments"] = raw_args
+            if terminal_scope is not None:
+                item[ACP_TOOL_CALL_SCOPE_METADATA_KEY] = terminal_scope
             ctx.emit(OutputItemDoneEvent(type="response.output_item.done", item=item))
         elif isinstance(event, TurnComplete):
             if event.response is not None:
@@ -1259,6 +1775,8 @@ class ExecutorAdapter(HarnessApp):
                 )
             )
         elif isinstance(event, SubAgentStarted):
+            if self._session_report_journal is not None:
+                return
             from omnigent.server.schemas import SubagentStartedEvent
 
             ctx.emit(
@@ -1270,6 +1788,8 @@ class ExecutorAdapter(HarnessApp):
                 )
             )
         elif isinstance(event, SubAgentCompleted):
+            if self._session_report_journal is not None:
+                return
             from omnigent.server.schemas import SubagentCompletedEvent
 
             ctx.emit(
@@ -1281,6 +1801,8 @@ class ExecutorAdapter(HarnessApp):
                 )
             )
         elif isinstance(event, SubAgentToolCall):
+            if self._session_report_journal is not None:
+                return
             from omnigent.server.schemas import SubagentToolCallEvent
 
             ctx.emit(
@@ -1360,13 +1882,22 @@ class ExecutorAdapter(HarnessApp):
 
     async def on_shutdown(self) -> None:
         """Drain background interrupt tasks, then close the executor session and executor."""
-        if self._bg_tasks:
-            await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
-            self._bg_tasks.clear()
-        if self._executor is not None:
-            await self._executor.close_session(self._session_key)
-            await self._executor.close()
-            self._executor = None
+        try:
+            if self._bg_tasks:
+                await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
+                self._bg_tasks.clear()
+            if self._executor is not None:
+                status = self._executor.session_report_status()
+                if status is not None:
+                    self._session_report_source_status = status
+                await self._executor.close_session(self._session_key)
+                await self._executor.close()
+                self._executor = None
+        finally:
+            journal = self._session_report_journal
+            self._session_report_journal = None
+            if journal is not None:
+                await asyncio.to_thread(journal.close)
 
 
 def _classify_openai_exception(exception: BaseException) -> str | None:
@@ -1516,6 +2047,7 @@ async def _bridge_one_dispatch(
     args: dict[str, Any],
     *,
     call_id: str | None = None,
+    suppress_completed_mirror: bool = False,
 ) -> dict[str, Any]:
     """Round-trip one tool call through ``ctx.dispatch_tool``; returns an MCP-compatible dict.
 
@@ -1526,12 +2058,21 @@ async def _bridge_one_dispatch(
     if call_id is None:
         call_id = f"call_{uuid.uuid4().hex[:12]}"
     try:
-        output = await ctx.dispatch_tool(
-            call_id=call_id,
-            name=tool_name,
-            arguments=json.dumps(args),
-            agent=agent,
-        )
+        if suppress_completed_mirror:
+            output = await ctx.dispatch_tool(
+                call_id=call_id,
+                name=tool_name,
+                arguments=json.dumps(args),
+                agent=agent,
+                suppress_completed_mirror=True,
+            )
+        else:
+            output = await ctx.dispatch_tool(
+                call_id=call_id,
+                name=tool_name,
+                arguments=json.dumps(args),
+                agent=agent,
+            )
     except Exception as exc:
         _logger.exception("dispatch_tool failed for %s", tool_name)
         return {"error": str(exc)}

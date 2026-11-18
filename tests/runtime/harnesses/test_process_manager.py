@@ -36,6 +36,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 import httpx
@@ -639,6 +640,7 @@ async def test_release_reaps_term_resistant_process_when_graceful_wait_is_cancel
     manager._registry_lock = asyncio.Lock()
     manager._release_generations = {}
     manager._in_flight_response_ids = {}
+    manager._background_activities = {}
     entry = process_manager_module._SubprocessEntry(
         process,
         _Client(),
@@ -694,7 +696,13 @@ async def test_release_reaps_process_when_teardown_is_cancelled(
                     await asyncio.Event().wait()
             elif cancel_stage == "force_wait":
                 self.force_wait_started.set()
-                await asyncio.Event().wait()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    # A real Process.wait() learns the kill status from the
+                    # child watcher even when the caller cancels its wait.
+                    self.returncode = -9
+                    raise
             return self.returncode
 
     class _Client:
@@ -719,15 +727,17 @@ async def test_release_reaps_process_when_teardown_is_cancelled(
     transport_closes: list[object] = []
 
     def terminate_tree(_process: object) -> None:
-        if cancel_stage == "client_close":
-            process.returncode = -15
+        return None
 
     def kill_tree(_process: object) -> None:
         process.dead = True
-        process.returncode = -9
+        if cancel_stage == "client_close":
+            process.returncode = -9
 
     monkeypatch.setattr(process_manager_module._proc, "terminate_tree", terminate_tree)
     monkeypatch.setattr(process_manager_module._proc, "kill_tree", kill_tree)
+    if cancel_stage == "client_close":
+        monkeypatch.setattr(process_manager_module, "_RELEASE_GRACE_S", 0.05)
     monkeypatch.setattr(
         process_manager_module,
         "close_subprocess_transport",
@@ -739,6 +749,7 @@ async def test_release_reaps_process_when_teardown_is_cancelled(
     manager._registry_lock = asyncio.Lock()
     manager._release_generations = {}
     manager._in_flight_response_ids = {}
+    manager._background_activities = {}
     entry = process_manager_module._SubprocessEntry(
         process,
         client,
@@ -1341,20 +1352,331 @@ class _FakeReapProc:
         await self._done.wait()
         return self.returncode
 
+    def exit(self, returncode: int) -> None:
+        """Represent an externally observed process exit without signaling a PID."""
+        self.returncode = returncode
+        self._done.set()
+
 
 class _SlowCloseClient:
     """httpx-client stand-in whose aclose() stalls, holding the reaper pass open."""
 
     def __init__(self, delay_s: float) -> None:
         self._delay_s = delay_s
+        self.closed = asyncio.Event()
 
     async def aclose(self) -> None:
-        await asyncio.sleep(self._delay_s)
+        try:
+            await asyncio.sleep(self._delay_s)
+        finally:
+            self.closed.set()
 
 
 class _FakeEndpoint:
+    socket_path = None
+
     def cleanup(self) -> None:
         pass
+
+
+async def test_background_child_leases_keep_harness_until_every_child_clears(
+    tmp_path: Path,
+) -> None:
+    """Background leases protect the process and clearing one preserves others."""
+    manager = HarnessProcessManager(
+        idle_timeout_s=0.15,
+        reaper_interval_s=0.02,
+        tmp_parent=tmp_path,
+    )
+    entry = _SubprocessEntry(_FakeReapProc(), _SlowCloseClient(0.0), _FakeEndpoint(), "acp")  # type: ignore[arg-type]
+    entry.last_used_at = time.monotonic() - 10.0
+    manager._entries["conv_children"] = entry
+
+    assert await manager.register_background_activity("conv_children", "child-a") is True
+    assert await manager.register_background_activity("conv_children", "child-b") is True
+    entry.last_used_at = time.monotonic() - 10.0
+    reaper = asyncio.create_task(manager._idle_reaper_loop())
+    try:
+        await asyncio.sleep(0.3)
+        assert not entry.process.killed, "a live background child must prevent idle reaping"
+        assert manager.has_active_background_activity("conv_children")
+
+        await manager.clear_background_activity("conv_children", "child-a")
+        entry.last_used_at = time.monotonic() - 10.0
+        await asyncio.sleep(0.1)
+        assert not entry.process.killed, "clearing one child must retain the other child's lease"
+
+        await manager.clear_background_activity("conv_children", "child-b")
+        entry.last_used_at = time.monotonic() - 10.0
+        deadline = time.monotonic() + 2.0
+        while not entry.process.killed:
+            assert time.monotonic() < deadline, "harness was not reaped after all children cleared"
+            await asyncio.sleep(0.02)
+        assert not manager.has_active_background_activity("conv_children")
+    finally:
+        reaper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reaper
+
+
+async def test_idle_reaper_rechecks_background_lease_after_stale_snapshot(
+    tmp_path: Path,
+) -> None:
+    """A child starting during an earlier teardown is not reaped from a stale list."""
+    manager = HarnessProcessManager(
+        idle_timeout_s=0.15,
+        reaper_interval_s=0.02,
+        tmp_parent=tmp_path,
+    )
+    first = _SubprocessEntry(_FakeReapProc(), _SlowCloseClient(0.35), _FakeEndpoint(), "acp")  # type: ignore[arg-type]
+    second = _SubprocessEntry(_FakeReapProc(), _SlowCloseClient(0.0), _FakeEndpoint(), "acp")  # type: ignore[arg-type]
+    first.last_used_at = second.last_used_at = time.monotonic() - 10.0
+    manager._entries = {"conv_first": first, "conv_second": second}
+    reaper = asyncio.create_task(manager._idle_reaper_loop())
+    try:
+        deadline = time.monotonic() + 2.0
+        while "conv_first" in manager._entries:
+            assert time.monotonic() < deadline, "reaper never started the stale snapshot"
+            await asyncio.sleep(0.01)
+
+        assert await manager.register_background_activity("conv_second", "child-live") is True
+        second.last_used_at = time.monotonic() - 10.0
+        await asyncio.sleep(0.5)
+        assert first.process.killed
+        assert not second.process.killed, "conditional release ignored a newly registered child"
+        assert manager._entries.get("conv_second") is second
+
+        await manager.clear_background_activity("conv_second", "child-live")
+        second.last_used_at = time.monotonic() - 10.0
+        deadline = time.monotonic() + 2.0
+        while not second.process.killed:
+            assert time.monotonic() < deadline, "harness was not reaped after its child cleared"
+            await asyncio.sleep(0.02)
+    finally:
+        reaper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reaper
+
+
+async def test_process_exit_watcher_recovers_generation_without_cancelling_itself(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An actual exit watcher can re-enter get_client and finish its recovery hook."""
+    manager = HarnessProcessManager(tmp_parent=tmp_path)
+    manager._started = True
+    conversation_id = "conv_exit_watch"
+    old_process = _FakeReapProc()
+    old_entry = _SubprocessEntry(
+        old_process,
+        _SlowCloseClient(0.0),
+        _FakeEndpoint(),
+        "acp",
+        session_report_subscriber_generation="generation-old",
+    )  # type: ignore[arg-type]
+    manager._entries[conversation_id] = old_entry
+    replacement_process = _FakeReapProc()
+    replacement = _SubprocessEntry(
+        replacement_process,
+        _SlowCloseClient(0.0),
+        _FakeEndpoint(),
+        "acp",
+        session_report_subscriber_generation="generation-new",
+    )  # type: ignore[arg-type]
+    spawned: list[tuple[str, str]] = []
+
+    async def spawn(_conversation_id: str, harness: str, _env: dict[str, str] | None):
+        spawned.append((_conversation_id, harness))
+        return replacement
+
+    monkeypatch.setattr(manager, "_spawn_entry", spawn)
+    callback_finished = asyncio.Event()
+    callback_calls: list[tuple[str, str, int | None]] = []
+
+    async def recover(conv_id: str, generation: str, returncode: int | None) -> None:
+        callback_calls.append((conv_id, generation, returncode))
+        client = await manager.get_client(conv_id, "acp")
+        assert client is replacement.client
+        callback_finished.set()
+
+    manager.set_process_exit_hook(recover)
+    manager._start_process_exit_watcher(conversation_id, old_entry)
+    watcher = old_entry.process_exit_watcher
+    assert watcher is not None
+    old_process.exit(-signal.SIGKILL)
+
+    await asyncio.wait_for(callback_finished.wait(), timeout=2.0)
+    await asyncio.wait_for(watcher, timeout=2.0)
+    assert callback_calls == [(conversation_id, "generation-old", -signal.SIGKILL)]
+    assert spawned == [(conversation_id, "acp")]
+    assert manager._entries[conversation_id] is replacement
+    assert watcher.cancelled() is False
+    await manager.release(conversation_id)
+
+
+@pytest.mark.parametrize("interrupt_mode", ["timeout", "cancel"])
+async def test_process_exit_hook_interruption_after_respawn_preserves_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupt_mode: str,
+) -> None:
+    """Once recovery registers a replacement, an interrupted hook cannot strand it."""
+    from omnigent.runtime.harnesses import process_manager as process_manager_module
+
+    manager = HarnessProcessManager(tmp_parent=tmp_path)
+    manager._started = True
+    conversation_id = "conv_exit_hook_interrupted"
+    old_process = _FakeReapProc()
+    old_entry = _SubprocessEntry(
+        old_process,
+        _SlowCloseClient(0.0),
+        _FakeEndpoint(),
+        "acp",
+        session_report_subscriber_generation="generation-old",
+    )  # type: ignore[arg-type]
+    manager._entries[conversation_id] = old_entry
+    replacement_process = _FakeReapProc()
+    replacement = _SubprocessEntry(
+        replacement_process,
+        _SlowCloseClient(0.0),
+        _FakeEndpoint(),
+        "acp",
+        session_report_subscriber_generation="generation-new",
+    )  # type: ignore[arg-type]
+    spawned: list[tuple[str, str]] = []
+
+    async def spawn(_conversation_id: str, harness: str, _env: dict[str, str] | None):
+        spawned.append((_conversation_id, harness))
+        return replacement
+
+    monkeypatch.setattr(manager, "_spawn_entry", spawn)
+    if interrupt_mode == "timeout":
+        # Let old-entry teardown finish before timing out the hook's post-spawn wait.
+        monkeypatch.setattr(process_manager_module, "_PROCESS_EXIT_CALLBACK_TIMEOUT_S", 0.25)
+    replacement_registered = asyncio.Event()
+
+    async def recover(conv_id: str, _generation: str, _returncode: int | None) -> None:
+        assert await manager.get_client(conv_id, "acp") is replacement.client
+        replacement_registered.set()
+        await asyncio.Event().wait()
+
+    manager.set_process_exit_hook(recover)
+    manager._start_process_exit_watcher(conversation_id, old_entry)
+    watcher = old_entry.process_exit_watcher
+    assert watcher is not None
+    old_process.exit(-signal.SIGKILL)
+
+    await asyncio.wait_for(replacement_registered.wait(), timeout=1.0)
+    if interrupt_mode == "cancel":
+        watcher.cancel()
+    await asyncio.wait_for(watcher, timeout=3.0)
+
+    replacement_watcher = replacement.process_exit_watcher
+    assert spawned == [(conversation_id, "acp")]
+    assert manager._entries[conversation_id] is replacement
+    assert replacement_process.returncode is None
+    assert not replacement_process.killed
+    assert replacement_watcher is not None and not replacement_watcher.done()
+    assert not replacement_watcher.cancelled()
+    assert watcher.cancelled() is False
+    await manager.release(conversation_id)
+
+
+async def test_process_exit_watcher_retries_a_failed_recovery_hook(
+    tmp_path: Path,
+) -> None:
+    """A transient runner recovery failure does not strand the exited generation."""
+    manager = HarnessProcessManager(tmp_parent=tmp_path)
+    conversation_id = "conv_exit_retry"
+    process = _FakeReapProc()
+    entry = _SubprocessEntry(
+        process,
+        _SlowCloseClient(0.0),
+        _FakeEndpoint(),
+        "acp",
+        session_report_subscriber_generation="generation-retry",
+    )  # type: ignore[arg-type]
+    manager._entries[conversation_id] = entry
+    calls: list[tuple[str, str, int | None]] = []
+    recovered = asyncio.Event()
+
+    async def recover(conv_id: str, generation: str, returncode: int | None) -> None:
+        calls.append((conv_id, generation, returncode))
+        if len(calls) == 1:
+            raise RuntimeError("temporary recovery failure")
+        recovered.set()
+
+    manager.set_process_exit_hook(recover)
+    manager._start_process_exit_watcher(conversation_id, entry)
+    watcher = entry.process_exit_watcher
+    assert watcher is not None
+    process.exit(-signal.SIGKILL)
+
+    try:
+        await asyncio.wait_for(recovered.wait(), timeout=3.0)
+        await asyncio.wait_for(watcher, timeout=2.0)
+        assert calls == [
+            (conversation_id, "generation-retry", -signal.SIGKILL),
+            (conversation_id, "generation-retry", -signal.SIGKILL),
+        ]
+        assert watcher.cancelled() is False
+    finally:
+        await manager.release(conversation_id)
+
+
+@pytest.mark.parametrize("replacement_kind", ["harness_switch", "release"])
+async def test_process_exit_watcher_ignores_deliberate_retirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_kind: str,
+) -> None:
+    """A planned harness replacement or release never triggers crash recovery."""
+    manager = HarnessProcessManager(tmp_parent=tmp_path)
+    manager._started = True
+    conversation_id = "conv_planned_exit"
+    old_process = _FakeReapProc()
+    old_entry = _SubprocessEntry(
+        old_process,
+        _SlowCloseClient(0.0),
+        _FakeEndpoint(),
+        "acp",
+        session_report_subscriber_generation="generation-old",
+    )  # type: ignore[arg-type]
+    manager._entries[conversation_id] = old_entry
+    calls: list[tuple[str, str, int | None]] = []
+
+    async def recover(conv_id: str, generation: str, returncode: int | None) -> None:
+        calls.append((conv_id, generation, returncode))
+
+    manager.set_process_exit_hook(recover)
+    manager._start_process_exit_watcher(conversation_id, old_entry)
+    watcher = old_entry.process_exit_watcher
+    assert watcher is not None
+
+    if replacement_kind == "harness_switch":
+        replacement = _SubprocessEntry(
+            _FakeReapProc(),
+            _SlowCloseClient(0.0),
+            _FakeEndpoint(),
+            "other-acp",
+        )  # type: ignore[arg-type]
+
+        async def spawn(_conversation_id: str, _harness: str, _env: dict[str, str] | None):
+            return replacement
+
+        monkeypatch.setattr(manager, "_spawn_entry", spawn)
+        assert await manager.get_client(conversation_id, "other-acp") is replacement.client
+        assert old_entry.process_exit_expected
+        assert watcher.cancelled()
+        await manager.release(conversation_id)
+    else:
+        await manager.release(conversation_id)
+        assert old_entry.process_exit_expected
+        assert watcher.cancelled()
+
+    old_process.exit(-signal.SIGTERM)
+    await asyncio.sleep(0)
+    assert calls == []
 
 
 async def test_idle_reaper_spares_turn_started_during_pass(tmp_path: Path) -> None:
@@ -1373,7 +1695,8 @@ async def test_idle_reaper_spares_turn_started_during_pass(tmp_path: Path) -> No
     pass once it goes idle again.
     """
     mgr = HarnessProcessManager(idle_timeout_s=0.5, reaper_interval_s=0.2, tmp_parent=tmp_path)
-    e1 = _SubprocessEntry(_FakeReapProc(), _SlowCloseClient(0.6), _FakeEndpoint(), "h")  # type: ignore[arg-type]
+    e1_client = _SlowCloseClient(0.6)
+    e1 = _SubprocessEntry(_FakeReapProc(), e1_client, _FakeEndpoint(), "h")  # type: ignore[arg-type]
     e2 = _SubprocessEntry(_FakeReapProc(), _SlowCloseClient(0.0), _FakeEndpoint(), "h")  # type: ignore[arg-type]
     e1.last_used_at = time.monotonic() - 100.0
     e2.last_used_at = time.monotonic() - 100.0
@@ -1392,7 +1715,8 @@ async def test_idle_reaper_spares_turn_started_during_pass(tmp_path: Path) -> No
         mgr.note_activity("conv2")
         mgr.mark_in_flight("conv2", "resp_live")
 
-        await asyncio.sleep(1.0)
+        await asyncio.wait_for(e1.process.wait(), timeout=3.0)
+        await asyncio.wait_for(e1_client.closed.wait(), timeout=3.0)
         assert e1.process.killed, "the genuinely idle entry must still be reaped"
         assert not e2.process.killed, (
             "reaper SIGTERMed a subprocess whose turn started during the pass"
@@ -1416,6 +1740,7 @@ async def test_idle_reaper_spares_turn_started_during_pass(tmp_path: Path) -> No
 async def test_idle_reaper_disabled_when_timeout_zero(
     register_test_harness: None,
     short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A non-positive idle window disables reaping (``OMNIGENT_HARNESS_IDLE_TIMEOUT_S=0``).
 
@@ -1424,6 +1749,25 @@ async def test_idle_reaper_disabled_when_timeout_zero(
     and since every ``last_used_at`` is <= now it reaps every entry on the first
     pass. The spawned entry must survive many fast reaper passes.
     """
+    from omnigent.runtime.harnesses import process_manager as process_manager_module
+
+    original_asyncio = process_manager_module.asyncio
+    reaper_passes = 0
+    enough_passes = asyncio.Event()
+
+    class _AsyncioSleepProxy:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(original_asyncio, name)
+
+        async def sleep(self, delay: float) -> None:
+            nonlocal reaper_passes
+            await original_asyncio.sleep(delay)
+            if original_asyncio.current_task() is fast._reaper_task:
+                reaper_passes += 1
+                if reaper_passes >= 20:
+                    enough_passes.set()
+
+    monkeypatch.setattr(process_manager_module, "asyncio", _AsyncioSleepProxy())
     fast = HarnessProcessManager(
         idle_timeout_s=0.0,
         reaper_interval_s=0.05,
@@ -1434,9 +1778,10 @@ async def test_idle_reaper_disabled_when_timeout_zero(
         await fast.get_client("conv_a", _TEST_HARNESS_NAME)
         socket_path = fast.instance_dir / "conv-conv_a.sock"
         assert socket_path.exists()
-        # ~20 reaper passes at 0.05 s. With the bug the socket is gone almost
-        # immediately; with the guard it survives because reaping is disabled.
-        await asyncio.sleep(1.0)
+        # Observe actual reaper iterations, not elapsed time. With the bug the
+        # socket is gone almost immediately; with the guard it survives.
+        await asyncio.wait_for(enough_passes.wait(), timeout=3.0)
+        assert reaper_passes >= 20
         assert socket_path.exists(), (
             "idle_timeout_s=0 must DISABLE reaping, not reap every entry each pass"
         )

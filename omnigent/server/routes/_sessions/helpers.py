@@ -83,6 +83,10 @@ from omnigent.harness_plugins import (
 )
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
+from omnigent.inner.acp_standard_subagents import (
+    ACP_TOOL_CALL_SCOPE_METADATA_KEY,
+    acp_standard_canonical_tool_item_id,
+)
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import (
@@ -268,6 +272,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     user_session_stream,
 )
 from omnigent.server.schemas import (
+    AcpSessionObservation,
     BackgroundTaskInfo,
     ChildSessionSummary,
     CompletedEvent,
@@ -328,6 +333,7 @@ from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
     PINNED_LABEL_KEY,
+    AcpToolCallAppendScope,
     ConversationNotFoundError,
     NameAlreadyExistsError,
 )
@@ -1712,7 +1718,13 @@ def _publish_elicitation_request_to_ancestors(
             if current is None:
                 return
             event = current[1]
-        mirrored = _targeted_elicitation_event(event, target_session_id=session_id)
+        params = event.get("params")
+        target_session_id = (
+            params.get("target_session_id")
+            if isinstance(params, dict) and isinstance(params.get("target_session_id"), str)
+            else session_id
+        )
+        mirrored = _targeted_elicitation_event(event, target_session_id=target_session_id)
         for ancestor_id in ancestor_ids:
             session_stream.publish(ancestor_id, mirrored)
 
@@ -3131,7 +3143,7 @@ def _drop_claude_launch_args_from_another_host(
     :param conv: The session row as just bound, with its stored ``host_id``.
     :returns: The session row, updated when its args were dropped.
     """
-    from omnigent.runner.routing import routing_host_id  # noqa: FlagLocalImports
+    from omnigent.runner.routing import routing_host_id
 
     source_id = conv.labels.get(FORK_SOURCE_LABEL_KEY)
     if (
@@ -3736,6 +3748,9 @@ async def _persist_external_acp_subagent_start(
     parent_conv: Conversation,
     body: SessionEventInput,
     conversation_store: ConversationStore,
+    *,
+    require_durable: bool = False,
+    publish_if_adopted: bool = True,
 ) -> str:
     """
     Mint a child :class:`Conversation` for an ACP agent's sub-agent.
@@ -3764,6 +3779,8 @@ async def _persist_external_acp_subagent_start(
         ``description`` (the delegated task).
     :param conversation_store: Store used to read existing children and create
         the new row.
+    :param publish_if_adopted: Whether title-collision recovery should publish
+        another session-created event for a child created by a concurrent call.
     :returns: The child conversation id, e.g. ``"conv_child456"``.
     :raises OmnigentError: 400 when a required key is missing or the parent has
         no ``agent_id``.
@@ -3796,6 +3813,16 @@ async def _persist_external_acp_subagent_start(
         _find_acp_subagent_child, conversation_store, parent_id, subagent_id
     )
     if existing is not None:
+        if require_durable:
+            from omnigent.server.subagent_activity import record_subagent_activity
+
+            await record_subagent_activity(
+                existing.id,
+                "delegated",
+                conversation_store,
+                parent_id=parent_id,
+                require_durable=True,
+            )
         return existing.id
 
     labels = {
@@ -3826,14 +3853,44 @@ async def _persist_external_acp_subagent_start(
         if adopted is None:
             raise
         await asyncio.to_thread(conversation_store.set_labels, adopted.id, labels)
-        await _publish_session_created(
-            parent_id, adopted.id, parent_conv.agent_id, conversation_store, harness=None
-        )
+        if require_durable:
+            from omnigent.server.subagent_activity import record_subagent_activity
+
+            await record_subagent_activity(
+                adopted.id,
+                "delegated",
+                conversation_store,
+                parent_id=parent_id,
+                require_durable=True,
+            )
+        elif publish_if_adopted:
+            await _publish_session_created(
+                parent_id, adopted.id, parent_conv.agent_id, conversation_store, harness=None
+            )
         return adopted.id
     await asyncio.to_thread(conversation_store.set_labels, child.id, labels)
-    await _publish_session_created(
-        parent_id, child.id, parent_conv.agent_id, conversation_store, harness=None
-    )
+    if require_durable:
+        await _publish_session_created(
+            parent_id,
+            child.id,
+            parent_conv.agent_id,
+            conversation_store,
+            harness=None,
+            record_activity=False,
+        )
+        from omnigent.server.subagent_activity import record_subagent_activity
+
+        await record_subagent_activity(
+            child.id,
+            "delegated",
+            conversation_store,
+            parent_id=parent_id,
+            require_durable=True,
+        )
+    else:
+        await _publish_session_created(
+            parent_id, child.id, parent_conv.agent_id, conversation_store, harness=None
+        )
     return child.id
 
 
@@ -3884,6 +3941,7 @@ async def _publish_session_created(
     conversation_store: ConversationStore,
     *,
     harness: str | None,
+    record_activity: bool = True,
 ) -> None:
     """
     Emit ``session.created`` on the parent's stream for a child session.
@@ -3926,11 +3984,12 @@ async def _publish_session_created(
             **harness_attributes(harness, source="subagent_event"),
         ),
     )
-    from omnigent.server.subagent_activity import record_subagent_activity
+    if record_activity:
+        from omnigent.server.subagent_activity import record_subagent_activity
 
-    await record_subagent_activity(
-        child_session_id, "delegated", conversation_store, parent_id=parent_id
-    )
+        await record_subagent_activity(
+            child_session_id, "delegated", conversation_store, parent_id=parent_id
+        )
 
 
 async def _persist_external_subagent_start(
@@ -4994,7 +5053,10 @@ def _require_permission_mode_forward(
     return settled if isinstance(settled, str) and settled else mode
 
 
-def _publish_child_status_to_parent(session_id: str, status: str) -> None:
+def _publish_child_status_to_parent(
+    session_id: str,
+    status: str,
+) -> None:
     """
     Mirror a status transition onto the session's parent stream.
 
@@ -5026,11 +5088,17 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
             return
         parent_id = conv.parent_conversation_id
         items_by_child = store.list_latest_message_items_for_conversations([conv.id], 10)
+        acp_observation = None
+        if conv.labels.get(_ACP_SUBAGENT_ID_LABEL_KEY):
+            observation_data = store.get_acp_session_observation(conv.id)
+            if observation_data is not None:
+                acp_observation = AcpSessionObservation.model_validate(observation_data)
         summary = _child_session_summary_from_conversation(
             conv,
             parent_id,
             _latest_message_preview(items_by_child.get(conv.id, [])),
             cached_status=status,
+            acp_session_observation=acp_observation,
         )
         event = SessionChildSessionUpdatedEvent(
             type="session.child_session.updated",
@@ -5439,6 +5507,7 @@ async def _persist_session_status_error_labels(
     owner_runner_id: str | None = None,
     agent_name: str | None = None,
     item_id: str | None = None,
+    require_durable: bool = False,
 ) -> None:
     """
     Persist or clear the reload-visible failure detail for a session status.
@@ -5489,7 +5558,9 @@ async def _persist_session_status_error_labels(
     )
     try:
         await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
-    except Exception:  # noqa: BLE001
+    except Exception:
+        if require_durable:
+            raise
         _logger.exception(
             "Failed to persist session status error labels for %s",
             session_id,
@@ -8630,6 +8701,12 @@ def _extract_persistent_item_from_sse(
     item = event.get("item")
     if not isinstance(item, dict):
         return None
+    # Private append proof is consumed by the relay before this parser. Keep
+    # direct helper callers from ever treating it as public item data.
+    if ACP_TOOL_CALL_SCOPE_METADATA_KEY in item:
+        item = dict(item)
+        item.pop(ACP_TOOL_CALL_SCOPE_METADATA_KEY, None)
+        event["item"] = item
     item_type = item.get("type")
     if item_type not in ("message", "function_call", "function_call_output"):
         return None
@@ -8654,6 +8731,82 @@ def _extract_persistent_item_from_sse(
         type=item_type,
         response_id=response_id or f"turn_{uuid.uuid4().hex}",
         data=data,
+    )
+
+
+def _extract_acp_tool_call_append_scope_from_sse(
+    event: dict[str, Any],
+    response_id: str | None = None,
+    root_conversation_id: str | None = None,
+) -> AcpToolCallAppendScope | None:
+    """Consume private ACP scope metadata and validate its canonical item fence."""
+    raw_item = event.get("item")
+    if not isinstance(raw_item, dict) or ACP_TOOL_CALL_SCOPE_METADATA_KEY not in raw_item:
+        return None
+    item = dict(raw_item)
+    raw_scope = item.pop(ACP_TOOL_CALL_SCOPE_METADATA_KEY)
+    event["item"] = item
+    item_type = item.get("type")
+    if event.get("type") != "response.output_item.done" or item_type not in {
+        "function_call",
+        "function_call_output",
+    }:
+        raise ValueError("private ACP tool-call scope is attached to a non-tool item event")
+    if not isinstance(raw_scope, dict) or set(raw_scope) != {
+        "source_id",
+        "native_call_id",
+        "action_origin_token",
+        "action_origin_generation",
+        "response_id",
+    }:
+        raise ValueError("private ACP tool-call scope is malformed")
+    source_id = raw_scope.get("source_id")
+    native_call_id = raw_scope.get("native_call_id")
+    action_origin_token = raw_scope.get("action_origin_token")
+    action_origin_generation = raw_scope.get("action_origin_generation")
+    scoped_response_id = raw_scope.get("response_id")
+    call_id = item.get("call_id")
+    if (
+        not isinstance(source_id, str)
+        or len(source_id) != 69
+        or not source_id.startswith("acp2:")
+        or any(char not in "0123456789abcdef" for char in source_id[5:])
+        or not isinstance(native_call_id, str)
+        or native_call_id != call_id
+        or not isinstance(call_id, str)
+        or not call_id
+        or len(call_id) > 512
+        or not isinstance(action_origin_token, str)
+        or not action_origin_token
+        or len(action_origin_token) > 256
+        or not isinstance(action_origin_generation, str)
+        or not action_origin_generation
+        or len(action_origin_generation) > 256
+        or not isinstance(scoped_response_id, str)
+        or not scoped_response_id
+        or len(scoped_response_id) > 64
+        or (item_type == "function_call" and item.get("agent") != scoped_response_id)
+        or (response_id is not None and scoped_response_id != response_id)
+    ):
+        raise ValueError("private ACP tool-call scope does not match its call or response")
+    if item_type == "function_call_output" and item.get("status") != "completed":
+        raise ValueError("scoped ACP tool output must be completed")
+    if item_type == "function_call" and item.get("status") != "completed":
+        return None
+    if response_id is None or scoped_response_id != response_id:
+        raise ValueError("completed ACP tool item has no matching fenced response")
+    if root_conversation_id is not None:
+        item["id"] = acp_standard_canonical_tool_item_id(
+            root_conversation_id,
+            source_id,
+            item_type,
+        )
+    return AcpToolCallAppendScope(
+        source_id=source_id,
+        native_call_id=native_call_id,
+        action_origin_token=action_origin_token,
+        action_origin_generation=action_origin_generation,
+        response_id=scoped_response_id,
     )
 
 
@@ -8924,28 +9077,45 @@ async def _relay_persist(
     conversation_store: ConversationStore | None,
     session_id: str,
     item: NewConversationItem,
-) -> None:
+    *,
+    acp_tool_call_scope: AcpToolCallAppendScope | None = None,
+) -> ConversationItem | None:
     """
     Persist a single conversation item from the relay.
 
-    :param conversation_store: Store instance, or ``None`` to skip.
+    :param conversation_store: Store instance, or ``None`` to skip ordinary items.
     :param session_id: Session/conversation identifier.
     :param item: The item to persist.
+    :returns: The authoritative persisted item for a scoped append, otherwise ``None``.
     """
     if conversation_store is None:
-        return
+        if acp_tool_call_scope is not None:
+            raise RuntimeError(
+                "scoped ACP tool item cannot be accepted without a conversation store"
+            )
+        return None
     try:
-        await asyncio.to_thread(
+        if acp_tool_call_scope is None:
+            await asyncio.to_thread(conversation_store.append, session_id, [item])
+            return None
+        persisted_items = await asyncio.to_thread(
             conversation_store.append,
             session_id,
             [item],
+            acp_tool_call_scope=acp_tool_call_scope,
         )
-    except Exception:  # noqa: BLE001
+        if len(persisted_items) != 1:
+            raise RuntimeError("scoped ACP tool append returned no canonical item")
+        return persisted_items[0]
+    except Exception:
         _logger.exception(
             "Relay persist failed for session=%s",
             session_id,
             extra={"session_id": session_id},
         )
+        if acp_tool_call_scope is not None:
+            raise
+        return None
 
 
 async def _relay_response_policy_deny_reason(
@@ -11419,12 +11589,46 @@ async def _notify_runner_of_bundled_child(
         "agent_id": agent_id,
         "sub_agent_name": None,
     }
+    report_attempt_id: str | None = None
+    if conversation is None and conversation_store is not None:
+        try:
+            conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        except Exception:  # noqa: BLE001 - an optional notification must not bypass admission.
+            _logger.warning(
+                "session-init snapshot lookup failed for bundled session %s; "
+                "skipping the runner notification",
+                session_id,
+                exc_info=True,
+            )
+            return
+    if conversation is not None and conversation_store is None:
+        _logger.warning(
+            "session-init report admission cannot be prepared for bundled session %s; "
+            "skipping the runner notification",
+            session_id,
+        )
+        return
+    if conversation is not None and conversation_store is not None:
+        from omnigent.server.runner_session_init import (
+            prepare_acp_report_connection_attempt_for_client,
+        )
+
+        try:
+            report_attempt_id = await prepare_acp_report_connection_attempt_for_client(
+                conversation,
+                conversation_store=conversation_store,
+                runner_client=runner_client,
+            )
+        except Exception:  # noqa: BLE001 - an optional notification must not bypass admission.
+            _logger.warning(
+                "session-init report admission preparation failed for bundled session %s; "
+                "skipping the runner notification",
+                session_id,
+                exc_info=True,
+            )
+            return
     if conversation is not None or conversation_store is not None:
         try:
-            if conversation is None and conversation_store is not None:
-                conversation = await asyncio.to_thread(
-                    conversation_store.get_conversation, session_id
-                )
             if conversation is not None:
                 # The route forwards any initial input itself right after
                 # this notify, so a recovery turn would run it twice.
@@ -11432,6 +11636,7 @@ async def _notify_runner_of_bundled_child(
                     conversation,
                     server_version=VERSION,
                     suppress_recovery_turn=True,
+                    acp_report_connection_attempt_id=report_attempt_id,
                 )
         except Exception:  # noqa: BLE001 — must not fail the create, as on the JSON path.
             # The runner falls back to fetching the row.
@@ -11441,6 +11646,8 @@ async def _notify_runner_of_bundled_child(
                 session_id,
                 exc_info=True,
             )
+            if report_attempt_id is not None:
+                return
     try:
         await runner_client.post("/v1/sessions", json=body, timeout=10.0)
     except (httpx.HTTPError, ConnectionError):
@@ -11564,12 +11771,33 @@ def _child_session_current_task_status_from_cached_status(status: object) -> str
     return None
 
 
+def _acp_child_activity_from_observation(
+    observation: AcpSessionObservation | None,
+) -> tuple[bool, str | None]:
+    """Project only a selected, recognized ACP observation onto legacy summary fields."""
+    if observation is None or not observation.source_current:
+        return False, None
+    transport = observation.transport
+    transport_state = transport.get("state") if isinstance(transport, dict) else None
+    if isinstance(transport, dict) and "state" in transport and transport_state != "connected":
+        return False, None
+    state = observation.state
+    if not isinstance(state, dict) or state.get("present") is not True:
+        return False, None
+    value = state.get("value")
+    state_name = value.get("state", value.get("kind")) if isinstance(value, dict) else value
+    if isinstance(state_name, str) and state_name in {"running", "requires_action"}:
+        return True, "in_progress"
+    return False, None
+
+
 def _child_session_summary_from_conversation(
     conv: Conversation,
     parent_session_id: str,
     last_message_preview: str | None,
     *,
     cached_status: str | None = None,
+    acp_session_observation: AcpSessionObservation | None = None,
 ) -> ChildSessionSummary:
     """
     Build a :class:`ChildSessionSummary` from a child conversation.
@@ -11604,9 +11832,12 @@ def _child_session_summary_from_conversation(
         child-message lookup, or ``None`` when no visible message exists.
     :param cached_status: Session status to derive ``busy`` /
         ``current_task_status`` from, e.g. ``"running"``. ``None`` reads the
-        live ``_session_status_cache``; a status-edge publisher passes the
-        edge's own value so a burst of transitions fans out one summary per
-        edge instead of the latest status repeated.
+        live ``_session_status_cache`` for ordinary child sessions. ACP
+        mirror children use ``acp_session_observation`` and ignore this value.
+        A status-edge publisher passes the edge's own value so a burst of
+        ordinary transitions fans out one summary per edge.
+    :param acp_session_observation: Exact ACP state observation and source
+        eligibility for a mirrored child, or ``None`` when unavailable.
     :returns: A populated :class:`ChildSessionSummary`.
     """
     display_title = title_without_closed_marker(conv.title)
@@ -11653,17 +11884,23 @@ def _child_session_summary_from_conversation(
         tool = display_title or None
         session_name = None
 
-    # Derive busy from the relay-fed cache; tasks table is gone.
-    if cached_status is None:
-        cached_status = _session_status_cache.get(conv.id)
-    if cached_status in ("running", "waiting"):
-        busy = True
-    else:
-        busy = False
     last_task_error = _last_task_error_from_labels(labels)
-    current_task_status = _child_session_current_task_status_from_cached_status(cached_status)
-    if last_task_error is not None:
-        current_task_status = "failed"
+    is_acp_child = bool(labels.get(_ACP_SUBAGENT_ID_LABEL_KEY))
+    if is_acp_child:
+        # ACP state describes reusable work, not a permanent task outcome.
+        # A bare idle observation must never become "completed", and stale
+        # execution status cannot override absent or historical ACP evidence.
+        busy, current_task_status = _acp_child_activity_from_observation(acp_session_observation)
+    else:
+        if cached_status is None:
+            cached_status = _session_status_cache.get(conv.id)
+        if cached_status in ("running", "waiting"):
+            busy = True
+        else:
+            busy = False
+        current_task_status = _child_session_current_task_status_from_cached_status(cached_status)
+        if last_task_error is not None:
+            current_task_status = "failed"
 
     # For Codex children, fall back to the prompt label as preview when the
     # real transcript has not arrived yet — avoids synthesizing a user message
@@ -11705,6 +11942,7 @@ def _child_session_summary_from_conversation(
         # conversation label rather than a new column.
         routed_model=conv.model_override if routing_decision_id is not None else None,
         routing_decision_id=routing_decision_id,
+        acp_session_observation=acp_session_observation if is_acp_child else None,
     )
 
 
@@ -11998,6 +12236,8 @@ async def _handle_mcp_tools_list(
     rpc_id: int | str | None,
     session_id: str,
     runner_router: RunnerRouter | None,
+    action_context_token: str | None = None,
+    action_context_generation: str | None = None,
 ) -> Response:
     """
     Handle a ``tools/list`` JSON-RPC request for the MCP proxy endpoint.
@@ -12032,7 +12272,17 @@ async def _handle_mcp_tools_list(
     try:
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/mcp/execute",
-            json={"method": "tools/list", "params": {}},
+            json={
+                "method": "tools/list",
+                "params": (
+                    {
+                        "_omnigent_action_context_token": action_context_token,
+                        "_omnigent_action_context_generation": action_context_generation,
+                    }
+                    if action_context_token is not None
+                    else {}
+                ),
+            },
             timeout=30.0,
         )
         resp.raise_for_status()
@@ -12660,6 +12910,7 @@ __all__ = [
     "_emit_server_routing_decision",
     "_error_item_from_sse",
     "_evaluate_output_policy",
+    "_extract_acp_tool_call_append_scope_from_sse",
     "_extract_assistant_text_from_event",
     "_extract_claude_native_runner_failure",
     "_extract_persistent_item_from_sse",

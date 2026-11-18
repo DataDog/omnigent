@@ -45,6 +45,93 @@ CompactedMessages: TypeAlias = list[Message]
 # (string text or a structured JSON value).
 EnqueuedContent: TypeAlias = Any  # type: ignore[explicit-any]
 
+# Private runner/harness report-channel contract, independent of ACP's version.
+SESSION_REPORT_PROTOCOL_VERSION = 3
+SESSION_REPORT_FEATURES = (
+    "standard-acp-subagents-v1",
+    "session-entities-v1",
+    "session-owned-actions-v2",
+    "root-source-epochs-v1",
+)
+
+
+@dataclass(frozen=True)
+class SessionReport:
+    """One durable, session-scoped report from an executor.
+
+    Reports are independent of a parent turn. ``source_id`` identifies one
+    logical persisted item within ``native_epoch`` and must remain stable when
+    the producer replays it. ``kind`` and ``data`` are protocol-neutral; the
+    receiving runner owns interpretation and persistence.
+    """
+
+    native_epoch: str
+    ingress_sequence: int
+    source_id: str
+    kind: str
+    data: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SessionReportRecord:
+    """A report after the durable journal assigned its parent sequence."""
+
+    sequence: int
+    journal_id: str
+    native_epoch: str
+    epoch_ordinal: int
+    ingress_sequence: int
+    source_id: str
+    kind: str
+    data: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SessionReportAppendResult:
+    """The durable record returned for a new or duplicate source identity."""
+
+    record: SessionReportRecord
+    inserted: bool
+
+
+@dataclass(frozen=True)
+class SessionReportStatus:
+    """Health of an executor's session-owned report producer."""
+
+    state: str
+    error: str | None = None
+    # True only after this actual ACP process generation has sent its first
+    # native prompt. Initialized-but-unprompted generations remain recoverable.
+    prompt_started: bool | None = None
+
+
+@dataclass(frozen=True)
+class SessionReportPage:
+    """An ordered snapshot returned by the private report channel."""
+
+    records: tuple[SessionReportRecord, ...]
+    highest_sequence: int
+    exposed_through: int
+    more: bool
+    source_status: SessionReportStatus | None = None
+
+
+class SessionReportSink(Protocol):
+    """Durable session-report operations injected by the harness runtime."""
+
+    protocol_version: int
+    features: tuple[str, ...]
+    server_identity: str
+
+    @property
+    def root_conversation_id(self) -> str: ...
+
+    def begin_native_epoch(self, native_epoch: str) -> None: ...
+
+    def bind_native_session(self, native_epoch: str, native_session_id: str) -> None: ...
+
+    def append(self, report: SessionReport) -> SessionReportAppendResult: ...
+
 
 # ``iterate_blocking_stream`` adapts provider-SDK iterators whose item types
 # come from third-party libraries (openai, anthropic). We keep the signature
@@ -708,6 +795,30 @@ class Executor:
 
     def supports_streaming(self) -> bool:
         return False
+
+    def supports_session_reports(self) -> bool:
+        """Whether this executor can publish reports outside a parent turn.
+
+        The default keeps the private session-report channel unavailable unless
+        an explicitly configured executor implements the session-owned source.
+        """
+        return False
+
+    def set_session_report_sink(self, sink: SessionReportSink) -> None:
+        """Attach the runtime's durable sink before this executor starts work.
+
+        Executors that return ``True`` from :meth:`supports_session_reports`
+        must override this method and retain the sink for their session
+        lifetime. The base implementation fails loudly if that contract is
+        accidentally claimed without an implementation.
+        """
+        del sink
+        if self.supports_session_reports():
+            raise NotImplementedError("session-reporting executor must accept a report sink")
+
+    def session_report_status(self) -> SessionReportStatus | None:
+        """Return producer health when this executor supports session reports."""
+        return None
 
     def supports_tool_calling(self) -> bool:
         return True

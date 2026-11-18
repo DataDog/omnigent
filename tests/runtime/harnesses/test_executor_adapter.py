@@ -13,6 +13,7 @@ elsewhere.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import shutil
@@ -27,6 +28,7 @@ import pytest
 
 from omnigent.inner.executor import Executor
 from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.runtime.harnesses._scaffold import TurnContext
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
 _TEST_HARNESS_NAME = "executor_adapter_fixture"
@@ -1679,7 +1681,7 @@ def test_observed_tool_call_reemits_a_completed_function_call() -> None:
     assert [(i["type"], i.get("status")) for i in items] == [
         ("function_call", "in_progress"),  # live-only; dropped by the persist filter
         ("function_call", "completed"),  # durable — survives reload
-        ("function_call_output", None),
+        ("function_call_output", "completed"),
     ]
     completed = items[1]
     assert completed["call_id"] == "c1", "same call_id → dedupes with the live card"
@@ -1711,7 +1713,7 @@ def test_uncached_completion_reemits_no_function_call() -> None:
     )
     items = _fc_items(ctx)
     assert [(i["type"], i.get("status")) for i in items] == [
-        ("function_call_output", None),
+        ("function_call_output", "completed"),
     ]
 
 
@@ -1756,7 +1758,7 @@ def test_observed_call_completed_request_is_not_reemitted_at_completion() -> Non
     assert [(i["type"], i.get("status")) for i in items] == [
         ("function_call", "in_progress"),  # live-only; dropped by the persist filter
         ("function_call", "completed"),  # the executor's own durable re-emit
-        ("function_call_output", None),  # completion emits only the output — no 2nd card
+        ("function_call_output", "completed"),  # completion emits only the output — no 2nd card
     ]
     assert sum(i["type"] == "function_call" and i.get("status") == "completed" for i in items) == 1
 
@@ -1912,7 +1914,7 @@ def test_internally_executed_tool_bypasses_dispatch_correlation_queue() -> None:
     assert [(e.item["type"], e.item.get("status")) for e in ctx.emitted] == [
         ("function_call", "in_progress"),
         ("function_call", "completed"),
-        ("function_call_output", None),
+        ("function_call_output", "completed"),
     ]
 
 
@@ -2232,6 +2234,404 @@ async def test_observed_and_dispatched_call_ids_match_for_openai_agents() -> Non
         f"REPL renders ⏵ sys_timer_set twice and an empty result "
         f"panel for the orphan call."
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "callbacks_before_observations",
+    [True, False],
+    ids=["callbacks-before-observations", "callbacks-after-observations"],
+)
+async def test_standard_acp_bridge_callbacks_are_independent_of_native_observations(
+    callbacks_before_observations: bool,
+) -> None:
+    """Native anchors own durable calls while two bridge futures stay independent."""
+    import asyncio as _aio
+    import hashlib as _hashlib
+
+    from omnigent.inner.acp_standard_subagents import ACP_TOOL_CALL_SCOPE_METADATA_KEY
+    from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import OutputItemDoneEvent
+
+    native_ids = ("native-call-a", "native-call-b")
+    scopes = {
+        call_id: {
+            "source_id": f"acp2:{_hashlib.sha256(call_id.encode()).hexdigest()}",
+            "native_call_id": call_id,
+            "action_origin_token": _hashlib.sha256(f"{call_id}:origin".encode()).hexdigest()[:32],
+            "action_origin_generation": f"generation-{call_id}",
+            "response_id": "response-current-b",
+        }
+        for call_id in native_ids
+    }
+
+    class _ScopeLookup(_StubExecutor):
+        def _root_tool_call_scope_metadata(self, call_id: str) -> dict[str, str] | None:
+            return scopes.get(call_id)
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    adapter._executor = _ScopeLookup()
+    adapter._standard_subagents_negotiated = True
+    adapter._current_agent = "test_agent"
+    ctx = TurnContext(
+        response_id="response-current-b",
+        event_queue=_aio.Queue(),
+        cancelled=_aio.Event(),
+    )
+    adapter._current_ctx = ctx
+    original_emit = ctx.emit.__func__
+
+    def translate_native_request(call_id: str) -> None:
+        adapter._translate_event(
+            ToolCallRequest(
+                name=f"tool_{call_id[-1]}",
+                args={"native_call": call_id},
+                metadata={"call_id": call_id},
+            ),
+            ctx,
+        )
+
+    def translate_native_completion(call_id: str) -> None:
+        adapter._translate_event(
+            ToolCallComplete(
+                name=f"tool_{call_id[-1]}",
+                status=ToolCallStatus.SUCCESS,
+                result=f"native-result-{call_id[-1]}",
+                metadata={"call_id": call_id},
+            ),
+            ctx,
+        )
+
+    captured_events: list[object] = []
+    callback_order = ("tool_b", "tool_a")
+
+    def drain_events() -> list[object]:
+        events: list[object] = []
+        while not ctx._event_queue.empty():
+            events.append(ctx._event_queue.get_nowait())
+        captured_events.extend(events)
+        return events
+
+    async def start_callbacks() -> dict[str, asyncio.Task[dict[str, Any]]]:
+        tasks = {
+            name: _aio.create_task(adapter._stable_tool_executor(name, {"callback_for": name}))
+            for name in callback_order
+        }
+        await _aio.sleep(0)
+        assert len(ctx._pending_tool_calls) == 2
+        action_events = drain_events()
+        action_items = [
+            event.item
+            for event in action_events
+            if isinstance(event, OutputItemDoneEvent)
+            and event.item.get("status") == "action_required"
+        ]
+        assert {item["name"] for item in action_items} == set(callback_order)
+        internal_ids = {item["name"]: item["call_id"] for item in action_items}
+        assert set(internal_ids.values()).isdisjoint(native_ids)
+        assert len(set(internal_ids.values())) == 2
+        assert set(ctx._pending_tool_calls) == set(internal_ids.values())
+        assert not adapter._pending_mcp_call_ids
+        assert adapter._dispatched_call_ids == set()
+        assert ctx.emit.__func__ is original_emit
+        return tasks
+
+    if not callbacks_before_observations:
+        for call_id in native_ids:
+            translate_native_request(call_id)
+        native_start_events = drain_events()
+        native_starts = [
+            event.item
+            for event in native_start_events
+            if isinstance(event, OutputItemDoneEvent) and event.item.get("type") == "function_call"
+        ]
+        assert {item["call_id"] for item in native_starts} == set(native_ids)
+
+    callback_tasks = await start_callbacks()
+    if callbacks_before_observations:
+        for call_id in native_ids:
+            translate_native_request(call_id)
+
+    # Complete native B then A, independently of callback order. A's captured
+    # response remains its original response even while B is the live context.
+    for call_id in reversed(native_ids):
+        translate_native_completion(call_id)
+    drain_events()
+    native_items = [
+        event.item
+        for event in captured_events
+        if isinstance(event, OutputItemDoneEvent) and event.item.get("call_id") in native_ids
+    ]
+    for call_id in native_ids:
+        call_events = [
+            item
+            for item in native_items
+            if item.get("type") == "function_call" and item.get("call_id") == call_id
+        ]
+        output_events = [
+            item
+            for item in native_items
+            if item.get("type") == "function_call_output" and item.get("call_id") == call_id
+        ]
+        assert [item.get("status") for item in call_events] == ["in_progress", "completed"]
+        assert len(output_events) == 1
+        assert ACP_TOOL_CALL_SCOPE_METADATA_KEY not in call_events[0]
+        assert call_events[1][ACP_TOOL_CALL_SCOPE_METADATA_KEY] == scopes[call_id]
+        assert output_events[0][ACP_TOOL_CALL_SCOPE_METADATA_KEY] == scopes[call_id]
+        assert output_events[0]["output"] == f"native-result-{call_id[-1]}"
+
+    # Resolve callbacks in the opposite order from their independent ids.
+    internal_id_by_name = {
+        event.item["name"]: event.item["call_id"]
+        for event in captured_events
+        if isinstance(event, OutputItemDoneEvent) and event.item.get("status") == "action_required"
+    }
+    for name in reversed(callback_order):
+        assert ctx._complete_tool(internal_id_by_name[name], f"bridge-result-{name}")
+    results = await _aio.gather(*callback_tasks.values())
+    assert results == [{"result": f"bridge-result-{name}"} for name in callback_order]
+    assert ctx._pending_tool_calls == {}
+    assert ctx.emit.__func__ is original_emit
+
+    callback_mirrors = [
+        event.item
+        for event in captured_events
+        if isinstance(event, OutputItemDoneEvent)
+        and event.item.get("call_id") in set(internal_id_by_name.values())
+    ]
+    assert [item.get("status") for item in callback_mirrors] == [
+        "action_required",
+        "action_required",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("initial_content", "terminal_payload", "expected_result", "expected_output"),
+    [
+        pytest.param(None, {}, None, None, id="absent-output"),
+        pytest.param(
+            None,
+            {"content": None},
+            None,
+            {"output": None, "content": None},
+            id="explicit-null-output",
+        ),
+        pytest.param(
+            None,
+            {"content": []},
+            [],
+            {"output": "", "content": []},
+            id="empty-content-output",
+        ),
+        pytest.param(
+            None,
+            {"rawOutput": ""},
+            "",
+            {"output": "", "raw_output": ""},
+            id="empty-raw-output",
+        ),
+        pytest.param(
+            None,
+            {
+                "content": [{"type": "text", "text": "final content"}],
+                "rawOutput": "ignored raw output",
+            },
+            [{"type": "text", "text": "final content"}],
+            {
+                "output": "final content",
+                "content": [{"type": "text", "text": "final content"}],
+                "raw_output": "ignored raw output",
+            },
+            id="content-wins-over-raw-output",
+        ),
+        pytest.param(
+            [{"type": "text", "text": "initial content"}],
+            {},
+            None,
+            None,
+            id="status-only-completion-emits-no-stale-output",
+        ),
+    ],
+)
+def test_standard_acp_completion_output_presence_survives_adapter_translation(
+    initial_content: list[dict[str, str]] | None,
+    terminal_payload: dict[str, object],
+    expected_result: object,
+    expected_output: dict[str, object] | None,
+) -> None:
+    """Mirror ACP's persisted output presence through the public turn event stream."""
+    import hashlib
+
+    from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+    from omnigent.inner.acp_standard_subagents import (
+        ACP_TOOL_CALL_SCOPE_METADATA_KEY,
+        ACP_TOOL_OUTPUT_METADATA_KEY,
+    )
+    from omnigent.inner.executor import ToolCallComplete, ToolCallRequest
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import OutputItemDoneEvent
+
+    call_id = "native-output-presence"
+    response_id = "response-output-presence"
+    source_id = f"acp2:{hashlib.sha256(call_id.encode()).hexdigest()}"
+    origin_token = hashlib.sha256(f"{call_id}:origin".encode()).hexdigest()[:32]
+    native_executor = AcpExecutor(AcpAgentConfig(command="unused"))
+    native_executor._standard_subagents_enabled = True
+    native_executor._session_reports_negotiated = True
+    native_executor._root_tool_call_scopes[call_id] = (
+        source_id,
+        (origin_token, "test-agent", "generation-output-presence", "context-generation"),
+        response_id,
+    )
+
+    adapter = ExecutorAdapter(executor_factory=lambda: native_executor)
+    adapter._executor = native_executor
+    adapter._standard_subagents_negotiated = True
+    adapter._current_agent = "test-agent"
+    ctx = TurnContext(
+        response_id=response_id,
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+    adapter._current_ctx = ctx
+
+    start_events = native_executor._handle_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": call_id,
+            "title": "native_tool",
+            "rawInput": {"input": "value"},
+        }
+    )
+    assert len(start_events) == 1
+    start_event = start_events[0]
+    assert isinstance(start_event, ToolCallRequest)
+    adapter._translate_event(start_event, ctx)
+
+    if initial_content is not None:
+        assert (
+            native_executor._handle_session_update(
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": call_id,
+                    "status": "in_progress",
+                    "content": initial_content,
+                }
+            )
+            == []
+        )
+
+    completed_events = native_executor._handle_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": call_id,
+            "status": "completed",
+            **terminal_payload,
+        }
+    )
+    assert len(completed_events) == 1
+    completion = completed_events[0]
+    assert isinstance(completion, ToolCallComplete)
+    assert completion.result == expected_result
+    output_metadata = completion.metadata[ACP_TOOL_OUTPUT_METADATA_KEY]
+    assert output_metadata["present"] is (expected_output is not None)
+    if expected_output is not None:
+        assert output_metadata["text"] == expected_output["output"]
+    adapter._translate_event(completion, ctx)
+
+    public_events = []
+    while not ctx._event_queue.empty():
+        public_events.append(ctx._event_queue.get_nowait())
+    assert len(public_events) == 2 + (expected_output is not None)
+    assert all(isinstance(event, OutputItemDoneEvent) for event in public_events)
+    call_items = [
+        event.item for event in public_events if event.item.get("type") == "function_call"
+    ]
+    output_items = [
+        event.item for event in public_events if event.item.get("type") == "function_call_output"
+    ]
+    assert [item["status"] for item in call_items] == ["in_progress", "completed"]
+    assert len(output_items) == (expected_output is not None)
+    assert [item["agent"] for item in call_items] == [response_id, response_id]
+    scope = native_executor._root_tool_call_scope_metadata(call_id)
+    assert scope is not None
+    assert ACP_TOOL_CALL_SCOPE_METADATA_KEY not in call_items[0]
+    assert call_items[1][ACP_TOOL_CALL_SCOPE_METADATA_KEY] == scope
+    if expected_output is not None:
+        output_item = output_items[0]
+        assert output_item["call_id"] == call_id
+        assert output_item[ACP_TOOL_CALL_SCOPE_METADATA_KEY] == scope
+        assert output_item["acp_agent_identity"] == "unknown"
+        for field, value in expected_output.items():
+            assert output_item[field] == value
+
+
+@pytest.mark.asyncio
+async def test_tool_bridge_keeps_policy_cancellation_and_non_acp_completion_defaults() -> None:
+    """The ACP mirror option preserves lifecycle handling and ordinary defaults."""
+    import asyncio as _aio
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload, TurnContext
+    from omnigent.server.schemas import OutputItemDoneEvent
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = TurnContext(
+        response_id="response-ordinary-tools",
+        event_queue=_aio.Queue(),
+        cancelled=_aio.Event(),
+    )
+    adapter._current_ctx = ctx
+    adapter._current_agent = "test_agent"
+    original_emit = ctx.emit.__func__
+
+    policy_task = _aio.create_task(
+        adapter._stable_policy_evaluator("PHASE_TOOL_CALL", {"tool_name": "ordinary"})
+    )
+    await _aio.sleep(0)
+    policy_event = ctx._event_queue.get_nowait()
+    assert policy_event.type == "policy_evaluation.requested"
+    assert ctx._complete_policy_evaluation(
+        policy_event.evaluation_id,
+        PolicyVerdictPayload(action="POLICY_ACTION_DENY", reason="blocked by policy"),
+    )
+    verdict = await policy_task
+    assert (verdict.action, verdict.reason) == ("POLICY_ACTION_DENY", "blocked by policy")
+
+    tool_task = _aio.create_task(adapter._stable_tool_executor("ordinary_tool", {"value": 1}))
+    await _aio.sleep(0)
+    action_event = ctx._event_queue.get_nowait()
+    assert isinstance(action_event, OutputItemDoneEvent)
+    action_call = action_event.item["call_id"]
+    assert action_event.item["status"] == "action_required"
+    assert ctx._complete_tool(action_call, '{"ok":true}')
+    assert await tool_task == {"ok": True}
+    completed = [ctx._event_queue.get_nowait(), ctx._event_queue.get_nowait()]
+    assert [event.item.get("status") for event in completed] == ["completed", "completed"]
+    assert [event.item.get("type") for event in completed] == [
+        "function_call",
+        "function_call_output",
+    ]
+    assert all(event.item["call_id"] == action_call for event in completed)
+    assert ctx.emit.__func__ is original_emit
+
+    cancelled_task = _aio.create_task(
+        adapter._stable_tool_executor("cancelled_tool", {"wait": True})
+    )
+    await _aio.sleep(0)
+    cancelled_action = ctx._event_queue.get_nowait()
+    assert isinstance(cancelled_action, OutputItemDoneEvent)
+    cancelled_call_id = cancelled_action.item["call_id"]
+    ctx.cancelled.set()
+    ctx._cancel_pending()
+    with pytest.raises(_aio.CancelledError):
+        await cancelled_task
+    assert ctx._pending_tool_calls == {}
+    assert cancelled_call_id in adapter._dispatched_call_ids
+    assert ctx.emit.__func__ is original_emit
 
 
 @pytest.mark.asyncio
@@ -3142,32 +3542,13 @@ async def test_policy_evaluator_no_active_turn_context_is_phase_aware() -> None:
         assert verdict.reason is None, advisory_phase
 
 
-class _CancelFlag:
-    """Records whether the adapter signalled cancellation.
-
-    A real class rather than MagicMock so an unexpected attribute access on the
-    flag fails loud, per the project's testing rules.
-    """
-
-    def __init__(self) -> None:
-        self.was_set = False
-
-    def set(self) -> None:
-        """Mark the turn cancelled."""
-        self.was_set = True
-
-
-class _ElicitingTurnContext:
-    """Stand-in for :class:`TurnContext` that captures one elicitation.
-
-    Only the surface the elicitation bridges touch is implemented: ``elicit`` and
-    ``cancelled``.
-    """
+class _ElicitingTurnContext(TurnContext):
+    """Real neutral turn context with a canned, captured elicitation."""
 
     def __init__(self, reply: Any) -> None:  # type: ignore[explicit-any]
         """:param reply: The :class:`ElicitationResult` to answer with."""
+        super().__init__("resp_elicitation", asyncio.Queue(), asyncio.Event())
         self.reply = reply
-        self.cancelled = _CancelFlag()
         self.seen: list[Any] = []  # type: ignore[explicit-any]
 
     async def elicit(self, elicitation_id: str, params: Any) -> Any:  # type: ignore[explicit-any]
@@ -3214,7 +3595,7 @@ async def test_elicitation_choice_handler_asks_for_one_button_per_option() -> No
     assert "Ran command" in params.message
     assert params.content_preview == 'Ran command({"command": "ls"})'
     assert params.phase == "tool_call"
-    assert not ctx.cancelled.was_set
+    assert not ctx.cancelled.is_set()
 
 
 @pytest.mark.asyncio
@@ -3230,7 +3611,7 @@ async def test_elicitation_choice_handler_declines_on_a_dismissed_card() -> None
     assert (
         await adapter._stable_elicitation_choice_handler("shell", {}, ["Allow", "Reject"]) is None
     )
-    assert ctx.cancelled.was_set
+    assert ctx.cancelled.is_set()
 
 
 @pytest.mark.asyncio
@@ -3295,7 +3676,7 @@ async def test_form_elicitation_handler_decline_does_not_cancel_the_turn() -> No
     params = ElicitationRequestParams(mode="form", message="Continue?")
     result = await adapter._stable_form_elicitation_handler("form-id", params)
     assert result.action == "decline"
-    assert not ctx.cancelled.was_set
+    assert not ctx.cancelled.is_set()
     assert ctx.seen[0][0] == "form-id"
 
 
@@ -3613,7 +3994,7 @@ async def test_ask_question_handler_explains_unanswered_question(
         {"questions": [{"question": "Q", "options": ["a", "b"]}]}
     )
     assert out == expected
-    assert not ctx.cancelled.was_set
+    assert not ctx.cancelled.is_set()
 
 
 @pytest.mark.asyncio

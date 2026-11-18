@@ -426,6 +426,19 @@ def has_subscribers(conversation_id: str) -> bool:
         return bool(_subscribers.get(conversation_id))
 
 
+def subscribed_conversation_ids() -> list[str]:
+    """Snapshot conversation ids with active stream subscribers in this workspace.
+
+    The snapshot shares the subscriber registry's lock with subscribe cleanup,
+    so callers see only slots that were active at one instant. The workspace
+    scoped cache limits the result to the caller's current workspace.
+    """
+    with _lock:
+        return sorted(
+            conversation_id for conversation_id, subscribers in _subscribers.items() if subscribers
+        )
+
+
 def close(conversation_id: str) -> None:
     """
     Broadcast an end-of-stream sentinel to every active subscriber

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextvars
+import hashlib
 import json
 import logging
+import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
 from itertools import batched
@@ -29,16 +32,30 @@ from sqlalchemy import (
     tuple_,
     update,
 )
+from sqlalchemy.exc import MultipleResultsFound
 from sqlalchemy.orm import QueryableAttribute, Session, load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.sql.selectable import Subquery
 
-from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
+from omnigent._wrapper_labels import (
+    ACP_SUBAGENT_ID_LABEL_KEY,
+    UI_MODE_LABEL_KEY,
+    WRAPPER_LABEL_KEY,
+)
 from omnigent.db.account_authority import AccountAuthority, require_active_account
 from omnigent.db.compression import encode as compress_text
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     LABEL_VALUE_MAX_LEN,
+    SqlAcpReportConnectionAttempt,
+    SqlAcpReportEpoch,
+    SqlAcpReportJournal,
+    SqlAcpReportOwner,
+    SqlAcpReportRootState,
+    SqlAcpSessionAssociation,
+    SqlAcpSessionEntity,
+    SqlAcpSessionReportReceipt,
+    SqlAcpToolCallItemBinding,
     SqlAgent,
     SqlComment,
     SqlConversation,
@@ -70,12 +87,14 @@ from omnigent.db.utils import (
     _supports_fts5,
     build_search_snippet,
     delete_fts_by_conversation_ids,
+    delete_fts_by_item_id,
     ensure_fts_table,
     extract_search_text,
     generate_conversation_id,
     generate_item_id,
     get_or_create_conversation_engine,
     get_or_create_engine,
+    insert_fts,
     insert_fts_bulk,
     is_postgresql_family,
     make_named_managed_session_maker,
@@ -91,10 +110,23 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
+from omnigent.entities.conversation import (
+    AcpToolSessionReference,
+    FunctionCallData,
+    FunctionCallOutputData,
+)
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
+from omnigent.inner.acp_standard_subagents import (
+    acp_standard_canonical_tool_item_id,
+    acp_standard_tool_entity_id,
+    acp_standard_tool_output_entity_id,
+    validate_acp_association_patch,
+    validate_acp_native_identity,
+)
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
+from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
@@ -111,6 +143,7 @@ from omnigent.stores.conversation_store import (
     PROJECT_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_COPY_ID_PREFIX_LEN,
+    AcpToolCallAppendScope,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -145,13 +178,102 @@ from omnigent.util.session_lifecycle import title_without_closed_marker
 
 _logger = logging.getLogger(__name__)
 
+_ACP_ASSOCIATION_PAGE_SIZE = 128
+_ACP_OBSERVATION_BATCH_SIZE = 64
+_ACP_OBSERVATION_MAX_IDS = 10_000
+_ACP_REPORT_PAYLOAD_MAX_BYTES = 512 * 1024
+_ACP_REPORT_REF_MAX_BYTES = 1_024
+_ACP_REPORT_BLOB_MAGIC = b"OMNIACP\x01"
+_ACP_REPORT_BLOB_MAX_OBJECTS = 6
+_ACP_REPORT_BLOB_MAX_BYTES = 2 * 1024 * 1024
+_ACP_TOOL_CALL_BINDING_MAX_ROWS = 10_000
+_ACP_PAYLOAD_WRITE_BUDGET: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar(
+    "acp_payload_write_budget", default=None
+)
+
+
+@contextmanager
+def _acp_payload_write_attempt() -> Iterator[None]:
+    """Bound immutable blob writes made by one database transaction attempt."""
+    token = _ACP_PAYLOAD_WRITE_BUDGET.set([0, 0])
+    try:
+        yield
+    finally:
+        _ACP_PAYLOAD_WRITE_BUDGET.reset(token)
+
+
+def _validate_acp_report_owner_identity(
+    connection_admission_id: str, runtime_incarnation: int, journal_id: str
+) -> None:
+    """Validate the bounded opaque identities used by report control events."""
+    if (
+        not isinstance(connection_admission_id, str)
+        or len(connection_admission_id) != 32
+        or any(character not in "0123456789abcdef" for character in connection_admission_id)
+    ):
+        raise ValueError("ACP report connection admission id is invalid")
+    if (
+        isinstance(runtime_incarnation, bool)
+        or not isinstance(runtime_incarnation, int)
+        or not 1 <= runtime_incarnation <= 2**63 - 1
+    ):
+        raise ValueError("ACP report runtime incarnation is invalid")
+    if (
+        not isinstance(journal_id, str)
+        or len(journal_id) != 32
+        or any(character not in "0123456789abcdef" for character in journal_id)
+    ):
+        raise ValueError("ACP report journal id is invalid")
+
+
 _DELETE_METADATA_BATCH_SIZE = 100
 _DELETE_LABEL_BATCH_SIZE = 100
 _FAMILY_READ_BATCH_SIZE = 10
 
 _SESSION_TODOS_STATE_KEY = "_omnigent_native_plan_snapshot_v1"
+_SESSION_ACTION_ORIGINS_KEY = "_omnigent_private_session_action_origins_v1"
+_SESSION_ACTION_ORIGINS_MAX_COUNT = 128
+_SESSION_ACTION_ORIGIN_MAX_BYTES = 8_192
+_SESSION_ACTION_ORIGINS_MAX_BYTES = 8_192
 _RUNNER_BINDING_LIMIT = 200
 _RUNNER_HOST_LOOKUP_LIMIT = 10_000
+
+
+def _require_string_keyed_object(value: object, message: str) -> dict[str, Any]:
+    """Validate a JSON object before using it as an ACP message patch."""
+    if not isinstance(value, dict):
+        raise ValueError(message)
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise ValueError(message)
+        result[key] = item
+    return result
+
+
+def _decode_session_state_private(
+    value: str | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Split policy state from the reserved Plan and private-origin snapshots."""
+    state = json.loads(value) if value else {}
+    if not isinstance(state, dict):
+        raise TypeError("session_state must decode to an object")
+    raw_todos = state.pop(_SESSION_TODOS_STATE_KEY, None)
+    raw_origins = state.pop(_SESSION_ACTION_ORIGINS_KEY, None)
+    todos: list[dict[str, Any]] = []
+    if raw_todos is not None:
+        with suppress(TypeError, ValueError):
+            todos = validate_session_todos(raw_todos)
+    origins: dict[str, dict[str, Any]] = {}
+    if raw_origins is not None:
+        if not isinstance(raw_origins, dict):
+            raise TypeError("session action origins must decode to an object")
+        for token, origin in raw_origins.items():
+            if not isinstance(token, str) or not isinstance(origin, dict):
+                raise TypeError("session action origin records must be objects keyed by tokens")
+            origins[token] = dict(origin)
+        _validate_session_action_origins(origins)
+    return state, todos, origins
 
 
 def _decode_session_state(
@@ -162,6 +284,9 @@ def _decode_session_state(
     if not isinstance(state, dict):
         raise TypeError("session_state must decode to an object")
     raw_todos = state.pop(_SESSION_TODOS_STATE_KEY, None)
+    # The private records must never escape through public Conversation fields.
+    # They are decoded strictly only by their dedicated storage operations.
+    state.pop(_SESSION_ACTION_ORIGINS_KEY, None)
     todos: list[dict[str, Any]] = []
     if raw_todos is not None:
         with suppress(TypeError, ValueError):
@@ -172,13 +297,35 @@ def _decode_session_state(
 def _encode_session_state(
     state: dict[str, Any],
     todos: list[dict[str, Any]] | None,
+    origins: dict[str, dict[str, Any]] | None = None,
 ) -> str:
-    """Serialize policy state while preserving an optional Plan snapshot."""
+    """Serialize policy state while preserving private operational snapshots."""
     payload = dict(state)
     payload.pop(_SESSION_TODOS_STATE_KEY, None)
+    payload.pop(_SESSION_ACTION_ORIGINS_KEY, None)
     if todos:
         payload[_SESSION_TODOS_STATE_KEY] = todos
-    return json.dumps(payload, separators=(",", ":"))
+    if origins:
+        payload[_SESSION_ACTION_ORIGINS_KEY] = origins
+    encoded = json.dumps(payload, separators=(",", ":"))
+    _validate_session_action_origins(origins or {})
+    return encoded
+
+
+def _validate_session_action_origins(origins: dict[str, dict[str, Any]]) -> None:
+    """Reject unbounded private action-origin snapshots before persisting them."""
+    if len(origins) > _SESSION_ACTION_ORIGINS_MAX_COUNT:
+        raise ValueError("session action origin capacity reached")
+    encoded_origins = json.dumps(origins, separators=(",", ":"))
+    if len(encoded_origins.encode("utf-8")) > _SESSION_ACTION_ORIGINS_MAX_BYTES:
+        raise ValueError("session action origin storage limit reached")
+    for token, origin in origins.items():
+        if not token or len(token) > 256:
+            raise ValueError("session action origin token is malformed")
+        if len(json.dumps(origin, separators=(",", ":")).encode("utf-8")) > (
+            _SESSION_ACTION_ORIGIN_MAX_BYTES
+        ):
+            raise ValueError("session action origin record is too large")
 
 
 # Server-side deadline (ms) for the content-search query in
@@ -921,7 +1068,11 @@ class SqlAlchemyConversationStore(ConversationStore):
     """
 
     def __init__(
-        self, storage_location: str, conversation_storage_location: str | None = None
+        self,
+        storage_location: str,
+        conversation_storage_location: str | None = None,
+        *,
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         """
         Initialize the SQLAlchemy conversation store.
@@ -935,8 +1086,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param conversation_storage_location: SQLAlchemy database URI for the Agent
             Platform DB (conversations, items, labels). Defaults to
             ``storage_location`` when ``None`` (single-DB mode).
+        :param artifact_store: Optional shared artifact backend for durable ACP
+            report payloads. ACP reporting remains unavailable until configured.
         """
         super().__init__(storage_location, conversation_storage_location)
+        self._artifact_store = artifact_store
         # Omnigent DB: agents, hosts, policies, files, user_daily_costs,
         # session_permissions, comments, omnigent_conversation_metadata.
         self._engine = get_or_create_engine(storage_location)
@@ -993,6 +1147,253 @@ class SqlAlchemyConversationStore(ConversationStore):
             else cast(ColumnElement[Any], SqlConversation.id)
         )
         ensure_fts_table(self._conv_engine)
+
+    @property
+    def acp_session_reporting_ready(self) -> bool:
+        """Whether an artifact backend is explicitly bound for ACP reports."""
+        return self._artifact_store is not None
+
+    def bind_artifact_store(self, artifact_store: ArtifactStore) -> None:
+        """Bind the configured artifact backend without allowing live rebinds."""
+        if artifact_store is None:
+            raise ValueError("ACP report ArtifactStore cannot be None")
+        current = self._artifact_store
+        if current is None:
+            self._artifact_store = artifact_store
+        elif current is not artifact_store:
+            raise RuntimeError(
+                "conversation store is already bound to a different ArtifactStore instance"
+            )
+
+    def _require_acp_reporting_ready(self) -> ArtifactStore:
+        artifact_store = self._artifact_store
+        if artifact_store is None:
+            raise RuntimeError(
+                "ACP session reporting requires an explicitly configured ArtifactStore"
+            )
+        return artifact_store
+
+    @staticmethod
+    def _acp_payload_scope_hash(value: object) -> str:
+        encoded = json.dumps(
+            value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _acp_payload_key(
+        self,
+        *,
+        workspace_id: int,
+        root_conversation_id: str,
+        row_identity: object,
+        field_name: str,
+        content_digest: str,
+    ) -> str:
+        if field_name not in {
+            "association",
+            "observation",
+            "action_origin",
+            "entity_data",
+            "entity_pending",
+            "entity_references",
+        }:
+            raise ValueError("ACP report payload field is invalid")
+        root_hash = hashlib.sha256(root_conversation_id.encode("utf-8")).hexdigest()
+        row_hash = self._acp_payload_scope_hash(row_identity)
+        return (
+            f"acp-session-report/v1/{workspace_id}/{root_hash}/{row_hash}/"
+            f"{field_name}/{content_digest}"
+        )
+
+    def _store_acp_payload_json(
+        self,
+        *,
+        workspace_id: int,
+        root_conversation_id: str,
+        row_identity: object,
+        field_name: str,
+        serialized_json: str,
+    ) -> str:
+        """Store and verify one immutable canonical ACP JSON blob."""
+        artifact_store = self._require_acp_reporting_ready()
+        value = json.loads(serialized_json)
+        payload = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(payload) > _ACP_REPORT_PAYLOAD_MAX_BYTES:
+            raise ValueError("ACP report payload exceeds its established size limit")
+        digest_bytes = hashlib.sha256(payload).digest()
+        digest = digest_bytes.hex()
+        key = self._acp_payload_key(
+            workspace_id=workspace_id,
+            root_conversation_id=root_conversation_id,
+            row_identity=row_identity,
+            field_name=field_name,
+            content_digest=digest,
+        )
+        reference = json.dumps(
+            {"v": 1, "key": key, "length": len(payload), "sha256": digest},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if len(reference.encode("utf-8")) > _ACP_REPORT_REF_MAX_BYTES:
+            raise ValueError("ACP report artifact reference exceeds its storage limit")
+        envelope = (
+            _ACP_REPORT_BLOB_MAGIC + len(payload).to_bytes(8, "big") + digest_bytes + payload
+        )
+        # Read before writing so an existing corrupt content-addressed object
+        # fails closed and cannot be silently replaced as an implicit repair.
+        try:
+            stored = artifact_store.get(key)
+        except KeyError:
+            budget = _ACP_PAYLOAD_WRITE_BUDGET.get()
+            if budget is not None:
+                budget[0] += 1
+                budget[1] += len(envelope)
+                if budget[0] > _ACP_REPORT_BLOB_MAX_OBJECTS:
+                    raise ValueError("ACP report blob object limit exceeded") from None
+                if budget[1] > _ACP_REPORT_BLOB_MAX_BYTES:
+                    raise ValueError("ACP report blob byte limit exceeded") from None
+            artifact_store.put(key, envelope)
+            stored = artifact_store.get(key)
+        if stored != envelope:
+            raise ValueError("ACP report artifact content-addressed object is corrupt")
+        self._verify_acp_payload_envelope(
+            stored, expected_length=len(payload), digest=digest_bytes
+        )
+        return reference
+
+    @staticmethod
+    def _verify_acp_payload_envelope(
+        envelope: bytes, *, expected_length: int, digest: bytes
+    ) -> bytes:
+        header_size = len(_ACP_REPORT_BLOB_MAGIC) + 8 + 32
+        if len(envelope) < header_size or not envelope.startswith(_ACP_REPORT_BLOB_MAGIC):
+            raise ValueError("ACP report artifact envelope version is invalid")
+        length_start = len(_ACP_REPORT_BLOB_MAGIC)
+        actual_length = int.from_bytes(envelope[length_start : length_start + 8], "big")
+        actual_digest = envelope[length_start + 8 : header_size]
+        payload = envelope[header_size:]
+        if (
+            actual_length != expected_length
+            or len(payload) != expected_length
+            or actual_digest != digest
+            or hashlib.sha256(payload).digest() != digest
+        ):
+            raise ValueError("ACP report artifact checksum or length is invalid")
+        return payload
+
+    def _load_acp_payload_json(
+        self,
+        reference: str,
+        *,
+        workspace_id: int,
+        root_conversation_id: str,
+        row_identity: object,
+        field_name: str,
+    ) -> str:
+        """Validate the private reference scope and hydrate its JSON payload."""
+        artifact_store = self._require_acp_reporting_ready()
+        if not isinstance(reference, str):
+            raise ValueError("ACP report artifact reference is malformed")
+        try:
+            reference_bytes = reference.encode("utf-8", "strict")
+        except UnicodeEncodeError as exc:
+            raise ValueError("ACP report artifact reference is malformed") from exc
+        if len(reference_bytes) > _ACP_REPORT_REF_MAX_BYTES:
+            raise ValueError("ACP report artifact reference exceeds its storage limit")
+        try:
+            value = json.loads(reference)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("ACP report artifact reference is malformed") from exc
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"v", "key", "length", "sha256"}
+            or value.get("v") != 1
+            or not isinstance(value.get("key"), str)
+            or isinstance(value.get("length"), bool)
+            or not isinstance(value.get("length"), int)
+            or not 0 <= value["length"] <= _ACP_REPORT_PAYLOAD_MAX_BYTES
+            or not isinstance(value.get("sha256"), str)
+            or len(value["sha256"]) != 64
+            or any(char not in "0123456789abcdef" for char in value["sha256"])
+        ):
+            raise ValueError("ACP report artifact reference is invalid")
+        expected_key = self._acp_payload_key(
+            workspace_id=workspace_id,
+            root_conversation_id=root_conversation_id,
+            row_identity=row_identity,
+            field_name=field_name,
+            content_digest=value["sha256"],
+        )
+        if value["key"] != expected_key:
+            raise ValueError("ACP report artifact reference has an invalid scope")
+        envelope = artifact_store.get(expected_key)
+        payload = self._verify_acp_payload_envelope(
+            envelope,
+            expected_length=value["length"],
+            digest=bytes.fromhex(value["sha256"]),
+        )
+        try:
+            decoded = json.loads(payload)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ValueError("ACP report artifact payload is invalid JSON") from exc
+        return json.dumps(
+            decoded,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _store_acp_payload_value(
+        self,
+        *,
+        workspace_id: int,
+        root_conversation_id: str,
+        row_identity: object,
+        field_name: str,
+        value: Any,
+    ) -> str:
+        """Serialize and store one canonical ACP payload value."""
+        serialized = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return self._store_acp_payload_json(
+            workspace_id=workspace_id,
+            root_conversation_id=root_conversation_id,
+            row_identity=row_identity,
+            field_name=field_name,
+            serialized_json=serialized,
+        )
+
+    def _load_acp_payload_value(
+        self,
+        reference: str,
+        *,
+        workspace_id: int,
+        root_conversation_id: str,
+        row_identity: object,
+        field_name: str,
+    ) -> Any:
+        """Load one verified ACP payload value from its private reference."""
+        return json.loads(
+            self._load_acp_payload_json(
+                reference,
+                workspace_id=workspace_id,
+                root_conversation_id=root_conversation_id,
+                row_identity=row_identity,
+                field_name=field_name,
+            )
+        )
 
     def _get_meta(self, conversation_id: str) -> SqlConversationMetadata | None:
         """
@@ -1757,10 +2158,328 @@ class SqlAlchemyConversationStore(ConversationStore):
                 q = q.with_for_update()
             meta = session.scalars(q).first()
             if meta is not None:
-                _, todos = _decode_session_state(meta.session_state)
-                meta.session_state = _encode_session_state(state, todos)
+                _, todos, origins = _decode_session_state_private(meta.session_state)
+                meta.session_state = _encode_session_state(state, todos, origins)
 
         run_write_transaction(self._session_immediate, "set_session_state", write)
+
+    def register_session_action_origin(
+        self,
+        conversation_id: str,
+        token: str,
+        origin: dict[str, Any],
+    ) -> None:
+        """Store a bounded server-captured origin privately before forwarding."""
+        if not token or len(token) > 256:
+            raise ValueError("session action origin token is malformed")
+        if not isinstance(origin, dict):
+            raise TypeError("session action origin must be an object")
+        stable_origin = dict(origin)
+        if any(
+            key in stable_origin
+            for key in (
+                "bound_credential_principal",
+                "bound_context_generation",
+                "bound_runner_id",
+                "bound_harness_generation",
+                "children",
+            )
+        ):
+            raise ValueError("session action origin contains reserved binding fields")
+        _validate_session_action_origins({token: stable_origin})
+
+        def write(session: Session) -> None:
+            q = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                q = q.with_for_update()
+            meta = session.scalars(q).first()
+            if meta is None:
+                raise ConversationNotFoundError(conversation_id)
+            state, todos, origins = _decode_session_state_private(meta.session_state)
+            existing = origins.get(token)
+            if existing is not None:
+                if existing != stable_origin:
+                    raise ValueError("session action origin token was rebound")
+                return
+            origins[token] = stable_origin
+            meta.session_state = _encode_session_state(state, todos, origins)
+
+        run_write_transaction(self._session_immediate, "register_session_action_origin", write)
+
+    def bind_session_action_origin(
+        self,
+        conversation_id: str,
+        token: str,
+        runner_id: str,
+        runner_generation: str,
+        credential_principal: str,
+        *,
+        context_generation: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Bind an origin to its live generation and authenticated credential principal."""
+        if (
+            not token
+            or len(token) > 256
+            or not runner_id
+            or not runner_generation
+            or not credential_principal
+            or (
+                context_generation is not None
+                and (not context_generation or len(context_generation) > 256)
+            )
+        ):
+            return None
+
+        def write(session: Session) -> dict[str, Any] | None:
+            q = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                q = q.with_for_update()
+            meta = session.scalars(q).first()
+            if meta is None:
+                return None
+            state, todos, origins = _decode_session_state_private(meta.session_state)
+            origin = origins.get(token)
+            if origin is None or origin.get("runner_id") != runner_id:
+                return None
+            bound_runner = origin.get("bound_runner_id")
+            bound_generation = origin.get("bound_harness_generation")
+            bound_principal = origin.get("bound_credential_principal")
+            if (
+                bound_runner is not None
+                or bound_generation is not None
+                or bound_principal is not None
+            ):
+                if (
+                    bound_runner != runner_id
+                    or bound_generation != runner_generation
+                    or bound_principal != credential_principal
+                ):
+                    return None
+                previous_context_generation = origin.get("bound_context_generation")
+                if (
+                    context_generation is not None
+                    and previous_context_generation is not None
+                    and previous_context_generation != context_generation
+                ):
+                    return None
+                if context_generation is not None and previous_context_generation is None:
+                    origin["bound_context_generation"] = context_generation
+                    origins[token] = origin
+                    meta.session_state = _encode_session_state(state, todos, origins)
+                return dict(origin)
+            origin["bound_runner_id"] = runner_id
+            origin["bound_harness_generation"] = runner_generation
+            origin["bound_credential_principal"] = credential_principal
+            if context_generation is not None:
+                origin["bound_context_generation"] = context_generation
+            origins[token] = origin
+            meta.session_state = _encode_session_state(state, todos, origins)
+            return dict(origin)
+
+        return run_write_transaction(self._session_immediate, "bind_session_action_origin", write)
+
+    def get_session_action_origin(self, conversation_id: str, token: str) -> dict[str, Any] | None:
+        """Read one private origin record; public conversation reads omit it."""
+        with self._session("get_session_action_origin") as session:
+            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            if meta is None:
+                return None
+            _state, _todos, origins = _decode_session_state_private(meta.session_state)
+            origin = origins.get(token)
+            return dict(origin) if origin is not None else None
+
+    def bind_session_action_origin_child(
+        self,
+        conversation_id: str,
+        token: str,
+        runner_id: str,
+        runner_generation: str,
+        credential_principal: str,
+        child_key: str,
+        child_id: str,
+        *,
+        native_epoch: str | None = None,
+        native_session_id: str | None = None,
+        parent_native_session_id: str | None = None,
+        context_generation: str | None = None,
+    ) -> bool:
+        """Bind an exact ACP child to an authenticated parent origin."""
+        if (
+            not token
+            or len(token) > 256
+            or not runner_id
+            or not runner_generation
+            or not credential_principal
+            or not child_key
+            or len(child_key) > 512
+            or not child_id
+            or len(child_id) > 256
+        ):
+            return False
+        association_scope = (
+            native_epoch,
+            native_session_id,
+            parent_native_session_id,
+            context_generation,
+        )
+        if any(value is not None for value in association_scope) and not all(
+            isinstance(value, str) and value for value in association_scope
+        ):
+            return False
+
+        def write(session: Session) -> bool:
+            workspace_id = current_workspace_id()
+            child = session.get(SqlConversation, (workspace_id, child_id))
+            if child is None or child.root_conversation_id != conversation_id:
+                return False
+            if native_epoch is None:
+                if child.parent_conversation_id != conversation_id:
+                    return False
+            else:
+                target_association = session.get(
+                    SqlAcpSessionAssociation,
+                    (
+                        workspace_id,
+                        conversation_id,
+                        native_epoch,
+                        native_session_id,
+                    ),
+                )
+                parent_association = session.get(
+                    SqlAcpSessionAssociation,
+                    (
+                        workspace_id,
+                        conversation_id,
+                        native_epoch,
+                        parent_native_session_id,
+                    ),
+                )
+                if (
+                    target_association is None
+                    or parent_association is None
+                    or target_association.conversation_id != child_id
+                    or target_association.parent_native_session_id != parent_native_session_id
+                    or target_association.context_generation != context_generation
+                    or parent_association.context_generation != context_generation
+                    or parent_association.conversation_id != child.parent_conversation_id
+                    or parent_association.root_conversation_id != conversation_id
+                ):
+                    return False
+            label = session.get(
+                SqlConversationLabel,
+                (workspace_id, child_id, ACP_SUBAGENT_ID_LABEL_KEY),
+            )
+            if label is None or label.value != child_key:
+                return False
+
+            q = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == workspace_id,
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                q = q.with_for_update()
+            meta = session.scalars(q).first()
+            if meta is None:
+                return False
+            state, todos, origins = _decode_session_state_private(meta.session_state)
+            origin = origins.get(token)
+            if (
+                origin is None
+                or origin.get("runner_id") != runner_id
+                or origin.get("bound_runner_id") != runner_id
+                or origin.get("bound_harness_generation") != runner_generation
+                or origin.get("bound_credential_principal") != credential_principal
+                or origin.get("session_id") != conversation_id
+                or origin.get("workspace_id") != workspace_id
+            ):
+                return False
+            children = origin.setdefault("children", {})
+            if not isinstance(children, dict):
+                return False
+            existing = children.get(child_key)
+            if existing is not None:
+                if existing != child_id:
+                    return False
+                if context_generation is None:
+                    return True
+                contexts = origin.get("child_context_generations")
+                return isinstance(contexts, dict) and contexts.get(child_key) == context_generation
+            children[child_key] = child_id
+            if context_generation is not None:
+                contexts = origin.setdefault("child_context_generations", {})
+                if not isinstance(contexts, dict):
+                    return False
+                contexts[child_key] = context_generation
+            origins[token] = origin
+            meta.session_state = _encode_session_state(state, todos, origins)
+            return True
+
+        return run_write_transaction(
+            self._session_immediate, "bind_session_action_origin_child", write
+        )
+
+    def list_session_action_origins(self, conversation_id: str) -> dict[str, dict[str, Any]]:
+        """Return detached copies of all private origins for one parent session."""
+        with self._session("list_session_action_origins") as session:
+            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            if meta is None:
+                return {}
+            _state, _todos, origins = _decode_session_state_private(meta.session_state)
+            return json.loads(json.dumps(origins))
+
+    def release_session_action_origin(
+        self,
+        conversation_id: str,
+        token: str,
+        runner_id: str,
+        runner_generation: str | None,
+        credential_principal: str,
+    ) -> bool:
+        """Release only the exact settled runner generation and credential principal."""
+
+        def write(session: Session) -> bool:
+            q = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                q = q.with_for_update()
+            meta = session.scalars(q).first()
+            if meta is None:
+                return False
+            state, todos, origins = _decode_session_state_private(meta.session_state)
+            origin = origins.get(token)
+            if origin is None or origin.get("runner_id") != runner_id:
+                return False
+            bound_runner = origin.get("bound_runner_id")
+            bound_generation = origin.get("bound_harness_generation")
+            bound_principal = origin.get("bound_credential_principal")
+            if runner_generation is None:
+                if (
+                    bound_runner is not None
+                    or bound_generation is not None
+                    or bound_principal is not None
+                ):
+                    return False
+            elif (
+                bound_runner != runner_id
+                or bound_generation != runner_generation
+                or bound_principal != credential_principal
+            ):
+                return False
+            del origins[token]
+            meta.session_state = _encode_session_state(state, todos, origins)
+            return True
+
+        return run_write_transaction(
+            self._session_immediate, "release_session_action_origin", write
+        )
 
     def set_session_usage(
         self,
@@ -1817,8 +2536,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta = session.scalars(q).first()
             if meta is None:
                 return False
-            state, _ = _decode_session_state(meta.session_state)
-            meta.session_state = _encode_session_state(state, validated)
+            state, _previous, origins = _decode_session_state_private(meta.session_state)
+            meta.session_state = _encode_session_state(state, validated, origins)
             return True
 
         return run_write_transaction(self._session_immediate, "set_session_todos", write)
@@ -3038,10 +3757,376 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         return strip_nul_bytes(extract_search_text(item))
 
+    def _validate_acp_scoped_append_item(
+        self,
+        session: Session,
+        *,
+        conversation_id: str,
+        canonical_item_id: str,
+        item_type: str,
+        response_id: str,
+        call_id: str,
+        stored_item_row: SqlConversationItem | None = None,
+    ) -> SqlConversationItem:
+        """Validate the actual selected row before accepting scoped append proof."""
+        item_row = (
+            stored_item_row
+            if stored_item_row is not None
+            else self._get_unique_conversation_item_row(
+                session,
+                conversation_id=conversation_id,
+                item_id=canonical_item_id,
+            )
+        )
+        if item_row is None:
+            raise ValueError("ACP canonical tool append has no persisted item")
+        if (
+            decode_item_type(item_row.type) != item_type
+            or item_row.response_id != response_id
+            or decode_item_status(item_row.status) != "completed"
+        ):
+            raise ValueError("persisted ACP canonical tool item conflicts with its append scope")
+        try:
+            decoded = self._decode_item_data_batch([item_row.data])[0]
+            stored_data = parse_item_data(item_type, json.loads(decoded))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("persisted ACP canonical tool item data is malformed") from exc
+        if (
+            item_type == "function_call"
+            and (not isinstance(stored_data, FunctionCallData) or stored_data.call_id != call_id)
+        ) or (
+            item_type == "function_call_output"
+            and (
+                not isinstance(stored_data, FunctionCallOutputData)
+                or stored_data.call_id != call_id
+            )
+        ):
+            raise ValueError("persisted ACP canonical tool item has another native call id")
+        return item_row
+
+    @staticmethod
+    def _get_unique_conversation_item_row(
+        session: Session,
+        *,
+        conversation_id: str,
+        item_id: str,
+    ) -> SqlConversationItem | None:
+        """Resolve one logical item prefix to its full physical primary key."""
+        try:
+            item_row = session.execute(
+                select(SqlConversationItem).where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.id == item_id,
+                )
+            ).scalar_one_or_none()
+        except MultipleResultsFound as exc:
+            raise ValueError("conversation item id prefix is ambiguous") from exc
+        return item_row
+
+    def _bind_acp_tool_call_item(
+        self,
+        session: Session,
+        *,
+        conversation_id: str,
+        canonical_item_id: str,
+        item_type: str,
+        scope: AcpToolCallAppendScope,
+        now: int,
+    ) -> ConversationItem | None:
+        """Persist one append-side half of the exact report/item anchor."""
+        expected_item_id = acp_standard_canonical_tool_item_id(
+            conversation_id, scope.source_id, item_type
+        )
+        if canonical_item_id != expected_item_id:
+            raise ValueError("ACP canonical tool item id does not match its anchor")
+        self._lock_conversation(session, conversation_id)
+        self._validate_acp_scoped_append_item(
+            session,
+            conversation_id=conversation_id,
+            canonical_item_id=canonical_item_id,
+            item_type=item_type,
+            response_id=scope.response_id,
+            call_id=scope.native_call_id,
+        )
+        key = (current_workspace_id(), conversation_id, scope.source_id)
+        binding = session.get(SqlAcpToolCallItemBinding, key)
+        if binding is None:
+            self._reserve_acp_tool_call_binding_capacity(
+                session, root_conversation_id=conversation_id
+            )
+            binding = SqlAcpToolCallItemBinding(
+                workspace_id=current_workspace_id(),
+                root_conversation_id=conversation_id,
+                source_id=scope.source_id,
+                native_epoch=None,
+                journal_id=None,
+                epoch_ordinal=None,
+                context_generation=None,
+                native_call_id=scope.native_call_id,
+                action_origin_token=scope.action_origin_token,
+                action_origin_generation=scope.action_origin_generation,
+                conversation_id=conversation_id,
+                canonical_item_id=(canonical_item_id if item_type == "function_call" else None),
+                response_id=scope.response_id,
+            )
+            session.add(binding)
+            return None
+        if (
+            binding.native_call_id != scope.native_call_id
+            or binding.action_origin_token != scope.action_origin_token
+            or binding.action_origin_generation != scope.action_origin_generation
+            or binding.conversation_id != conversation_id
+            or (
+                binding.canonical_item_id is not None
+                and binding.canonical_item_id
+                != acp_standard_canonical_tool_item_id(
+                    conversation_id, scope.source_id, "function_call"
+                )
+            )
+            or (binding.response_id is not None and binding.response_id != scope.response_id)
+        ):
+            raise ValueError("ACP canonical tool-call append scope was rebound")
+        if item_type == "function_call":
+            binding.canonical_item_id = canonical_item_id
+        binding.response_id = scope.response_id
+        if binding.native_epoch is None:
+            return None
+        root_row = session.scalar(
+            select(SqlAcpSessionAssociation)
+            .where(
+                SqlAcpSessionAssociation.workspace_id == current_workspace_id(),
+                SqlAcpSessionAssociation.root_conversation_id == conversation_id,
+                SqlAcpSessionAssociation.native_epoch == binding.native_epoch,
+                SqlAcpSessionAssociation.conversation_id == conversation_id,
+                SqlAcpSessionAssociation.parent_native_session_id.is_(None),
+            )
+            .limit(1)
+        )
+        if root_row is None:
+            raise ValueError("ACP canonical tool-call anchor has no root association")
+        native_entity_id = (
+            acp_standard_tool_entity_id(scope.native_call_id)
+            if item_type == "function_call"
+            else acp_standard_tool_output_entity_id(scope.native_call_id)
+        )
+        entity = session.get(
+            SqlAcpSessionEntity,
+            (
+                current_workspace_id(),
+                conversation_id,
+                binding.native_epoch,
+                root_row.native_session_id,
+                "item",
+                native_entity_id,
+            ),
+        )
+        patched = (
+            self._join_acp_tool_call_item_baseline(
+                session,
+                entity=entity,
+                conversation_id=conversation_id,
+                canonical_item_id=canonical_item_id,
+                item_type=item_type,
+                response_id=scope.response_id,
+                call_id=scope.native_call_id,
+                now=now,
+            )
+            if entity is not None
+            else None
+        )
+        if item_type != "function_call" or entity is None or entity.references_json is None:
+            return patched
+        native_ids = self._load_acp_payload_value(
+            entity.references_json,
+            workspace_id=entity.workspace_id,
+            root_conversation_id=conversation_id,
+            row_identity=(
+                entity.native_epoch,
+                entity.native_session_id,
+                entity.entity_type,
+                entity.entity_id,
+            ),
+            field_name="entity_references",
+        )
+        if not isinstance(native_ids, list):
+            raise ValueError("ACP canonical tool-call references are malformed")
+        references = self._resolve_acp_tool_references(
+            session,
+            conversation_id=conversation_id,
+            native_epoch=binding.native_epoch,
+            native_session_ids=native_ids,
+        )
+        return self._patch_root_tool_call_references(
+            session,
+            root_conversation_id=conversation_id,
+            native_epoch=binding.native_epoch,
+            call_id=scope.native_call_id,
+            references=references,
+            now=now,
+        )
+
+    def _join_acp_tool_call_item_baseline(
+        self,
+        session: Session,
+        *,
+        entity: SqlAcpSessionEntity,
+        conversation_id: str,
+        canonical_item_id: str,
+        item_type: str,
+        response_id: str,
+        call_id: str,
+        now: int,
+    ) -> ConversationItem:
+        """Join a generic baseline without overwriting ordered report fields."""
+        if entity.stable_item_id != canonical_item_id:
+            raise ValueError("ACP canonical tool entity points at another item")
+        if entity.item_type not in {None, item_type} or entity.response_id not in {
+            None,
+            response_id,
+        }:
+            raise ValueError("ACP canonical tool entity identity changed")
+        item_row = session.execute(
+            select(SqlConversationItem).where(
+                SqlConversationItem.workspace_id == current_workspace_id(),
+                SqlConversationItem.conversation_id == conversation_id,
+                SqlConversationItem.id == canonical_item_id,
+            )
+        ).scalar_one_or_none()
+        if item_row is None:
+            raise ValueError("ACP canonical tool entity has no materialized item")
+        if item_row.response_id != response_id or decode_item_type(item_row.type) != item_type:
+            raise ValueError("ACP canonical tool item identity changed")
+        baseline_json = self._decode_item_data_batch([item_row.data])[0]
+        baseline_data = _require_string_keyed_object(
+            json.loads(baseline_json), "ACP canonical tool item data is malformed"
+        )
+        baseline_item = parse_item_data(item_type, baseline_data)
+        if (
+            item_type == "function_call"
+            and (
+                not isinstance(baseline_item, FunctionCallData) or baseline_item.call_id != call_id
+            )
+        ) or (
+            item_type == "function_call_output"
+            and (
+                not isinstance(baseline_item, FunctionCallOutputData)
+                or baseline_item.call_id != call_id
+            )
+        ):
+            raise ValueError("ACP canonical tool item does not match its native call")
+        baseline_data = baseline_item.model_dump(exclude_none=True)
+        row_identity = (
+            entity.native_epoch,
+            entity.native_session_id,
+            entity.entity_type,
+            entity.entity_id,
+        )
+        item_data = (
+            _require_string_keyed_object(
+                self._load_acp_payload_value(
+                    entity.item_data_json,
+                    workspace_id=entity.workspace_id,
+                    root_conversation_id=conversation_id,
+                    row_identity=row_identity,
+                    field_name="entity_data",
+                ),
+                "ACP stored entity data is malformed",
+            )
+            if entity.item_data_json
+            else {}
+        )
+        pending = (
+            _require_string_keyed_object(
+                self._load_acp_payload_value(
+                    entity.pending_json,
+                    workspace_id=entity.workspace_id,
+                    root_conversation_id=conversation_id,
+                    row_identity=row_identity,
+                    field_name="entity_pending",
+                ),
+                "ACP stored pending entity data is malformed",
+            )
+            if entity.pending_json
+            else {"patch": {}, "content": []}
+        )
+        if entity.item_type is None:
+            item_data = baseline_data | item_data
+            patch = pending.get("patch", {})
+            if not isinstance(patch, dict):
+                raise ValueError("ACP pending tool entity patch is malformed")
+            item_data.update(patch)
+            pending_content = pending.get("content", [])
+            if pending_content:
+                existing_content = item_data.get("content", [])
+                if not isinstance(existing_content, list) or not isinstance(pending_content, list):
+                    raise ValueError("ACP pending tool entity content is malformed")
+                item_data["content"] = [*pending_content, *existing_content]
+            pending = {"patch": {}, "content": []}
+        else:
+            if entity.item_type != item_type:
+                raise ValueError("ACP canonical tool entity type changed")
+            for field_name, value in baseline_data.items():
+                item_data.setdefault(field_name, value)
+        if item_data.get("call_id") != call_id:
+            raise ValueError("ACP canonical tool entity does not match its native call")
+        parsed_data = parse_item_data(item_type, item_data)
+        serialized = strip_nul_bytes(
+            json.dumps(parsed_data.model_dump(exclude_none=True), ensure_ascii=False)
+        )
+        encoded_data = self._encode_item_data(serialized)
+        search_text = (
+            self._item_search_text(
+                NewConversationItem(
+                    type=item_type,
+                    response_id=response_id,
+                    status="completed",
+                    data=parsed_data,
+                    stable_id=canonical_item_id,
+                )
+            )
+            or ""
+        )
+        entity.item_type = item_type
+        entity.response_id = response_id
+        entity.item_data_json = self._store_acp_payload_value(
+            workspace_id=entity.workspace_id,
+            root_conversation_id=conversation_id,
+            row_identity=row_identity,
+            field_name="entity_data",
+            value=item_data,
+        )
+        entity.pending_json = self._store_acp_payload_value(
+            workspace_id=entity.workspace_id,
+            root_conversation_id=conversation_id,
+            row_identity=row_identity,
+            field_name="entity_pending",
+            value=pending,
+        )
+        item_row.data = encoded_data
+        item_row.search_text = search_text
+        delete_fts_by_item_id(session, canonical_item_id)
+        if search_text:
+            insert_fts(session, canonical_item_id, conversation_id, search_text)
+        conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+        if conv_row is not None:
+            conv_row.updated_at = now
+        return ConversationItem(
+            id=canonical_item_id,
+            type=item_type,
+            status=decode_item_status(item_row.status),
+            response_id=response_id,
+            created_at=item_row.created_at,
+            data=parsed_data,
+            created_by=item_row.created_by,
+        )
+
     def append(
         self,
         conversation_id: str,
         items: list[NewConversationItem],
+        *,
+        acp_tool_call_scope: AcpToolCallAppendScope | None = None,
     ) -> list[ConversationItem]:
         """
         Append items to a conversation.
@@ -3054,9 +4139,67 @@ class SqlAlchemyConversationStore(ConversationStore):
             e.g. ``"conv_abc123"``.
         :param items: List of :class:`NewConversationItem` objects
             to persist.
+        :param acp_tool_call_scope: Private proof for one canonical ACP
+            function_call or function_call_output item; it is persisted
+            atomically and never exposed.
         :returns: The persisted :class:`ConversationItem` list
             with store-assigned IDs and timestamps.
         """
+        scoped_item_index: int | None = None
+        if acp_tool_call_scope is not None:
+            self._require_acp_reporting_ready()
+            if not isinstance(acp_tool_call_scope, AcpToolCallAppendScope):
+                raise TypeError("ACP tool-call append scope has an invalid type")
+            scope = acp_tool_call_scope
+            if (
+                not isinstance(scope.source_id, str)
+                or len(scope.source_id) != 69
+                or not scope.source_id.startswith("acp2:")
+                or any(char not in "0123456789abcdef" for char in scope.source_id[5:])
+                or not isinstance(scope.native_call_id, str)
+                or not scope.native_call_id
+                or len(scope.native_call_id) > 512
+                or len(scope.native_call_id.encode("utf-8")) > 512
+                or not isinstance(scope.action_origin_token, str)
+                or len(scope.action_origin_token) != 32
+                or any(char not in "0123456789abcdef" for char in scope.action_origin_token)
+                or not isinstance(scope.action_origin_generation, str)
+                or not scope.action_origin_generation
+                or len(scope.action_origin_generation) > 256
+                or not isinstance(scope.response_id, str)
+                or not scope.response_id
+                or len(scope.response_id) > 64
+            ):
+                raise ValueError("ACP tool-call append scope is malformed")
+            items = list(items)
+            matches = [
+                index
+                for index, item in enumerate(items)
+                if (
+                    item.type == "function_call"
+                    and isinstance(item.data, FunctionCallData)
+                    and item.data.call_id == scope.native_call_id
+                )
+                or (
+                    item.type == "function_call_output"
+                    and isinstance(item.data, FunctionCallOutputData)
+                    and item.data.call_id == scope.native_call_id
+                )
+            ]
+            if len(matches) != 1:
+                raise ValueError("ACP tool-call append scope has no unique canonical item")
+            scoped_item_index = matches[0]
+            scoped_item = items[scoped_item_index]
+            expected_item_id = acp_standard_canonical_tool_item_id(
+                conversation_id, scope.source_id, scoped_item.type
+            )
+            if scoped_item.status != "completed" or scoped_item.response_id != scope.response_id:
+                raise ValueError("ACP tool-call append scope does not match its canonical item")
+            if scoped_item.stable_id is not None and scoped_item.stable_id != expected_item_id:
+                raise ValueError("ACP canonical tool item has a conflicting stable id")
+            items[scoped_item_index] = scoped_item.model_copy(
+                update={"stable_id": expected_item_id}
+            )
         now = now_epoch()
 
         # Encode every item payload up front, in one batch, BEFORE opening the
@@ -3156,11 +4299,25 @@ class SqlAlchemyConversationStore(ConversationStore):
                     # retry must not make an old conversation look active.
                     # Membership (not a length compare) so a batch repeating
                     # one persisted stable id still counts as pure.
-                    return [
+                    duplicates = [
                         deduped_by_id[item.stable_id]
                         for item in items
                         if item.stable_id is not None
                     ]
+                    if acp_tool_call_scope is not None and scoped_item_index is not None:
+                        patched = self._bind_acp_tool_call_item(
+                            session,
+                            conversation_id=conversation_id,
+                            canonical_item_id=duplicates[scoped_item_index].id,
+                            item_type=items[scoped_item_index].type,
+                            scope=acp_tool_call_scope,
+                            now=now,
+                        )
+                        if patched is not None:
+                            duplicates[scoped_item_index] = patched.model_copy(
+                                update={"deduplicated": True}
+                            )
+                    return duplicates
 
             replacements: dict[str, tuple[int, int]] = {}
             for item, prepared, _ in prepared_rows:
@@ -3299,12 +4456,2893 @@ class SqlAlchemyConversationStore(ConversationStore):
             if conv_row is not None:
                 conv_row.next_position = next_pos
 
+            if acp_tool_call_scope is not None and scoped_item_index is not None:
+                patched = self._bind_acp_tool_call_item(
+                    session,
+                    conversation_id=conversation_id,
+                    canonical_item_id=persisted[scoped_item_index].id,
+                    item_type=items[scoped_item_index].type,
+                    scope=acp_tool_call_scope,
+                    now=now,
+                )
+                if patched is not None:
+                    persisted[scoped_item_index] = patched
+
             return persisted
 
         return run_write_transaction(
             self._conv_session_immediate,
             "append_conversation_items",
             write,
+        )
+
+    def _patch_root_tool_call_references(
+        self,
+        session: Session,
+        *,
+        root_conversation_id: str,
+        native_epoch: str,
+        call_id: str,
+        references: list[AcpToolSessionReference],
+        now: int,
+    ) -> ConversationItem | None:
+        """Patch only the canonical root item bound to this exact epoch/call."""
+        binding = session.scalar(
+            select(SqlAcpToolCallItemBinding).where(
+                SqlAcpToolCallItemBinding.workspace_id == current_workspace_id(),
+                SqlAcpToolCallItemBinding.root_conversation_id == root_conversation_id,
+                SqlAcpToolCallItemBinding.native_epoch == native_epoch,
+                SqlAcpToolCallItemBinding.native_call_id == call_id,
+            )
+        )
+        if (
+            binding is None
+            or binding.conversation_id != root_conversation_id
+            or binding.canonical_item_id is None
+            or binding.response_id is None
+        ):
+            return None
+        row = session.execute(
+            select(SqlConversationItem).where(
+                SqlConversationItem.workspace_id == current_workspace_id(),
+                SqlConversationItem.conversation_id == binding.conversation_id,
+                SqlConversationItem.id == binding.canonical_item_id,
+            )
+        ).scalar_one_or_none()
+        if (
+            row is None
+            or decode_item_type(row.type) != "function_call"
+            or row.response_id != binding.response_id
+        ):
+            raise ValueError("ACP canonical tool-call binding points to a missing item")
+        decoded = self._decode_item_data_batch([row.data])[0]
+        data = parse_item_data("function_call", json.loads(decoded))
+        if not isinstance(data, FunctionCallData) or data.call_id != call_id:
+            raise ValueError("ACP canonical tool-call binding does not match its item")
+        updated_data = data.model_copy(update={"acp_session_references": references})
+        data_json = strip_nul_bytes(
+            json.dumps(updated_data.model_dump(exclude_none=True), ensure_ascii=False)
+        )
+        row.data = self._encode_item_data(data_json)
+        conv_row = session.get(SqlConversation, (current_workspace_id(), root_conversation_id))
+        if conv_row is not None:
+            conv_row.updated_at = now
+        return ConversationItem(
+            id=row.id,
+            type="function_call",
+            status=decode_item_status(row.status),
+            response_id=row.response_id,
+            created_at=row.created_at,
+            data=updated_data,
+            created_by=row.created_by,
+        )
+
+    @staticmethod
+    def _resolve_acp_tool_references(
+        session: Session,
+        *,
+        conversation_id: str,
+        native_epoch: str,
+        native_session_ids: list[Any],
+    ) -> list[AcpToolSessionReference]:
+        """Resolve reported native targets through this root epoch's associations."""
+        if len(native_session_ids) > 128:
+            raise ValueError("ACP tool references exceed their count limit")
+        resolved: list[AcpToolSessionReference] = []
+        for native_session_id in native_session_ids:
+            if (
+                not isinstance(native_session_id, str)
+                or not native_session_id
+                or len(native_session_id) > 512
+            ):
+                raise ValueError("ACP tool reference contains an invalid native session id")
+            association = session.get(
+                SqlAcpSessionAssociation,
+                (
+                    current_workspace_id(),
+                    conversation_id,
+                    native_epoch,
+                    native_session_id,
+                ),
+            )
+            resolved.append(
+                AcpToolSessionReference(
+                    native_session_id=native_session_id,
+                    conversation_id=(
+                        association.conversation_id
+                        if association is not None and association.conversation_id
+                        else None
+                    ),
+                )
+            )
+        return resolved
+
+    def _bind_acp_tool_call_report_anchor(
+        self,
+        session: Session,
+        *,
+        root_conversation_id: str,
+        journal_id: str,
+        epoch_ordinal: int,
+        native_epoch: str,
+        source_id: str,
+        context_generation: str,
+        root_native_session_id: str,
+        target_session_id: str,
+        parent_session_id: str | None,
+        conversation_id: str,
+        operation: dict[str, Any],
+        action_origin: dict[str, Any] | None,
+        allow_create: bool,
+        allow_source_alias: bool,
+    ) -> SqlAcpToolCallItemBinding:
+        """Establish or verify one root tool-call anchor against trusted origin."""
+        if (
+            target_session_id != root_native_session_id
+            or parent_session_id is not None
+            or conversation_id != root_conversation_id
+        ):
+            raise ValueError("ACP canonical tool-call anchor must target its root session")
+        call_id = operation.get("call_id")
+        if (
+            not isinstance(call_id, str)
+            or not call_id
+            or len(call_id) > 512
+            or len(call_id.encode("utf-8")) > 512
+            or operation.get("entity_type", "item") != "item"
+            or operation.get("entity_id") != acp_standard_tool_entity_id(call_id)
+        ):
+            raise ValueError("ACP canonical tool-call anchor identity is malformed")
+        anchor_response_id = None
+        if "references" not in operation:
+            anchor_response_id = operation.get("response_id")
+            if (
+                not isinstance(anchor_response_id, str)
+                or not anchor_response_id
+                or len(anchor_response_id) > 64
+            ):
+                raise ValueError("ACP canonical tool-call anchor response identity is malformed")
+        if (
+            not isinstance(action_origin, dict)
+            or not isinstance(action_origin.get("token"), str)
+            or len(action_origin["token"]) != 32
+            or any(char not in "0123456789abcdef" for char in action_origin["token"])
+            or not isinstance(action_origin.get("generation"), str)
+            or not action_origin["generation"]
+            or len(action_origin["generation"]) > 256
+        ):
+            raise ValueError("ACP canonical tool-call anchor has no trusted action origin")
+        token = action_origin["token"]
+        generation = action_origin["generation"]
+        source_key = (current_workspace_id(), root_conversation_id, source_id)
+        binding = session.get(SqlAcpToolCallItemBinding, source_key)
+        call_binding = session.scalar(
+            select(SqlAcpToolCallItemBinding).where(
+                SqlAcpToolCallItemBinding.workspace_id == current_workspace_id(),
+                SqlAcpToolCallItemBinding.root_conversation_id == root_conversation_id,
+                SqlAcpToolCallItemBinding.native_epoch == native_epoch,
+                SqlAcpToolCallItemBinding.native_call_id == call_id,
+            )
+        )
+        if binding is not None and call_binding is not None and binding is not call_binding:
+            raise ValueError("ACP canonical tool-call source does not match its epoch anchor")
+        if binding is None and call_binding is not None:
+            binding = call_binding
+        if binding is None:
+            if not allow_create:
+                raise ValueError("ACP canonical tool-call anchor has no established proof")
+            self._reserve_acp_tool_call_binding_capacity(
+                session, root_conversation_id=root_conversation_id
+            )
+            binding = SqlAcpToolCallItemBinding(
+                workspace_id=current_workspace_id(),
+                root_conversation_id=root_conversation_id,
+                source_id=source_id,
+                native_epoch=native_epoch,
+                journal_id=journal_id,
+                epoch_ordinal=epoch_ordinal,
+                context_generation=context_generation,
+                native_call_id=call_id,
+                action_origin_token=token,
+                action_origin_generation=generation,
+                conversation_id=root_conversation_id,
+                canonical_item_id=None,
+                response_id=anchor_response_id,
+            )
+            session.add(binding)
+            return binding
+        if not allow_source_alias and binding.source_id != source_id:
+            raise ValueError("ACP canonical tool-call source does not match its anchor")
+        if (
+            binding.native_call_id != call_id
+            or binding.action_origin_token != token
+            or binding.action_origin_generation != generation
+            or binding.conversation_id != root_conversation_id
+            or (
+                binding.canonical_item_id is not None
+                and binding.canonical_item_id
+                != acp_standard_canonical_tool_item_id(
+                    root_conversation_id, binding.source_id, "function_call"
+                )
+            )
+            or (binding.native_epoch is not None and binding.native_epoch != native_epoch)
+            or (binding.journal_id is not None and binding.journal_id != journal_id)
+            or (binding.epoch_ordinal is not None and binding.epoch_ordinal != epoch_ordinal)
+            or (
+                binding.context_generation is not None
+                and binding.context_generation != context_generation
+            )
+            or (
+                anchor_response_id is not None
+                and binding.response_id is not None
+                and binding.response_id != anchor_response_id
+            )
+            or (
+                not allow_create
+                and (
+                    binding.native_epoch is None
+                    or binding.journal_id is None
+                    or binding.epoch_ordinal is None
+                    or binding.context_generation is None
+                )
+            )
+        ):
+            raise ValueError("ACP canonical tool-call report anchor was rebound")
+        if binding.native_epoch is None:
+            binding.native_epoch = native_epoch
+            binding.journal_id = journal_id
+            binding.epoch_ordinal = epoch_ordinal
+            binding.context_generation = context_generation
+        if anchor_response_id is not None and binding.response_id is None:
+            binding.response_id = anchor_response_id
+        return binding
+
+    def _reserve_acp_tool_call_binding_capacity(
+        self, session: Session, *, root_conversation_id: str
+    ) -> None:
+        """Reserve one binding slot on the serialized owning conversation row."""
+        self._lock_conversation(session, root_conversation_id)
+        stored_count = SqlConversation.acp_tool_call_binding_count
+        binding_count = func.coalesce(stored_count, 0)
+        result = session.execute(
+            update(SqlConversation)
+            .where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id == root_conversation_id,
+                binding_count >= 0,
+                binding_count < _ACP_TOOL_CALL_BINDING_MAX_ROWS,
+            )
+            .values(acp_tool_call_binding_count=binding_count + 1)
+            .execution_options(synchronize_session=False)
+        )
+        if cast(_RowCountResult, result).rowcount != 1:
+            raise ValueError("ACP canonical tool-call binding capacity reached")
+
+    def _validate_acp_tool_call_report_binding(
+        self,
+        session: Session,
+        *,
+        root_conversation_id: str,
+        journal_id: str,
+        epoch_ordinal: int,
+        native_epoch: str,
+        context_generation: str,
+        root_native_session_id: str,
+        target_session_id: str,
+        parent_session_id: str | None,
+        conversation_id: str,
+        operation: dict[str, Any],
+    ) -> SqlAcpToolCallItemBinding | None:
+        """Resolve an established anchor for a genuine references update."""
+        call_id = operation.get("call_id")
+        if (
+            target_session_id != root_native_session_id
+            or parent_session_id is not None
+            or conversation_id != root_conversation_id
+            or not isinstance(call_id, str)
+            or not call_id
+            or len(call_id) > 512
+            or len(call_id.encode("utf-8")) > 512
+            or operation.get("entity_type", "item") != "item"
+            or operation.get("entity_id") != acp_standard_tool_entity_id(call_id)
+        ):
+            raise ValueError("ACP canonical tool-call reference identity is malformed")
+        binding = session.scalar(
+            select(SqlAcpToolCallItemBinding).where(
+                SqlAcpToolCallItemBinding.workspace_id == current_workspace_id(),
+                SqlAcpToolCallItemBinding.root_conversation_id == root_conversation_id,
+                SqlAcpToolCallItemBinding.native_epoch == native_epoch,
+                SqlAcpToolCallItemBinding.native_call_id == call_id,
+            )
+        )
+        if binding is not None and (
+            binding.native_epoch != native_epoch
+            or binding.journal_id != journal_id
+            or binding.epoch_ordinal != epoch_ordinal
+            or binding.context_generation != context_generation
+            or binding.conversation_id != root_conversation_id
+        ):
+            raise ValueError("ACP canonical tool-call reference has a different anchor scope")
+        return binding
+
+    def _resolve_acp_root_tool_item_binding(
+        self,
+        session: Session,
+        *,
+        root_conversation_id: str,
+        journal_id: str,
+        epoch_ordinal: int,
+        native_epoch: str,
+        context_generation: str,
+        root_native_session_id: str,
+        target_session_id: str,
+        parent_session_id: str | None,
+        conversation_id: str,
+        kind: str,
+        operation: dict[str, Any],
+        action_origin: dict[str, Any] | None,
+    ) -> tuple[SqlAcpToolCallItemBinding | None, str | None]:
+        """Resolve an exact accepted root call/output identity without scanning."""
+        entity_type = operation.get("entity_type", "item")
+        entity_id = operation.get("entity_id")
+        call_id = operation.get("call_id")
+        reserved_tool_item = (
+            isinstance(entity_id, str)
+            and entity_type == "item"
+            and entity_id.startswith(("acp2t_", "acp2o_"))
+        )
+        if call_id is None:
+            if reserved_tool_item:
+                raise ValueError("ACP root tool entity operation has no native call id")
+            return None, None
+        if (
+            target_session_id != root_native_session_id
+            or parent_session_id is not None
+            or conversation_id != root_conversation_id
+            or not isinstance(call_id, str)
+            or not call_id
+            or len(call_id) > 512
+            or len(call_id.encode("utf-8")) > 512
+            or entity_type != "item"
+        ):
+            raise ValueError("ACP root tool entity operation identity is malformed")
+        call_entity_id = acp_standard_tool_entity_id(call_id)
+        output_entity_id = acp_standard_tool_output_entity_id(call_id)
+        if entity_id == call_entity_id:
+            item_type = "function_call"
+        elif entity_id == output_entity_id:
+            item_type = "function_call_output"
+        else:
+            raise ValueError("ACP root tool entity id does not match its native call id")
+        binding = session.scalar(
+            select(SqlAcpToolCallItemBinding).where(
+                SqlAcpToolCallItemBinding.workspace_id == current_workspace_id(),
+                SqlAcpToolCallItemBinding.root_conversation_id == root_conversation_id,
+                SqlAcpToolCallItemBinding.native_epoch == native_epoch,
+                SqlAcpToolCallItemBinding.native_call_id == call_id,
+            )
+        )
+        if binding is None:
+            return None, item_type
+        if (
+            binding.native_epoch != native_epoch
+            or binding.journal_id != journal_id
+            or binding.epoch_ordinal != epoch_ordinal
+            or binding.context_generation != context_generation
+            or binding.conversation_id != root_conversation_id
+            or not isinstance(binding.source_id, str)
+            or not isinstance(binding.response_id, str)
+            or not binding.response_id
+            or (
+                action_origin is not None
+                and (
+                    action_origin.get("token") != binding.action_origin_token
+                    or action_origin.get("generation") != binding.action_origin_generation
+                )
+            )
+        ):
+            raise ValueError("ACP root tool entity operation has a different anchor scope")
+        canonical_call_id = acp_standard_canonical_tool_item_id(
+            root_conversation_id, binding.source_id, "function_call"
+        )
+        if binding.canonical_item_id not in {None, canonical_call_id}:
+            raise ValueError("ACP root tool entity binding points at another call item")
+        if kind == "entity.upsert":
+            value = operation.get("value")
+            if (
+                not isinstance(value, dict)
+                or value.get("item_type") != item_type
+                or value.get("response_id") != binding.response_id
+                or not isinstance(value.get("item_data"), dict)
+                or value["item_data"].get("call_id") != call_id
+            ):
+                raise ValueError("ACP root tool entity upsert conflicts with its anchor")
+        elif kind == "entity.patch":
+            patch = operation.get("patch")
+            if not isinstance(patch, dict) or ("call_id" in patch and patch["call_id"] != call_id):
+                raise ValueError("ACP root tool entity patch conflicts with its anchor")
+        elif kind != "tool.references":
+            raise ValueError("ACP canonical tool entity operation kind is invalid")
+        return binding, item_type
+
+    def get_acp_session_association(
+        self, root_conversation_id: str, native_epoch: str, native_session_id: str
+    ) -> dict[str, Any] | None:
+        """Return one durable ACP-native session mapping, if it was announced."""
+        self._require_acp_reporting_ready()
+        with self._conv_session("get_acp_session_association") as session:
+            row = session.get(
+                SqlAcpSessionAssociation,
+                (
+                    current_workspace_id(),
+                    root_conversation_id,
+                    native_epoch,
+                    native_session_id,
+                ),
+            )
+            return self._acp_association_dict(row) if row is not None else None
+
+    def get_acp_session_association_for_conversation(
+        self, root_conversation_id: str, conversation_id: str
+    ) -> dict[str, Any] | None:
+        """Return one unambiguous ACP-native mapping for a child conversation."""
+        self._require_acp_reporting_ready()
+        with self._conv_session("get_acp_association_for_conversation") as session:
+            rows = session.scalars(
+                select(SqlAcpSessionAssociation)
+                .where(
+                    SqlAcpSessionAssociation.workspace_id == current_workspace_id(),
+                    SqlAcpSessionAssociation.root_conversation_id == root_conversation_id,
+                    SqlAcpSessionAssociation.conversation_id == conversation_id,
+                )
+                .limit(2)
+            ).all()
+            if len(rows) != 1:
+                return None
+            return self._acp_association_dict(rows[0])
+
+    def list_acp_session_associations(
+        self,
+        root_conversation_id: str,
+        *,
+        after: str | None = None,
+        limit: int = _ACP_ASSOCIATION_PAGE_SIZE,
+    ) -> PagedList[dict[str, Any]]:
+        """Return one keyset page of durable native-session bindings."""
+        self._require_acp_reporting_ready()
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= _ACP_ASSOCIATION_PAGE_SIZE
+        ):
+            raise ValueError(
+                f"ACP association page limit must be between 1 and {_ACP_ASSOCIATION_PAGE_SIZE}"
+            )
+        cursor_epoch: str | None = None
+        cursor_session: str | None = None
+        if after is not None:
+            try:
+                cursor_value = json.loads(after)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("ACP association cursor is malformed") from exc
+            if (
+                not isinstance(cursor_value, list)
+                or len(cursor_value) != 2
+                or not all(isinstance(value, str) and value for value in cursor_value)
+            ):
+                raise ValueError("ACP association cursor is malformed")
+            try:
+                cursor_identity_bytes = tuple(
+                    len(value.encode("utf-8", "strict")) for value in cursor_value
+                )
+            except UnicodeEncodeError as exc:
+                raise ValueError("ACP association cursor is malformed") from exc
+            if (
+                len(cursor_value[0]) > 128
+                or len(cursor_value[1]) > 512
+                or cursor_identity_bytes[0] > 512
+                or cursor_identity_bytes[1] > 512
+                or json.dumps(cursor_value, separators=(",", ":")) != after
+            ):
+                raise ValueError("ACP association cursor is malformed")
+            cursor_epoch, cursor_session = cursor_value
+        statement = select(SqlAcpSessionAssociation).where(
+            SqlAcpSessionAssociation.workspace_id == current_workspace_id(),
+            SqlAcpSessionAssociation.root_conversation_id == root_conversation_id,
+        )
+        if cursor_epoch is not None and cursor_session is not None:
+            statement = statement.where(
+                tuple_(
+                    SqlAcpSessionAssociation.native_epoch,
+                    SqlAcpSessionAssociation.native_session_id,
+                )
+                > tuple_(
+                    literal(
+                        cursor_epoch,
+                        type_=SqlAcpSessionAssociation.native_epoch.type,
+                    ),
+                    literal(
+                        cursor_session,
+                        type_=SqlAcpSessionAssociation.native_session_id.type,
+                    ),
+                )
+            )
+        statement = statement.order_by(
+            SqlAcpSessionAssociation.native_epoch,
+            SqlAcpSessionAssociation.native_session_id,
+        ).limit(limit + 1)
+        with self._conv_session("list_acp_session_associations") as session:
+            if cursor_epoch is not None and session.get_bind().dialect.name == "mysql":
+                same_epoch_statement = (
+                    select(SqlAcpSessionAssociation)
+                    .where(
+                        SqlAcpSessionAssociation.workspace_id == current_workspace_id(),
+                        SqlAcpSessionAssociation.root_conversation_id == root_conversation_id,
+                        SqlAcpSessionAssociation.native_epoch
+                        == literal(
+                            cursor_epoch,
+                            type_=SqlAcpSessionAssociation.native_epoch.type,
+                        ),
+                        SqlAcpSessionAssociation.native_session_id
+                        > literal(
+                            cursor_session,
+                            type_=SqlAcpSessionAssociation.native_session_id.type,
+                        ),
+                    )
+                    .order_by(
+                        SqlAcpSessionAssociation.native_epoch,
+                        SqlAcpSessionAssociation.native_session_id,
+                    )
+                    .limit(limit + 1)
+                )
+                rows = list(session.scalars(same_epoch_statement).all())
+                remaining = limit + 1 - len(rows)
+                if remaining > 0:
+                    later_epochs_statement = (
+                        select(SqlAcpSessionAssociation)
+                        .where(
+                            SqlAcpSessionAssociation.workspace_id == current_workspace_id(),
+                            SqlAcpSessionAssociation.root_conversation_id == root_conversation_id,
+                            SqlAcpSessionAssociation.native_epoch
+                            > literal(
+                                cursor_epoch,
+                                type_=SqlAcpSessionAssociation.native_epoch.type,
+                            ),
+                        )
+                        .order_by(
+                            SqlAcpSessionAssociation.native_epoch,
+                            SqlAcpSessionAssociation.native_session_id,
+                        )
+                        .limit(remaining)
+                    )
+                    rows.extend(session.scalars(later_epochs_statement).all())
+            else:
+                rows = list(session.scalars(statement).all())
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            return PagedList(
+                data=[self._acp_inventory_association_dict(row) for row in rows],
+                first_id=(
+                    json.dumps(
+                        [rows[0].native_epoch, rows[0].native_session_id], separators=(",", ":")
+                    )
+                    if rows
+                    else None
+                ),
+                last_id=(
+                    json.dumps(
+                        [rows[-1].native_epoch, rows[-1].native_session_id], separators=(",", ":")
+                    )
+                    if rows
+                    else None
+                ),
+                has_more=has_more,
+            )
+
+    def _acp_inventory_association_dict(self, row: SqlAcpSessionAssociation) -> dict[str, Any]:
+        """Project only fields required for private runner recovery."""
+        row_identity = (row.native_epoch, row.native_session_id)
+        return {
+            "root_conversation_id": row.root_conversation_id,
+            "native_epoch": row.native_epoch,
+            "native_session_id": row.native_session_id,
+            "context_generation": row.context_generation,
+            "parent_native_session_id": row.parent_native_session_id,
+            "conversation_id": row.conversation_id,
+            "association_source_id": row.association_source_id,
+            "action_origin": (
+                self._load_acp_payload_value(
+                    row.action_origin_json,
+                    workspace_id=row.workspace_id,
+                    root_conversation_id=row.root_conversation_id,
+                    row_identity=row_identity,
+                    field_name="action_origin",
+                )
+                if row.action_origin_json
+                else None
+            ),
+        }
+
+    def prepare_acp_report_connection_attempt(
+        self,
+        root_id: str,
+        authenticated_runner_id: str,
+        authenticated_principal: str | None,
+        server_connection_id: str,
+    ) -> str:
+        """Capture a durable predecessor before dispatching session initialization."""
+        self._require_acp_reporting_ready()
+        if not root_id or not authenticated_runner_id or not server_connection_id:
+            raise ValueError("ACP report connection attempt identity is incomplete")
+        if len(authenticated_runner_id) > 256 or len(server_connection_id) > 64:
+            raise ValueError("ACP report connection attempt identity exceeds its size limit")
+        if authenticated_principal is not None and (
+            not isinstance(authenticated_principal, str) or len(authenticated_principal) > 256
+        ):
+            raise ValueError("ACP report authenticated principal is invalid")
+        bound_runner_id = self.get_runner_ids([root_id]).get(root_id)
+        if bound_runner_id != authenticated_runner_id:
+            raise ValueError("ACP report runner is not bound to the root conversation")
+
+        def prepare(session: Session) -> str:
+            self._lock_conversation(session, root_id)
+            conversation = session.get(SqlConversation, (current_workspace_id(), root_id))
+            if conversation is None:
+                raise ValueError("ACP report root conversation does not exist")
+            state_key = (current_workspace_id(), root_id)
+            root_state = session.get(SqlAcpReportRootState, state_key)
+            if root_state is None:
+                root_state = SqlAcpReportRootState(
+                    workspace_id=current_workspace_id(),
+                    root_conversation_id=root_id,
+                    runner_id=authenticated_runner_id,
+                    authenticated_principal=authenticated_principal,
+                    principal_bound=True,
+                    source_revision=0,
+                )
+                session.add(root_state)
+                session.flush()
+            elif root_state.runner_id == authenticated_runner_id and root_state.principal_bound:
+                if root_state.authenticated_principal != authenticated_principal:
+                    raise ValueError("ACP report root principal binding changed")
+
+            existing = session.scalar(
+                select(SqlAcpReportConnectionAttempt).where(
+                    SqlAcpReportConnectionAttempt.workspace_id == current_workspace_id(),
+                    SqlAcpReportConnectionAttempt.root_conversation_id == root_id,
+                    SqlAcpReportConnectionAttempt.server_connection_id == server_connection_id,
+                )
+            )
+            if existing is not None:
+                if (
+                    existing.authenticated_runner_id != authenticated_runner_id
+                    or existing.authenticated_principal != authenticated_principal
+                ):
+                    raise ValueError("ACP report connection attempt identity was reused")
+                return existing.attempt_id
+
+            attempt_id = uuid.uuid4().hex
+            session.add(
+                SqlAcpReportConnectionAttempt(
+                    workspace_id=current_workspace_id(),
+                    attempt_id=attempt_id,
+                    root_conversation_id=root_id,
+                    server_connection_id=server_connection_id,
+                    authenticated_runner_id=authenticated_runner_id,
+                    authenticated_principal=authenticated_principal,
+                    expected_source_revision=root_state.source_revision,
+                    state="prepared",
+                    admission_revision=None,
+                )
+            )
+            return attempt_id
+
+        return run_write_transaction(
+            self._conv_session_immediate,
+            "prepare_acp_report_connection_attempt",
+            prepare,
+        )
+
+    def admit_acp_report_connection(
+        self,
+        attempt_id: str,
+        connection_context: Any,
+        *,
+        expected_root_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Compare the prepared predecessor and atomically hand source authority over."""
+        self._require_acp_reporting_ready()
+        runner_id = getattr(connection_context, "runner_id", None)
+        principal = getattr(connection_context, "owner", None)
+        server_connection_id = getattr(connection_context, "server_connection_id", None)
+        if (
+            not isinstance(attempt_id, str)
+            or not attempt_id
+            or not isinstance(runner_id, str)
+            or not isinstance(server_connection_id, str)
+        ):
+            raise ValueError("ACP report connection context is incomplete")
+        if getattr(connection_context, "superseded", False):
+            raise ValueError("ACP report connection has been superseded")
+
+        if expected_root_id is not None:
+            root_id = expected_root_id
+        else:
+            with self._conv_session("select_acp_report_connection_attempt_root") as lookup_session:
+                attempt_scope = lookup_session.get(
+                    SqlAcpReportConnectionAttempt,
+                    (current_workspace_id(), attempt_id),
+                )
+            if attempt_scope is None:
+                raise ValueError("ACP report connection attempt is unknown")
+            root_id = attempt_scope.root_conversation_id
+        bound_runner_id = self.get_runner_ids([root_id]).get(root_id)
+
+        def admit(session: Session) -> dict[str, Any]:
+            attempt = session.get(
+                SqlAcpReportConnectionAttempt,
+                (current_workspace_id(), attempt_id),
+            )
+            if attempt is None:
+                raise ValueError("ACP report connection attempt is unknown")
+            if expected_root_id is not None and attempt.root_conversation_id != expected_root_id:
+                raise ValueError("ACP report connection attempt belongs to another root")
+            if attempt.root_conversation_id != root_id:
+                raise ValueError("ACP report connection attempt root changed during admission")
+            self._lock_conversation(session, attempt.root_conversation_id)
+            root_state = session.get(
+                SqlAcpReportRootState,
+                (current_workspace_id(), attempt.root_conversation_id),
+            )
+            if root_state is None:
+                raise ValueError("ACP report root source state is missing")
+            if (
+                attempt.authenticated_runner_id != runner_id
+                or attempt.authenticated_principal != principal
+                or attempt.server_connection_id != server_connection_id
+            ):
+                raise ValueError("ACP report connection context does not match its attempt")
+            if attempt.state == "rejected":
+                raise ValueError("ACP report connection attempt was permanently rejected")
+            if attempt.state == "admitted":
+                current = root_state.current_connection_admission_id == attempt.attempt_id
+                if current and (
+                    root_state.runner_id != runner_id
+                    or not root_state.principal_bound
+                    or root_state.authenticated_principal != principal
+                ):
+                    raise ValueError("current ACP report connection binding is inconsistent")
+                return {
+                    "connection_admission_id": attempt.attempt_id,
+                    "current": current,
+                    "selector_changed": False,
+                }
+            if bound_runner_id != runner_id:
+                attempt.state = "rejected"
+                return {"rejected": True}
+            if (
+                root_state.runner_id == runner_id
+                and root_state.principal_bound
+                and root_state.authenticated_principal != principal
+            ):
+                attempt.state = "rejected"
+                return {"rejected": True}
+            if attempt.expected_source_revision != root_state.source_revision:
+                attempt.state = "rejected"
+                return {"rejected": True}
+            if root_state.source_revision >= 2**63 - 1:
+                raise ValueError("ACP report source revision limit reached")
+            selector_changed = any(
+                value is not None
+                for value in (
+                    root_state.current_journal_id,
+                    root_state.current_epoch_ordinal,
+                    root_state.current_native_epoch,
+                )
+            )
+            root_state.runner_id = runner_id
+            root_state.authenticated_principal = principal
+            root_state.principal_bound = True
+            root_state.source_revision += 1
+            root_state.current_connection_admission_id = attempt.attempt_id
+            root_state.current_runtime_incarnation = None
+            root_state.current_journal_id = None
+            root_state.current_epoch_ordinal = None
+            root_state.current_native_epoch = None
+            attempt.state = "admitted"
+            attempt.admission_revision = root_state.source_revision
+            return {
+                "connection_admission_id": attempt.attempt_id,
+                "current": True,
+                "selector_changed": selector_changed,
+            }
+
+        result = run_write_transaction(
+            self._conv_session_immediate,
+            "admit_acp_report_connection",
+            admit,
+        )
+        if result.get("rejected") is True:
+            raise ValueError("ACP report connection predecessor revision changed")
+        return result
+
+    def admit_acp_report_owner(
+        self,
+        root_id: str,
+        connection_admission_id: str,
+        runtime_incarnation: int,
+        journal_id: str,
+    ) -> dict[str, Any]:
+        """Authorize one journal delivery owner and unbind a replaced runtime epoch."""
+        self._require_acp_reporting_ready()
+        _validate_acp_report_owner_identity(
+            connection_admission_id, runtime_incarnation, journal_id
+        )
+
+        def admit(session: Session) -> dict[str, Any]:
+            self._lock_conversation(session, root_id)
+            state = session.get(SqlAcpReportRootState, (current_workspace_id(), root_id))
+            if state is None or state.current_connection_admission_id != connection_admission_id:
+                raise ValueError("ACP report owner requires the current connection admission")
+            attempt = session.get(
+                SqlAcpReportConnectionAttempt,
+                (current_workspace_id(), connection_admission_id),
+            )
+            if attempt is None or attempt.state != "admitted":
+                raise ValueError("ACP report owner connection was never admitted")
+            owner_key = (
+                current_workspace_id(),
+                root_id,
+                connection_admission_id,
+                runtime_incarnation,
+            )
+            existing_owner = session.get(SqlAcpReportOwner, owner_key)
+            if existing_owner is not None:
+                if existing_owner.journal_id != journal_id:
+                    raise ValueError("ACP report runtime incarnation changed its journal")
+                return {
+                    "current": (
+                        state.current_runtime_incarnation == runtime_incarnation
+                        and state.current_journal_id == journal_id
+                    ),
+                    "selector_changed": False,
+                }
+            journal = session.scalar(
+                select(SqlAcpReportJournal).where(
+                    SqlAcpReportJournal.workspace_id == current_workspace_id(),
+                    SqlAcpReportJournal.journal_id == journal_id,
+                )
+            )
+            if journal is not None and journal.root_conversation_id != root_id:
+                raise ValueError("ACP report journal lineage belongs to another root")
+            if journal is None:
+                journal = SqlAcpReportJournal(
+                    workspace_id=current_workspace_id(),
+                    root_conversation_id=root_id,
+                    journal_id=journal_id,
+                    highest_epoch_ordinal=0,
+                )
+                session.add(journal)
+
+            current_incarnation = state.current_runtime_incarnation
+            if current_incarnation is not None:
+                if runtime_incarnation < current_incarnation:
+                    raise ValueError("ACP report runtime incarnation is stale")
+                if runtime_incarnation == current_incarnation:
+                    if state.current_journal_id != journal_id:
+                        raise ValueError(
+                            "ACP report owner reused an incarnation with another journal"
+                        )
+                    # There is no durable owner tuple for an equal incarnation here;
+                    # the current one must have been inserted atomically with state.
+                    raise ValueError("ACP report owner identity is inconsistent")
+            selector_changed = any(
+                value is not None
+                for value in (
+                    state.current_journal_id,
+                    state.current_epoch_ordinal,
+                    state.current_native_epoch,
+                )
+            )
+            state.current_runtime_incarnation = runtime_incarnation
+            state.current_journal_id = journal_id
+            state.current_epoch_ordinal = None
+            state.current_native_epoch = None
+            session.add(
+                SqlAcpReportOwner(
+                    workspace_id=current_workspace_id(),
+                    root_conversation_id=root_id,
+                    connection_admission_id=connection_admission_id,
+                    runtime_incarnation=runtime_incarnation,
+                    journal_id=journal_id,
+                )
+            )
+            return {"current": True, "selector_changed": selector_changed}
+
+        return run_write_transaction(self._conv_session_immediate, "admit_acp_report_owner", admit)
+
+    def activate_acp_report_epoch(
+        self,
+        root_id: str,
+        connection_admission_id: str,
+        runtime_incarnation: int,
+        journal_id: str,
+        native_epoch: str,
+        epoch_ordinal: int,
+        *,
+        historical_only: bool = False,
+    ) -> dict[str, Any]:
+        """Bind an epoch, selecting it only for live capability activation.
+
+        Historical-only binding retains replay identity while leaving the root
+        selector and journal high-water untouched.
+        """
+        self._require_acp_reporting_ready()
+        _validate_acp_report_owner_identity(
+            connection_admission_id, runtime_incarnation, journal_id
+        )
+        validate_acp_native_identity(native_epoch)
+        if (
+            isinstance(epoch_ordinal, bool)
+            or not isinstance(epoch_ordinal, int)
+            or not 1 <= epoch_ordinal <= 2**63 - 1
+        ):
+            raise ValueError("ACP report epoch ordinal is invalid")
+        if not isinstance(historical_only, bool):
+            raise ValueError("ACP report historical binding mode is invalid")
+
+        def activate(session: Session) -> dict[str, Any]:
+            self._lock_conversation(session, root_id)
+            state = session.get(SqlAcpReportRootState, (current_workspace_id(), root_id))
+            if state is None or (
+                state.current_connection_admission_id != connection_admission_id
+                or state.current_runtime_incarnation != runtime_incarnation
+                or state.current_journal_id != journal_id
+            ):
+                raise ValueError("ACP report epoch requires the exact current owner")
+            owner = session.get(
+                SqlAcpReportOwner,
+                (
+                    current_workspace_id(),
+                    root_id,
+                    connection_admission_id,
+                    runtime_incarnation,
+                ),
+            )
+            journal = session.get(
+                SqlAcpReportJournal,
+                (current_workspace_id(), root_id, journal_id),
+            )
+            if owner is None or owner.journal_id != journal_id or journal is None:
+                raise ValueError("ACP report epoch lineage was never admitted")
+
+            root_native_epoch = session.scalar(
+                select(SqlAcpReportEpoch).where(
+                    SqlAcpReportEpoch.workspace_id == current_workspace_id(),
+                    SqlAcpReportEpoch.root_conversation_id == root_id,
+                    SqlAcpReportEpoch.native_epoch == native_epoch,
+                )
+            )
+            if root_native_epoch is not None and root_native_epoch.journal_id != journal_id:
+                raise ValueError("ACP report native epoch was already bound to another journal")
+
+            epoch = session.get(
+                SqlAcpReportEpoch,
+                (current_workspace_id(), root_id, journal_id, epoch_ordinal),
+            )
+            by_native = session.scalar(
+                select(SqlAcpReportEpoch).where(
+                    SqlAcpReportEpoch.workspace_id == current_workspace_id(),
+                    SqlAcpReportEpoch.root_conversation_id == root_id,
+                    SqlAcpReportEpoch.journal_id == journal_id,
+                    SqlAcpReportEpoch.native_epoch == native_epoch,
+                )
+            )
+            if epoch is not None and epoch.native_epoch != native_epoch:
+                raise ValueError("ACP report epoch ordinal was reused")
+            if by_native is not None and by_native.epoch_ordinal != epoch_ordinal:
+                raise ValueError("ACP report native epoch was rebound to another ordinal")
+            if historical_only:
+                if epoch is None:
+                    session.add(
+                        SqlAcpReportEpoch(
+                            workspace_id=current_workspace_id(),
+                            root_conversation_id=root_id,
+                            journal_id=journal_id,
+                            epoch_ordinal=epoch_ordinal,
+                            native_epoch=native_epoch,
+                        )
+                    )
+                return {"bound": True, "selected": False, "selector_changed": False}
+            if epoch is not None and by_native is not None:
+                if (
+                    state.current_epoch_ordinal == epoch_ordinal
+                    and state.current_native_epoch == native_epoch
+                ):
+                    return {"active": True, "selector_changed": False}
+                if epoch_ordinal < journal.highest_epoch_ordinal:
+                    return {"active": False, "selected": False, "selector_changed": False}
+            elif epoch_ordinal <= journal.highest_epoch_ordinal:
+                raise ValueError("ACP report epoch ordinal is below the journal high-water")
+
+            if epoch is None:
+                session.add(
+                    SqlAcpReportEpoch(
+                        workspace_id=current_workspace_id(),
+                        root_conversation_id=root_id,
+                        journal_id=journal_id,
+                        epoch_ordinal=epoch_ordinal,
+                        native_epoch=native_epoch,
+                    )
+                )
+            journal.highest_epoch_ordinal = max(journal.highest_epoch_ordinal, epoch_ordinal)
+            selector_changed = (
+                state.current_journal_id != journal_id
+                or state.current_epoch_ordinal != epoch_ordinal
+                or state.current_native_epoch != native_epoch
+            )
+            state.current_epoch_ordinal = epoch_ordinal
+            state.current_native_epoch = native_epoch
+            return {"active": True, "selector_changed": selector_changed}
+
+        return run_write_transaction(
+            self._conv_session_immediate,
+            "activate_acp_report_epoch",
+            activate,
+        )
+
+    def get_acp_session_observation(self, conversation_id: str) -> dict[str, Any] | None:
+        """Read one observation through the shared bounded projection."""
+        return self.get_acp_session_observations([conversation_id]).get(conversation_id)
+
+    def get_acp_session_observations(
+        self, conversation_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Hydrate a bounded batch of observations with selected-source status.
+
+        Current rows are resolved through the root selector and immutable
+        journal/ordinal/native-epoch binding. For an ID without a selected row,
+        a single unambiguous historical association is still returned with
+        ``source_current=False``; ambiguous mappings are omitted.
+        """
+        self._require_acp_reporting_ready()
+        if len(conversation_ids) > _ACP_OBSERVATION_MAX_IDS:
+            raise ValueError("ACP observation request exceeds its input limit")
+        if any(
+            not isinstance(conversation_id, str)
+            or not conversation_id
+            or len(conversation_id) > 128
+            for conversation_id in conversation_ids
+        ):
+            raise ValueError("ACP observation request contains an invalid conversation id")
+        ordered_ids = list(dict.fromkeys(conversation_ids))
+        if not ordered_ids:
+            return {}
+
+        result: dict[str, dict[str, Any]] = {}
+        with self._conv_session("get_acp_session_observations") as session:
+            for batch in batched(ordered_ids, _ACP_OBSERVATION_BATCH_SIZE):
+                batch_ids = list(batch)
+                requested_root_states = session.scalars(
+                    select(SqlAcpReportRootState).where(
+                        SqlAcpReportRootState.workspace_id == current_workspace_id(),
+                        SqlAcpReportRootState.root_conversation_id.in_(batch_ids),
+                    )
+                ).all()
+                requested_root_ids = {
+                    state.root_conversation_id for state in requested_root_states
+                }
+                child_ids = [
+                    conversation_id
+                    for conversation_id in batch_ids
+                    if conversation_id not in requested_root_ids
+                ]
+                child_rows = (
+                    session.scalars(
+                        select(SqlAcpSessionAssociation)
+                        .where(
+                            SqlAcpSessionAssociation.workspace_id == current_workspace_id(),
+                            SqlAcpSessionAssociation.conversation_id.in_(child_ids),
+                            SqlAcpSessionAssociation.parent_native_session_id.is_not(None),
+                        )
+                        .order_by(
+                            SqlAcpSessionAssociation.conversation_id,
+                            SqlAcpSessionAssociation.root_conversation_id,
+                            SqlAcpSessionAssociation.native_epoch,
+                            SqlAcpSessionAssociation.native_session_id,
+                        )
+                        .limit(2 * len(child_ids) + 1)
+                    ).all()
+                    if child_ids
+                    else []
+                )
+                if len(child_rows) > 2 * len(child_ids):
+                    raise ValueError("ACP child observation row capacity exceeded")
+
+                candidate_root_ids = requested_root_ids | {
+                    row.root_conversation_id for row in child_rows
+                }
+                root_states = (
+                    session.scalars(
+                        select(SqlAcpReportRootState).where(
+                            SqlAcpReportRootState.workspace_id == current_workspace_id(),
+                            SqlAcpReportRootState.root_conversation_id.in_(candidate_root_ids),
+                        )
+                    ).all()
+                    if candidate_root_ids
+                    else []
+                )
+                selected_epoch_keys = [
+                    (
+                        state.root_conversation_id,
+                        state.current_journal_id,
+                        state.current_epoch_ordinal,
+                    )
+                    for state in root_states
+                    if state.current_journal_id is not None
+                    and state.current_epoch_ordinal is not None
+                    and state.current_native_epoch is not None
+                ]
+                selected_epochs = (
+                    session.scalars(
+                        select(SqlAcpReportEpoch).where(
+                            SqlAcpReportEpoch.workspace_id == current_workspace_id(),
+                            tuple_(
+                                SqlAcpReportEpoch.root_conversation_id,
+                                SqlAcpReportEpoch.journal_id,
+                                SqlAcpReportEpoch.epoch_ordinal,
+                            ).in_(selected_epoch_keys),
+                        )
+                    ).all()
+                    if selected_epoch_keys
+                    else []
+                )
+                epoch_by_key = {
+                    (epoch.root_conversation_id, epoch.journal_id, epoch.epoch_ordinal): epoch
+                    for epoch in selected_epochs
+                }
+                active_epoch_by_root: dict[str, str] = {}
+                for state in root_states:
+                    if (
+                        state.current_journal_id is None
+                        or state.current_epoch_ordinal is None
+                        or state.current_native_epoch is None
+                    ):
+                        continue
+                    selected_epoch = epoch_by_key.get(
+                        (
+                            state.root_conversation_id,
+                            state.current_journal_id,
+                            state.current_epoch_ordinal,
+                        )
+                    )
+                    if (
+                        selected_epoch is not None
+                        and selected_epoch.native_epoch == state.current_native_epoch
+                    ):
+                        active_epoch_by_root[state.root_conversation_id] = (
+                            state.current_native_epoch
+                        )
+
+                root_keys = [
+                    (root_id, active_epoch_by_root[root_id])
+                    for root_id in requested_root_ids
+                    if root_id in active_epoch_by_root
+                ]
+                root_rows = (
+                    session.scalars(
+                        select(SqlAcpSessionAssociation)
+                        .where(
+                            SqlAcpSessionAssociation.workspace_id == current_workspace_id(),
+                            tuple_(
+                                SqlAcpSessionAssociation.root_conversation_id,
+                                SqlAcpSessionAssociation.native_epoch,
+                            ).in_(root_keys),
+                            SqlAcpSessionAssociation.conversation_id
+                            == SqlAcpSessionAssociation.root_conversation_id,
+                            SqlAcpSessionAssociation.parent_native_session_id.is_(None),
+                        )
+                        .limit(len(root_keys) + 1)
+                    ).all()
+                    if root_keys
+                    else []
+                )
+                if len(root_rows) > len(root_keys):
+                    raise ValueError("ACP root observation row capacity exceeded")
+                for row in root_rows:
+                    result[row.root_conversation_id] = self._acp_observation_dict(
+                        row, source_current=True
+                    )
+
+                child_rows_by_id: dict[str, list[SqlAcpSessionAssociation]] = {}
+                for row in child_rows:
+                    child_rows_by_id.setdefault(row.conversation_id, []).append(row)
+                for conversation_id, rows in child_rows_by_id.items():
+                    current_rows = [
+                        row
+                        for row in rows
+                        if active_epoch_by_root.get(row.root_conversation_id) == row.native_epoch
+                    ]
+                    if len(current_rows) == 1:
+                        result[conversation_id] = self._acp_observation_dict(
+                            current_rows[0], source_current=True
+                        )
+                    elif not current_rows and len(rows) == 1:
+                        result[conversation_id] = self._acp_observation_dict(
+                            rows[0], source_current=False
+                        )
+        return result
+
+    def _acp_observation_dict(
+        self, row: SqlAcpSessionAssociation, *, source_current: bool
+    ) -> dict[str, Any]:
+        """Build the public observation projection from one immutable row."""
+        observation = self._load_acp_payload_value(
+            row.observation_json,
+            workspace_id=row.workspace_id,
+            root_conversation_id=row.root_conversation_id,
+            row_identity=(row.native_epoch, row.native_session_id),
+            field_name="observation",
+        )
+        if not isinstance(observation, dict):
+            raise ValueError("ACP stored observation is malformed")
+        state = observation.get("state")
+        if not isinstance(state, dict) or not isinstance(state.get("present"), bool):
+            state = None
+        return {
+            "state": state,
+            "source_current": source_current,
+            "state_ingress_sequence": row.state_ingress_sequence,
+            "state_observed_at": row.state_observed_at,
+            "last_ingress_sequence": row.last_ingress_sequence,
+            "last_reported_at": row.last_reported_at,
+            **{
+                field_name: observation[field_name]
+                for field_name in (
+                    "session_info",
+                    "usage",
+                    "config_options",
+                    "mode",
+                    "plan",
+                    "transport",
+                )
+                if field_name in observation
+            },
+            # ACP v1 session updates carry no heartbeat or terminal receipt.
+            "transport_unconfirmed": True,
+        }
+
+    def validate_acp_session_report_order(
+        self,
+        *,
+        root_conversation_id: str,
+        connection_admission_id: str,
+        runtime_incarnation: int,
+        journal_id: str,
+        journal_sequence: int,
+        epoch_ordinal: int,
+        native_epoch: str,
+        ingress_sequence: int,
+        source_id: str,
+        payload_hash: str,
+        root_native_session_id: str,
+    ) -> None:
+        """Check v3 delivery authority and report position before child creation."""
+
+        def check(session: Session) -> None:
+            self._lock_conversation(session, root_conversation_id)
+            receipt, _origin_is_active = self._validate_acp_report_delivery_origin(
+                session,
+                root_conversation_id=root_conversation_id,
+                connection_admission_id=connection_admission_id,
+                runtime_incarnation=runtime_incarnation,
+                journal_id=journal_id,
+                journal_sequence=journal_sequence,
+                epoch_ordinal=epoch_ordinal,
+                native_epoch=native_epoch,
+                ingress_sequence=ingress_sequence,
+                source_id=source_id,
+                payload_hash=payload_hash,
+            )
+            epoch_roots = session.scalars(
+                select(SqlAcpSessionAssociation).where(
+                    SqlAcpSessionAssociation.workspace_id == current_workspace_id(),
+                    SqlAcpSessionAssociation.root_conversation_id == root_conversation_id,
+                    SqlAcpSessionAssociation.native_epoch == native_epoch,
+                    SqlAcpSessionAssociation.parent_native_session_id.is_(None),
+                )
+            ).all()
+            if any(row.native_session_id != root_native_session_id for row in epoch_roots):
+                raise ValueError("ACP root native session identity changed within its epoch")
+            if receipt is not None:
+                return
+
+        run_write_transaction(
+            self._conv_session_immediate, "check_acp_session_report_order", check
+        )
+
+    def _validate_acp_report_delivery_origin(
+        self,
+        session: Session,
+        *,
+        root_conversation_id: str,
+        connection_admission_id: str,
+        runtime_incarnation: int,
+        journal_id: str,
+        journal_sequence: int,
+        epoch_ordinal: int,
+        native_epoch: str,
+        ingress_sequence: int,
+        source_id: str,
+        payload_hash: str,
+    ) -> tuple[SqlAcpSessionReportReceipt | None, bool]:
+        """Validate owner, epoch, and the immutable position/source receipt tuple."""
+        _validate_acp_report_owner_identity(
+            connection_admission_id, runtime_incarnation, journal_id
+        )
+        validate_acp_native_identity(native_epoch)
+        for value, name in (
+            (journal_sequence, "journal sequence"),
+            (epoch_ordinal, "epoch ordinal"),
+            (ingress_sequence, "ingress sequence"),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 1 <= value <= 2**63 - 1
+            ):
+                raise ValueError(f"ACP report {name} is invalid")
+        if (
+            not isinstance(source_id, str)
+            or len(source_id) != 69
+            or not source_id.startswith("acp2:")
+            or not isinstance(payload_hash, str)
+            or len(payload_hash) != 64
+            or any(character not in "0123456789abcdef" for character in payload_hash)
+        ):
+            raise ValueError("ACP report source or payload identity is invalid")
+
+        owner = session.get(
+            SqlAcpReportOwner,
+            (
+                current_workspace_id(),
+                root_conversation_id,
+                connection_admission_id,
+                runtime_incarnation,
+            ),
+        )
+        journal = session.get(
+            SqlAcpReportJournal,
+            (current_workspace_id(), root_conversation_id, journal_id),
+        )
+        epoch = session.get(
+            SqlAcpReportEpoch,
+            (current_workspace_id(), root_conversation_id, journal_id, epoch_ordinal),
+        )
+        if owner is None or owner.journal_id != journal_id or journal is None:
+            raise ValueError("ACP report delivery owner was never admitted")
+        if epoch is None or epoch.native_epoch != native_epoch:
+            raise ValueError("ACP report native epoch was never activated for this journal")
+
+        position = session.get(
+            SqlAcpSessionReportReceipt,
+            (
+                current_workspace_id(),
+                root_conversation_id,
+                journal_id,
+                journal_sequence,
+            ),
+        )
+        source_receipt = session.scalar(
+            select(SqlAcpSessionReportReceipt).where(
+                SqlAcpSessionReportReceipt.workspace_id == current_workspace_id(),
+                SqlAcpSessionReportReceipt.root_conversation_id == root_conversation_id,
+                SqlAcpSessionReportReceipt.source_id == source_id,
+            )
+        )
+        ingress_receipt = session.scalar(
+            select(SqlAcpSessionReportReceipt).where(
+                SqlAcpSessionReportReceipt.workspace_id == current_workspace_id(),
+                SqlAcpSessionReportReceipt.root_conversation_id == root_conversation_id,
+                SqlAcpSessionReportReceipt.journal_id == journal_id,
+                SqlAcpSessionReportReceipt.native_epoch == native_epoch,
+                SqlAcpSessionReportReceipt.ingress_sequence == ingress_sequence,
+            )
+        )
+
+        def matches(receipt: SqlAcpSessionReportReceipt) -> bool:
+            return (
+                receipt.journal_id == journal_id
+                and receipt.journal_sequence == journal_sequence
+                and receipt.epoch_ordinal == epoch_ordinal
+                and receipt.native_epoch == native_epoch
+                and receipt.ingress_sequence == ingress_sequence
+                and receipt.source_id == source_id
+                and receipt.payload_hash == payload_hash
+            )
+
+        for receipt in (position, source_receipt, ingress_receipt):
+            if receipt is not None and not matches(receipt):
+                raise ValueError("ACP report source, position, or origin was reused")
+        if position is not None:
+            if source_receipt is not position or ingress_receipt is not position:
+                raise ValueError("ACP report immutable origin mapping is inconsistent")
+            return position, self._acp_report_origin_is_active(
+                session,
+                root_conversation_id,
+                connection_admission_id,
+                runtime_incarnation,
+                journal_id,
+                epoch_ordinal,
+                native_epoch,
+            )
+        if source_receipt is not None or ingress_receipt is not None:
+            raise ValueError(
+                "ACP report source or ingress identity was reused at another position"
+            )
+
+        # Root serialization plus the exact +1 checks allow only one pending
+        # tail per journal/epoch, so the applied filter skips at most that row.
+        applied_journal_sequence = (
+            session.scalar(
+                select(SqlAcpSessionReportReceipt.journal_sequence)
+                .where(
+                    SqlAcpSessionReportReceipt.workspace_id == current_workspace_id(),
+                    SqlAcpSessionReportReceipt.root_conversation_id == root_conversation_id,
+                    SqlAcpSessionReportReceipt.journal_id == journal_id,
+                    SqlAcpSessionReportReceipt.applied.is_(True),
+                )
+                .order_by(SqlAcpSessionReportReceipt.journal_sequence.desc())
+                .limit(1)
+            )
+            or 0
+        )
+        applied_ingress_sequence = (
+            session.scalar(
+                select(SqlAcpSessionReportReceipt.ingress_sequence)
+                .where(
+                    SqlAcpSessionReportReceipt.workspace_id == current_workspace_id(),
+                    SqlAcpSessionReportReceipt.root_conversation_id == root_conversation_id,
+                    SqlAcpSessionReportReceipt.journal_id == journal_id,
+                    SqlAcpSessionReportReceipt.native_epoch == native_epoch,
+                    SqlAcpSessionReportReceipt.applied.is_(True),
+                )
+                .order_by(SqlAcpSessionReportReceipt.ingress_sequence.desc())
+                .limit(1)
+            )
+            or 0
+        )
+        if journal_sequence != applied_journal_sequence + 1:
+            raise ValueError("ACP report journal sequence is not contiguous")
+        if ingress_sequence != applied_ingress_sequence + 1:
+            raise ValueError("ACP report ingress sequence is not contiguous")
+        return None, self._acp_report_origin_is_active(
+            session,
+            root_conversation_id,
+            connection_admission_id,
+            runtime_incarnation,
+            journal_id,
+            epoch_ordinal,
+            native_epoch,
+        )
+
+    @staticmethod
+    def _acp_report_origin_is_active(
+        session: Session,
+        root_conversation_id: str,
+        connection_admission_id: str,
+        runtime_incarnation: int,
+        journal_id: str,
+        epoch_ordinal: int,
+        native_epoch: str,
+    ) -> bool:
+        state = session.get(SqlAcpReportRootState, (current_workspace_id(), root_conversation_id))
+        return bool(
+            state is not None
+            and state.current_connection_admission_id == connection_admission_id
+            and state.current_runtime_incarnation == runtime_incarnation
+            and state.current_journal_id == journal_id
+            and state.current_epoch_ordinal == epoch_ordinal
+            and state.current_native_epoch == native_epoch
+        )
+
+    def reserve_acp_session_report(
+        self,
+        *,
+        root_conversation_id: str,
+        connection_admission_id: str,
+        runtime_incarnation: int,
+        journal_id: str,
+        journal_sequence: int,
+        epoch_ordinal: int,
+        native_epoch: str,
+        ingress_sequence: int,
+        source_id: str,
+        payload_hash: str,
+        context_generation: str,
+        root_native_session_id: str,
+        target_session_id: str,
+        parent_session_id: str,
+        action_origin: dict[str, Any] | None = None,
+    ) -> None:
+        """Durably admit an association report before creating its child row.
+
+        A pending receipt is recoverable by replaying the same source/hash.
+        The root row lock serializes contenders across server processes, while
+        only applied receipts advance the sequence expected by later reports.
+        """
+        self._require_acp_reporting_ready()
+        validate_acp_native_identity(
+            native_epoch, root_native_session_id, target_session_id, parent_session_id
+        )
+        if ingress_sequence < 1:
+            raise ValueError("ACP ingress sequence must be positive")
+
+        def reserve(session: Session) -> None:
+            self._lock_conversation(session, root_conversation_id)
+            existing_receipt, _is_active = self._validate_acp_report_delivery_origin(
+                session,
+                root_conversation_id=root_conversation_id,
+                connection_admission_id=connection_admission_id,
+                runtime_incarnation=runtime_incarnation,
+                journal_id=journal_id,
+                journal_sequence=journal_sequence,
+                epoch_ordinal=epoch_ordinal,
+                native_epoch=native_epoch,
+                ingress_sequence=ingress_sequence,
+                source_id=source_id,
+                payload_hash=payload_hash,
+            )
+            if existing_receipt is not None and existing_receipt.applied:
+                return
+
+            epoch_roots = session.scalars(
+                select(SqlAcpSessionAssociation).where(
+                    SqlAcpSessionAssociation.workspace_id == current_workspace_id(),
+                    SqlAcpSessionAssociation.root_conversation_id == root_conversation_id,
+                    SqlAcpSessionAssociation.native_epoch == native_epoch,
+                    SqlAcpSessionAssociation.parent_native_session_id.is_(None),
+                )
+            ).all()
+            if any(row.native_session_id != root_native_session_id for row in epoch_roots):
+                raise ValueError("ACP root native session identity changed within its epoch")
+
+            root_key = (
+                current_workspace_id(),
+                root_conversation_id,
+                native_epoch,
+                root_native_session_id,
+            )
+            root_row = session.get(SqlAcpSessionAssociation, root_key)
+            if root_row is not None and (
+                root_row.context_generation != context_generation
+                or root_row.conversation_id != root_conversation_id
+                or root_row.parent_native_session_id is not None
+            ):
+                raise ValueError("ACP root session identity changed within its native epoch")
+
+            parent_key = (
+                current_workspace_id(),
+                root_conversation_id,
+                native_epoch,
+                parent_session_id,
+            )
+            parent_row = (
+                root_row
+                if parent_session_id == root_native_session_id
+                else session.get(SqlAcpSessionAssociation, parent_key)
+            )
+            if parent_session_id == root_native_session_id and root_row is None:
+                parent_context_generation = context_generation
+            else:
+                parent_context_generation = (
+                    parent_row.context_generation if parent_row is not None else None
+                )
+            if parent_context_generation != context_generation:
+                raise ValueError("ACP child association has no validated parent")
+
+            target_key = (
+                current_workspace_id(),
+                root_conversation_id,
+                native_epoch,
+                target_session_id,
+            )
+            target_row = session.get(SqlAcpSessionAssociation, target_key)
+            if target_row is not None and (
+                target_row.context_generation != context_generation
+                or target_row.parent_native_session_id != parent_session_id
+            ):
+                raise ValueError("ACP child association attempted to change its owner")
+            if target_row is not None and action_origin is not None:
+                stored_origin = (
+                    self._load_acp_payload_value(
+                        target_row.action_origin_json,
+                        workspace_id=target_row.workspace_id,
+                        root_conversation_id=target_row.root_conversation_id,
+                        row_identity=(target_row.native_epoch, target_row.native_session_id),
+                        field_name="action_origin",
+                    )
+                    if target_row.action_origin_json
+                    else None
+                )
+                if stored_origin != action_origin:
+                    raise ValueError("ACP child action origin cannot be retargeted")
+
+            if root_row is None:
+                root_identity = (native_epoch, root_native_session_id)
+                root_row = SqlAcpSessionAssociation(
+                    workspace_id=current_workspace_id(),
+                    root_conversation_id=root_conversation_id,
+                    native_epoch=native_epoch,
+                    native_session_id=root_native_session_id,
+                    context_generation=context_generation,
+                    parent_native_session_id=None,
+                    conversation_id=root_conversation_id,
+                    association_source_id=None,
+                    association_json=self._store_acp_payload_value(
+                        workspace_id=current_workspace_id(),
+                        root_conversation_id=root_conversation_id,
+                        row_identity=root_identity,
+                        field_name="association",
+                        value={},
+                    ),
+                    observation_json=self._store_acp_payload_value(
+                        workspace_id=current_workspace_id(),
+                        root_conversation_id=root_conversation_id,
+                        row_identity=root_identity,
+                        field_name="observation",
+                        value={},
+                    ),
+                    state_ingress_sequence=None,
+                    state_observed_at=None,
+                    last_reported_at=None,
+                    action_origin_json=None,
+                    last_ingress_sequence=0,
+                )
+                session.add(root_row)
+
+            if existing_receipt is None:
+                session.add(
+                    SqlAcpSessionReportReceipt(
+                        workspace_id=current_workspace_id(),
+                        root_conversation_id=root_conversation_id,
+                        journal_id=journal_id,
+                        journal_sequence=journal_sequence,
+                        epoch_ordinal=epoch_ordinal,
+                        native_epoch=native_epoch,
+                        ingress_sequence=ingress_sequence,
+                        connection_admission_id=connection_admission_id,
+                        runtime_incarnation=runtime_incarnation,
+                        source_id=source_id,
+                        payload_hash=payload_hash,
+                        applied=False,
+                    )
+                )
+
+        with _acp_payload_write_attempt():
+            run_write_transaction(
+                self._conv_session_immediate, "reserve_acp_session_report", reserve
+            )
+
+    def apply_acp_session_report(
+        self,
+        *,
+        root_conversation_id: str,
+        connection_admission_id: str,
+        runtime_incarnation: int,
+        journal_id: str,
+        journal_sequence: int,
+        epoch_ordinal: int,
+        native_epoch: str,
+        ingress_sequence: int,
+        source_id: str,
+        payload_hash: str,
+        context_generation: str,
+        root_native_session_id: str,
+        target_session_id: str,
+        parent_session_id: str | None,
+        conversation_id: str,
+        kind: str,
+        operation: dict[str, Any],
+        action_origin: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Apply one normalized ACP mutation and its replay fence in one AP transaction."""
+        self._require_acp_reporting_ready()
+        if kind not in {
+            "association.patch",
+            "observation.patch",
+            "entity.upsert",
+            "entity.patch",
+            "entity.append",
+            "tool.references",
+        }:
+            raise ValueError("unsupported ACP session report kind")
+        native_ids = [root_native_session_id, target_session_id]
+        if parent_session_id is not None:
+            native_ids.append(parent_session_id)
+        entity_id = operation.get("entity_id")
+        if entity_id is not None:
+            native_ids.append(entity_id)
+        call_id = operation.get("call_id")
+        if call_id is not None:
+            native_ids.append(call_id)
+        validate_acp_native_identity(native_epoch, *native_ids)
+        if kind == "association.patch":
+            validate_acp_association_patch(
+                _require_string_keyed_object(
+                    operation.get("patch"), "ACP association patch must be an object"
+                )
+            )
+        now = now_epoch()
+
+        def write(session: Session) -> dict[str, Any]:
+            self._lock_conversation(session, root_conversation_id)
+            if conversation_id != root_conversation_id:
+                self._lock_conversation(session, conversation_id)
+            receipt, _origin_is_active = self._validate_acp_report_delivery_origin(
+                session,
+                root_conversation_id=root_conversation_id,
+                connection_admission_id=connection_admission_id,
+                runtime_incarnation=runtime_incarnation,
+                journal_id=journal_id,
+                journal_sequence=journal_sequence,
+                epoch_ordinal=epoch_ordinal,
+                native_epoch=native_epoch,
+                ingress_sequence=ingress_sequence,
+                source_id=source_id,
+                payload_hash=payload_hash,
+            )
+            epoch_roots = session.scalars(
+                select(SqlAcpSessionAssociation).where(
+                    SqlAcpSessionAssociation.workspace_id == current_workspace_id(),
+                    SqlAcpSessionAssociation.root_conversation_id == root_conversation_id,
+                    SqlAcpSessionAssociation.native_epoch == native_epoch,
+                    SqlAcpSessionAssociation.parent_native_session_id.is_(None),
+                )
+            ).all()
+            if any(row.native_session_id != root_native_session_id for row in epoch_roots):
+                raise ValueError("ACP root native session identity changed within its epoch")
+            root_key = (
+                current_workspace_id(),
+                root_conversation_id,
+                native_epoch,
+                root_native_session_id,
+            )
+            root_row = session.get(SqlAcpSessionAssociation, root_key)
+            if root_row is None:
+                root_identity = (native_epoch, root_native_session_id)
+                root_row = SqlAcpSessionAssociation(
+                    workspace_id=current_workspace_id(),
+                    root_conversation_id=root_conversation_id,
+                    native_epoch=native_epoch,
+                    native_session_id=root_native_session_id,
+                    context_generation=context_generation,
+                    parent_native_session_id=None,
+                    conversation_id=root_conversation_id,
+                    association_source_id=None,
+                    association_json=self._store_acp_payload_value(
+                        workspace_id=current_workspace_id(),
+                        root_conversation_id=root_conversation_id,
+                        row_identity=root_identity,
+                        field_name="association",
+                        value={},
+                    ),
+                    observation_json=self._store_acp_payload_value(
+                        workspace_id=current_workspace_id(),
+                        root_conversation_id=root_conversation_id,
+                        row_identity=root_identity,
+                        field_name="observation",
+                        value={},
+                    ),
+                    state_ingress_sequence=None,
+                    state_observed_at=None,
+                    last_reported_at=None,
+                    action_origin_json=None,
+                    last_ingress_sequence=0,
+                )
+                session.add(root_row)
+                session.flush()
+            elif (
+                root_row.context_generation != context_generation
+                or root_row.conversation_id != root_conversation_id
+                or root_row.parent_native_session_id is not None
+            ):
+                raise ValueError("ACP root session identity changed within its native epoch")
+
+            if receipt is not None:
+                if receipt.applied:
+                    target_row = session.get(
+                        SqlAcpSessionAssociation,
+                        (
+                            current_workspace_id(),
+                            root_conversation_id,
+                            native_epoch,
+                            target_session_id,
+                        ),
+                    )
+                    return {
+                        "duplicate": True,
+                        "association": (
+                            self._acp_association_dict(target_row)
+                            if target_row is not None
+                            else None
+                        ),
+                        "item": self._acp_report_materialized_item(
+                            session,
+                            root_conversation_id=root_conversation_id,
+                            native_epoch=native_epoch,
+                            root_native_session_id=root_native_session_id,
+                            native_session_id=target_session_id,
+                            conversation_id=(
+                                target_row.conversation_id
+                                if target_row is not None
+                                else conversation_id
+                            ),
+                            operation=operation,
+                        ),
+                    }
+            target_key = (
+                current_workspace_id(),
+                root_conversation_id,
+                native_epoch,
+                target_session_id,
+            )
+            target_row = session.get(SqlAcpSessionAssociation, target_key)
+            if target_session_id == root_native_session_id:
+                if conversation_id != root_conversation_id or parent_session_id is not None:
+                    raise ValueError("ACP root report has conflicting Omnigent or parent identity")
+                target_row = root_row
+            elif kind != "association.patch":
+                if target_row is None:
+                    raise ValueError("ACP report references a session with no association")
+                if (
+                    target_row.context_generation != context_generation
+                    or target_row.conversation_id != conversation_id
+                    or target_row.parent_native_session_id != parent_session_id
+                ):
+                    raise ValueError("ACP report session association changed")
+
+            if kind == "tool.references":
+                if target_session_id == root_native_session_id:
+                    if "references" not in operation:
+                        self._bind_acp_tool_call_report_anchor(
+                            session,
+                            root_conversation_id=root_conversation_id,
+                            journal_id=journal_id,
+                            epoch_ordinal=epoch_ordinal,
+                            native_epoch=native_epoch,
+                            source_id=source_id,
+                            context_generation=context_generation,
+                            root_native_session_id=root_native_session_id,
+                            target_session_id=target_session_id,
+                            parent_session_id=parent_session_id,
+                            conversation_id=conversation_id,
+                            operation=operation,
+                            action_origin=action_origin,
+                            allow_create=True,
+                            allow_source_alias=False,
+                        )
+                    elif action_origin is not None:
+                        self._bind_acp_tool_call_report_anchor(
+                            session,
+                            root_conversation_id=root_conversation_id,
+                            journal_id=journal_id,
+                            epoch_ordinal=epoch_ordinal,
+                            native_epoch=native_epoch,
+                            source_id=source_id,
+                            context_generation=context_generation,
+                            root_native_session_id=root_native_session_id,
+                            target_session_id=target_session_id,
+                            parent_session_id=parent_session_id,
+                            conversation_id=conversation_id,
+                            operation=operation,
+                            action_origin=action_origin,
+                            allow_create=False,
+                            allow_source_alias=True,
+                        )
+                    else:
+                        self._validate_acp_tool_call_report_binding(
+                            session,
+                            root_conversation_id=root_conversation_id,
+                            journal_id=journal_id,
+                            epoch_ordinal=epoch_ordinal,
+                            native_epoch=native_epoch,
+                            context_generation=context_generation,
+                            root_native_session_id=root_native_session_id,
+                            target_session_id=target_session_id,
+                            parent_session_id=parent_session_id,
+                            conversation_id=conversation_id,
+                            operation=operation,
+                        )
+                elif action_origin is not None:
+                    raise ValueError("ACP child tool references cannot bind a root tool item")
+
+            item: ConversationItem | None = None
+            association: dict[str, Any] | None = None
+            if kind == "association.patch":
+                session_id = operation.get("session_id")
+                parent_id = operation.get("parent_session_id")
+                patch = operation.get("patch")
+                if (
+                    session_id != target_session_id
+                    or parent_id != parent_session_id
+                    or not isinstance(patch, dict)
+                ):
+                    raise ValueError("ACP association patch identity is inconsistent")
+                if session_id == root_native_session_id or parent_id is None:
+                    raise ValueError("ACP association patch cannot reannounce the root")
+                parent_row = session.get(
+                    SqlAcpSessionAssociation,
+                    (
+                        current_workspace_id(),
+                        root_conversation_id,
+                        native_epoch,
+                        parent_id,
+                    ),
+                )
+                if parent_row is None or parent_row.context_generation != context_generation:
+                    raise ValueError("ACP child association has no validated parent")
+                if parent_row.conversation_id == conversation_id:
+                    raise ValueError("ACP child association would create a self-cycle")
+                if target_row is not None and (
+                    target_row.context_generation != context_generation
+                    or target_row.parent_native_session_id != parent_id
+                    or target_row.conversation_id != conversation_id
+                ):
+                    raise ValueError("ACP child association attempted to reparent a session")
+                target_identity = (native_epoch, target_session_id)
+                current_association = (
+                    self._load_acp_payload_value(
+                        target_row.association_json,
+                        workspace_id=target_row.workspace_id,
+                        root_conversation_id=root_conversation_id,
+                        row_identity=target_identity,
+                        field_name="association",
+                    )
+                    if target_row is not None
+                    else {}
+                )
+                current_association.update(patch)
+                association_reference = self._store_acp_payload_value(
+                    workspace_id=current_workspace_id(),
+                    root_conversation_id=root_conversation_id,
+                    row_identity=target_identity,
+                    field_name="association",
+                    value=current_association,
+                )
+                if target_row is None:
+                    target_row = SqlAcpSessionAssociation(
+                        workspace_id=current_workspace_id(),
+                        root_conversation_id=root_conversation_id,
+                        native_epoch=native_epoch,
+                        native_session_id=target_session_id,
+                        context_generation=context_generation,
+                        parent_native_session_id=parent_id,
+                        conversation_id=conversation_id,
+                        association_source_id=source_id,
+                        association_json=association_reference,
+                        observation_json=self._store_acp_payload_value(
+                            workspace_id=current_workspace_id(),
+                            root_conversation_id=root_conversation_id,
+                            row_identity=target_identity,
+                            field_name="observation",
+                            value={},
+                        ),
+                        state_ingress_sequence=None,
+                        state_observed_at=None,
+                        last_reported_at=now,
+                        action_origin_json=(
+                            self._store_acp_payload_value(
+                                workspace_id=current_workspace_id(),
+                                root_conversation_id=root_conversation_id,
+                                row_identity=target_identity,
+                                field_name="action_origin",
+                                value=action_origin,
+                            )
+                            if action_origin is not None
+                            else None
+                        ),
+                        last_ingress_sequence=ingress_sequence,
+                    )
+                    session.add(target_row)
+                else:
+                    if action_origin is not None:
+                        stored_origin = (
+                            self._load_acp_payload_value(
+                                target_row.action_origin_json,
+                                workspace_id=target_row.workspace_id,
+                                root_conversation_id=root_conversation_id,
+                                row_identity=(
+                                    target_row.native_epoch,
+                                    target_row.native_session_id,
+                                ),
+                                field_name="action_origin",
+                            )
+                            if target_row.action_origin_json
+                            else None
+                        )
+                        if stored_origin != action_origin:
+                            raise ValueError("ACP child action origin cannot be retargeted")
+                    target_row.association_json = association_reference
+                    target_row.last_ingress_sequence = ingress_sequence
+                association = self._acp_association_dict(target_row)
+                if "state" in patch:
+                    current_observation = self._load_acp_payload_value(
+                        target_row.observation_json,
+                        workspace_id=target_row.workspace_id,
+                        root_conversation_id=root_conversation_id,
+                        row_identity=target_identity,
+                        field_name="observation",
+                    )
+                    current_observation["state"] = {
+                        "present": True,
+                        "value": patch["state"],
+                    }
+                    target_row.observation_json = self._store_acp_payload_value(
+                        workspace_id=target_row.workspace_id,
+                        root_conversation_id=root_conversation_id,
+                        row_identity=target_identity,
+                        field_name="observation",
+                        value=current_observation,
+                    )
+                    target_row.state_ingress_sequence = ingress_sequence
+                    target_row.state_observed_at = now
+            else:
+                if target_row is None:
+                    raise ValueError("ACP report target has no durable session association")
+                if kind == "observation.patch":
+                    observation = operation.get("observation")
+                    if not isinstance(observation, dict):
+                        raise ValueError("ACP observation patch must be an object")
+                    target_identity = (native_epoch, target_session_id)
+                    current_observation = self._load_acp_payload_value(
+                        target_row.observation_json,
+                        workspace_id=target_row.workspace_id,
+                        root_conversation_id=root_conversation_id,
+                        row_identity=target_identity,
+                        field_name="observation",
+                    )
+                    current_observation.update(observation)
+                    target_row.observation_json = self._store_acp_payload_value(
+                        workspace_id=target_row.workspace_id,
+                        root_conversation_id=root_conversation_id,
+                        row_identity=target_identity,
+                        field_name="observation",
+                        value=current_observation,
+                    )
+                    if "state" in observation:
+                        target_row.state_ingress_sequence = ingress_sequence
+                        target_row.state_observed_at = now
+                    target_row.last_ingress_sequence = ingress_sequence
+                    association = self._acp_association_dict(target_row)
+                else:
+                    canonical_tool_binding = None
+                    canonical_tool_item_type = None
+                    if target_session_id == root_native_session_id:
+                        canonical_tool_binding, canonical_tool_item_type = (
+                            self._resolve_acp_root_tool_item_binding(
+                                session,
+                                root_conversation_id=root_conversation_id,
+                                journal_id=journal_id,
+                                epoch_ordinal=epoch_ordinal,
+                                native_epoch=native_epoch,
+                                context_generation=context_generation,
+                                root_native_session_id=root_native_session_id,
+                                target_session_id=target_session_id,
+                                parent_session_id=parent_session_id,
+                                conversation_id=conversation_id,
+                                kind=kind,
+                                operation=operation,
+                                action_origin=action_origin,
+                            )
+                        )
+                    item = self._apply_acp_session_entity(
+                        session,
+                        root_conversation_id=root_conversation_id,
+                        native_epoch=native_epoch,
+                        root_native_session_id=root_native_session_id,
+                        native_session_id=target_session_id,
+                        conversation_id=conversation_id,
+                        ingress_sequence=ingress_sequence,
+                        kind=kind,
+                        operation=operation,
+                        now=now,
+                        canonical_tool_binding=canonical_tool_binding,
+                        canonical_tool_item_type=canonical_tool_item_type,
+                    )
+                    target_row.last_ingress_sequence = ingress_sequence
+                    association = self._acp_association_dict(target_row)
+
+            target_row.last_reported_at = now
+            target_row.last_ingress_sequence = ingress_sequence
+            association = self._acp_association_dict(target_row)
+
+            if receipt is None:
+                session.add(
+                    SqlAcpSessionReportReceipt(
+                        workspace_id=current_workspace_id(),
+                        root_conversation_id=root_conversation_id,
+                        journal_id=journal_id,
+                        journal_sequence=journal_sequence,
+                        epoch_ordinal=epoch_ordinal,
+                        native_epoch=native_epoch,
+                        ingress_sequence=ingress_sequence,
+                        connection_admission_id=connection_admission_id,
+                        runtime_incarnation=runtime_incarnation,
+                        source_id=source_id,
+                        payload_hash=payload_hash,
+                        applied=True,
+                    )
+                )
+            else:
+                receipt.applied = True
+            return {"duplicate": False, "association": association, "item": item}
+
+        with _acp_payload_write_attempt():
+            return run_write_transaction(
+                self._conv_session_immediate,
+                "apply_acp_session_report",
+                write,
+            )
+
+    def _acp_report_materialized_item(
+        self,
+        session: Session,
+        *,
+        root_conversation_id: str,
+        native_epoch: str,
+        root_native_session_id: str,
+        native_session_id: str,
+        conversation_id: str,
+        operation: dict[str, Any],
+    ) -> ConversationItem | None:
+        """Return the current item snapshot when a committed report is replayed."""
+        entity_type = operation.get("entity_type", "item")
+        entity_id = operation.get("entity_id")
+        if entity_type not in {"message", "item"} or not isinstance(entity_id, str):
+            return None
+        entity = session.get(
+            SqlAcpSessionEntity,
+            (
+                current_workspace_id(),
+                root_conversation_id,
+                native_epoch,
+                native_session_id,
+                entity_type,
+                entity_id,
+            ),
+        )
+        if entity is None:
+            return None
+        if entity.item_type is None:
+            if entity.references_json is None or entity_type != "item":
+                return None
+            native_ids = self._load_acp_payload_value(
+                entity.references_json,
+                workspace_id=entity.workspace_id,
+                root_conversation_id=root_conversation_id,
+                row_identity=(
+                    entity.native_epoch,
+                    entity.native_session_id,
+                    entity.entity_type,
+                    entity.entity_id,
+                ),
+                field_name="entity_references",
+            )
+            if not isinstance(native_ids, list):
+                return None
+            references = self._resolve_acp_tool_references(
+                session,
+                conversation_id=root_conversation_id,
+                native_epoch=native_epoch,
+                native_session_ids=native_ids,
+            )
+            if native_session_id == root_native_session_id:
+                return self._patch_root_tool_call_references(
+                    session,
+                    root_conversation_id=root_conversation_id,
+                    native_epoch=native_epoch,
+                    call_id=operation.get("call_id", entity_id),
+                    references=references,
+                    now=now_epoch(),
+                )
+            return None
+        item_row = self._get_unique_conversation_item_row(
+            session,
+            conversation_id=conversation_id,
+            item_id=entity.stable_item_id,
+        )
+        if item_row is None:
+            return None
+        if (
+            native_session_id == root_native_session_id
+            and entity_type == "item"
+            and entity.item_type in {"function_call", "function_call_output"}
+        ):
+            call_id = operation.get("call_id")
+            if (
+                not isinstance(call_id, str)
+                or not call_id
+                or len(call_id) > 512
+                or len(call_id.encode("utf-8")) > 512
+                or entity.entity_id
+                != (
+                    acp_standard_tool_entity_id(call_id)
+                    if entity.item_type == "function_call"
+                    else acp_standard_tool_output_entity_id(call_id)
+                )
+                or not isinstance(entity.response_id, str)
+                or not entity.response_id
+            ):
+                raise ValueError("ACP canonical report replay entity identity is malformed")
+            self._validate_acp_scoped_append_item(
+                session,
+                conversation_id=conversation_id,
+                canonical_item_id=entity.stable_item_id,
+                item_type=entity.item_type,
+                response_id=entity.response_id,
+                call_id=call_id,
+                stored_item_row=item_row,
+            )
+            binding = session.scalar(
+                select(SqlAcpToolCallItemBinding).where(
+                    SqlAcpToolCallItemBinding.workspace_id == current_workspace_id(),
+                    SqlAcpToolCallItemBinding.root_conversation_id == root_conversation_id,
+                    SqlAcpToolCallItemBinding.native_epoch == native_epoch,
+                    SqlAcpToolCallItemBinding.native_call_id == call_id,
+                )
+            )
+            if binding is not None:
+                expected_stable_id = acp_standard_canonical_tool_item_id(
+                    root_conversation_id, binding.source_id, entity.item_type
+                )
+                expected_call_item_id = acp_standard_canonical_tool_item_id(
+                    root_conversation_id, binding.source_id, "function_call"
+                )
+                if (
+                    entity.stable_item_id != expected_stable_id
+                    or entity.response_id != binding.response_id
+                    or binding.canonical_item_id not in {None, expected_call_item_id}
+                ):
+                    raise ValueError("ACP canonical report replay does not match its anchor")
+        decoded_data = self._decode_item_data_batch([item_row.data])[0]
+        return _to_item(item_row, decoded_data)
+
+    def _acp_association_dict(self, row: SqlAcpSessionAssociation) -> dict[str, Any]:
+        row_identity = (row.native_epoch, row.native_session_id)
+        return {
+            "root_conversation_id": row.root_conversation_id,
+            "native_epoch": row.native_epoch,
+            "native_session_id": row.native_session_id,
+            "context_generation": row.context_generation,
+            "parent_native_session_id": row.parent_native_session_id,
+            "conversation_id": row.conversation_id,
+            "association_source_id": row.association_source_id,
+            "association": self._load_acp_payload_value(
+                row.association_json,
+                workspace_id=row.workspace_id,
+                root_conversation_id=row.root_conversation_id,
+                row_identity=row_identity,
+                field_name="association",
+            ),
+            "observation": self._load_acp_payload_value(
+                row.observation_json,
+                workspace_id=row.workspace_id,
+                root_conversation_id=row.root_conversation_id,
+                row_identity=row_identity,
+                field_name="observation",
+            ),
+            "state_ingress_sequence": row.state_ingress_sequence,
+            "state_observed_at": row.state_observed_at,
+            "last_reported_at": row.last_reported_at,
+            "action_origin": (
+                self._load_acp_payload_value(
+                    row.action_origin_json,
+                    workspace_id=row.workspace_id,
+                    root_conversation_id=row.root_conversation_id,
+                    row_identity=row_identity,
+                    field_name="action_origin",
+                )
+                if row.action_origin_json
+                else None
+            ),
+            "last_ingress_sequence": row.last_ingress_sequence,
+        }
+
+    @staticmethod
+    def _merge_acp_message_patch(
+        session: Session,
+        *,
+        root_conversation_id: str,
+        native_epoch: str,
+        current: Mapping[str, Any],
+        patch: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Merge sparse directed-message fields and resolve only trusted links."""
+        merged = dict(patch)
+        if "acp_session_message" not in patch:
+            return merged
+        directed_patch = patch["acp_session_message"]
+        if directed_patch is None:
+            merged["acp_session_message"] = None
+            return merged
+        if not isinstance(directed_patch, Mapping):
+            raise ValueError("ACP directed message metadata must be an object or null")
+
+        existing = current.get("acp_session_message")
+        directed = dict(existing) if isinstance(existing, Mapping) else {}
+        for field_name in (
+            "kind",
+            "sender_session_id",
+            "recipient_session_id",
+            "sender_message_id",
+            "recipient_message_id",
+        ):
+            if field_name in directed_patch:
+                directed[field_name] = directed_patch[field_name]
+        SqlAlchemyConversationStore._resolve_acp_message_participants(
+            session,
+            root_conversation_id=root_conversation_id,
+            native_epoch=native_epoch,
+            item_data={"acp_session_message": directed},
+        )
+        merged["acp_session_message"] = directed
+        return merged
+
+    @staticmethod
+    def _resolve_acp_message_participants(
+        session: Session,
+        *,
+        root_conversation_id: str,
+        native_epoch: str,
+        item_data: dict[str, Any],
+    ) -> None:
+        """Drop reported Omnigent links and derive links from this epoch's registry."""
+        directed = item_data.get("acp_session_message")
+        if directed is None:
+            return
+        if not isinstance(directed, dict):
+            raise ValueError("ACP directed message metadata must be an object or null")
+
+        # These values are server-owned and must never be accepted from ACP data.
+        directed.pop("sender_conversation_id", None)
+        directed.pop("recipient_conversation_id", None)
+        for native_field, conversation_field in (
+            ("sender_session_id", "sender_conversation_id"),
+            ("recipient_session_id", "recipient_conversation_id"),
+        ):
+            native_session_id = directed.get(native_field)
+            if not isinstance(native_session_id, str) or not native_session_id:
+                continue
+            association = session.get(
+                SqlAcpSessionAssociation,
+                (
+                    current_workspace_id(),
+                    root_conversation_id,
+                    native_epoch,
+                    native_session_id,
+                ),
+            )
+            if association is not None and association.conversation_id:
+                directed[conversation_field] = association.conversation_id
+
+    def _apply_acp_session_entity(
+        self,
+        session: Session,
+        *,
+        root_conversation_id: str,
+        native_epoch: str,
+        root_native_session_id: str,
+        native_session_id: str,
+        conversation_id: str,
+        ingress_sequence: int,
+        kind: str,
+        operation: dict[str, Any],
+        now: int,
+        canonical_tool_binding: SqlAcpToolCallItemBinding | None = None,
+        canonical_tool_item_type: str | None = None,
+    ) -> ConversationItem | None:
+        entity_type = operation.get("entity_type", "item")
+        entity_id = operation.get("entity_id")
+        if (
+            entity_type not in {"message", "item"}
+            or not isinstance(entity_id, str)
+            or not entity_id
+        ):
+            raise ValueError("ACP entity operation has an invalid native entity identity")
+        if len(entity_id) > 512:
+            raise ValueError("ACP native entity id exceeds its size limit")
+        key = (
+            current_workspace_id(),
+            root_conversation_id,
+            native_epoch,
+            native_session_id,
+            entity_type,
+            entity_id,
+        )
+        row = session.get(SqlAcpSessionEntity, key)
+        if row is not None and row.conversation_id != conversation_id:
+            raise ValueError("ACP entity changed its owning conversation")
+        entity_identity = (native_epoch, native_session_id, entity_type, entity_id)
+        stable_item_id = (
+            row.stable_item_id
+            if row is not None
+            else hashlib.sha256(
+                b"".join(
+                    len(encoded).to_bytes(4, "big") + encoded
+                    for encoded in (
+                        root_conversation_id.encode("utf-8"),
+                        native_epoch.encode("utf-8"),
+                        native_session_id.encode("utf-8"),
+                        entity_type.encode("utf-8"),
+                        entity_id.encode("utf-8"),
+                    )
+                )
+            ).hexdigest()[:32]
+        )
+        item_data: dict[str, Any] = (
+            _require_string_keyed_object(
+                self._load_acp_payload_value(
+                    row.item_data_json,
+                    workspace_id=row.workspace_id,
+                    root_conversation_id=root_conversation_id,
+                    row_identity=entity_identity,
+                    field_name="entity_data",
+                ),
+                "ACP stored entity data is malformed",
+            )
+            if row is not None
+            else {}
+        )
+        pending: dict[str, Any] = (
+            _require_string_keyed_object(
+                self._load_acp_payload_value(
+                    row.pending_json,
+                    workspace_id=row.workspace_id,
+                    root_conversation_id=root_conversation_id,
+                    row_identity=entity_identity,
+                    field_name="entity_pending",
+                ),
+                "ACP stored pending entity data is malformed",
+            )
+            if row is not None
+            else {"patch": {}, "content": []}
+        )
+        references = (
+            self._load_acp_payload_value(
+                row.references_json,
+                workspace_id=row.workspace_id,
+                root_conversation_id=root_conversation_id,
+                row_identity=entity_identity,
+                field_name="entity_references",
+            )
+            if row is not None and row.references_json
+            else None
+        )
+        item_type = row.item_type if row is not None else None
+        response_id = row.response_id if row is not None else None
+        if canonical_tool_binding is not None:
+            if (
+                canonical_tool_item_type not in {"function_call", "function_call_output"}
+                or operation.get("call_id") != canonical_tool_binding.native_call_id
+            ):
+                raise ValueError("ACP canonical tool entity has no exact native call identity")
+            stable_item_id = acp_standard_canonical_tool_item_id(
+                root_conversation_id,
+                canonical_tool_binding.source_id,
+                canonical_tool_item_type,
+            )
+            if row is not None and row.stable_item_id != stable_item_id:
+                raise ValueError("ACP canonical tool entity points at another item")
+            if item_type is not None and (
+                item_type != canonical_tool_item_type
+                or response_id != canonical_tool_binding.response_id
+            ):
+                raise ValueError("ACP canonical tool entity identity changed")
+            if item_type is None:
+                baseline_row = session.execute(
+                    select(SqlConversationItem).where(
+                        SqlConversationItem.workspace_id == current_workspace_id(),
+                        SqlConversationItem.conversation_id == conversation_id,
+                        SqlConversationItem.id == stable_item_id,
+                    )
+                ).scalar_one_or_none()
+                if baseline_row is not None:
+                    if (
+                        decode_item_type(baseline_row.type) != canonical_tool_item_type
+                        or baseline_row.response_id != canonical_tool_binding.response_id
+                    ):
+                        raise ValueError("ACP canonical tool baseline identity changed")
+                    baseline_json = self._decode_item_data_batch([baseline_row.data])[0]
+                    baseline_item = parse_item_data(
+                        canonical_tool_item_type, json.loads(baseline_json)
+                    )
+                    if (
+                        getattr(baseline_item, "call_id", None)
+                        != canonical_tool_binding.native_call_id
+                    ):
+                        raise ValueError("ACP canonical tool baseline has another native call")
+                    item_data = baseline_item.model_dump(exclude_none=True) | item_data
+                    pending_patch = pending.get("patch", {})
+                    if not isinstance(pending_patch, dict):
+                        raise ValueError("ACP pending tool entity patch is malformed")
+                    item_data.update(pending_patch)
+                    pending_content = pending.get("content", [])
+                    if pending_content:
+                        existing_content = item_data.get("content", [])
+                        if not isinstance(existing_content, list) or not isinstance(
+                            pending_content, list
+                        ):
+                            raise ValueError("ACP pending tool entity content is malformed")
+                        item_data["content"] = [*pending_content, *existing_content]
+                    pending = {"patch": {}, "content": []}
+                    item_type = canonical_tool_item_type
+                    response_id = canonical_tool_binding.response_id
+        replace_pending_message_identity = False
+        canonical_root_tool_call: ConversationItem | None = None
+
+        if kind == "entity.upsert":
+            value = operation.get("value")
+            if not isinstance(value, dict):
+                raise ValueError("ACP entity upsert value must be an object")
+            next_type = value.get("item_type")
+            next_response_id = value.get("response_id")
+            next_data = value.get("item_data")
+            if (
+                not isinstance(next_type, str)
+                or len(next_type) > 64
+                or not isinstance(next_response_id, str)
+                or not next_response_id
+                or len(next_response_id) > 64
+                or not isinstance(next_data, dict)
+            ):
+                raise ValueError("ACP entity upsert value is malformed")
+            pending_message_response_id = f"acp2p_{stable_item_id}"
+            replace_pending_message_identity = (
+                item_type == "message" and response_id == pending_message_response_id
+            )
+            if item_type is not None and (
+                item_type != next_type
+                or (response_id != next_response_id and not replace_pending_message_identity)
+            ):
+                raise ValueError("ACP entity type and response identity are immutable")
+            item_type = next_type
+            response_id = next_response_id
+            next_item_data = _require_string_keyed_object(
+                next_data, "ACP entity upsert data must be an object"
+            )
+            pending_patch = _require_string_keyed_object(
+                pending.get("patch", {}), "ACP pending entity patch is malformed"
+            )
+            if canonical_tool_binding is not None:
+                item_data.update(pending_patch)
+                item_data.update(next_item_data)
+            else:
+                item_data = next_item_data
+            pending_content = pending.get("content", [])
+            if pending_content:
+                existing_content = item_data.get("content", [])
+                if not isinstance(existing_content, list):
+                    raise ValueError("ACP entity content is malformed")
+                if not (canonical_tool_binding is not None and "content" in next_item_data):
+                    item_data["content"] = [*pending_content, *existing_content]
+            if references is not None:
+                resolved_references = self._resolve_acp_tool_references(
+                    session,
+                    conversation_id=root_conversation_id,
+                    native_epoch=native_epoch,
+                    native_session_ids=references,
+                )
+                item_data["acp_session_references"] = [
+                    reference.model_dump(exclude_none=True) for reference in resolved_references
+                ]
+            pending = {"patch": {}, "content": []}
+            if entity_type == "message":
+                self._resolve_acp_message_participants(
+                    session,
+                    root_conversation_id=root_conversation_id,
+                    native_epoch=native_epoch,
+                    item_data=item_data,
+                )
+        elif kind == "entity.patch":
+            patch = _require_string_keyed_object(
+                operation.get("patch"), "ACP entity patch must be an object"
+            )
+            if entity_type == "message":
+                pending_patch = _require_string_keyed_object(
+                    pending.get("patch", {}), "ACP pending entity patch is malformed"
+                )
+                current_message_data = item_data if item_type is not None else pending_patch
+                if item_type is None:
+                    combined_patch = dict(pending_patch)
+                    combined_patch.update(patch)
+                    patch = combined_patch
+                patch = self._merge_acp_message_patch(
+                    session,
+                    root_conversation_id=root_conversation_id,
+                    native_epoch=native_epoch,
+                    current=current_message_data,
+                    patch=patch,
+                )
+                if "content" in patch:
+                    if patch["content"] is None:
+                        patch["content"] = []
+                    pending_content = pending.get("content", [])
+                    if not isinstance(pending_content, list):
+                        raise ValueError("ACP pending entity content is malformed")
+                    pending["content"] = []
+                if item_type is None:
+                    pending_content = pending.get("content", [])
+                    if not isinstance(pending_content, list):
+                        raise ValueError("ACP pending entity content is malformed")
+                    if pending_content and "content" not in patch:
+                        item_data["content"] = list(pending_content)
+                    item_type = "message"
+                    response_id = f"acp2p_{stable_item_id}"
+                    pending["patch"] = {}
+                item_data.update(patch)
+            elif item_type is None:
+                pending_patch = _require_string_keyed_object(
+                    pending.get("patch", {}), "ACP pending entity patch is malformed"
+                )
+                pending_patch.update(patch)
+                pending["patch"] = pending_patch
+            else:
+                item_data.update(patch)
+        elif kind == "entity.append":
+            content = operation.get("content")
+            if entity_type != "message" or not isinstance(content, list) or not content:
+                raise ValueError("ACP entity append requires message content blocks")
+            if item_type is None:
+                pending_content = pending.setdefault("content", [])
+                if not isinstance(pending_content, list):
+                    raise ValueError("ACP pending entity content is malformed")
+                pending_content.extend(content)
+            else:
+                existing_content = item_data.get("content", [])
+                if not isinstance(existing_content, list):
+                    raise ValueError("ACP entity content is malformed")
+                item_data["content"] = [*existing_content, *content]
+        elif kind == "tool.references":
+            call_id = operation.get("call_id")
+            if (
+                entity_type != "item"
+                or not isinstance(call_id, str)
+                or not call_id
+                or len(call_id) > 512
+                or len(call_id.encode("utf-8")) > 512
+                or entity_id != acp_standard_tool_entity_id(call_id)
+            ):
+                raise ValueError("ACP tool references are malformed")
+            if "references" in operation:
+                next_references = operation["references"]
+                if not isinstance(next_references, list) or len(next_references) > 128:
+                    raise ValueError("ACP tool references are malformed")
+                resolved_references = self._resolve_acp_tool_references(
+                    session,
+                    conversation_id=root_conversation_id,
+                    native_epoch=native_epoch,
+                    native_session_ids=next_references,
+                )
+                references = next_references
+                if item_type is not None:
+                    item_data["acp_session_references"] = [
+                        reference.model_dump(exclude_none=True)
+                        for reference in resolved_references
+                    ]
+                elif native_session_id == root_native_session_id:
+                    canonical_root_tool_call = self._patch_root_tool_call_references(
+                        session,
+                        root_conversation_id=root_conversation_id,
+                        native_epoch=native_epoch,
+                        call_id=call_id,
+                        references=resolved_references,
+                        now=now,
+                    )
+        else:
+            raise ValueError("unsupported ACP entity operation")
+
+        if item_type is not None and (not isinstance(response_id, str) or not response_id):
+            raise ValueError("ACP entity has no response identity")
+
+        serialized_data = json.dumps(
+            item_data, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+        )
+        serialized_pending = json.dumps(
+            pending, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+        )
+        if (
+            len(serialized_data.encode("utf-8")) + len(serialized_pending.encode("utf-8"))
+            > 512 * 1024
+        ):
+            raise ValueError("ACP entity value exceeds its size limit")
+        if row is None:
+            row = SqlAcpSessionEntity(
+                workspace_id=current_workspace_id(),
+                root_conversation_id=root_conversation_id,
+                native_epoch=native_epoch,
+                native_session_id=native_session_id,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                conversation_id=conversation_id,
+                item_type=item_type,
+                response_id=response_id,
+                item_data_json=self._store_acp_payload_value(
+                    workspace_id=current_workspace_id(),
+                    root_conversation_id=root_conversation_id,
+                    row_identity=entity_identity,
+                    field_name="entity_data",
+                    value=item_data,
+                ),
+                pending_json=self._store_acp_payload_value(
+                    workspace_id=current_workspace_id(),
+                    root_conversation_id=root_conversation_id,
+                    row_identity=entity_identity,
+                    field_name="entity_pending",
+                    value=pending,
+                ),
+                references_json=(
+                    self._store_acp_payload_value(
+                        workspace_id=current_workspace_id(),
+                        root_conversation_id=root_conversation_id,
+                        row_identity=entity_identity,
+                        field_name="entity_references",
+                        value=references,
+                    )
+                    if references is not None
+                    else None
+                ),
+                stable_item_id=stable_item_id,
+                last_ingress_sequence=ingress_sequence,
+            )
+            session.add(row)
+        else:
+            if ingress_sequence <= row.last_ingress_sequence:
+                raise ValueError("ACP entity report sequence moved backwards")
+            row.item_type = item_type
+            row.response_id = response_id
+            row.item_data_json = self._store_acp_payload_value(
+                workspace_id=row.workspace_id,
+                root_conversation_id=root_conversation_id,
+                row_identity=entity_identity,
+                field_name="entity_data",
+                value=item_data,
+            )
+            row.pending_json = self._store_acp_payload_value(
+                workspace_id=row.workspace_id,
+                root_conversation_id=root_conversation_id,
+                row_identity=entity_identity,
+                field_name="entity_pending",
+                value=pending,
+            )
+            row.references_json = (
+                self._store_acp_payload_value(
+                    workspace_id=row.workspace_id,
+                    root_conversation_id=root_conversation_id,
+                    row_identity=entity_identity,
+                    field_name="entity_references",
+                    value=references,
+                )
+                if references is not None
+                else None
+            )
+            row.last_ingress_sequence = ingress_sequence
+
+        if item_type is None:
+            return canonical_root_tool_call
+        try:
+            parsed_data = parse_item_data(item_type, item_data)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid ACP {item_type} entity data: {exc}") from exc
+        new_item = NewConversationItem(
+            type=item_type,
+            response_id=response_id or "",
+            data=parsed_data,
+            stable_id=stable_item_id,
+        )
+        data_json = strip_nul_bytes(json.dumps(parsed_data.model_dump(exclude_none=True)))
+        encoded_data = self._encode_item_data(data_json)
+        search_text = self._item_search_text(new_item) or ""
+        item_row = self._get_unique_conversation_item_row(
+            session,
+            conversation_id=conversation_id,
+            item_id=stable_item_id,
+        )
+        if item_row is not None and canonical_tool_item_type is not None:
+            self._validate_acp_scoped_append_item(
+                session,
+                conversation_id=conversation_id,
+                canonical_item_id=stable_item_id,
+                item_type=canonical_tool_item_type,
+                response_id=response_id or "",
+                call_id=canonical_tool_binding.native_call_id
+                if canonical_tool_binding is not None
+                else cast(str, operation.get("call_id")),
+                stored_item_row=item_row,
+            )
+        if item_row is None:
+            conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if conv_row is None:
+                raise ValueError("ACP entity conversation does not exist")
+            next_position = conv_row.next_position
+            if next_position is None:
+                next_position = (
+                    session.execute(
+                        select(func.coalesce(func.max(SqlConversationItem.position), -1)).where(
+                            SqlConversationItem.workspace_id == current_workspace_id(),
+                            SqlConversationItem.conversation_id == conversation_id,
+                        )
+                    ).scalar_one()
+                    + 1
+                )
+            session.execute(
+                insert(SqlConversationItem).values(
+                    workspace_id=current_workspace_id(),
+                    conversation_id=conversation_id,
+                    id=stable_item_id,
+                    created_at=now,
+                    response_id=response_id,
+                    status=encode_item_status("completed"),
+                    position=next_position,
+                    type=encode_item_type(item_type),
+                    data=encoded_data,
+                    search_text=search_text,
+                    created_by=None,
+                )
+            )
+            conv_row.next_position = next_position + 1
+            conv_row.updated_at = now
+            if search_text:
+                insert_fts(session, stable_item_id, conversation_id, search_text)
+            created_at = now
+        else:
+            existing_item_type = decode_item_type(item_row.type)
+            if not replace_pending_message_identity and (
+                item_row.response_id != response_id or existing_item_type != item_type
+            ):
+                raise ValueError("ACP materialized entity identity changed")
+            if replace_pending_message_identity:
+                if not isinstance(response_id, str) or not response_id:
+                    raise ValueError("ACP entity has no response identity")
+                item_row.response_id = response_id
+                item_row.type = encode_item_type(item_type)
+            item_row.data = encoded_data
+            item_row.search_text = search_text
+            delete_fts_by_item_id(session, stable_item_id)
+            if search_text:
+                insert_fts(session, stable_item_id, conversation_id, search_text)
+            conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if conv_row is not None:
+                conv_row.updated_at = now
+            created_at = item_row.created_at
+        return ConversationItem(
+            id=stable_item_id,
+            type=item_type,
+            status="completed",
+            response_id=response_id or "",
+            created_at=created_at,
+            data=parsed_data,
+            created_by=None,
         )
 
     def list_projects(

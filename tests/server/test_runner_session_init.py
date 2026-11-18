@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -24,6 +25,7 @@ from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store import (
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
@@ -40,6 +42,26 @@ class _Registry:
 
     def get(self, _runner_id: str) -> Any:
         return self.connection
+
+
+class _ReportRegistry(_Registry):
+    """Registry stub backed by a server-created tunnel session."""
+
+    def __init__(
+        self,
+        runner_id: str,
+        capabilities: list[str] | None = None,
+        *,
+        owner: str | None = None,
+    ) -> None:
+        super().__init__()
+        registry = TunnelRegistry()
+        hello = HelloFrame(
+            runner_version="test",
+            frame_protocol_version=1,
+            capabilities=capabilities or [],
+        )
+        self.connection = registry.register(runner_id, AsyncMock(), hello, owner=owner)
 
 
 class _Client:
@@ -187,6 +209,94 @@ async def test_initializer_evicts_rejected_result_for_retry(
 
 
 @pytest.mark.asyncio
+async def test_report_connection_ticket_is_prepared_before_init_and_reused_after_failure(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed init retry keeps the ticket captured before candidate dispatch."""
+    store = SqlAlchemyConversationStore(
+        db_uri,
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+    )
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent = agent_store.create(generate_agent_id(), "report-ticket", "bundle/loc")
+    runner_id = "runner-report-ticket"
+    global_parent = store.create_conversation()
+    owner_session = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=global_parent.id,
+        agent_id=agent.id,
+        runner_id=runner_id,
+    )
+    registry = _ReportRegistry(runner_id, owner="owner@example.test")
+    connection = registry.connection
+    order: list[str] = []
+    original_prepare = store.prepare_acp_report_connection_attempt
+
+    def record_prepare(*args: Any, **kwargs: Any) -> str:
+        order.append("prepare")
+        return original_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(store, "prepare_acp_report_connection_attempt", record_prepare)
+
+    class _OrderedClient(_Client):
+        async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+            order.append("dispatch")
+            return await super().post(path, **kwargs)
+
+    client = _OrderedClient()
+    client.release.set()
+    client.status_code = 503
+    initializer = RunnerSessionInitializer(
+        registry,  # type: ignore[arg-type]
+        server_version="test",
+        conversation_store=store,
+    )
+
+    first = await initializer.initialize(owner_session, client, timeout=10)  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+    second = await initializer.initialize(owner_session, client, timeout=10)  # type: ignore[arg-type]
+
+    first_attempt = client.calls[0]["session_init"]["acp_report_connection_attempt_id"]
+    second_attempt = client.calls[1]["session_init"]["acp_report_connection_attempt_id"]
+    assert first.status_code == second.status_code == 503
+    assert order == ["prepare", "dispatch", "prepare", "dispatch"]
+    assert first_attempt == second_attempt
+    assert isinstance(first_attempt, str) and first_attempt
+    # The private source root is the harness-owning child session, not the
+    # ordinary conversation above it.
+    root_attempt = original_prepare(
+        owner_session.id,
+        runner_id,
+        connection.owner,
+        connection.server_connection_id,
+    )
+    assert first_attempt == root_attempt
+
+
+@pytest.mark.asyncio
+async def test_initializer_keeps_ordinary_init_for_unready_custom_store() -> None:
+    """A custom store without ACP readiness still gets normal session init."""
+    runner_id = "runner_init"
+    registry = _ReportRegistry(runner_id, owner="owner@example.test")
+    client = _Client()
+    client.release.set()
+    unsupported_store = SimpleNamespace(acp_session_reporting_ready=False)
+    initializer = RunnerSessionInitializer(
+        registry,  # type: ignore[arg-type]
+        server_version="test",
+        conversation_store=unsupported_store,  # type: ignore[arg-type]
+    )
+
+    response = await initializer.initialize(_conversation(), client, timeout=10)  # type: ignore[arg-type]
+
+    assert response.status_code == 201
+    assert len(client.calls) == 1
+    assert client.calls[0]["session_init"]["acp_report_connection_attempt_id"] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("payload", "expected_ready"),
     [
@@ -319,18 +429,9 @@ async def test_recovery_has_own_readiness_and_stable_identity_across_failed_post
     assert initializer.is_initialized(conv, client)  # type: ignore[arg-type]
 
 
-class _AdvertisedRunner:
-    generation = 1
-
-    def __init__(self, capabilities: list[str]) -> None:
-        self.hello = HelloFrame(
-            runner_version="test", frame_protocol_version=1, capabilities=capabilities
-        )
-
-
 def _attachment_initializer(
     db_uri: str, filename: str | None, capabilities: list[str]
-) -> tuple[RunnerSessionInitializer, Conversation, _Registry, _Client]:
+) -> tuple[RunnerSessionInitializer, Conversation, _ReportRegistry, _Client]:
     """Build an initializer over real persisted attachment metadata and history."""
     agent_store = SqlAlchemyAgentStore(db_uri)
     conv_store = SqlAlchemyConversationStore(db_uri)
@@ -351,8 +452,7 @@ def _attachment_initializer(
                 )
             ],
         )
-    registry, client = _Registry(), _Client()
-    registry.connection = _AdvertisedRunner(capabilities)
+    registry, client = _ReportRegistry(conversation.runner_id, capabilities), _Client()
     initializer = RunnerSessionInitializer(
         registry,  # type: ignore[arg-type]
         server_version="test",
@@ -415,7 +515,6 @@ async def test_attachment_init_error_propagates_and_can_retry_after_upgrade(
     assert not client.calls
     assert not initializer._tasks
 
-    assert isinstance(registry.connection, _AdvertisedRunner)
     registry.connection.hello.capabilities.append(CAP_FILESYSTEM_ATTACHMENTS)
     response = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
     assert response.status_code == 201

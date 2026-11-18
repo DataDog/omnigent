@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import uuid
 from typing import Any
 
 import httpx
@@ -700,9 +701,12 @@ async def test_decline_verdict_rides_resolved_events_to_parent(
         pending_elicitations.reset_for_tests()
 
 
+@pytest.mark.parametrize("resolve_via", ["url", "approval_event"])
 async def test_child_mcp_elicitation_bubbles_to_parent_stream(
     client: httpx.AsyncClient,
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    resolve_via: str,
 ) -> None:
     """
     A child MCP ``elicitation/create`` prompt is actionable from parent chat.
@@ -723,10 +727,23 @@ async def test_child_mcp_elicitation_bubbles_to_parent_stream(
     :param db_uri: Test database URI.
     """
     from omnigent.runtime import pending_elicitations
+    from omnigent.server._elicitation_registry import (
+        _harness_elicitation_owners,
+        _harness_elicitation_registry,
+    )
+    from omnigent.server.routes._sessions import orchestration as orchestration_mod
 
     agent = await create_test_agent(client, "test-child-mcp-bubble")
     parent_id = await _create_session(client, agent["id"])
     child_id = _create_child_session(db_uri, parent_id=parent_id, agent_id=agent["id"])
+    forwarded: list[tuple[str, dict[str, Any]]] = []
+
+    async def _capture_runner_approval(
+        session_id: str, data: dict[str, Any], _runner_router: Any
+    ) -> None:
+        forwarded.append((session_id, data))
+
+    monkeypatch.setattr(orchestration_mod, "_forward_approval_to_runner", _capture_runner_approval)
 
     parent_subscribed = asyncio.Event()
     parent_drain = asyncio.create_task(
@@ -762,6 +779,21 @@ async def test_child_mcp_elicitation_bubbles_to_parent_stream(
         # the verdict to the child's resolve endpoint, not the parent's.
         assert event["params"]["target_session_id"] == child_id
         assert event["params"]["message"] == "MCP server asks: proceed with deletion?"
+        # MCP runner prompts are indexed on the parent stream but have no
+        # server-owned harness Future or owner registration. The DB relation
+        # and exact target_session_id identify their real owner.
+        assert _harness_elicitation_owners.get(elicitation_id) is None
+        assert _harness_elicitation_registry.get(elicitation_id) is None
+
+        pending_page = await client.get(f"/v1/sessions/{child_id}/elicitations/{elicitation_id}")
+        assert pending_page.status_code == 200, pending_page.text
+        assert pending_page.json() == {
+            "status": "pending",
+            "message": "MCP server asks: proceed with deletion?",
+            "phase": None,
+            "policy_name": None,
+            "content_preview": None,
+        }
 
         parent_resolved_subscribed = asyncio.Event()
         parent_resolved = asyncio.create_task(
@@ -773,18 +805,23 @@ async def test_child_mcp_elicitation_bubbles_to_parent_stream(
         )
         await parent_resolved_subscribed.wait()
 
-        # Resolve via the child session (what the parent UI does with the
-        # mirrored target_session_id). The MCP path resolves through the
-        # generic approval event → _resolve_elicitation, which mirrors the
-        # resolved signal back up to ancestors.
-        verdict = await client.post(
-            f"/v1/sessions/{child_id}/events",
-            json={
-                "type": "approval",
-                "data": {"elicitation_id": elicitation_id, "action": "accept"},
-            },
-        )
+        # This prompt originated on the child, so its runner-owned verdict
+        # returns to the child while the resolved signal mirrors to the parent.
+        if resolve_via == "url":
+            verdict = await client.post(
+                f"/v1/sessions/{child_id}/elicitations/{elicitation_id}/resolve",
+                json={"action": "accept"},
+            )
+        else:
+            verdict = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "approval",
+                    "data": {"elicitation_id": elicitation_id, "action": "accept"},
+                },
+            )
         assert verdict.status_code == 202, verdict.text
+        assert forwarded == [(child_id, {"elicitation_id": elicitation_id, "action": "accept"})]
 
         resolved_event = await parent_resolved
         assert resolved_event == {
@@ -799,6 +836,154 @@ async def test_child_mcp_elicitation_bubbles_to_parent_stream(
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
         pending_elicitations.reset_for_tests()
+
+
+async def test_runner_owned_child_target_cards_require_exact_child_and_access(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the targeted child can resolve a parent-indexed runner card."""
+    from omnigent.runtime import pending_elicitations
+    from omnigent.server.routes._sessions import orchestration as orchestration_mod
+
+    pending_elicitations.reset_for_tests()
+    request.addfinalizer(pending_elicitations.reset_for_tests)
+    alice = "alice@example.com"
+    agent = await create_test_agent(auth_client, user=alice)
+    parent_id = await _create_session(auth_client, agent["id"], user=alice)
+    target_child = _create_child_session(
+        db_uri,
+        parent_id=parent_id,
+        agent_id=agent["id"],
+        title="worker:target",
+    )
+    sibling_child = _create_child_session(
+        db_uri,
+        parent_id=parent_id,
+        agent_id=agent["id"],
+        title="worker:sibling",
+    )
+    forwarded: list[tuple[str, dict[str, Any]]] = []
+
+    async def _capture_runner_approval(
+        session_id: str, data: dict[str, Any], _runner_router: Any
+    ) -> None:
+        forwarded.append((session_id, data))
+
+    monkeypatch.setattr(orchestration_mod, "_forward_approval_to_runner", _capture_runner_approval)
+    targeted_id = f"runner-owned-{uuid.uuid4().hex}"
+    session_stream.publish(
+        parent_id,
+        {
+            "type": "response.elicitation_request",
+            "elicitation_id": targeted_id,
+            "params": {
+                "mode": "form",
+                "message": "Approve the child request?",
+                "target_session_id": target_child,
+            },
+        },
+    )
+    alice_headers = {"X-Forwarded-Email": alice}
+    bob_headers = {"X-Forwarded-Email": "bob@example.com"}
+
+    # The child page finds the real parent-owned request by the conversation
+    # relationship and exact target id. A caller without access to both cannot
+    # inspect or resolve the parent's pending card.
+    pending_page = await auth_client.get(
+        f"/v1/sessions/{target_child}/elicitations/{targeted_id}",
+        headers=alice_headers,
+    )
+    assert pending_page.status_code == 200, pending_page.text
+    assert pending_page.json() == {
+        "status": "pending",
+        "message": "Approve the child request?",
+        "phase": "",
+        "policy_name": "",
+        "content_preview": "",
+    }
+    for response in (
+        await auth_client.get(
+            f"/v1/sessions/{target_child}/elicitations/{targeted_id}",
+            headers=bob_headers,
+        ),
+        await auth_client.post(
+            f"/v1/sessions/{target_child}/elicitations/{targeted_id}/resolve",
+            json={"action": "accept"},
+            headers=bob_headers,
+        ),
+    ):
+        assert response.status_code in {403, 404}, response.text
+        assert pending_elicitations.lookup(targeted_id, conversation_id=parent_id) is not None
+
+    # A sibling cannot answer a card targeted at another child. The page is
+    # intentionally indistinguishable from an unknown/resolved id, and its
+    # resolve request must leave the real parent's pending entry untouched.
+    sibling_page = await auth_client.get(
+        f"/v1/sessions/{sibling_child}/elicitations/{targeted_id}",
+        headers=alice_headers,
+    )
+    assert sibling_page.status_code == 200, sibling_page.text
+    assert sibling_page.json() == {"status": "resolved"}
+    sibling_verdict = await auth_client.post(
+        f"/v1/sessions/{sibling_child}/elicitations/{targeted_id}/resolve",
+        json={"action": "accept"},
+        headers=alice_headers,
+    )
+    assert sibling_verdict.status_code == 202, sibling_verdict.text
+    assert pending_elicitations.lookup(targeted_id, conversation_id=parent_id) is not None
+    still_pending = await auth_client.get(
+        f"/v1/sessions/{target_child}/elicitations/{targeted_id}",
+        headers=alice_headers,
+    )
+    assert still_pending.json()["status"] == "pending"
+
+    # Untargeted parent cards keep their ordinary parent scope. A child URL
+    # carrying that id cannot make the parent's generic card disappear.
+    generic_id = f"runner-owned-generic-{uuid.uuid4().hex}"
+    session_stream.publish(
+        parent_id,
+        {
+            "type": "response.elicitation_request",
+            "elicitation_id": generic_id,
+            "params": {"mode": "form", "message": "Generic parent approval?"},
+        },
+    )
+    generic_parent_page = await auth_client.get(
+        f"/v1/sessions/{parent_id}/elicitations/{generic_id}",
+        headers=alice_headers,
+    )
+    assert generic_parent_page.status_code == 200, generic_parent_page.text
+    assert generic_parent_page.json()["status"] == "pending"
+    generic_child_page = await auth_client.get(
+        f"/v1/sessions/{target_child}/elicitations/{generic_id}",
+        headers=alice_headers,
+    )
+    assert generic_child_page.status_code == 200, generic_child_page.text
+    assert generic_child_page.json() == {"status": "resolved"}
+    generic_child_verdict = await auth_client.post(
+        f"/v1/sessions/{target_child}/elicitations/{generic_id}/resolve",
+        json={"action": "accept"},
+        headers=alice_headers,
+    )
+    assert generic_child_verdict.status_code == 202, generic_child_verdict.text
+    assert pending_elicitations.lookup(generic_id, conversation_id=parent_id) is not None
+    generic_parent_after = await auth_client.get(
+        f"/v1/sessions/{parent_id}/elicitations/{generic_id}",
+        headers=alice_headers,
+    )
+    assert generic_parent_after.json()["status"] == "pending"
+
+    proper_verdict = await auth_client.post(
+        f"/v1/sessions/{target_child}/elicitations/{targeted_id}/resolve",
+        json={"action": "accept"},
+        headers=alice_headers,
+    )
+    assert proper_verdict.status_code == 202, proper_verdict.text
+    assert pending_elicitations.lookup(targeted_id, conversation_id=parent_id) is None
+    assert forwarded == [(parent_id, {"elicitation_id": targeted_id, "action": "accept"})]
 
 
 async def test_child_claude_ask_user_question_bubbles_to_parent_stream(
@@ -1307,14 +1492,14 @@ async def test_resolve_url_cross_session_does_not_resolve(
     session_b = await _create_session(client, agent["id"])
     hook_task, elicitation_id = await _park_permission_hook(client, session_a)
 
-    # Wrong session: B tries to resolve A's elicitation.
+    # Wrong session: B tries to resolve A's elicitation and is rejected before
+    # any verdict can be forwarded or applied to A's parked Future.
     cross = await client.post(
         f"/v1/sessions/{session_b}/elicitations/{elicitation_id}/resolve",
         json={"action": "accept"},
     )
-    # The endpoint itself accepts the call (B owns the URL path), but
-    # the owner-scoped helper must NOT touch A's Future.
-    assert cross.status_code == 202, cross.text
+    # Session B must not use A's elicitation id to forward or apply a verdict.
+    assert cross.status_code == 403, cross.text
     assert not hook_task.done(), "cross-session verdict wrongly resolved another session's Future"
 
     # Resolve correctly under A so the parked hook returns (and the

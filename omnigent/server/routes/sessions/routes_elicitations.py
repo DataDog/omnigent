@@ -43,7 +43,9 @@ from omnigent.server.routes._sessions.helpers import (
     _apply_pending_policy_ask_writes,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    _has_unowned_parent_pending_elicitation,
     _resolve_elicitation,
+    _targeted_harness_elicitation_owner,
 )
 from omnigent.server.schemas import (
     ElicitationResult,
@@ -131,12 +133,37 @@ def register_elicitations_routes(
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if conv is None:
                 raise _session_not_found()
+        owner_session_id = await _targeted_harness_elicitation_owner(
+            session_id, elicitation_id, conversation_store
+        )
+        if owner_session_id is None and await _has_unowned_parent_pending_elicitation(
+            session_id, elicitation_id, conversation_store
+        ):
+            return {"queued": False}
+        approval_conv = conv
+        if owner_session_id is not None:
+            owner_access = await _require_access_and_level(
+                user_id,
+                owner_session_id,
+                ELICITATION_RESOLVE_LEVEL,
+                permission_store,
+                conversation_store,
+            )
+            approval_conv = owner_access.conversation or await asyncio.to_thread(
+                conversation_store.get_conversation, owner_session_id
+            )
+            if approval_conv is None:
+                raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
         await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
         # Apply any policy writes deferred by the relay tool-call ASK gate
-        # (e.g. a cost-budget checkpoint) now that the verdict is in.
+        # (e.g. a cost-budget checkpoint) on the runner-owning session.
         await _apply_pending_policy_ask_writes(
-            session_id, conv, conversation_store, agent_store, _resolve_data
+            owner_session_id or session_id,
+            approval_conv,
+            conversation_store,
+            agent_store,
+            _resolve_data,
         )
         return {"queued": False}
 
@@ -183,9 +210,23 @@ def register_elicitations_routes(
             if conv is None:
                 raise _session_not_found()
 
-        found = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+        owner_session_id = await _targeted_harness_elicitation_owner(
+            session_id, elicitation_id, conversation_store
+        )
+        if owner_session_id is not None:
+            await _require_access_and_level(
+                user_id,
+                owner_session_id,
+                ELICITATION_RESOLVE_LEVEL,
+                permission_store,
+                conversation_store,
+            )
+        lookup_session_id = owner_session_id or session_id
+        found = pending_elicitations.lookup(elicitation_id, conversation_id=lookup_session_id)
         if found is None:
-            resolution = pending_elicitations.native_resolution_for(session_id, elicitation_id)
+            resolution = pending_elicitations.native_resolution_for(
+                lookup_session_id, elicitation_id
+            )
             return {"status": "resolved", **({"resolution": resolution} if resolution else {})}
 
         _conv_id, event = found

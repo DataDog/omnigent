@@ -327,6 +327,11 @@ class _FakeProcessManager:
         self._sessions.add(conversation_id)
         return self._client
 
+    def get_session_report_subscriber_generation(self, conversation_id: str) -> str | None:
+        """Return no generation because this fake has no report-enabled harness."""
+        del conversation_id
+        return None
+
     def has_session(self, conversation_id: str) -> bool:
         """Check if a session was registered via :meth:`get_client`."""
         return conversation_id in self._sessions

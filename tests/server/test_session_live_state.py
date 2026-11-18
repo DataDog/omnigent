@@ -15,6 +15,7 @@ short polling deadline — the same shape as the host-tunnel route tests'
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 
@@ -116,6 +117,76 @@ def test_persist_live_status_dedupes_transitions(recording_store: _RecordingStor
         ("conv_1", "idle"),
         ("conv_2", "idle"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_required_live_status_uses_ordered_writer_and_waits_for_commit(
+    recording_store: _RecordingStore,
+) -> None:
+    """A required status waits behind earlier live-state writes and its store call."""
+    release = threading.Event()
+    blocker = session_live_state.submit("hold_live_state_writer", release.wait, 10)
+    try:
+        write = asyncio.create_task(
+            session_live_state.persist_live_status_required("conv_durable", "running")
+        )
+        await asyncio.sleep(0.02)
+        assert not write.done(), "required status returned before its ordered store write ran"
+        assert recording_store.status_writes == []
+
+        release.set()
+        await asyncio.wait_for(write, timeout=10)
+    finally:
+        release.set()
+
+    assert blocker.result(timeout=10) is True
+    assert recording_store.status_writes == [("conv_durable", "running")]
+
+
+@pytest.mark.asyncio
+async def test_required_live_status_propagates_store_failure(
+    recording_store: _RecordingStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A required status cannot report success when its store write fails."""
+
+    def fail_write(_session_id: str, _status: str) -> None:
+        raise RuntimeError("status store unavailable")
+
+    monkeypatch.setattr(recording_store, "set_session_live_status", fail_write)
+
+    with pytest.raises(RuntimeError, match="status store unavailable"):
+        await session_live_state.persist_live_status_required("conv_failed_write", "running")
+
+    assert recording_store.status_writes == []
+
+
+@pytest.mark.asyncio
+async def test_dropped_best_effort_status_can_retry_same_value_durably(
+    recording_store: _RecordingStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dropped queued status does not suppress a durable same-status retry."""
+    attempts = 0
+    dropped = threading.Event()
+    persist = recording_store.set_session_live_status
+
+    def drop_first_write(session_id: str, status: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            dropped.set()
+            raise RuntimeError("transient status write failure")
+        persist(session_id, status)
+
+    monkeypatch.setattr(recording_store, "set_session_live_status", drop_first_write)
+    session_live_state.persist_live_status("conv_retry", "running")
+    assert await asyncio.to_thread(dropped.wait, 10), "best-effort status write did not run"
+
+    await session_live_state.persist_live_status_required("conv_retry", "running")
+
+    assert attempts == 2
+    assert recording_store.status_writes == [("conv_retry", "running")]
 
 
 def test_every_background_report_is_written_with_its_runner_and_time(

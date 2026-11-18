@@ -1,4 +1,8 @@
-import type { AssistantMessagePhase } from "./conversationItems";
+import type {
+  AcpSessionMessage,
+  AcpToolSessionReference,
+  AssistantMessagePhase,
+} from "./conversationItems";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_blocks.py.
 //
@@ -197,6 +201,10 @@ export interface ToolExecution {
   executedBy: "server" | "client";
   /** Tool output text, or `null` if not yet available. */
   output: string | null;
+  /** Native ACP references to associated sessions, when reported. */
+  acpSessionReferences?: AcpToolSessionReference[] | null;
+  /** Explicit provenance when ACP did not report the child model. */
+  acpAgentIdentity?: "unknown";
 }
 
 // ── Response lifecycle ───────────────────────────────────
@@ -272,7 +280,7 @@ export interface ToolResultBlock {
   name: string;
   callId: string;
   agentName: string;
-  output: string;
+  output: string | null;
 }
 
 /** A provider-native tool output (web_search, mcp, etc.). */
@@ -404,6 +412,10 @@ export interface TextDone {
   interrupted?: boolean;
   /** Harness label for the message, when the harness reports one (Codex). */
   phase?: AssistantMessagePhase;
+  /** Structured ACP From/To metadata for a directed native session message. */
+  acpSessionMessage?: AcpSessionMessage | null;
+  /** Explicit provenance when ACP did not report the child model. */
+  acpAgentIdentity?: "unknown";
   /** UI-only marker for a provisional native preview with missing live output. */
   previewInterrupted?: boolean;
   /** Last native chunk index rendered in this provisional preview. */
@@ -446,6 +458,8 @@ export interface ReasoningBlock {
   ctx: BlockContext;
   reasoningText: string;
   summaryText: string;
+  /** Explicit provenance when ACP did not report the child model. */
+  acpAgentIdentity?: "unknown";
 }
 
 // ── Status ───────────────────────────────────────────────

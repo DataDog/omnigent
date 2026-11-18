@@ -26,6 +26,7 @@ function child(overrides: Partial<ChildSessionInfo>): ChildSessionInfo {
     last_message_preview: overrides.last_message_preview ?? null,
     pending_elicitations_count: overrides.pending_elicitations_count ?? 0,
     routed_model: overrides.routed_model ?? null,
+    acp_session_observation: overrides.acp_session_observation ?? null,
   };
 }
 
@@ -147,6 +148,34 @@ describe("SubagentTaskIndicator", () => {
       .find((status) => status.textContent === "Disconnected");
     expect(disconnectedStatus).toHaveClass("text-muted-foreground");
     expect(screen.getByRole("link", { name: /Sub-agent.*Disconnected/ })).toBeInTheDocument();
+  });
+
+  it("shows a current-source-unconfirmed ACP child in the composer indicator", () => {
+    setChildren([
+      child({
+        id: "acp-unconfirmed",
+        title: "worker:one",
+        labels: { "omnigent.acp.subagent_id": "native-child-1" },
+        busy: true,
+        current_task_status: "in_progress",
+        acp_session_observation: {
+          source_current: false,
+          state: { present: true, value: { state: "running" } },
+        },
+      }),
+    ]);
+    renderIndicator();
+
+    const pill = screen.getByTestId("subagent-task-pill");
+    expect(pill).toHaveAttribute("data-state", "uncertain");
+    expect(pill).toHaveAccessibleName("1 sub-agent: 1 unconfirmed");
+
+    fireEvent.click(pill);
+    const unconfirmedStatus = screen
+      .getAllByRole("status")
+      .find((status) => status.textContent === "Unconfirmed");
+    expect(unconfirmedStatus).toHaveClass("text-muted-foreground");
+    expect(screen.getByRole("link", { name: /one.*Unconfirmed/ })).toBeInTheDocument();
   });
 
   it("uses the parked trigger treatment when no child has an error", () => {

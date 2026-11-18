@@ -414,6 +414,11 @@ missing executor values.
 Register commands in `~/.omnigent/config.yaml` under `acp.agents`; the slug is
 derived from the agent name.
 
+Compatible agents can expose persistent child sessions through the ACP v1
+subagents preview, without a vendor extension setting. See the
+[ACP subagent guide](acp-subagents.md) for compatibility, configuration, and
+runner lifetime requirements.
+
 Every ACP `session/prompt`, including Goose and Qwen prompts, carries
 `params._meta["ai.omnigent/inputItemId"]`. Its value is the persisted user item
 ID, already readable via `GET /v1/sessions/{id}/items` when the prompt arrives.

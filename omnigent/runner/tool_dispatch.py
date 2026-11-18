@@ -33,7 +33,7 @@ import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
 from omnigent.util.json_serialization import json_dumps_transport_safe
@@ -1112,6 +1112,7 @@ async def _execute_local_python_tool(
     agent_id: str | None,
     runner_workspace: Path | None,
     local_tool_workdir: Path | None,
+    caller_user_id: str | None,
 ) -> str:
     if agent_spec is None:
         return f"Error: {tool_name} not in local dispatch table (no agent spec)"
@@ -1122,6 +1123,7 @@ async def _execute_local_python_tool(
             agent_id=agent_id or agent_spec.name or "runner-agent",
             workspace=runner_workspace,
             conversation_id=conversation_id,
+            caller_user_id=caller_user_id,
         )
         return await asyncio.to_thread(manager.call_tool, tool_name, args, ctx)
     except Exception as exc:
@@ -7234,6 +7236,7 @@ async def execute_tool(
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
+    caller_user_id: str | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -7549,6 +7552,7 @@ async def execute_tool(
                     if local_tool_workdir is _UNSET_LOCAL_TOOL_WORKDIR
                     else cast(Path | None, local_tool_workdir)
                 ),
+                caller_user_id=caller_user_id,
             )
         elif _is_uc_function_tool(tool_name, agent_spec):
             output = await _execute_uc_function_tool(tool_name, args, agent_spec=agent_spec)
@@ -7656,6 +7660,8 @@ async def dispatch_tool_locally(
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
+    caller_user_id: str | None = None,
+    on_result_delivery: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> str:
     """Execute a tool once and POST its result to the harness.
 
@@ -7681,6 +7687,9 @@ async def dispatch_tool_locally(
         ``execute_tool`` for the granted-surface check.
     :param wake_on_async_result: Forwarded to ``execute_tool`` so a
         ``sys_call_async`` result can wake the session after its turn ends.
+    :param on_result_delivery: Optional result sink. When supplied, it receives
+        the completed result exactly once and owns idempotent delivery retries;
+        tool execution is never retried by this helper.
     :returns: The tool output string.
     """
     if not conversation_id:
@@ -7709,6 +7718,7 @@ async def dispatch_tool_locally(
         publish_event=publish_event,
         effective_harness=effective_harness,
         wake_on_async_result=wake_on_async_result,
+        caller_user_id=caller_user_id,
     )
 
     # A file-mutating tool just ran — nudge the web to refetch the
@@ -7720,13 +7730,24 @@ async def dispatch_tool_locally(
             now=asyncio.get_running_loop().time(),
         )
 
+    result_body: dict[str, Any] = {
+        "type": "tool_result",
+        "call_id": call_id,
+        "output": output,
+    }
+    if on_result_delivery is not None:
+        # The callback owns delivery retries. The side-effecting tool has already
+        # run, so this helper must not invoke it again after an uncertain POST.
+        await on_result_delivery(result_body)
+        return output
+
     # Retry only delivery: tools can have side effects. The harness ignores
     # duplicate call_ids, including when the first acknowledgement was lost.
     for attempt in range(2):
         try:
             resp = await harness_client.post(
                 f"{_session_url(conversation_id)}/events",
-                json={"type": "tool_result", "call_id": call_id, "output": output},
+                json=result_body,
                 timeout=30.0,
             )
             resp.raise_for_status()

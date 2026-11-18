@@ -1,35 +1,33 @@
-"""Normalized sub-agent lifecycle for ACP agents.
+"""Compatibility lifecycle for non-standard ACP subagent dialects.
 
-The Agent Client Protocol has not standardized sub-agents. An RFD proposes a
-``tool_call`` with ``kind: "subagent"`` plus a ``childSessionId`` and a distinct
-child ``sessionId``, but no shipping agent emits that yet, so an agent that
-spawns sub-agents reports them in its own dialect.
-
-This module owns only the **generic** half: a small normalized lifecycle
-(:class:`SubAgentStart` / :class:`SubAgentEnd`, plus :class:`SubAgentActivity`
-for a tool call the sub-agent ran) and the :class:`AcpSubAgentSource` protocol
-that maps one dialect onto it. It reads no vendor field and names no vendor;
-:class:`~omnigent.inner.acp_executor.AcpExecutor` runs whatever sources its
-:class:`~omnigent.inner.acp_extension.AcpExtension` supplies and emits the
-matching :class:`~omnigent.inner.executor.SubAgentStarted` /
-:class:`~omnigent.inner.executor.SubAgentCompleted` /
-:class:`~omnigent.inner.executor.SubAgentToolCall`, which the runner turns into
-an Omnigent child session and its transcript so the web "Subagents" panel lists
-one row per child with the work it did.
-
-A vendor's dialect lives with that vendor — see
-a vendor source implements this protocol for the worked
-example — so supporting another agent means adding one source in that agent's
-own package, with nothing here or downstream to change. When ACP standardizes
-the convention, a single source keyed on the standard fields covers every
-compliant agent at once, and can ship here rather than per-vendor.
+ACP's v1 subagents preview is decoded by :mod:`acp_standard_subagents` and
+persists reusable sessions and transcript entities. The older
+:class:`SubAgentStart` / :class:`SubAgentEnd` lifecycle remains only as a
+separate compatibility seam for any existing vendor adapter; its terminal
+events are not used by standard ACP subagent reporting.
 """
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
+
+
+def acp_child_key(
+    parent_session_id: str,
+    native_epoch: str,
+    native_session_id: str,
+    run_id: str,
+) -> str:
+    """Return the stable key encoding used by the retired run-report reader."""
+    parts = (parent_session_id, native_epoch, native_session_id, run_id)
+    if any(not isinstance(part, str) or not part for part in parts):
+        raise ValueError("ACP child-key components must be non-empty strings")
+    encoded_parts = [part.encode("utf-8") for part in parts]
+    payload = b"".join(len(part).to_bytes(4, "big") + part for part in encoded_parts)
+    return "acp_" + hashlib.sha256(payload).hexdigest()
 
 
 @dataclass(frozen=True)

@@ -24,7 +24,6 @@ def create_mcp_gateway_router(adapter: McpPolicyAdapter) -> APIRouter:
             str, Header(alias="X-Omnigent-Session-Id", min_length=1, max_length=128)
         ],
     ) -> Response:
-        context = await adapter.authorize(request, session_id, service_id)
         try:
             body = await request.json()
         except ValueError:
@@ -40,6 +39,7 @@ def create_mcp_gateway_router(adapter: McpPolicyAdapter) -> APIRouter:
         params: Any = body.get("params", {})
         if not isinstance(params, dict):
             return _mcp_error_response(rpc_id, -32602, "Expected object params")
+        context = await adapter.authorize(request, session_id, service_id, params)
         if method == "initialize":
             return _mcp_ok_response(
                 rpc_id,

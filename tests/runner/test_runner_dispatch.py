@@ -115,6 +115,16 @@ from tests.runner.conftest import (
 )
 from tests.runner.helpers import NullServerClient
 
+
+class _NonReportingProcessManager:
+    """Report-generation contract for fakes with no reporting harness."""
+
+    def get_session_report_subscriber_generation(self, conversation_id: str) -> str | None:
+        """Match the real manager's ``None`` result for non-reporting harnesses."""
+        del conversation_id
+        return None
+
+
 _TEST_HARNESS_NAME = "runner-test-default"
 _TEST_HARNESS_MODULE = "tests._fixtures.runner_test_harness"
 
@@ -376,7 +386,7 @@ class _FakeHarnessClient:
         return _FakeHarnessStream(self._chunks)
 
 
-class _FakeProcessManager:
+class _FakeProcessManager(_NonReportingProcessManager):
     """
     Process manager stub for runner dispatch tests.
 
@@ -650,7 +660,7 @@ async def test_create_session_returns_400_when_spec_resolver_returns_none(
     assert "ag_unregistered" in body["detail"]
 
 
-class _RecordingProcessManager:
+class _RecordingProcessManager(_NonReportingProcessManager):
     """
     Process manager stub that records the harness name get_client saw.
 
@@ -802,7 +812,7 @@ async def test_runner_resolves_agent_from_server_snapshot_when_msg_lacks_agent_i
     assert captured["harness"] == resolved_harness
 
 
-class _ContentCapturingProcessManager:
+class _ContentCapturingProcessManager(_NonReportingProcessManager):
     """
     Process manager stub that captures the body sent to the harness.
 
@@ -3321,6 +3331,51 @@ async def test_runner_terminal_dispatch_passes_cli_workspace(
     assert json.loads(out)["status"] == "captured"
     assert json.loads(captured["arguments"]) == {"terminal": "zsh", "session": "s1"}
     assert captured["workspace"] == workspace.resolve()
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_passes_captured_actor_to_local_python_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Detached child tools retain the actor captured when their origin was bound."""
+    from omnigent.runner import tool_dispatch
+    from omnigent.runner.tool_dispatch import execute_tool
+    from omnigent.spec.types import AgentSpec, LocalToolInfo
+    from omnigent.tools.base import ToolContext
+
+    captured_contexts: list[ToolContext] = []
+
+    class _CaptureToolManager:
+        def __init__(self, _spec: AgentSpec, *, workdir: Path | None = None) -> None:
+            del workdir
+
+        def call_tool(self, _name: str, _arguments: str, context: ToolContext) -> str:
+            captured_contexts.append(context)
+            return "captured"
+
+        def shutdown(self) -> None:
+            return None
+
+    monkeypatch.setattr(tool_dispatch, "ToolManager", _CaptureToolManager)
+    monkeypatch.setattr(tool_dispatch, "_ungranted_tool_reason", lambda *_args: None)
+    spec = AgentSpec(
+        spec_version=1,
+        name="probe",
+        local_tools=[
+            LocalToolInfo(name="actor_probe", path="tools/python/probe.py", language="python")
+        ],
+    )
+
+    output = await execute_tool(
+        tool_name="actor_probe",
+        arguments="{}",
+        agent_spec=spec,
+        caller_user_id="alice@example.com",
+    )
+
+    assert output == "captured"
+    assert len(captured_contexts) == 1
+    assert captured_contexts[0].caller_user_id == "alice@example.com"
 
 
 class _StubTerminalInstance:
@@ -11976,7 +12031,7 @@ class _ChainEmptyStream:
         yield  # pragma: no cover
 
 
-class _ChainProcessManager:
+class _ChainProcessManager(_NonReportingProcessManager):
     """Process-manager stub for the three-factor chain."""
 
     handles_tool_dispatch = True

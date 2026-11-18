@@ -4379,7 +4379,79 @@ def test_run_harness_acp_slug_resolves_client_side(
     assert env["HARNESS_ACP_NAME"] == "Devin"
 
 
-def test_run_harness_acp_slug_embeds_with_remote_server(
+def test_configured_acp_agent_survives_setup_reload_and_slug_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The setup CLI saves a generic ACP command that a fresh run can select."""
+    from omnigent.runtime.workflow import _build_acp_spawn_env
+    from omnigent.spec import load
+
+    config_home = tmp_path / "config"
+    config_home.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("omnigent.cli_config._warn_missing_harness_dependencies", lambda: None)
+    monkeypatch.setattr("omnigent.cli_config._adopt_ambient_credentials", list)
+
+    selected_agent = False
+
+    def choose_acp_agent(
+        title: str,
+        options: list[str],
+        **_kwargs: object,
+    ) -> int:
+        assert title == "Configure harnesses"
+        if not selected_agent:
+            return next(
+                index for index, option in enumerate(options) if "Custom ACP agent" in option
+            )
+        return next(index for index, option in enumerate(options) if option == "Quit")
+
+    def add_agent(label: str, **_kwargs: object) -> str:
+        nonlocal selected_agent
+        if label.startswith("Agent name"):
+            selected_agent = True
+            return "Fixture Reporter"
+        if label.startswith("Command to launch"):
+            return "fixture-agent stdio"
+        if label.startswith("Model"):
+            return ""
+        raise AssertionError(f"Unexpected ACP setup prompt: {label}")
+
+    monkeypatch.setattr("omnigent.onboarding.interactive.select", choose_acp_agent)
+    monkeypatch.setattr("omnigent.onboarding.interactive.prompt_text", add_agent)
+
+    configured = CliRunner().invoke(cli, ["setup"])
+    assert configured.exit_code == 0, configured.output
+    persisted = yaml.safe_load((config_home / "config.yaml").read_text())
+    assert persisted["acp"]["agents"] == [
+        {"name": "Fixture Reporter", "command": "fixture-agent stdio"}
+    ]
+
+    run_chat = Mock()
+    monkeypatch.setattr("omnigent.chat.run_chat", run_chat)
+    selected = CliRunner().invoke(
+        cli,
+        ["run", "--harness", "acp:fixture-reporter", "-p", "select this agent"],
+    )
+    assert selected.exit_code == 0, selected.output
+    run_chat.assert_called_once()
+    generated = Path(run_chat.call_args.kwargs["target"])
+    raw = yaml.safe_load(generated.read_text())
+    assert raw["executor"]["harness"] == "acp:fixture-reporter"
+    assert raw["executor"]["acp_agent"] == {
+        "name": "Fixture Reporter",
+        "command": "fixture-agent stdio",
+    }
+    runtime_env = _build_acp_spawn_env(load(generated))
+    assert runtime_env["HARNESS_ACP_COMMAND"] == "fixture-agent stdio"
+    assert runtime_env["HARNESS_ACP_NAME"] == "Fixture Reporter"
+    assert "HARNESS_ACP_EXTENSION" not in runtime_env
+
+
+def test_run_harness_acp_slug_drops_legacy_extension_when_embedded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4404,6 +4476,7 @@ def test_run_harness_acp_slug_embeds_with_remote_server(
                         {
                             "name": "Local Agent",
                             "command": "agent stdio",
+                            "extension": "gemini",
                             "slug": "local-agent",
                         }
                     ]
@@ -4436,9 +4509,11 @@ def test_run_harness_acp_slug_embeds_with_remote_server(
     # Agent is embedded so the remote server can use it
     assert raw["executor"]["acp_agent"]["name"] == "Local Agent"
     assert raw["executor"]["acp_agent"]["command"] == "agent stdio"
+    assert "extension" not in raw["executor"]["acp_agent"]
     # Verify it works through the full spawn path
     env = _build_acp_spawn_env(load(generated))
     assert env["HARNESS_ACP_COMMAND"] == "agent stdio"
+    assert "HARNESS_ACP_EXTENSION" not in env
 
 
 def test_run_harness_acp_slug_embeds_all_fields(

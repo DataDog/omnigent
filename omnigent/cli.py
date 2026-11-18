@@ -4904,9 +4904,12 @@ def server(
         SqlAlchemyScheduledTaskStore,
     )
 
+    artifact_store = _create_artifact_store(art_loc)
     agent_store = SqlAlchemyAgentStore(db_uri, conv_db_uri)
     file_store = SqlAlchemyFileStore(db_uri)
-    conversation_store = SqlAlchemyConversationStore(db_uri, conv_db_uri)
+    conversation_store = SqlAlchemyConversationStore(
+        db_uri, conv_db_uri, artifact_store=artifact_store
+    )
     comment_store = SqlAlchemyCommentStore(db_uri)
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
@@ -4917,8 +4920,6 @@ def server(
         from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferenceStore
 
         preference_store = SqlAlchemyPreferenceStore(db_uri, authority_id=authority_id)
-    artifact_store = _create_artifact_store(art_loc)
-
     # Initialize the runtime with store references so workflow code
     # can access them via getter functions (get_agent_cache(), etc.).
     from omnigent.runtime import init as init_runtime

@@ -411,6 +411,55 @@ describe("itemsToBlocks — flat shape", () => {
   });
 });
 
+describe("itemsToBlocks — standard ACP metadata", () => {
+  it("preserves directed links, tool references, and unknown speaker identity on reload", () => {
+    const directed = {
+      kind: "directed" as const,
+      sender_session_id: "native-child",
+      recipient_session_id: "native-parent",
+      sender_conversation_id: "conv_child",
+      recipient_conversation_id: "conv_parent",
+    };
+    const references = [
+      { native_session_id: "worker:α", conversation_id: "conv_worker" },
+      { native_session_id: "unresolved-worker" },
+    ];
+    const items: ConversationItem[] = [
+      {
+        id: "item_child_message",
+        response_id: "resp_child",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        acp_agent_identity: "unknown",
+        acp_session_message: directed,
+        content: [{ type: "output_text", text: "A result for the parent." }],
+      },
+      {
+        id: "item_parent_call",
+        response_id: "resp_parent",
+        type: "function_call",
+        status: "completed",
+        call_id: "call_parent",
+        name: "delegate",
+        arguments: "{}",
+        acp_session_references: references,
+      },
+    ];
+
+    const blocks = itemsToBlocks(items);
+    const message = blocks.find((block): block is TextDone => block.type === "text_done");
+    const tool = blocks.find((block): block is ToolGroup => block.type === "tool_group");
+
+    expect(message).toMatchObject({
+      fullText: "A result for the parent.",
+      acpSessionMessage: directed,
+      ctx: { agent: null },
+    });
+    expect(tool?.executions[0]).toHaveProperty("acpSessionReferences", references);
+  });
+});
+
 describe("itemsToBlocks — historical error attribution", () => {
   function errorItem(responseId: string, code = "RuntimeError"): ErrorItem {
     return {

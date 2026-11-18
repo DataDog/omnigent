@@ -194,6 +194,54 @@ describe("parseEvent — response.output_item.done (message)", () => {
     });
     expect(unknown).not.toHaveProperty("phase");
   });
+
+  it("retains directed ACP participants and unknown speaker provenance", () => {
+    const directed = {
+      kind: "directed",
+      sender_session_id: "native-child",
+      recipient_session_id: "native-parent",
+      sender_conversation_id: "conv_child",
+      recipient_conversation_id: "conv_parent",
+    };
+    const ev = parseEvent("response.output_item.done", {
+      item: {
+        id: "item_child_message",
+        type: "message",
+        response_id: "resp_child",
+        content: [{ type: "output_text", text: "A result for the parent." }],
+        acp_session_message: directed,
+        acp_agent_identity: "unknown",
+      },
+    });
+
+    expect(ev).toMatchObject({
+      type: "message_done",
+      acpSessionMessage: directed,
+      acpAgentIdentity: "unknown",
+    });
+  });
+});
+
+describe("parseEvent — response.output_item.done (tool session references)", () => {
+  it("retains native ids and separately resolved Omnigent links", () => {
+    const references = [
+      { native_session_id: "worker:α", conversation_id: "conv_worker" },
+      { native_session_id: "unresolved-worker" },
+    ];
+    const ev = parseEvent("response.output_item.done", {
+      item: {
+        id: "item_parent_call",
+        type: "function_call",
+        response_id: "resp_parent",
+        call_id: "call_parent",
+        name: "delegate",
+        arguments: "{}",
+        acp_session_references: references,
+      },
+    });
+
+    expect(ev).toMatchObject({ type: "tool_call", acpSessionReferences: references });
+  });
 });
 
 describe("parseEvent — response.output_item.done (reasoning)", () => {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import yaml
 
 from omnigent.onboarding.acp_auth import (
     acp_agents,
@@ -66,6 +67,35 @@ def test_omnigent_mcp_requires_boolean(value: object) -> None:
                 }
             }
         )
+
+
+def test_legacy_acp_extension_is_ignored_and_dropped_on_save() -> None:
+    """Old vendor selectors do not change generic ACP configuration."""
+    parsed = acp_agents(
+        {
+            "acp": {
+                "agents": [
+                    {
+                        "name": "Gemini CLI",
+                        "command": "gemini --experimental-acp",
+                        "extension": "gemini",
+                    }
+                ]
+            }
+        }
+    )
+
+    assert [(entry.slug, entry.command) for entry in parsed] == [
+        ("gemini-cli", "gemini --experimental-acp")
+    ]
+    saved = acp_agents_settings(parsed)
+    assert saved == {
+        "acp": {"agents": [{"name": "Gemini CLI", "command": "gemini --experimental-acp"}]}
+    }
+    reloaded = acp_agents(yaml.safe_load(yaml.safe_dump(saved)))
+    assert [(entry.slug, entry.command) for entry in reloaded] == [
+        ("gemini-cli", "gemini --experimental-acp")
+    ]
 
 
 def test_env_passthrough_parses_and_round_trips() -> None:

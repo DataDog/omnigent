@@ -77,7 +77,11 @@ _log = logging.getLogger(__name__)
 # Defined once here so the enforcement sites
 # (``omnigent.runner.app`` and ``omnigent.runtime.harnesses._scaffold``)
 # can't drift if the set of fail-closed phases changes.
-FAIL_CLOSED_PHASES: tuple[str, ...] = ("PHASE_TOOL_CALL", "PHASE_REQUEST")
+FAIL_CLOSED_PHASES: tuple[str, ...] = (
+    "PHASE_TOOL_CALL",
+    "PHASE_REQUEST",
+    "ACP_ACTION_ORIGIN_CHECK",
+)
 
 
 @dataclass(frozen=True)

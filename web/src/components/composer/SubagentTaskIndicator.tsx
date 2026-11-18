@@ -19,7 +19,7 @@ import { childStatus } from "@/shell/subagentStatus";
  * so the two counts read as one family (background shells + delegated agents).
  */
 
-type IndicatorState = "active" | "parked" | "quiet" | "error";
+type IndicatorState = "active" | "parked" | "quiet" | "uncertain" | "error";
 
 interface IndicatorChild {
   child: ChildSessionInfo;
@@ -48,6 +48,9 @@ function indicatorChild(child: ChildSessionInfo): IndicatorChild | null {
   if (status.activity === "disconnected") {
     return { child, state: "quiet", statusLabel: status.label };
   }
+  if (status.activity === "unconfirmed") {
+    return { child, state: "uncertain", statusLabel: status.label };
+  }
   if (status.activity === "failed") {
     return { child, state: "error", statusLabel: status.label };
   }
@@ -58,12 +61,14 @@ function statusSummary(items: IndicatorChild[]): string {
   const active = items.filter((item) => item.state === "active").length;
   const parked = items.filter((item) => item.state === "parked").length;
   const quiet = items.filter((item) => item.state === "quiet").length;
+  const uncertain = items.filter((item) => item.state === "uncertain").length;
   const errors = items.filter((item) => item.state === "error").length;
   const total = items.length;
   const parts = [
     active > 0 ? `${active} active` : null,
     parked > 0 ? `${parked} awaiting input` : null,
     quiet > 0 ? `${quiet} disconnected` : null,
+    uncertain > 0 ? `${uncertain} unconfirmed` : null,
     errors > 0 ? `${errors} need${errors === 1 ? "s" : ""} attention` : null,
   ].filter(Boolean);
   return `${total} sub-agent${total === 1 ? "" : "s"}: ${parts.join(", ")}`;
@@ -190,7 +195,9 @@ export function SubagentTaskIndicator({ conversationId }: { conversationId: stri
       ? "parked"
       : items.some((item) => item.state === "active")
         ? "active"
-        : "quiet";
+        : items.some((item) => item.state === "uncertain")
+          ? "uncertain"
+          : "quiet";
 
   const handleNavigate = (event: MouseEvent<HTMLAnchorElement>) => {
     if (!event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) setOpen(false);

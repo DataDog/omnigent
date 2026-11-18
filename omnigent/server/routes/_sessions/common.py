@@ -186,6 +186,15 @@ _EXTERNAL_SUBAGENT_START_TYPE: str = "external_subagent_start"
 _EXTERNAL_ACP_SUBAGENT_START_TYPE: str = "external_acp_subagent_start"
 
 
+_EXTERNAL_ACP_SESSION_REPORT_TYPE: str = "external_acp_session_report"
+
+_EXTERNAL_ACP_REPORT_CONNECTION_ADMIT_TYPE: str = "external_acp_report_connection_admit"
+
+_EXTERNAL_ACP_REPORT_OWNER_ADMIT_TYPE: str = "external_acp_report_owner_admit"
+
+_EXTERNAL_ACP_REPORT_EPOCH_ACTIVATE_TYPE: str = "external_acp_report_epoch_activate"
+
+
 # Stable id an ACP agent gave the sub-agent it spawned (Devin's ``agentId``);
 # the idempotency key for the child row. Unlike the native families there is no
 # ``omnigent.wrapper`` value: an ACP sub-agent runs the SAME harness as its
@@ -612,6 +621,7 @@ _RUNNER_SESSION_EVENT_TYPES: frozenset[str] = frozenset(
         _EXTERNAL_SESSION_TODOS_TYPE,
         _EXTERNAL_SUBAGENT_START_TYPE,
         _EXTERNAL_ACP_SUBAGENT_START_TYPE,
+        _EXTERNAL_ACP_SESSION_REPORT_TYPE,
         _EXTERNAL_CODEX_SUBAGENT_START_TYPE,
         _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
         _EXTERNAL_DEVIN_SUBAGENT_START_TYPE,
@@ -1178,6 +1188,7 @@ __all__ = [
     "_DEVIN_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE",
     "_DEVIN_NATIVE_WRAPPER_LABEL_VALUE",
     "_EVALUATE_HOOK_ELICITATION_ID_RE",
+    "_EXTERNAL_ACP_SESSION_REPORT_TYPE",
     "_EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE",
     "_EXTERNAL_ASSISTANT_MESSAGE_TYPE",
     "_EXTERNAL_BACKGROUND_WORK_TYPE",
