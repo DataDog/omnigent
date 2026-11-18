@@ -15,7 +15,9 @@ mkdir -p "$RUN_DIR/data" "$RUN_DIR/config"
 
 export OMNIGENT_AUTH_PROVIDER=accounts
 export OMNIGENT_ACCOUNTS_COOKIE_SECRET="$(cat "$RUN_DIR/cookie_secret")"
-export OMNIGENT_ACCOUNTS_BASE_URL="http://$HOST:$PORT"
+BASE_HOST="$HOST"
+[ "$HOST" = "0.0.0.0" ] && BASE_HOST=127.0.0.1
+export OMNIGENT_ACCOUNTS_BASE_URL="http://$BASE_HOST:$PORT"
 export OMNIGENT_ACCOUNTS_INIT_ADMIN_USERNAME=alice
 export OMNIGENT_DATA_DIR="$RUN_DIR/data"
 export OMNIGENT_CONFIG_HOME="$RUN_DIR/config"
@@ -25,7 +27,7 @@ if [ -n "${TUNNEL_ALLOWLIST:-}" ]; then
 else
   unset OMNIGENT_RUNNER_TUNNEL_TOKEN
 fi
-echo "$HOST:$PORT" > "$RUN_DIR/server_addr"
+echo "$BASE_HOST:$PORT" > "$RUN_DIR/server_addr"
 cd "$REPO_DIR"
 exec uv run --no-sync omnigent server --host "$HOST" --port "$PORT" \
   --database-uri "sqlite:///$RUN_DIR/chat.db" \
