@@ -1,7 +1,38 @@
 # S3 findings: prod probe for Vitrine as a hostless Omnigent runner
 
-**Outcome: inconclusive. The stored CLI bearer had expired, and prod rejected it before either check could run.**
-Nothing was created on prod and nothing needed cleanup.
+**Final outcome (run 2, 2026-11-18 21:32Z): B1 GO, and B8 shows no default `__public__` grant on a hostless session.**
+Cleanup is verified: the session read back as 404 and the runner as `online:false`.
+Run 1 failed on an expired token and is kept below as history.
+
+## Run 2: fresh login (approved as one additional run)
+Nick re-ran `omnigent login --server https://omnigent.us1.ddbuild.io` and approved exactly one more run, with the same 9 calls and bearer source (b).
+Before calling prod, a local check confirmed the token's `expires_at` (1795066302) was later than now (1795037538). The token value was not printed.
+
+| # | Call | Result |
+|---|------|--------|
+| 1 | WS tunnel + hello | **upgrade accepted (open)**; hello sent; no inbound non-ping frames in 3s, so the server sends **no hello response** |
+| 2 | `GET /v1/runners/{id}/status` | **200** `{"runner_id":"runner_token_1d478dbf9c4e196ef978633cb9c315e8","online":true}` |
+| 3 | `GET /v1/agents` | **200**, 20 agents; used `bff16b9fe359057d7766c82ef2db80e7` |
+| 4 | `POST /v1/sessions` | **201** id `598c454cebee4f6694ea26a1c4a18561`, `host_id:null`, labels `{"vitrine.mirror.spike":"s3","omnigent.client_surface":"web"}` |
+| 5 | `GET /v1/sessions/{id}/permissions` | **200**: only the owner grant (`nick.isaacs@…`, level 4); **no `__public__`** |
+| 6 | `DELETE /v1/sessions/{id}` | **200** `{"object":"conversation.deleted","deleted":true}` |
+| 7 | WS close | **1000 "runner idle shutdown"** |
+| 8 | `GET /v1/sessions/{id}` | **404** `not_found: Conversation not found` |
+| 9 | `GET /v1/runners/{id}/status` (2 s later) | **200** `{"online":false}` |
+
+Timestamps (UTC): connect 21:32:19.409, open 21:32:19.705, status 21:32:22.948, create 21:32:23.269, grants 21:32:23.366,
+delete 21:32:23.682, close 21:32:23.834, session read-back 21:32:23.913, runner read-back 21:32:26.005. Exit code 0.
+
+Notes:
+- The server added `omnigent.client_surface: web` on its own.
+- The create response did not echo `harness_override`, so the probe could not confirm from the response that `acp:vitrine` was stored.
+- Prod accepted the omnigent CLI token (the token issued after OIDC login) as the Bearer for both REST and the tunnel. Whether that is a raw OIDC id_token or an Omnigent session token was not determined; either way, it is what a Vitrine user's CLI login yields.
+
+### Go / no-go (final)
+- **B1: GO.** Prod accepts a self-minted binding token with a real user bearer and no runner allow-list (consistent with the token var being unset in omnigent-ops). The runner shows online to its owner and goes offline on a graceful close.
+- **B8: GO, with a caveat.** No `__public__` READ grant was added to a hostless session created this way, so mirrored sessions start private under prod's current default-public policy. That policy is server config (`new_session_starts_public`) and could change.
+
+## Run 1 (history): expired token
 
 ## Approval
 Nick approved the 9 calls below through the Lead, with bearer source (b): the omnigent CLI login,
@@ -41,7 +72,7 @@ the same auth failure. It is not evidence of a runner allow-list.
 - Step 4 never ran, so no session was created. The tunnel never opened (the upgrade was refused), so no runner was ever registered.
 - Read-back 9 returned 401, so the server has no authenticated view to confirm offline state. But a refused upgrade cannot leave a runner online.
 
-## Go / no-go
+### Go / no-go (run 1)
 - **B1 (prod accepts Vitrine's tunnel with a real bearer):** **no verdict.** This run says nothing about the allow-list.
   It needs a re-run with a fresh login (`omnigent login --server https://omnigent.us1.ddbuild.io`) and fresh approval.
 - **B8 (a `__public__` READ grant is added automatically to a hostless session):** **no verdict.** No session was created.
@@ -50,6 +81,6 @@ the same auth failure. It is not evidence of a runner allow-list.
 - **Auth type:** the CLI token may be an Omnigent session token issued after OIDC login, not the raw OIDC id_token.
   In this run the server accepted neither form, because the token had expired. A re-run should note which form a fresh token is.
 - **S1 contrast:** S1 authenticated with an accounts JWT on a local server, not real OIDC. Its allow-list refusal was simulated with
-  `X-Forwarded-For`, because loopback bypasses the allow-list. A live S3 handshake with a real prod bearer is still the remaining auth check, and it is **still open**.
+  `X-Forwarded-For`, because loopback bypasses the allow-list. A live S3 handshake with a real prod bearer is still the remaining auth check, and it is now **covered by run 2**.
 - **Scope:** the probe has no reconnect/backoff, token refresh or `event.batch`. S1's no-op handling of non-message requests is
   not a production stance. Interrupts and approvals will need real handling later.
