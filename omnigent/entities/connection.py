@@ -38,6 +38,7 @@ class ProviderConnection:
     metadata: dict[str, Any]
     created_at: int
     updated_at: int
+    credential_revision: str | None = dataclasses.field(default=None, repr=False)
 
     def __repr__(self) -> str:
         # ``is not None`` (not truthiness) so a loaded-but-empty secret still

@@ -24,6 +24,7 @@ password hash, not an IdP authorization code exchange.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import re
@@ -776,7 +777,7 @@ def create_accounts_auth_router(
         if scheduled_task_store is not None and scheduler is not None and not persistent:
             owned_task_ids = [t.id for t in scheduled_task_store.list(owner_user_id=user_id)]
 
-        result = account_store.delete_user(user_id)
+        result = await asyncio.to_thread(account_store.delete_user, user_id)
         if result is None:
             return JSONResponse(status_code=404, content={"error": "not found"})
         if result is False:

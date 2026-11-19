@@ -7,9 +7,11 @@ Header/OIDC identities leave the accounts-specific columns unset.
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import cast
 
 from sqlalchemy import and_, delete, exists, or_, select, update
@@ -195,6 +197,15 @@ def _to_account_token(row: SqlAccountToken) -> AccountToken:
     )
 
 
+@dataclass(frozen=True, repr=False)
+class _RetiredCredential:
+    workspace_id: int
+    user_id: str
+    provider: str
+    account_id: str
+    secret_enc: str = field(repr=False)
+
+
 class SqlAlchemyAccountStore:
     """SQLAlchemy-backed persistence for accounts-mode credentials and tokens.
 
@@ -208,7 +219,10 @@ class SqlAlchemyAccountStore:
         with PermissionStore via :func:`get_or_create_engine`.
     """
 
-    def __init__(self, storage_location: str) -> None:
+    def __init__(
+        self, storage_location: str, *, retire_deleted: Callable[..., None] | None = None
+    ) -> None:
+        self._retire_deleted = retire_deleted
         self.storage_location = storage_location
         self._engine = get_or_create_engine(storage_location)
         self._session = make_named_managed_session_maker(
@@ -483,7 +497,7 @@ class SqlAlchemyAccountStore:
             user exists.
         """
 
-        def write(session: Session) -> bool | None:
+        def write(session: Session) -> tuple[bool | None, tuple[_RetiredCredential, ...]]:
             # Acquire the complete lock set in username order, including the
             # actor and target, before checking the last-admin invariant.
             actor = current_account_user()
@@ -492,11 +506,25 @@ class SqlAlchemyAccountStore:
             require_active_account(session, None)
             target = lock_account(session, user_id)
             if target is None or target.deleted_at is not None:
-                return None
+                return None, ()
             if target.is_admin:
                 other_admins = [uid for uid in admin_ids if uid != user_id]
                 if not other_admins:
-                    return False
+                    return False, ()
+            retired = ()
+            if self._retire_deleted is not None:
+                query = select(SqlConnection).where(
+                    SqlConnection.workspace_id == current_workspace_id(),
+                    SqlConnection.user_id == user_id,
+                )
+                if self._supports_for_update:
+                    query = query.with_for_update()
+                retired = tuple(
+                    _RetiredCredential(
+                        row.workspace_id, row.user_id, row.provider, row.account_id, row.secret_enc
+                    )
+                    for row in session.execute(query).scalars()
+                )
             session.execute(
                 delete(SqlSessionPermission).where(
                     SqlSessionPermission.workspace_id == current_workspace_id(),
@@ -519,9 +547,22 @@ class SqlAlchemyAccountStore:
                     or_(SqlAccountToken.user_id == user_id, SqlAccountToken.created_by == user_id),
                 )
             )
-            return True
+            return True, retired
 
-        return run_write_transaction(self._session_immediate, "delete_user", write)
+        result, retired = run_write_transaction(self._session_immediate, "delete_user", write)
+        if self._retire_deleted is not None:
+            for item in retired:
+                try:
+                    self._retire_deleted(
+                        workspace_id=item.workspace_id,
+                        user_id=item.user_id,
+                        provider=item.provider,
+                        account_id=item.account_id,
+                        secret_enc=item.secret_enc,
+                    )
+                except Exception:  # noqa: BLE001 — cleanup must not reverse committed revocation
+                    logging.getLogger(__name__).warning("credential retirement failed")
+        return result
 
     def login_snapshot(self, user_id: str) -> tuple[str | None, str | None]:
         """Read the password and generation together before password verification."""

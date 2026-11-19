@@ -1,0 +1,11 @@
+[build-system]
+requires = []
+build-backend = "build_backend"
+backend-path = ["."]
+
+[project]
+name = "omnigent-test-credential-backend"
+version = "0.0.1"
+
+[project.entry-points."omnigent.credential_backends"]
+fixture = "fixture_credentials:build"

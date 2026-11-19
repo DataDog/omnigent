@@ -956,6 +956,7 @@ def _build_accounts_app(
     monkeypatch: pytest.MonkeyPatch,
     *,
     init_admin_password: str | None,
+    db_url_override: str | None = None,
 ) -> Iterator[TestClient]:
     """Build a production-shaped accounts-mode app + TestClient.
 
@@ -990,7 +991,7 @@ def _build_accounts_app(
     # Don't auto-open the browser during tests.
     monkeypatch.setenv("OMNIGENT_ACCOUNTS_AUTO_OPEN", "0")
 
-    db_url = f"sqlite:///{tmp_path}/test.db"
+    db_url = db_url_override or f"sqlite:///{tmp_path}/test.db"
     from omnigent.db.utils import get_or_create_engine
     from omnigent.runtime import init as init_runtime
     from omnigent.runtime import telemetry
@@ -2174,3 +2175,153 @@ def test_cli_login_with_issue_refresh_issues_grant(accounts_app: TestClient) -> 
     assert "access_token" in refresh_body
     # Login grants don't rotate — same token is returned.
     assert refresh_body["refresh_token"] == refresh_token
+
+
+def test_synthetic_account_delete_calls_retirement_after_commit(db_uri):
+    """Disposable SQLite only: the callback sees committed synthetic snapshots."""
+    from sqlalchemy.orm import Session
+
+    from omnigent.db.db_models import SqlConnection, current_workspace_id
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+    from tests.server.test_credential_store import _FakeCipher
+
+    retired = []
+    holder = {}
+
+    def retire_deleted(**snapshot):
+        with Session(holder["store"]._engine) as session:
+            identity = (
+                snapshot["workspace_id"],
+                snapshot["user_id"],
+                snapshot["provider"],
+                snapshot["account_id"],
+            )
+            assert session.get(SqlConnection, identity) is None
+        retired.append(snapshot)
+
+    accounts = SqlAlchemyAccountStore(db_uri, retire_deleted=retire_deleted)
+    holder["store"] = accounts
+    accounts.create_user_with_password("synthetic-user", "synthetic-hash")
+    raw = CredentialStore(db_uri, _FakeCipher())
+    expected = {}
+    for provider in ("github", "mcp-pending:fixture"):
+        raw.upsert("synthetic-user", provider, secret={"token": "synthetic"}, metadata={})
+        with Session(accounts._engine) as session, session.begin():
+            row = session.get(
+                SqlConnection, (current_workspace_id(), "synthetic-user", provider, "")
+            )
+            row.secret_enc = f"onook:v1:synthetic-{provider}"
+            expected[provider] = row.secret_enc
+    assert accounts.delete_user("synthetic-user") is True
+    assert accounts.get_user("synthetic-user") is None
+    assert {item["provider"]: item["secret_enc"] for item in retired} == expected
+    assert all(
+        (item["workspace_id"], item["user_id"], item["account_id"])
+        == (current_workspace_id(), "synthetic-user", "")
+        for item in retired
+    )
+
+
+def test_synthetic_retirement_failure_preserves_committed_revocation(db_uri):
+    """The trusted local test callback fails; committed SQL revocation survives."""
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+    from tests.server.test_credential_store import _FakeCipher
+
+    seen = []
+
+    def fail_retirement(**snapshot):
+        seen.append(snapshot)
+        raise RuntimeError("synthetic-cleanup-failure")
+
+    accounts = SqlAlchemyAccountStore(db_uri, retire_deleted=fail_retirement)
+    accounts.create_user_with_password("synthetic-user", "synthetic-hash")
+    raw = CredentialStore(db_uri, _FakeCipher())
+    raw.upsert("synthetic-user", "github", secret={"token": "synthetic"}, metadata={})
+    assert accounts.delete_user("synthetic-user") is True
+    assert len(seen) == 1
+    assert accounts.get_user("synthetic-user") is None
+    assert raw.get("synthetic-user", "github") is None
+
+
+def test_synthetic_delayed_retirement_preserves_new_generation(db_uri):
+    """A local callback paused after commit receives only the old snapshot."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+    from tests.server.test_credential_store import _FakeCipher
+
+    entered, release = Event(), Event()
+    snapshots = []
+
+    def retire_deleted(**snapshot):
+        snapshots.append(snapshot)
+        entered.set()
+        assert release.wait(10)
+
+    accounts = SqlAlchemyAccountStore(db_uri, retire_deleted=retire_deleted)
+    original = accounts.create_user_with_password("synthetic-user", "synthetic-old-hash")
+    raw = CredentialStore(db_uri, _FakeCipher())
+    raw.upsert("synthetic-user", "github", secret={"token": "synthetic-old"}, metadata={})
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        deleting = executor.submit(accounts.delete_user, "synthetic-user")
+        try:
+            assert entered.wait(10)
+            assert accounts.get_user("synthetic-user") is None
+            replacement = accounts.create_user_with_password(
+                "synthetic-user", "synthetic-new-hash"
+            )
+            assert replacement.account_generation != original.account_generation
+            raw.upsert("synthetic-user", "github", secret={"token": "synthetic-new"}, metadata={})
+        finally:
+            release.set()
+        assert deleting.result(timeout=10) is True
+    assert len(snapshots) == 1
+    assert raw.get("synthetic-user", "github", with_secret=True).secret == {
+        "token": "synthetic-new"
+    }
+
+
+@pytest.mark.parametrize("outcome", ["rolled_back", "committed_ack_lost"])
+def test_synthetic_unknown_delete_commit_never_retires(db_uri, monkeypatch, outcome):
+    """A local commit-boundary fault never triggers an unconfirmed callback."""
+    import omnigent.server.accounts_store as accounts_module
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+    from tests.server.test_credential_store import _FakeCipher
+
+    retired = []
+    accounts = SqlAlchemyAccountStore(
+        db_uri, retire_deleted=lambda **snapshot: retired.append(snapshot)
+    )
+    accounts.create_user_with_password("synthetic-user", "synthetic-hash")
+    raw = CredentialStore(db_uri, _FakeCipher())
+    raw.upsert("synthetic-user", "github", secret={"token": "synthetic"}, metadata={})
+    original = accounts_module.run_write_transaction
+
+    def uncertain(session_maker, name, operation):
+        if name != "delete_user":
+            return original(session_maker, name, operation)
+        if outcome == "rolled_back":
+
+            def abort(session):
+                operation(session)
+                raise RuntimeError("synthetic lost acknowledgment")
+
+            return original(session_maker, name, abort)
+        original(session_maker, name, operation)
+        raise RuntimeError("synthetic lost acknowledgment")
+
+    monkeypatch.setattr(accounts_module, "run_write_transaction", uncertain)
+    with pytest.raises(RuntimeError, match="synthetic lost acknowledgment"):
+        accounts.delete_user("synthetic-user")
+    assert retired == []
+    if outcome == "rolled_back":
+        assert accounts.get_user("synthetic-user") is not None
+        assert raw.get("synthetic-user", "github") is not None
+    else:
+        assert accounts.get_user("synthetic-user") is None
+        assert raw.get("synthetic-user", "github") is None
