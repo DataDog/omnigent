@@ -23,6 +23,10 @@ pytestmark = pytest.mark.asyncio
 
 @pytest.fixture
 def app(runtime_init, db_uri, tmp_path):
+    return _make_app(db_uri, tmp_path)
+
+
+def _make_app(db_uri, tmp_path, **kwargs):
     from omnigent.runtime import get_agent_cache, get_agent_store, get_conversation_store
     from omnigent.server.app import create_app
     from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -34,6 +38,7 @@ def app(runtime_init, db_uri, tmp_path):
         agent_cache=get_agent_cache(),
         artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
         file_store=SqlAlchemyFileStore(db_uri),
+        **kwargs,
     )
 
 
@@ -601,3 +606,253 @@ async def test_source_name_conflict_can_be_resolved_by_removing_selection(client
     assert (await client.delete(f"{url}/tracker")).status_code == 204
     servers = (await client.get(url)).json()["data"]
     assert [(s["name"], s["transport"]) for s in servers] == [("tracker", "http")]
+
+
+async def test_installed_plugin_factory_oauth_bearer_refresh_execution_and_outages(
+    runtime_init, db_uri, tmp_path, monkeypatch, installed_credential_plugin
+):
+    """Real app wiring and MCP client, with HTTP fixtures only at provider boundaries."""
+    import base64
+    import hashlib
+    from types import SimpleNamespace
+    from urllib.parse import parse_qs, urlsplit
+
+    import respx
+
+    from omnigent.server import mcp_registry as registry_module
+    from omnigent.stores.credential_store import token_cache as cache_module
+    from omnigent.stores.credential_store.backend import build_credential_backend
+
+    monkeypatch.setenv("OMNIGENT_MCP_CREDENTIAL_BACKEND", "fixture")
+    monkeypatch.setenv("OMNIGENT_MCP_OAUTH_STATE_SECRET", "synthetic-state-key-32-characters-long")
+    clock = SimpleNamespace(now=1000)
+    monkeypatch.setattr(registry_module, "time", SimpleNamespace(time=lambda: clock.now))
+    monkeypatch.setattr(cache_module, "time", SimpleNamespace(time=lambda: clock.now))
+    monkeypatch.setattr(cache_module.random, "uniform", lambda *_: 0)
+    backend = build_credential_backend(storage_location=db_uri)
+    remote = backend.cache.backend.remote
+    services = [
+        McpService(
+            id="oauth",
+            title="OAuth",
+            url="https://fixture.test/mcp",
+            tools=["read_ticket"],
+            auth="oauth",
+            oauth={
+                "authorize_url": "https://fixture.test/authorize",
+                "token_url": "https://fixture.test/token",
+                "client_id": "fixture",
+            },
+        ),
+        McpService(
+            id="bearer",
+            title="Bearer",
+            url="https://fixture.test/mcp",
+            tools=["read_ticket"],
+            auth="bearer",
+        ),
+    ]
+    registry = McpRegistry(
+        McpRegistryConfig(public_url="https://test", services=services), backend
+    )
+    app = _make_app(db_uri, tmp_path, mcp_registry=registry)
+    forms, used_tokens = [], []
+    challenge = None
+
+    def token_response(request):
+        form = parse_qs(request.content.decode())
+        forms.append(form)
+        if form["grant_type"] == ["authorization_code"]:
+            verifier = form["code_verifier"][0]
+            assert (
+                base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+                .rstrip(b"=")
+                .decode()
+                == challenge
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "initial-private",
+                    "refresh_token": "rotate-private",
+                    "expires_in": 1000,
+                },
+            )
+        assert form["refresh_token"] == ["rotate-private"]
+        return httpx.Response(200, json={"access_token": "refreshed-private", "expires_in": 1000})
+
+    def mcp_response(request):
+        if request.method == "GET":
+            return httpx.Response(405)
+        if request.method == "DELETE":
+            return httpx.Response(200)
+        used_tokens.append(request.headers.get("authorization"))
+        message = json.loads(request.content)
+        if "id" not in message:
+            return httpx.Response(202)
+        if message["method"] == "initialize":
+            result = {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "fixture", "version": "1"},
+            }
+        elif message["method"] == "tools/call":
+            result = {"content": [{"type": "text", "text": "fixture result"}]}
+        else:
+            result = {"tools": [{"name": "read_ticket", "inputSchema": {"type": "object"}}]}
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": message["id"], "result": result})
+
+    with respx.mock(assert_all_called=False) as provider:
+        token_route = provider.post("https://fixture.test/token").mock(side_effect=token_response)
+        provider.route(host="fixture.test", path="/mcp").mock(side_effect=mcp_response)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as browser:
+            remote.unavailable = True
+            failed_start = await browser.get("/v1/connections/mcp-oauth/connect")
+            assert failed_start.status_code == 302
+            assert "temporarily_unavailable" in failed_start.headers["location"]
+            remote.unavailable = False
+            start = await browser.get("/v1/connections/mcp-oauth/connect")
+            query = parse_qs(urlsplit(start.headers["location"]).query)
+            challenge = query["code_challenge"][0]
+            pending = backend.get("local", "mcp-pending:oauth", with_secret=True)
+            assert pending.secret.keys() == {"verifier", "nonce"}
+            remote.unavailable = True
+            failed_callback = await browser.get(
+                "/v1/connections/mcp-oauth/callback",
+                params={"code": "fixture", "state": query["state"][0]},
+            )
+            assert "temporarily_unavailable" in failed_callback.headers["location"]
+            assert backend.get("local", "mcp-pending:oauth") is not None
+            remote.unavailable = False
+            complete = await browser.get(
+                "/v1/connections/mcp-oauth/callback",
+                params={"code": "fixture", "state": query["state"][0]},
+            )
+            assert "mcp-oauth=connected" in complete.headers["location"]
+            assert backend.get("local", "mcp-pending:oauth") is None
+            status = await browser.get("/v1/connections/mcp-oauth/status")
+            assert status.status_code == 200 and status.json()["connected"] is True
+            assert "private" not in status.text
+            assert (
+                await browser.put(
+                    "/v1/mcp-registry/services/bearer/connection", json={"token": "manual-private"}
+                )
+            ).status_code == 200
+            assert (await browser.post("/v1/mcp-registry/services/bearer/test")).json() == {
+                "tools": ["read_ticket"]
+            }
+            assert "Bearer manual-private" in used_tokens
+            assert (await browser.post("/v1/mcp-registry/services/oauth/test")).status_code == 200
+            reads = remote.reads
+            clock.now = 1200
+            assert (await browser.post("/v1/mcp-registry/services/oauth/test")).status_code == 200
+            assert remote.reads == reads
+            clock.now = 1600
+            result = await registry.execute("oauth", "local", app.state, tool="read_ticket")
+            assert result.content[0].text == "fixture result"
+            assert used_tokens[-1] == "Bearer refreshed-private"
+            assert token_route.call_count == 2
+            assert (
+                backend.get("local", "mcp:oauth", with_secret=True).secret["refresh_token"]
+                == "rotate-private"
+            )
+            session = await create_test_session(browser, name="plugin-registry")
+            session_id = session["id"]
+            attached = await browser.post(
+                f"/v1/sessions/{session_id}/agent/mcp-servers",
+                json={"name": "oauth", "transport": "registry"},
+            )
+            assert attached.status_code == 200, attached.text
+            gateway_headers = {"X-Omnigent-Session-Id": session_id}
+            listed = await browser.post(
+                "/v1/mcp/oauth",
+                headers=gateway_headers,
+                json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            )
+            assert listed.status_code == 200 and "result" in listed.json(), listed.text
+            # Clear the cache to exercise a required remote read during an outage.
+            backend.cache.invalidate("local", "mcp:oauth")
+            remote.unavailable = True
+            unavailable = await browser.post("/v1/mcp-registry/services/oauth/test")
+            assert unavailable.status_code == 503
+            assert (
+                "temporarily unavailable" in unavailable.text and "private" not in unavailable.text
+            )
+            for rpc in [
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "read_ticket", "arguments": {}},
+                },
+            ]:
+                failure = await browser.post("/v1/mcp/oauth", headers=gateway_headers, json=rpc)
+                assert failure.status_code == 200, failure.text
+                assert failure.json()["error"]["code"] == -32001, failure.text
+                assert "temporarily unavailable" in failure.json()["error"]["message"]
+                assert "private" not in failure.text
+            # Metadata status is truthful and never fetches remote secrets.
+            assert (await browser.get("/v1/connections/mcp-oauth/status")).json()[
+                "connected"
+            ] is True
+            remote.unavailable = False
+            assert (
+                await browser.delete("/v1/mcp-registry/services/oauth/connection")
+            ).status_code == 200
+            assert (await browser.get("/v1/connections/mcp-oauth/status")).json()[
+                "connected"
+            ] is False
+            assert (await browser.post("/v1/mcp-registry/services/oauth/test")).status_code == 400
+            assert (await browser.post("/v1/connections/mcp-oauth/disconnect")).json() == {
+                "disconnected": False
+            }
+
+
+async def test_installed_plugin_real_cli_startup_without_sql_cipher(
+    tmp_path, installed_credential_plugin
+):
+    import os
+
+    from tests._helpers.live_server import isolated_local_server
+
+    catalog = tmp_path / "registry.yaml"
+    catalog.write_text(
+        "services:\n  - id: fixture\n    title: Fixture\n"
+        "    url: https://fixture.test/mcp\n    tools: [read]\n"
+    )
+    with isolated_local_server(
+        tmp_path / "server",
+        env={
+            "PYTHONPATH": os.pathsep.join(
+                [str(installed_credential_plugin), os.environ.get("PYTHONPATH", "")]
+            ),
+            "OMNIGENT_MCP_CREDENTIAL_BACKEND": "fixture",
+            "OMNIGENT_MCP_REGISTRY": str(catalog),
+            "OMNIGENT_CREDENTIAL_KMS_KEY_ID": None,
+            "OMNIGENT_CREDENTIAL_CIPHER": None,
+            "OMNIGENT_CREDENTIAL_ENC_KEY": None,
+            "OMNIGENT_GITHUB_APP_CLIENT_ID": "fixture-client",
+            "OMNIGENT_GITHUB_APP_CLIENT_SECRET": "fixture-secret",
+            "OMNIGENT_GITHUB_APP_REDIRECT_URI": "https://callback.test/github",
+            "OMNIGENT_DATABRICKS_CLIENT_ID": "fixture-client",
+            "OMNIGENT_DATABRICKS_CLIENT_SECRET": "fixture-secret",
+            "OMNIGENT_DATABRICKS_REDIRECT_URI": "https://callback.test/databricks",
+        },
+    ) as url:
+        with httpx.Client(base_url=url, trust_env=False) as client:
+            saved = client.put(
+                "/v1/mcp-registry/services/fixture/connection", json={"token": "synthetic-private"}
+            )
+            assert saved.status_code == 200, saved.text
+            catalog_response = client.get("/v1/mcp-registry/services")
+            assert catalog_response.json()["data"][0]["connected"] is True
+            assert "synthetic-private" not in catalog_response.text
+            assert client.delete("/v1/mcp-registry/services/fixture/connection").status_code == 200
+            for provider in ("github", "databricks"):
+                status = client.get(f"/v1/connections/{provider}/status")
+                assert status.status_code == 200, status.text
+                assert status.json()["enabled"] is True
+                assert status.json()["connected"] is False

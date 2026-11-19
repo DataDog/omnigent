@@ -19,6 +19,7 @@ from omnigent.server.databricks_app import (
     token_set_from_payload,
     token_url,
 )
+from omnigent.stores.credential_store.refresh_retry import refresh_retry_safe
 
 # SCIM "current user" on the workspace host — reports the connected identity.
 _ME_PATH = "/api/2.0/preview/scim/v2/Me"
@@ -83,5 +84,9 @@ class DatabricksAppClient:
                 headers={"Accept": "application/json"},
             )
         if resp.status_code != 200:
-            raise DatabricksAppError(f"Databricks token endpoint returned {resp.status_code}")
+            raise DatabricksAppError(
+                "Credential provider token request failed",
+                reauth_required=resp.status_code in (400, 401),
+                refresh_retry_safe=refresh_retry_safe(resp),
+            )
         return token_set_from_payload(resp.json())
