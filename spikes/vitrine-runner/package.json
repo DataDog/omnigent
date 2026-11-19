@@ -22,7 +22,7 @@
     "check:9": "node --experimental-strip-types src/checks/check9.ts"
   },
   "dependencies": {
-    "ws": "8.18.0"
+    "ws": "8.22.2"
   },
   "devDependencies": {
     "@types/ws": "8.5.12",

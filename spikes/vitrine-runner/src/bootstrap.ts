@@ -1,9 +1,14 @@
 // Create the two spike users: alice (first-run admin) and bob (invited).
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { Api } from "./api.ts";
-import { RUN_DIR, loginAs, serverBaseUrl, writeUsers } from "./env.ts";
+import { RUN_DIR, loginAs, serverBaseUrl, usersFile, writeUsers } from "./env.ts";
+
+if (existsSync(usersFile())) {
+  console.log("users already bootstrapped; reusing", usersFile());
+  process.exit(0);
+}
 
 const alicePassword = readFileSync(join(RUN_DIR, "admin_password"), "utf-8").trim();
 const bobPassword = randomBytes(12).toString("hex");
