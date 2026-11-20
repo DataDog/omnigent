@@ -225,6 +225,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _RUNNER_FORWARD_TIMEOUT,
     _RUNNER_RELAY_READY_TIMEOUT_S,
     _RUNNER_SESSION_INIT_TIMEOUT_S,
+    _STALE_RUNNING_GRACE_S,
     _SUBAGENT_FORWARD_RECONNECT_WAIT_S,
     _TERMINAL_RESPONSE_EVENT_TYPES,
     _TURN_ACTOR_LABEL,
@@ -251,6 +252,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _runner_relay_tasks,
     _runner_status_probe_backoff,
     _runner_status_probe_inflight,
+    _runner_status_probe_invalidated,
     _RunnerStatusProbeBackoff,
     _session_active_response_cache,
     _session_background_agents_cache,
@@ -261,9 +263,11 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
+    _stale_running_since,
     _unbound_managed_launch_tasks,
     get_caps,
     get_server_runner_router,
+    note_stale_running_status,
     session_stream,
     set_server_runner_router,
 )
@@ -14029,13 +14033,17 @@ def _runner_status_probe_window_s(failures: int) -> float:
 
 
 async def _probe_runner_live_status(
-    runner_client: httpx.AsyncClient, session_id: str, runner_id: str | None = None
+    runner_client: httpx.AsyncClient,
+    session_id: str,
+    runner_id: str | None = None,
+    *,
+    settle_stale_running_404: bool = False,
 ) -> str | None:
     """
     Ask a session's bound runner for its live status, bounded, shared, and backed off.
 
     Concurrent snapshots of one session await the same in-flight probe. A 200
-    fills ``_session_status_cache`` only if no live event has filled it meanwhile.
+    updates ``_session_status_cache`` only if no status edge arrived meanwhile.
     A timeout, transport failure, or slow reply without a status puts the session
     in a skip window that doubles per consecutive slow probe.
 
@@ -14044,6 +14052,11 @@ async def _probe_runner_live_status(
     :param runner_id: The session's bound runner, e.g.
         ``"runner_0123456789abcdef"``. A skip window recorded against a
         different runner is discarded so a rebound session is probed at once.
+    :param settle_stale_running_404: When ``True``, a prompt 404 from a
+        responsive runner settles the session idle instead of asking again —
+        reserved for statuses cached ``running`` past the stale-running grace,
+        where a 404 means the runner no longer holds the session rather than
+        "session init has not landed yet".
     :returns: The newer cached status or the runner's raw status, e.g.
         ``"running"``, or ``None`` when the probe is in backoff, timed out,
         failed, or returned a non-200.
@@ -14055,7 +14068,15 @@ async def _probe_runner_live_status(
             _runner_status_probe_backoff.pop(session_id, None)
         elif backoff is not None and time.monotonic() < backoff.skip_until:
             return None
-        probe = asyncio.create_task(_run_runner_status_probe(runner_client, session_id, runner_id))
+        _runner_status_probe_invalidated[session_id] = False
+        probe = asyncio.create_task(
+            _run_runner_status_probe(
+                runner_client,
+                session_id,
+                runner_id,
+                settle_stale_running_404=settle_stale_running_404,
+            )
+        )
         _runner_status_probe_inflight[session_id] = probe
     # Shielded so one cancelled snapshot request does not abort the probe the
     # other waiters share.
@@ -14063,7 +14084,11 @@ async def _probe_runner_live_status(
 
 
 async def _run_runner_status_probe(
-    runner_client: httpx.AsyncClient, session_id: str, runner_id: str | None
+    runner_client: httpx.AsyncClient,
+    session_id: str,
+    runner_id: str | None,
+    *,
+    settle_stale_running_404: bool = False,
 ) -> str | None:
     """
     Run one bounded runner status probe and record its outcome.
@@ -14071,10 +14096,14 @@ async def _run_runner_status_probe(
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param runner_id: The session's bound runner, recorded with any skip window.
+    :param settle_stale_running_404: Settle a prompt 404 to ``idle`` (see
+        :func:`_probe_runner_live_status`).
     :returns: The newer cached status or the runner's raw status on a 200,
         else ``None``.
     """
     started = time.monotonic()
+    cached_at_start = _session_status_cache.get(session_id)
+    _runner_status_probe_invalidated.setdefault(session_id, False)
     try:
         try:
             resp = await asyncio.wait_for(
@@ -14089,20 +14118,25 @@ async def _run_runner_status_probe(
             failure = f"{type(exc).__name__}: {exc}"
         else:
             elapsed = time.monotonic() - started
+            published_status = _session_status_cache.get(session_id)
+            # A status edge wins even when it repeats the cached value or starts
+            # a new turn while the probe waits. A stale cache alone does not.
+            if (
+                _runner_status_probe_invalidated.get(session_id)
+                or published_status != cached_at_start
+                or (not settle_stale_running_404 and published_status is not None)
+            ):
+                _runner_status_probe_backoff.pop(session_id, None)
+                return published_status
             if resp.status_code == 200:
                 try:
                     payload = resp.json()
                 except ValueError:
                     payload = None
                 if isinstance(payload, dict):
-                    # Probes fill a cold cache; a turn edge received while the
-                    # request waited takes precedence over its sampled status.
-                    published_status = _session_status_cache.get(session_id)
-                    if published_status is not None:
-                        _runner_status_probe_backoff.pop(session_id, None)
-                        return published_status
                     raw = str(payload.get("status", "idle"))
                     _session_status_cache[session_id] = raw
+                    note_stale_running_status(session_id, raw)
                     if raw in ("idle", "running", "waiting", "failed"):
                         session_live_state.persist_live_status(session_id, raw)
                     _runner_status_probe_backoff.pop(session_id, None)
@@ -14110,6 +14144,22 @@ async def _run_runner_status_probe(
                 failure = "HTTP 200 with a malformed body"
             elif elapsed < _RUNNER_STATUS_PROBE_SLOW_S:
                 _runner_status_probe_backoff.pop(session_id, None)
+                if settle_stale_running_404 and resp.status_code == 404:
+                    # A responsive runner says the session is not on it. For a
+                    # status cached running past the stale-running grace that is
+                    # "the runner dropped the finished session", not "session
+                    # init has not landed yet" — settle idle so the child cannot
+                    # stay busy forever after its terminal edge was lost.
+                    _session_status_cache[session_id] = "idle"
+                    note_stale_running_status(session_id, "idle")
+                    session_live_state.persist_live_status(session_id, "idle")
+                    _logger.info(
+                        "Runner status probe for session=%s answered 404; "
+                        "settling stale running status to idle",
+                        session_id,
+                        extra={"session_id": session_id},
+                    )
+                    return "idle"
                 _logger.debug(
                     "Runner status probe for session=%s answered HTTP %s",
                     session_id,
@@ -14135,6 +14185,7 @@ async def _run_runner_status_probe(
         return None
     finally:
         _runner_status_probe_inflight.pop(session_id, None)
+        _runner_status_probe_invalidated.pop(session_id, None)
 
 
 async def _get_session_snapshot(
@@ -14267,6 +14318,17 @@ async def _get_session_snapshot(
     # Prefer it because native injection can finish before an external harness turn,
     # making the runner's generic active-turn probe report a false ``idle``.
     status = _session_status_from_cache(session_id, conv.live_status)
+    cached_status = _session_status_cache.get(session_id)
+    if cached_status not in ("running", "waiting"):
+        # The status left the mid-turn set (or was never in it): clear any
+        # stale-running clock so this session's NEXT turn starts a fresh
+        # grace instead of inheriting a first-seen time from a previous turn
+        # and being probed — potentially settled idle while live — within
+        # its own grace. ``_publish_status`` clears it too; this read path
+        # covers statuses written directly (the runner status probe) and
+        # keeps the tracker from leaking an entry per session ever seen
+        # running.
+        _stale_running_since.pop(session_id, None)
     if status == "idle":
         # Cache miss (or truly idle): either the server restarted, or the
         # relay has not yet published the first ``"running"`` event for a
@@ -14283,6 +14345,31 @@ async def _get_session_snapshot(
         ):
             await _probe_runner_live_status(runner_client, session_id, conv.runner_id)
             status = _session_status_from_cache(session_id, conv.live_status)
+    elif (
+        include_live_status
+        and runner_client is not None
+        and cached_status
+        in (
+            "running",
+            "waiting",
+        )
+    ):
+        # Stale-running correction: a terminal edge that never landed (a lost
+        # forwarder POST, a dropped relay) leaves the cache ``running`` forever
+        # while the runner has already finished or dropped the session. After
+        # the grace, trust the bound runner's live answer — it never stamps a
+        # child the runner still reports running/waiting. Freshly bound
+        # sessions stay protected by the grace (see _STALE_RUNNING_GRACE_S).
+        first_seen = _stale_running_since.setdefault(session_id, time.monotonic())
+        if time.monotonic() - first_seen >= _STALE_RUNNING_GRACE_S:
+            probed = await _probe_runner_live_status(
+                runner_client,
+                session_id,
+                conv.runner_id,
+                settle_stale_running_404=True,
+            )
+            if probed is not None:
+                status = _session_status_from_cache(session_id, status)
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
     last_total_tokens: int | None = None

@@ -1144,3 +1144,73 @@ async def test_parent_output_forwards_while_child_history_is_blocked(
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+@pytest.mark.asyncio
+async def test_permanent_status_rejection_is_logged_as_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A permanently rejected idle observation is surfaced loudly, then throttled.
+
+    A 401-class rejection never lands the terminal edge; without the ERROR
+    escalation the child stays busy forever with only per-poll warnings. The
+    watcher retries each poll, so repeats are throttled instead of spamming.
+    """
+    monkeypatch.setattr(forwarder, "_PERMANENT_STATUS_ERROR_LOGGED_AT", {})
+    caplog.set_level(logging.DEBUG, logger=forwarder.__name__)
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
+    (subagents_dir / "agent-unauthorized.jsonl").write_text("", encoding="utf-8")
+    entry = forwarder.SubagentEntry(
+        subagent_id="unauthorized",
+        child_conversation_id="conv_child_unauthorized",
+        last_activity_ts=time.time() - 60,
+        last_status="running",
+    )
+    checkpoint = forwarder._SubagentStateCheckpoint(
+        bridge_dir,
+        forwarder.SubagentForwardState(subagents={"unauthorized": entry}),
+    )
+
+    def reject_with_401(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": {"code": "unauthorized"}})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(reject_with_401),
+        base_url="http://ap",
+    ) as client:
+        status_retry_tracker = forwarder._PostRetryTracker(
+            base_delay_s=0.0,
+            max_permanent_attempts=1,
+        )
+        for _ in range(2):
+            await forwarder._forward_one_subagent(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                subagents_dir=subagents_dir,
+                entry=entry,
+                agent_name="claude-native-ui",
+                checkpoint=checkpoint,
+                item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                status_retry_tracker=status_retry_tracker,
+                batch_capability=forwarder._SessionEventBatchCapability(),
+                status_capability=forwarder._SubagentStatusCapability(),
+            )
+
+    status_failures = [
+        record
+        for record in caplog.records
+        if "Failed to forward claude-native sub-agent status" in record.getMessage()
+    ]
+    errors = [record for record in status_failures if record.levelno == logging.ERROR]
+    assert len(errors) == 1, [record.levelname for record in status_failures]
+    assert "permanently rejected" in errors[0].getMessage()
+    assert "401" in errors[0].getMessage()
+    assert len(status_failures) == 2
+    assert status_failures[1].levelno == logging.WARNING
+    assert "permanently rejected" not in status_failures[1].getMessage()

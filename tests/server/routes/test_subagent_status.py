@@ -32,6 +32,10 @@ from tests.server.routes.test_sessions_runner_relay import _ScriptedRunnerClient
 
 _BACKGROUND_TASK = BackgroundTaskInfo(status="running", description="Wait for CI")
 
+# The ambiguous idle observation the route mirrors to the runner: no turn
+# outcome, so the runner settles nothing for forwarder-confirmed harnesses.
+_IDLE_OBSERVATION_FORWARD = {"type": "external_session_status", "data": {"status": "idle"}}
+
 
 async def _flush_live_state() -> None:
     """Wait for ordered persistence and parent fanout before inspecting their effects."""
@@ -239,7 +243,13 @@ async def test_subagent_idle_publishes_status_without_completion(
         )
     else:
         assert len(events) == 1
-    assert route.forwarded == []
+    if is_child:
+        # The idle observation is mirrored to the runner as an AMBIGUOUS
+        # external_session_status (no turn outcome) so an already-settled
+        # work entry can retry its pending parent delivery.
+        assert route.forwarded == [(f"/v1/sessions/{sid}/events", _IDLE_OBSERVATION_FORWARD)]
+    else:
+        assert route.forwarded == []
     route.telemetry.assert_not_called()
 
 
@@ -275,7 +285,9 @@ async def test_offline_sweep_refreshes_child_status_after_idle_observation(
     assert sessions._last_task_error_from_labels(child.labels) is None
     assert route.store.list_items(route.parent_id).data == []
     route.published.assert_not_called()
-    assert route.forwarded == []
+    assert route.forwarded == [
+        (f"/v1/sessions/{route.child_id}/events", _IDLE_OBSERVATION_FORWARD)
+    ]
 
     decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
     assert decision["session_id"] == route.child_id

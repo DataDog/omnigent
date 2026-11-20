@@ -1127,6 +1127,7 @@ def _use_runner_client(monkeypatch: pytest.MonkeyPatch, runner_client: object) -
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("initial_status", [None, "running", "waiting"])
 @pytest.mark.parametrize("probe_http_status", [200, 404])
 @pytest.mark.parametrize(
     ("probed_status", "published_status"),
@@ -1137,9 +1138,12 @@ async def test_session_snapshot_preserves_status_published_during_probe(
     probed_status: str,
     published_status: str,
     probe_http_status: int,
+    initial_status: str | None,
 ) -> None:
     """A late status reply cannot undo a turn edge or make completed work fail on disconnect."""
-    from omnigent.server.routes._sessions import helpers, orchestration
+    import time
+
+    from omnigent.server.routes._sessions import common, helpers, orchestration
 
     session_id = "52970ab86e2a4eeaa9804421091d5002"
     conv = Conversation(
@@ -1153,6 +1157,9 @@ async def test_session_snapshot_preserves_status_published_during_probe(
     conv_store = _ConversationStore([], conversations={session_id: conv})
     _sessions_mod._session_status_cache.pop(session_id, None)
     _sessions_mod._runner_status_probe_backoff.pop(session_id, None)
+    if initial_status is not None:
+        _sessions_mod._session_status_cache[session_id] = initial_status
+        monkeypatch.setitem(common._stale_running_since, session_id, time.monotonic() - 10_000)
     persisted: list[tuple[str, str]] = []
     monkeypatch.setattr(
         helpers.session_live_state,
@@ -1183,6 +1190,7 @@ async def test_session_snapshot_preserves_status_published_during_probe(
         assert _sessions_mod._session_status_cache.get(session_id) == published_status
         assert persisted == [(session_id, published_status)]
         assert _sessions_mod._runner_status_probe_inflight.get(session_id) is None
+        assert common._runner_status_probe_invalidated.get(session_id) is None
         assert _sessions_mod._runner_status_probe_backoff.get(session_id) is None
         assert await orchestration._runner_disconnect_requires_failure(
             session_id,
@@ -1269,6 +1277,227 @@ async def test_session_snapshot_skips_runner_status_probe_when_excluded(
     full = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
     assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
     assert full.status == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runner_status", ["idle", "running", "failed"])
+async def test_session_snapshot_corrects_stale_running_from_runner_answer(
+    monkeypatch: pytest.MonkeyPatch, runner_status: str
+) -> None:
+    """A cached running status past the grace is corrected from the runner's live answer.
+
+    A native child whose terminal edge never landed (a lost forwarder POST)
+    otherwise stays busy forever: the cache is only probed on a cold miss.
+    """
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "7c1e9a2b4d6f8a0b3c5d7e9f1a3b5c7d"
+    _mod._session_status_cache[session_id] = "running"
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_stale_running_since", {})
+    monkeypatch.setattr(orchestration, "_STALE_RUNNING_GRACE_S", 0.0)
+
+    class _IdleRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=200, json=lambda: {"status": runner_status})
+
+    runner_client = _IdleRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert snapshot.status == runner_status
+    assert _mod._session_status_cache[session_id] == runner_status
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_stale_running_within_grace_is_not_probed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A running status younger than the grace is left alone — no probe, no settle.
+
+    Freshly bound sessions answer 404 or a false idle before session-init
+    lands; the grace keeps the correction away from them.
+    """
+    import time as _time
+
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "8d2f0b3c5e7a9b1c4d6f8a0b2c4d6f8a"
+    _mod._session_status_cache[session_id] = "running"
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(
+        orchestration,
+        "_stale_running_since",
+        {session_id: _time.monotonic()},
+    )
+
+    class _RecordingRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "idle"})
+
+    runner_client = _RecordingRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert runner_client.get_calls == []
+    assert snapshot.status == "running"
+    assert _mod._session_status_cache[session_id] == "running"
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_settles_stale_running_on_prompt_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prompt 404 from a responsive runner settles a stale running status idle.
+
+    Past the grace, a 404 means the runner no longer holds the session
+    (a finished child whose runner state was dropped), not "session init
+    has not landed yet".
+    """
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "9e3a1c4d6f8b0c2d5e7a9b1c3d5e7a9b"
+    _mod._session_status_cache[session_id] = "running"
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_stale_running_since", {})
+    monkeypatch.setattr(orchestration, "_STALE_RUNNING_GRACE_S", 0.0)
+
+    class _GoneRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=404, json=lambda: {"error": "not_found"})
+
+    runner_client = _GoneRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert snapshot.status == "idle"
+    assert _mod._session_status_cache[session_id] == "idle"
+
+
+def test_note_stale_running_status_arms_and_clears(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A mid-turn status arms the stale-running clock; leaving the set clears it.
+
+    The next turn must start a fresh grace: a first-seen time inherited from a
+    finished turn would let its first snapshot probe — and potentially settle
+    a live turn idle — immediately.
+    """
+    from omnigent.server.routes._sessions import common
+
+    monkeypatch.setattr(common, "_stale_running_since", {})
+    common.note_stale_running_status("conv_clock", "running")
+    assert "conv_clock" in common._stale_running_since
+    first_seen = common._stale_running_since["conv_clock"]
+    common.note_stale_running_status("conv_clock", "running")
+    assert common._stale_running_since["conv_clock"] == first_seen
+    common.note_stale_running_status("conv_clock", "idle")
+    assert "conv_clock" not in common._stale_running_since
+    common.note_stale_running_status("conv_clock", "running")
+    assert "conv_clock" in common._stale_running_since
+
+
+@pytest.mark.asyncio
+async def test_stale_running_clock_clears_when_status_leaves_mid_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A snapshot of a settled session clears its leftover stale-running clock.
+
+    Regression: the entry used to survive once the status left the mid-turn
+    set, so it leaked one dict entry per session ever seen running and let the
+    session's NEXT turn be probed (and settled idle while live) within its own
+    grace.
+    """
+    import time as _time
+
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "bf4c2d5e7a9b0c3d6e8f9a1b3c5d7e9f"
+    _mod._session_status_cache[session_id] = "failed"
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(
+        orchestration,
+        "_stale_running_since",
+        {session_id: _time.monotonic() - 10_000},
+    )
+
+    class _RecordingRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+
+    runner_client = _RecordingRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    assert snapshot.status == "failed"
+    assert runner_client.get_calls == []
+    assert session_id not in orchestration._stale_running_since
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("answer", "clock_survives"), [("idle", False), ("running", True)])
+async def test_runner_status_probe_updates_stale_running_clock(
+    monkeypatch: pytest.MonkeyPatch,
+    answer: str,
+    clock_survives: bool,
+) -> None:
+    """The probe's direct cache writes update the stale-running clock immediately.
+
+    Otherwise a settled session's entry survives until the NEXT snapshot
+    read, and a new turn's running publish landing before any further read
+    inherits the stale first-seen — probed (and potentially settled idle
+    while live) within its own grace.
+    """
+    import time as _time
+
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import common, orchestration
+
+    session_id = "cf5d3e6f8b9a1d4e7f9a0b2c4d6e8f9a"
+    monkeypatch.delitem(_mod._session_status_cache, session_id, raising=False)
+    monkeypatch.setattr(
+        common,
+        "_stale_running_since",
+        {session_id: _time.monotonic() - 10_000},
+    )
+    monkeypatch.setattr(orchestration, "_stale_running_since", common._stale_running_since)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+
+    class _AnsweringRunnerClient:
+        async def get(self, url: str, timeout: float = 5.0) -> Any:
+            return SimpleNamespace(status_code=200, json=lambda: {"status": answer})
+
+    probed = await orchestration._probe_runner_live_status(
+        _AnsweringRunnerClient(),  # type: ignore[arg-type]
+        session_id,
+    )
+    assert probed == answer
+    assert _mod._session_status_cache[session_id] == answer
+    assert (session_id in common._stale_running_since) is clock_survives
 
 
 @pytest.mark.asyncio
