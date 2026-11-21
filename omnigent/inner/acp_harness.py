@@ -85,6 +85,10 @@ _ENV_CWD = "HARNESS_ACP_CWD"
 _ENV_OS_ENV = "HARNESS_ACP_OS_ENV"
 _ENV_ENV_PASSTHROUGH = "HARNESS_ACP_ENV_PASSTHROUGH"
 _ENV_PERMISSION_MODE = "HARNESS_ACP_PERMISSION_MODE"
+_ENV_REPORT_PROTOCOL = "OMNIGENT_ACP_SESSION_REPORT_PROTOCOL"
+_ENV_REPORT_SERVER_IDENTITY = "OMNIGENT_ACP_SESSION_REPORT_SERVER_IDENTITY"
+_ENV_REPORT_GENERATION = "OMNIGENT_ACP_SESSION_REPORT_SUBSCRIBER_GENERATION"
+_ENV_REPORT_ROOT = "OMNIGENT_ACP_SESSION_REPORT_ROOT"
 _DEFAULT_PERMISSION_MODE = "auto"
 
 
@@ -114,6 +118,31 @@ def _csv_names(env_name: str) -> tuple[str, ...]:
         if name and name not in names:
             names.append(name)
     return tuple(names)
+
+
+def _session_report_scope_from_env() -> dict[str, str]:
+    """Return the report scope installed by the trusted process manager.
+
+    These values are deliberately not part of the executor config or the
+    per-turn workflow env. ``HarnessProcessManager._spawn_entry`` creates the
+    generation and binds the server identity/root to runner state once per
+    actual harness subprocess.
+    """
+    names = {
+        "session_report_protocol": _ENV_REPORT_PROTOCOL,
+        "session_report_server_identity": _ENV_REPORT_SERVER_IDENTITY,
+        "session_report_subscriber_generation": _ENV_REPORT_GENERATION,
+        "session_report_root": _ENV_REPORT_ROOT,
+    }
+    values = {key: os.environ.get(env_name) for key, env_name in names.items()}
+    if all(value is None for value in values.values()):
+        return {}
+    missing = [names[key] for key, value in values.items() if not value]
+    if missing:
+        raise RuntimeError(
+            "incomplete trusted ACP session-report scope; missing " + ", ".join(missing)
+        )
+    return {key: value for key, value in values.items() if value is not None}
 
 
 def _resolve_os_env() -> OSEnvSpec:
@@ -185,7 +214,12 @@ def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> Executor:
         permission_mode=permission_mode,
         inject_system_prompt=inject_system_prompt,
     )
-    return AcpExecutor(config=config, cwd=cwd, os_env=_resolve_os_env(), extension=extension)
+    return AcpExecutor(
+        config=config,
+        cwd=cwd,
+        os_env=_resolve_os_env(),
+        extension=extension,
+    )
 
 
 def create_app(extension: AcpExtension = NO_ACP_EXTENSION) -> FastAPI:
@@ -204,6 +238,8 @@ def create_app(extension: AcpExtension = NO_ACP_EXTENSION) -> FastAPI:
     """
     label = os.environ.get(_ENV_NAME, "").strip() or "ACP agent"
     adapter = ExecutorAdapter(
-        executor_factory=lambda: _build_acp_executor(extension), harness_label=label
+        executor_factory=lambda: _build_acp_executor(extension),
+        harness_label=label,
+        **_session_report_scope_from_env(),
     )
     return adapter.build()

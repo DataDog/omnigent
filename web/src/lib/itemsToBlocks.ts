@@ -136,7 +136,9 @@ function agentNamesByResponseId(items: ConversationItem[]): Map<string, string |
 function toolOutputsByCallId(items: ConversationItem[]): Map<string, string> {
   const outputs = new Map<string, string>();
   for (const item of items) {
-    if (isFunctionCallOutputItem(item)) outputs.set(item.call_id, item.output);
+    if (!isFunctionCallOutputItem(item)) continue;
+    if (typeof item.output === "string") outputs.set(item.call_id, item.output);
+    else outputs.delete(item.call_id);
   }
   return outputs;
 }
@@ -286,7 +288,7 @@ function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBloc
     return functionCallToBlock(item);
   }
   if (isFunctionCallOutputItem(item)) {
-    return functionCallOutputToBlock(item);
+    return typeof item.output === "string" ? functionCallOutputToBlock(item) : null;
   }
   if (isErrorItem(item)) {
     return errorToBlock(item, agentName);
@@ -363,6 +365,10 @@ function assistantMessageToBlock(item: MessageItem): TextDone {
     hasCodeBlocks: text.includes("```"),
     ...(item.interrupted === true ? { interrupted: true } : {}),
     ...(phase !== undefined ? { phase } : {}),
+    ...(item.acp_session_message !== undefined
+      ? { acpSessionMessage: item.acp_session_message }
+      : {}),
+    ...(item.acp_agent_identity === "unknown" ? { acpAgentIdentity: "unknown" as const } : {}),
   };
 }
 
@@ -381,6 +387,10 @@ function functionCallToBlock(item: FunctionCallItem): ToolGroup {
     agentName: item.model ?? "",
     executedBy: "server",
     output: null,
+    ...(item.acp_session_references !== undefined
+      ? { acpSessionReferences: item.acp_session_references }
+      : {}),
+    ...(item.acp_agent_identity === "unknown" ? { acpAgentIdentity: "unknown" as const } : {}),
   };
   return {
     type: "tool_group",
@@ -398,7 +408,7 @@ function functionCallOutputToBlock(item: FunctionCallOutputItem): ToolResultBloc
     name: "",
     callId: item.call_id,
     agentName: ctx.agent ?? "",
-    output: item.output,
+    output: item.output ?? null,
   };
 }
 
@@ -420,6 +430,7 @@ function reasoningToBlock(item: ReasoningItem): ReasoningBlock {
     ctx: ctxFor(item),
     reasoningText: (item.content ?? []).map((block) => block.text).join("\n\n"),
     summaryText: item.summary.map((block) => block.text).join("\n\n"),
+    ...(item.acp_agent_identity === "unknown" ? { acpAgentIdentity: "unknown" as const } : {}),
   };
 }
 
@@ -505,7 +516,12 @@ function ctxFor(item: ConversationItem): BlockContext {
   // stay live-only. The server's epoch `created_at` travels separately as
   // `createdAtS` (drives the completed-turn "Worked for" duration).
   // `agent` comes from the item's `model` field when present.
-  const agent = "model" in item && typeof item.model === "string" ? item.model : null;
+  const agent =
+    "acp_agent_identity" in item && item.acp_agent_identity === "unknown"
+      ? null
+      : "model" in item && typeof item.model === "string"
+        ? item.model
+        : null;
   const depth = agent ? (agent.match(/\./g)?.length ?? 0) : 0;
   // Preserve human authorship only when the server sent it.
   const createdBy =

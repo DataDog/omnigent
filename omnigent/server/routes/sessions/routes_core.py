@@ -235,6 +235,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _validate_session_model_selection,
     ensure_runner_connected,
 )
+from omnigent.server.runner_session_init import prepare_acp_report_connection_attempt_for_client
 from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
@@ -550,6 +551,21 @@ def register_core_routes(
             raise OmnigentError(
                 "initial_files must contain uploaded files", code=ErrorCode.INVALID_INPUT
             )
+
+    async def _prepare_report_connection_attempt(
+        request: Request, conversation: Conversation, runner_client: httpx.AsyncClient
+    ) -> str | None:
+        initializer = getattr(request.app.state, "runner_session_initializer", None)
+        prepare: Callable[[Conversation], Awaitable[str | None]] | None = getattr(
+            initializer, "prepare_report_connection_attempt", None
+        )
+        if callable(prepare):
+            return await prepare(conversation)
+        return await prepare_acp_report_connection_attempt_for_client(
+            conversation,
+            conversation_store=conversation_store,
+            runner_client=runner_client,
+        )
 
     async def _accept_initial_input(
         request: Request, session_id: str, event: SessionEventInput | None, user_id: str | None
@@ -1471,7 +1487,9 @@ def register_core_routes(
                 "agent_id": conv.agent_id,
                 "sub_agent_name": conv.sub_agent_name,
             }
+            notify_runner = True
             if conv.agent_id is not None:
+                report_attempt_id = await _prepare_report_connection_attempt(request, conv, _rc)
                 try:
                     # ``initial_items`` are already persisted and forwarded by
                     # now, so suppress the runner's recovery turn or they run
@@ -1480,6 +1498,7 @@ def register_core_routes(
                         conv,
                         server_version=VERSION,
                         suppress_recovery_turn=True,
+                        acp_report_connection_attempt_id=report_attempt_id,
                     )
                 except Exception:
                     # Must not fail the create, but the degradation loses the
@@ -1492,14 +1511,16 @@ def register_core_routes(
                         resp.id,
                         exc_info=True,
                     )
-            try:
-                await _rc.post("/v1/sessions", json=init_body, timeout=10.0)
-            except (httpx.HTTPError, ConnectionError):
-                _logger.warning(
-                    "Failed to notify runner about session %s",
-                    resp.id,
-                    exc_info=True,
-                )
+                    notify_runner = report_attempt_id is None
+            if notify_runner:
+                try:
+                    await _rc.post("/v1/sessions", json=init_body, timeout=10.0)
+                except (httpx.HTTPError, ConnectionError):
+                    _logger.warning(
+                        "Failed to notify runner about session %s",
+                        resp.id,
+                        exc_info=True,
+                    )
         # Grant the creator ownership BEFORE any host launch so the
         # launch's session-ownership check (shared with
         # POST /v1/hosts/{host_id}/runners via resolve_host_launch)
@@ -3782,6 +3803,9 @@ def register_core_routes(
                 if _runner_client is not None and conv is not None and conv.agent_id is not None:
                     # The versioned snapshot keeps harness_override on rebind.
                     # Recovery runs the pending kickoff, except a side chat's copied turn.
+                    report_attempt_id = await _prepare_report_connection_attempt(
+                        request, conv, _runner_client
+                    )
                     try:
                         runner_init_resp = await _runner_client.post(
                             "/v1/sessions",
@@ -3789,6 +3813,7 @@ def register_core_routes(
                                 conv,
                                 server_version=VERSION,
                                 suppress_recovery_turn=conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1",
+                                acp_report_connection_attempt_id=report_attempt_id,
                             ),
                             timeout=10.0,
                         )

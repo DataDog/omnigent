@@ -93,6 +93,53 @@ def test_other_slug_resolves_independently(_isolate_config: Path) -> None:
     assert env["HARNESS_ACP_NAME"] == "Gemini CLI"
 
 
+def test_legacy_extension_is_ignored_at_spawn(_isolate_config: Path) -> None:
+    _write_acp_config(
+        _isolate_config,
+        agents=[
+            {
+                "name": "Gemini CLI",
+                "command": "gemini --experimental-acp",
+                "extension": "gemini",
+            }
+        ],
+    )
+
+    env = _build_acp_spawn_env(_make_spec(harness="acp:gemini-cli"))
+
+    assert env["HARNESS_ACP_COMMAND"] == "gemini --experimental-acp"
+    assert env["HARNESS_ACP_NAME"] == "Gemini CLI"
+    assert "HARNESS_ACP_EXTENSION" not in env
+
+
+def test_embedded_agent_config_wins_and_ignores_legacy_extension(
+    _isolate_config: Path,
+) -> None:
+    """The embedded command remains authoritative over the runner's registry."""
+    _write_acp_config(
+        _isolate_config,
+        agents=[
+            {
+                "name": "Gemini CLI",
+                "command": "gemini --server-config",
+            }
+        ],
+    )
+    spec = _make_spec(
+        harness="acp:gemini-cli",
+        acp_agent={
+            "name": "Gemini CLI",
+            "command": "gemini --embedded-config",
+            "extension": "gemini",
+        },
+    )
+
+    env = _build_acp_spawn_env(spec)
+
+    assert env["HARNESS_ACP_COMMAND"] == "gemini --embedded-config"
+    assert "HARNESS_ACP_EXTENSION" not in env
+
+
 def test_bare_acp_falls_back_to_first_agent(_isolate_config: Path) -> None:
     """A bare ``acp`` id (slug lost) still launches the first configured agent."""
     _write_acp_config(_isolate_config)

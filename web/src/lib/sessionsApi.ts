@@ -22,6 +22,7 @@ import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitles
 import { parseBackgroundTasks } from "./sse";
 import type {
   BackgroundTaskInfo,
+  AcpSessionObservation,
   ModelUsage,
   NativeModelOption,
   NestedSessionItem,
@@ -141,6 +142,20 @@ interface SessionResponseWire {
    */
   archived?: boolean;
   status: SessionStatus;
+  acp_session_observation?: {
+    state: { present: boolean; value?: unknown } | null;
+    state_ingress_sequence: number | null;
+    state_observed_at: number | null;
+    last_ingress_sequence: number;
+    last_reported_at: number | null;
+    session_info?: unknown;
+    usage?: unknown;
+    config_options?: unknown;
+    mode?: unknown;
+    plan?: unknown;
+    transport?: unknown;
+    transport_unconfirmed: true;
+  } | null;
   /**
    * Background shells (claude-native) still running as of the last status
    * edge, so a reload re-shows "N background tasks still running" after the session
@@ -375,6 +390,34 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     hostResumable: wire.host_resumable ?? false,
     archived: wire.archived ?? false,
     status: snapshotStatus(wire),
+    acpSessionObservation: wire.acp_session_observation
+      ? ({
+          state: wire.acp_session_observation.state,
+          stateIngressSequence: wire.acp_session_observation.state_ingress_sequence,
+          stateObservedAt: wire.acp_session_observation.state_observed_at,
+          lastIngressSequence: wire.acp_session_observation.last_ingress_sequence,
+          lastReportedAt: wire.acp_session_observation.last_reported_at,
+          ...(Object.hasOwn(wire.acp_session_observation, "session_info")
+            ? { sessionInfo: wire.acp_session_observation.session_info }
+            : {}),
+          ...(Object.hasOwn(wire.acp_session_observation, "usage")
+            ? { usage: wire.acp_session_observation.usage }
+            : {}),
+          ...(Object.hasOwn(wire.acp_session_observation, "config_options")
+            ? { configOptions: wire.acp_session_observation.config_options }
+            : {}),
+          ...(Object.hasOwn(wire.acp_session_observation, "mode")
+            ? { mode: wire.acp_session_observation.mode }
+            : {}),
+          ...(Object.hasOwn(wire.acp_session_observation, "plan")
+            ? { plan: wire.acp_session_observation.plan }
+            : {}),
+          ...(Object.hasOwn(wire.acp_session_observation, "transport")
+            ? { transport: wire.acp_session_observation.transport }
+            : {}),
+          transportUnconfirmed: true,
+        } satisfies AcpSessionObservation)
+      : null,
     backgroundTaskCount: wire.background_task_count ?? undefined,
     backgroundTasks: parseBackgroundTasks(wire.background_tasks),
     backgroundAgents: parseBackgroundTasks(wire.background_agents),

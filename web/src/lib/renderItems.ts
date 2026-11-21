@@ -35,7 +35,7 @@ import {
   isSessionScopedDecision,
   routingExtras,
 } from "./routingDecision";
-import type { AssistantMessagePhase } from "./conversationItems";
+import type { AcpSessionMessage, AssistantMessagePhase } from "./conversationItems";
 import { isSystemUserContent } from "./systemMessage";
 import type { AgyPermission, CodexPersistMode, FileEditRequest, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
@@ -80,6 +80,10 @@ export type RenderItem =
       previewInterrupted?: boolean;
       /** Harness label for the message (Codex); `commentary` is progress narration. */
       phase?: AssistantMessagePhase;
+      /** Structured ACP From/To metadata for a directed native session message. */
+      acpSessionMessage?: AcpSessionMessage | null;
+      /** Explicit provenance when ACP did not report the child model. */
+      acpAgentIdentity?: "unknown";
     }
   | {
       kind: "reasoning";
@@ -1879,6 +1883,8 @@ function textItem(run: AnyBlock[], ordinal: number): RenderItem {
         ...streamed,
         ...(b.previewInterrupted ? { previewInterrupted: true } : {}),
         ...(b.phase !== undefined ? { phase: b.phase } : {}),
+        ...(b.acpSessionMessage !== undefined ? { acpSessionMessage: b.acpSessionMessage } : {}),
+        ...(b.acpAgentIdentity === "unknown" ? { acpAgentIdentity: "unknown" as const } : {}),
       };
     }
   }
@@ -1935,7 +1941,7 @@ function toolItem(
   lifecycle: ActiveResponse["state"],
   isLiveToolCall: boolean,
 ): RenderItem {
-  const output = result?.output ?? execution.output ?? null;
+  const output = result !== undefined ? result.output : (execution.output ?? null);
   const startedAt = startedAtTimestamp > 0 ? startedAtTimestamp : null;
   const duration =
     result !== undefined && startedAt !== null && result.ctx.timestamp >= startedAt

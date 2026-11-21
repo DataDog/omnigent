@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
+import re
 import weakref
 from collections.abc import Callable
 from typing import Any, NamedTuple
@@ -17,6 +19,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
+from omnigent.db.db_models import current_workspace_id
 from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Conversation
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
@@ -105,6 +108,14 @@ from omnigent.server.routes._sessions.orchestration import (
 )
 from omnigent.server.schemas import (
     ElicitationRequestParams,
+)
+from omnigent.server.session_action_origins import (
+    action_child_target_fields,
+    action_context_fields,
+    bind_action_origin_request,
+    load_pinned_action_spec,
+    validate_action_origin_child_target,
+    validate_action_origin_request,
 )
 from omnigent.spec.types import (
     Phase,
@@ -762,6 +773,359 @@ def register_hooks_routes(
         PolicyAction.ASK: "POLICY_ACTION_ASK",
     }
 
+    @router.post(
+        "/sessions/{session_id}/action-origins/{token}/bind",
+        include_in_schema=False,
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def bind_session_action_origin(
+        request: Request, session_id: str, token: str
+    ) -> dict[str, Any]:
+        """Activate the server-captured origin for this runner generation."""
+        if re.fullmatch(r"[0-9a-f]{32}", token) is None:
+            raise OmnigentError(
+                "Invalid detached child origin token.", code=ErrorCode.INVALID_INPUT
+            )
+        credential_principal = _get_user_id(request, auth_provider)
+        if credential_principal is None:
+            raise OmnigentError(
+                "An authenticated runner principal is required to bind an action origin.",
+                code=ErrorCode.FORBIDDEN,
+            )
+        conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conversation is None:
+            raise OmnigentError("Session not found.", code=ErrorCode.NOT_FOUND)
+        runner_id = bind_action_origin_request(
+            request, conversation=conversation, credential_principal=credential_principal
+        )
+        assert credential_principal is not None
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                "Invalid JSON in action-origin bind body.", code=ErrorCode.INVALID_INPUT
+            ) from exc
+        if not isinstance(payload, dict):
+            raise OmnigentError(
+                "Action-origin bind body must be an object.", code=ErrorCode.INVALID_INPUT
+            )
+        generation = payload.get("generation")
+        if not isinstance(generation, str) or not generation or len(generation) > 256:
+            raise OmnigentError("Invalid action-origin generation.", code=ErrorCode.INVALID_INPUT)
+        origin = await asyncio.to_thread(
+            conversation_store.get_session_action_origin, session_id, token
+        )
+        if (
+            origin is None
+            or origin.get("session_id") != session_id
+            or origin.get("workspace_id") != current_workspace_id()
+            or origin.get("runner_id") != runner_id
+        ):
+            raise OmnigentError(
+                "Detached child origin context is unavailable.", code=ErrorCode.FORBIDDEN
+            )
+        origin_actor = origin.get("actor")
+        if not isinstance(origin_actor, str) or not origin_actor:
+            raise OmnigentError(
+                "Detached child origin actor is malformed.", code=ErrorCode.FORBIDDEN
+            )
+        await _require_access(
+            origin_actor,
+            session_id,
+            LEVEL_EDIT,
+            permission_store,
+            conversation_store,
+        )
+        access_scope: dict[str, Any] = {
+            "conversation_id": session_id,
+            "required_level": LEVEL_EDIT,
+            "permissions_enforced": permission_store is not None,
+        }
+        if permission_store is not None:
+            access = await asyncio.to_thread(
+                permission_store.resolve_access,
+                origin_actor,
+                session_id,
+            )
+            has_any_grants = await asyncio.to_thread(
+                permission_store.has_any_grants,
+                session_id,
+            )
+            access_scope.update(
+                {
+                    "is_admin": access.is_admin,
+                    "user_grant_level": access.user_grant_level,
+                    "public_grant_level": access.public_grant_level,
+                    "has_any_grants": has_any_grants,
+                }
+            )
+        credential_identity_refs = {
+            "authenticated_principal": credential_principal,
+            "runner_id": runner_id,
+            "agent_id": origin.get("agent_id"),
+            "bundle_location": origin.get("bundle_location"),
+            "mcp_selection_snapshot": origin.get("mcp_selection_snapshot"),
+        }
+        try:
+            from omnigent.session_action_origin import session_action_context_generation
+
+            workspace_id = origin.get("workspace_id")
+            actor = origin.get("actor")
+            agent_id = origin.get("agent_id")
+            bundle_location = origin.get("bundle_location")
+            agent_provenance = origin.get("agent_provenance")
+            operator_authored = origin.get("operator_authored")
+            effective_spec_digest = origin.get("effective_spec_digest")
+            operator_environment_digest = origin.get("operator_environment_digest")
+            policy_scope_digest = origin.get("policy_scope_digest")
+            mcp_selection_raw = origin.get("mcp_selection_snapshot")
+            if (
+                isinstance(workspace_id, bool)
+                or not isinstance(workspace_id, int)
+                or not isinstance(actor, str)
+                or not actor
+                or not isinstance(agent_id, str)
+                or not agent_id
+                or not isinstance(bundle_location, str)
+                or not bundle_location
+                or agent_provenance not in {"operator", "tenant"}
+                or not isinstance(operator_authored, bool)
+                or not isinstance(effective_spec_digest, str)
+                or not effective_spec_digest
+                or not isinstance(operator_environment_digest, str)
+                or not operator_environment_digest
+                or not isinstance(policy_scope_digest, str)
+                or not policy_scope_digest
+                or not isinstance(mcp_selection_raw, dict)
+                or not isinstance(credential_principal, str)
+                or not credential_principal
+            ):
+                raise ValueError("action origin context is incomplete")
+            mcp_selection_snapshot: dict[str, str] = {}
+            for key, value in mcp_selection_raw.items():
+                if not isinstance(key, str) or not isinstance(value, str):
+                    raise ValueError("action origin MCP selection is malformed")
+                mcp_selection_snapshot[key] = value
+            context_generation = session_action_context_generation(
+                workspace_id=workspace_id,
+                root_conversation_id=session_id,
+                runner_id=runner_id,
+                actor=actor,
+                credential_principal=credential_principal,
+                agent_id=agent_id,
+                bundle_location=bundle_location,
+                agent_provenance=agent_provenance,
+                operator_authored=operator_authored,
+                effective_spec_digest=effective_spec_digest,
+                operator_environment_digest=operator_environment_digest,
+                policy_scope_digest=policy_scope_digest,
+                mcp_selection_snapshot=mcp_selection_snapshot,
+                access_scope=access_scope,
+                credential_identity_refs=credential_identity_refs,
+            )
+        except (TypeError, ValueError) as exc:
+            raise OmnigentError(
+                "Detached child origin security context is malformed.",
+                code=ErrorCode.FORBIDDEN,
+            ) from exc
+        try:
+            bound = await asyncio.to_thread(
+                conversation_store.bind_session_action_origin,
+                session_id,
+                token,
+                runner_id,
+                generation,
+                credential_principal,
+                context_generation=context_generation,
+            )
+        except Exception as exc:
+            _logger.warning(
+                "ACP action origin could not be bound",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+            raise OmnigentError(
+                "Detached child origin could not be bound to this runner generation.",
+                code=ErrorCode.CONFLICT,
+            ) from exc
+        if bound is None:
+            raise OmnigentError(
+                "Detached child origin could not be bound to this runner generation.",
+                code=ErrorCode.CONFLICT,
+            )
+        return {
+            "bound": True,
+            "session_id": session_id,
+            "workspace_id": bound.get("workspace_id"),
+            "runner_id": runner_id,
+            "credential_principal": bound.get("bound_credential_principal"),
+            "agent_id": bound.get("agent_id"),
+            "bundle_location": bound.get("bundle_location"),
+            "agent_provenance": bound.get("agent_provenance"),
+            "operator_authored": bound.get("operator_authored"),
+            "operator_environment_digest": bound.get("operator_environment_digest"),
+            "policy_scope_digest": bound.get("policy_scope_digest"),
+            "mcp_selection_snapshot": bound.get("mcp_selection_snapshot"),
+            "effective_spec_digest": bound.get("effective_spec_digest"),
+            "context_generation": bound.get("bound_context_generation"),
+            "actor": bound.get("actor"),
+            "access_scope": access_scope,
+            "credential_identity_refs": credential_identity_refs,
+        }
+
+    @router.get(
+        "/sessions/{session_id}/action-origins",
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def list_session_action_origins(
+        request: Request, session_id: str
+    ) -> dict[str, list[dict[str, str]]]:
+        """List bound generations for this authenticated runner and principal."""
+        credential_principal = _get_user_id(request, auth_provider)
+        if credential_principal is None:
+            raise OmnigentError(
+                "An authenticated runner principal is required to inspect action origins.",
+                code=ErrorCode.FORBIDDEN,
+            )
+        conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conversation is None:
+            raise OmnigentError("Session not found.", code=ErrorCode.NOT_FOUND)
+        runner_id = bind_action_origin_request(
+            request, conversation=conversation, credential_principal=credential_principal
+        )
+        origins = await asyncio.to_thread(
+            conversation_store.list_session_action_origins, session_id
+        )
+        bound_origins: list[dict[str, str]] = []
+        for token, origin in origins.items():
+            generation = origin.get("bound_harness_generation")
+            if (
+                re.fullmatch(r"[0-9a-f]{32}", token) is not None
+                and origin.get("session_id") == session_id
+                and origin.get("workspace_id") == current_workspace_id()
+                and origin.get("runner_id") == runner_id
+                and origin.get("bound_runner_id") == runner_id
+                and origin.get("bound_credential_principal") == credential_principal
+                and isinstance(generation, str)
+                and generation
+                and len(generation) <= 256
+            ):
+                bound_origins.append({"token": token, "generation": generation})
+        return {"origins": bound_origins}
+
+    @router.post(
+        "/sessions/{session_id}/action-origins/{token}/settle",
+        include_in_schema=False,
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def settle_session_action_origin(
+        request: Request, session_id: str, token: str
+    ) -> dict[str, bool]:
+        """Release an origin after its authenticated harness generation has drained."""
+        credential_principal = _get_user_id(request, auth_provider)
+        if credential_principal is None:
+            raise OmnigentError(
+                "An authenticated runner principal is required to settle an action origin.",
+                code=ErrorCode.FORBIDDEN,
+            )
+        conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conversation is None:
+            raise OmnigentError("Session not found.", code=ErrorCode.NOT_FOUND)
+        runner_id = bind_action_origin_request(
+            request, conversation=conversation, credential_principal=credential_principal
+        )
+        try:
+            payload = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                "Invalid JSON in action-origin settle body.", code=ErrorCode.INVALID_INPUT
+            ) from exc
+        generation = payload.get("generation") if isinstance(payload, dict) else None
+        if not isinstance(generation, str) or not generation or len(generation) > 256:
+            raise OmnigentError("Invalid action-origin generation.", code=ErrorCode.INVALID_INPUT)
+        origin = await asyncio.to_thread(
+            conversation_store.get_session_action_origin, session_id, token
+        )
+        if origin is None:
+            return {"settled": True}
+        from omnigent.server.session_action_origins import validate_action_origin_request
+
+        validate_action_origin_request(
+            request,
+            conversation=conversation,
+            origin=origin,
+            token=token,
+            generation=generation,
+            credential_principal=credential_principal,
+        )
+        released = await asyncio.to_thread(
+            conversation_store.release_session_action_origin,
+            session_id,
+            token,
+            runner_id,
+            generation,
+            credential_principal,
+        )
+        if not released:
+            raise OmnigentError(
+                "Detached child origin could not be settled.", code=ErrorCode.CONFLICT
+            )
+        return {"settled": True}
+
+    @router.post(
+        "/sessions/{session_id}/action-origins/{token}/discard",
+        include_in_schema=False,
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def discard_session_action_origin(
+        request: Request, session_id: str, token: str
+    ) -> dict[str, bool]:
+        """Remove a server-captured origin when no action subscriber can bind it."""
+        if re.fullmatch(r"[0-9a-f]{32}", token) is None:
+            raise OmnigentError(
+                "Invalid detached child origin token.", code=ErrorCode.INVALID_INPUT
+            )
+        credential_principal = _get_user_id(request, auth_provider)
+        conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conversation is None:
+            raise OmnigentError("Session not found.", code=ErrorCode.NOT_FOUND)
+        runner_id = bind_action_origin_request(
+            request, conversation=conversation, credential_principal=credential_principal
+        )
+        origin = await asyncio.to_thread(
+            conversation_store.get_session_action_origin, session_id, token
+        )
+        if origin is None:
+            return {"discarded": True}
+        if (
+            origin.get("session_id") != session_id
+            or origin.get("workspace_id") != current_workspace_id()
+            or origin.get("runner_id") != runner_id
+            or origin.get("bound_runner_id") is not None
+            or origin.get("bound_harness_generation") is not None
+        ):
+            raise OmnigentError(
+                "Detached child origin context is unavailable.", code=ErrorCode.FORBIDDEN
+            )
+        assert credential_principal is not None
+        discarded = await asyncio.to_thread(
+            conversation_store.release_session_action_origin,
+            session_id,
+            token,
+            runner_id,
+            None,
+            credential_principal,
+        )
+        if not discarded:
+            raise OmnigentError(
+                "Detached child origin could not be discarded.", code=ErrorCode.CONFLICT
+            )
+        return {"discarded": True}
+
     # ── POST /sessions/{session_id}/policies/evaluate ─────────────
 
     @router.post(
@@ -804,27 +1168,6 @@ def register_hooks_routes(
         from omnigent.server.routes import sessions as _sf
 
         user_id = _sf._get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
-        )
-        is_read_only = permission_store is not None and (
-            access.level is None or access.level < LEVEL_EDIT
-        )
-        if (
-            permission_store is not None
-            and access.conversation is not None
-            and access.conversation.parent_conversation_id is not None
-        ):
-            # Child display levels do not describe the parent's mutation authority.
-            is_read_only = not await asyncio.to_thread(
-                check_session_access,
-                user_id,
-                session_id,
-                LEVEL_EDIT,
-                permission_store,
-                conversation_store,
-                access.conversation,
-            )
         try:
             payload = await request.json()
         except json.JSONDecodeError as exc:
@@ -837,6 +1180,125 @@ def register_hooks_routes(
                 "Policy evaluate body must be a JSON object.",
                 code=ErrorCode.INVALID_INPUT,
             )
+        action_token, action_generation = action_context_fields(payload)
+        action_child_key, action_child_id = action_child_target_fields(payload)
+        origin: dict[str, Any] | None = None
+        action_target_session_id: str | None = None
+        pinned_spec = None
+        access = None
+        is_read_only = False
+        if action_child_key is not None and action_token is None:
+            raise OmnigentError(
+                "A detached child approval target requires an authenticated action origin.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if action_token is not None:
+            conv_for_origin = await asyncio.to_thread(
+                conversation_store.get_conversation, session_id
+            )
+            if conv_for_origin is None:
+                raise OmnigentError("Session not found.", code=ErrorCode.NOT_FOUND)
+            origin = await asyncio.to_thread(
+                conversation_store.get_session_action_origin, session_id, action_token
+            )
+            origin = validate_action_origin_request(
+                request,
+                conversation=conv_for_origin,
+                origin=origin,
+                token=action_token,
+                generation=action_generation or "",
+                credential_principal=user_id,
+            )
+            if action_child_key is not None and action_child_id is not None:
+                child = await asyncio.to_thread(
+                    conversation_store.get_conversation, action_child_id
+                )
+                child_association = await asyncio.to_thread(
+                    conversation_store.get_acp_session_association_for_conversation,
+                    session_id,
+                    action_child_id,
+                )
+                parent_association = None
+                if child_association is not None:
+                    native_epoch = child_association.get("native_epoch")
+                    parent_native_session_id = child_association.get("parent_native_session_id")
+                    if (
+                        not isinstance(native_epoch, str)
+                        or not native_epoch
+                        or not isinstance(parent_native_session_id, str)
+                        or not parent_native_session_id
+                    ):
+                        raise OmnigentError(
+                            "Detached child ACP association is malformed.",
+                            code=ErrorCode.FORBIDDEN,
+                        )
+                    parent_association = await asyncio.to_thread(
+                        conversation_store.get_acp_session_association,
+                        session_id,
+                        native_epoch,
+                        parent_native_session_id,
+                    )
+                action_target_session_id = validate_action_origin_child_target(
+                    origin,
+                    child_key=action_child_key,
+                    child_id=action_child_id,
+                    parent_id=session_id,
+                    child=child,
+                    child_association=child_association,
+                    parent_association=parent_association,
+                )
+            origin_actor = origin.get("actor")
+            if not isinstance(origin_actor, str) or not origin_actor:
+                raise OmnigentError(
+                    "Detached child origin actor is malformed.", code=ErrorCode.FORBIDDEN
+                )
+            await _require_access(
+                origin_actor,
+                session_id,
+                LEVEL_EDIT,
+                permission_store,
+                conversation_store,
+            )
+            cache = agent_cache or _sf.get_agent_cache()
+            try:
+                pinned_spec = await asyncio.to_thread(
+                    load_pinned_action_spec,
+                    origin,
+                    conversation=conv_for_origin,
+                    agent_cache=cache,
+                )
+            except OmnigentError:
+                raise
+            except Exception as exc:
+                raise OmnigentError(
+                    "Detached child origin context is unavailable.",
+                    code=ErrorCode.FORBIDDEN,
+                ) from exc
+            conv = conv_for_origin
+        else:
+            access = await _require_access_and_level(
+                user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            )
+            is_read_only = permission_store is not None and (
+                access.level is None or access.level < LEVEL_EDIT
+            )
+            if (
+                permission_store is not None
+                and access.conversation is not None
+                and access.conversation.parent_conversation_id is not None
+            ):
+                # Child display levels do not describe the parent's mutation authority.
+                is_read_only = not await asyncio.to_thread(
+                    check_session_access,
+                    user_id,
+                    session_id,
+                    LEVEL_EDIT,
+                    permission_store,
+                    conversation_store,
+                    access.conversation,
+                )
+            conv = access.conversation
+
         event = payload.get("event")
         if not isinstance(event, dict):
             raise OmnigentError(
@@ -850,6 +1312,21 @@ def register_hooks_routes(
             raise OmnigentError(
                 f"Policy evaluate 'event.type' must be a string; got {type(event_type).__name__}.",
                 code=ErrorCode.INVALID_INPUT,
+            )
+        if event_type == "ACP_ACTION_ORIGIN_CHECK":
+            if (
+                action_token is None
+                or action_child_key is None
+                or action_child_id is None
+                or action_target_session_id is None
+            ):
+                raise OmnigentError(
+                    "ACP action-origin checks require a validated child target.",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            return Response(
+                content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
+                media_type="application/json",
             )
         schema = _PHASE_SCHEMA_BY_WIRE_TYPE.get(event_type or "")
         if schema is None:
@@ -953,7 +1430,6 @@ def register_hooks_routes(
         # fewer on the blocking PreToolUse path. Absent for admin callers
         # (who bypass the conversation lookup) and when permissions are
         # disabled, which fall back to their own read.
-        conv = access.conversation
         if conv is None:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
@@ -972,7 +1448,7 @@ def register_hooks_routes(
         # is gated here — the hook is its only request-phase gate. The signal
         # is "is a web prompt in flight", not text correlation (the native
         # transcript gives no reliable id channel — see ``pending_inputs``).
-        if phase == Phase.REQUEST and pending_inputs.snapshot_for(session_id):
+        if origin is None and phase == Phase.REQUEST and pending_inputs.snapshot_for(session_id):
             return Response(
                 content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
                 media_type="application/json",
@@ -980,7 +1456,7 @@ def register_hooks_routes(
         # A native harness calls this hook once per tool call. Keep the
         # synchronous store reads below off the event loop shared by all sessions.
         agent = await asyncio.to_thread(agent_store.get, conv.agent_id) if conv.agent_id else None
-        if agent is None:
+        if agent is None and pinned_spec is None:
             # No agent — no policies. Return unspecified (pass-through).
             return Response(
                 content=json.dumps({"result": "POLICY_ACTION_UNSPECIFIED"}),
@@ -989,12 +1465,18 @@ def register_hooks_routes(
 
         # Warm-cache loads are in-memory; the thread hop covers the cold path
         # that extracts the bundle from disk.
-        loaded = await asyncio.to_thread(
-            _sf.get_agent_cache().load,
-            agent.id,
-            agent.bundle_location,
-            expand_env=agent.operator_authored,
-        )
+        if pinned_spec is not None:
+            evaluation_spec = pinned_spec
+        else:
+            assert agent is not None
+            evaluation_spec = (
+                await asyncio.to_thread(
+                    _sf.get_agent_cache().load,
+                    agent.id,
+                    agent.bundle_location,
+                    expand_env=agent.operator_authored,
+                )
+            ).spec
 
         _caps = _sf.get_caps()
 
@@ -1008,7 +1490,7 @@ def register_hooks_routes(
         # _no_policy_allow_body) expires.
         policy_store = get_policy_store()
         if not any_policies_apply(
-            spec=loaded.spec,
+            spec=evaluation_spec,
             conversation_id=session_id,
             default_policies=_caps.default_policies,
             policy_store=policy_store,
@@ -1049,13 +1531,15 @@ def register_hooks_routes(
                 persisted state for ``session_id``.
             """
             return build_policy_engine(
-                spec=loaded.spec,
+                spec=evaluation_spec,
                 conversation_id=session_id,
                 conversation_store=conversation_store,
                 conversation=preloaded_conv,
-                # ``agent`` below was resolved from conv.agent_id; the builder
-                # re-reads the row and fails closed if it was rebound since.
-                expected_agent_id=agent.id,
+                # Normal hook requests fail closed if the current session was
+                # rebound while its spec loaded. Detached actions instead use
+                # their server-captured bundle snapshot and freshly read policy
+                # state, so a later agent edit must not replace their context.
+                expected_agent_id=agent.id if origin is None and agent is not None else None,
                 default_policies=_caps.default_policies,
                 policy_store=get_policy_store(),
                 server_llm=_caps.llm,
@@ -1077,9 +1561,12 @@ def register_hooks_routes(
         # cannot be treated the same way — it selects the spec the engine is
         # built from, so it is necessarily read first.)
         turn_actor = engine.labels.get(_TURN_ACTOR_LABEL)
-        ctx = _build_evaluation_context(
-            phase, data, event, actor=_build_actor(turn_actor or user_id)
-        )
+        actor_id = origin.get("actor") if origin is not None else turn_actor or user_id
+        if actor_id is not None and not isinstance(actor_id, str):
+            raise OmnigentError(
+                "Detached child origin actor is malformed.", code=ErrorCode.FORBIDDEN
+            )
+        ctx = _build_evaluation_context(phase, data, event, actor=_build_actor(actor_id))
         result = await engine.evaluate(ctx, read_only=is_read_only)
 
         # URL-based elicitation for blocking phases: on a TOOL_CALL or
@@ -1136,20 +1623,19 @@ def register_hooks_routes(
                                 result=result,
                                 conversation_store=conversation_store,
                                 elicitation_id=hook_elicitation_id,
+                                target_session_id=action_target_session_id,
                                 actor_user_id=user_id,
                             )
                         except ElicitationDeclinedError as exc:
-                            # Explicit user decline: interrupt the native
-                            # harness BEFORE returning the hook deny so the
-                            # Escape key reaches Claude Code's tmux pane first.
-                            # By the time the DENY response reaches the hook
-                            # subprocess, the abort signal is already queued.
-                            # Best-effort: forwarding failures are swallowed.
-                            await _forward_session_change_to_runner(
-                                session_id,
-                                get_server_runner_router(),
-                                {"type": "interrupt"},
-                            )
+                            # A detached child action is released by this hook's
+                            # DENY response. Interrupting its parent could cancel
+                            # a newer, unrelated turn.
+                            if action_target_session_id is None:
+                                await _forward_session_change_to_runner(
+                                    session_id,
+                                    get_server_runner_router(),
+                                    {"type": "interrupt"},
+                                )
                             decline_body = {
                                 "result": "POLICY_ACTION_DENY",
                                 "reason": exc.args[0] or "Approval was declined.",

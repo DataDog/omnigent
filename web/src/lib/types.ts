@@ -287,6 +287,22 @@ export interface SessionFamily {
   pinned_at?: string | null;
 }
 
+/** Durable ACP state observation; the transport cannot confirm current activity. */
+export interface AcpSessionObservation {
+  state: { present: boolean; value?: unknown } | null;
+  stateIngressSequence: number | null;
+  stateObservedAt: number | null;
+  lastIngressSequence: number;
+  lastReportedAt: number | null;
+  sessionInfo?: unknown;
+  usage?: unknown;
+  configOptions?: unknown;
+  mode?: unknown;
+  plan?: unknown;
+  transport?: unknown;
+  transportUnconfirmed: true;
+}
+
 export interface Session {
   family?: SessionFamily | null;
   sandboxProfile?: SandboxProfile | null;
@@ -339,6 +355,8 @@ export interface Session {
    */
   archived?: boolean;
   status: SessionStatus;
+  /** Standard ACP session observation, separate from Omnigent execution status. */
+  acpSessionObservation?: AcpSessionObservation | null;
   /**
    * Background shells (claude-native) still running as of the last status
    * edge, so a reload re-shows "N background tasks still running" even though the

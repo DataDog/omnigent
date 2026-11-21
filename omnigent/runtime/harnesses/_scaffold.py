@@ -38,28 +38,52 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import gc
+import hashlib
 import hmac
+import json
 import logging
 import os
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, FastAPI, Request, Response, status
+from fastapi import APIRouter, FastAPI, Query, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, TypeAdapter
 
 from omnigent.errors import ErrorCode, HarnessTransportClosedError, OmnigentError
+from omnigent.inner.acp_standard_subagents import (
+    ACTION_FEATURES as _SESSION_ACTION_FEATURES,
+)
+from omnigent.inner.acp_standard_subagents import (
+    ACTION_PROTOCOL as _SESSION_ACTION_PROTOCOL,
+)
+from omnigent.inner.acp_standard_subagents import (
+    ACTION_PROTOCOL_VERSION as _SESSION_ACTION_VERSION,
+)
 from omnigent.inner.executor import (
+    SESSION_REPORT_FEATURES,
     LiveMcpHarnessNotRunning,
     LiveMcpReconnectRefused,
     LiveMcpServerStatus,
     LiveMcpServerUnknown,
+    SessionReportPage,
 )
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.policies.types import FAIL_CLOSED_PHASES
+from omnigent.runtime.harnesses.session_reports import (
+    SessionReportJournalBusy,
+    SessionReportJournalCapacity,
+    SessionReportJournalConflict,
+    SessionReportJournalCorrupt,
+    SessionReportJournalError,
+    SessionReportJournalFenced,
+    SessionReportJournalUnavailable,
+    SessionReportJournalVersionMismatch,
+)
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
     CompletedEvent,
@@ -115,6 +139,16 @@ _POLICY_EVAL_TIMEOUT_S = 86400.0
 # lost in delivery must not stall the turn for the full human-wait budget.
 _HUMAN_GATED_POLICY_PHASES = frozenset({"PHASE_TOOL_CALL", "PHASE_LLM_REQUEST", "PHASE_REQUEST"})
 _UNGATED_POLICY_EVAL_TIMEOUT_S = 120.0
+
+# Session-owned actions are ephemeral (unlike the durable report journal), but
+# the pending set and retry tombstones must stay bounded for the lifetime of a
+# harness process. Refuse new work at the limits rather than evicting an
+# idempotency record and risking the same action being executed twice.
+_MAX_PENDING_SESSION_ACTIONS = 512
+_MAX_SESSION_ACTION_TOMBSTONES = 2048
+_MAX_SESSION_ACTION_POLLS = 4
+_SESSION_ACTION_POLL_LIMIT = 512
+_SESSION_ACTION_POLL_WAIT_MS = 25_000
 
 # Stable, client-visible error code for a turn-context desync (the inner SDK
 # generation outlived its turn — an orphaned tool/policy callback, or a turn
@@ -298,10 +332,30 @@ class MessageEvent(BaseModel):
         # ``input`` and drop the discriminator + role fields the
         # legacy schema doesn't carry.
         payload = self.model_dump()
+        action_origin_token = payload.pop("_omnigent_action_origin_token", None)
+        action_origin_generation = payload.pop("_omnigent_action_context_generation", None)
+        action_context_fingerprint = payload.pop("_omnigent_action_context_fingerprint", None)
+        report_features = payload.pop("_omnigent_acp_report_features", None)
+        action_features = payload.pop("_omnigent_acp_action_features", None)
         payload.pop("type", None)
         payload.pop("role", None)
         payload["input"] = payload.pop("content")
-        return CreateResponseRequest(**payload)
+        request = CreateResponseRequest(**payload)
+        if isinstance(action_origin_token, str) and action_origin_token:
+            request._session_action_origin_token = action_origin_token
+        if isinstance(action_origin_generation, str) and action_origin_generation:
+            request._session_action_origin_generation = action_origin_generation
+        if isinstance(action_context_fingerprint, str) and action_context_fingerprint:
+            request._session_action_context_generation = action_context_fingerprint
+        if isinstance(report_features, list) and all(
+            isinstance(feature, str) for feature in report_features
+        ):
+            request._standard_acp_report_features = tuple(report_features)
+        if isinstance(action_features, list) and all(
+            isinstance(feature, str) for feature in action_features
+        ):
+            request._standard_acp_action_features = tuple(action_features)
+        return request
 
 
 class InterruptEvent(BaseModel):
@@ -416,6 +470,99 @@ class PolicyVerdictEvent(BaseModel):
     data: dict[str, Any] | None = None
 
 
+class SessionReportAckRequest(BaseModel):
+    """Acknowledge a contiguous, already-exposed report prefix."""
+
+    subscriber_generation: str = Field(min_length=1, max_length=256)
+    through_sequence: StrictInt = Field(ge=0)
+
+
+@dataclass(frozen=True)
+class SessionActionChild:
+    """Trusted, runner-visible identity for one registered native child run."""
+
+    native_epoch: str
+    native_session_id: str
+    run_id: str
+    parent_tool_call_id: str
+    background: bool
+    child_scheduler_id: str | None = None
+    child_tool_call_id: str | None = None
+    approval_correlation_id: str | None = None
+    request_id: str | int = ""
+    request_invocation_id: int = 1
+    origin_token: str = ""
+    origin_agent: str | None = None
+    origin_generation: str = ""
+    root_native_session_id: str = ""
+    parent_native_session_id: str | None = None
+    association_source_id: str = ""
+    context_generation: str = ""
+    cwd_present: bool = False
+    cwd: str | None = None
+    additional_directories_present: bool = False
+    additional_directories: tuple[str, ...] | None = ()
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.request_invocation_id, bool)
+            or not isinstance(self.request_invocation_id, int)
+            or not 1 <= self.request_invocation_id <= 2**63 - 1
+        ):
+            raise ValueError("session action request invocation id is invalid")
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "native_epoch": self.native_epoch,
+            "native_session_id": self.native_session_id,
+            "run_id": self.run_id,
+            "parent_tool_call_id": self.parent_tool_call_id,
+            "background": self.background,
+            "child_scheduler_id": self.child_scheduler_id,
+            "child_tool_call_id": self.child_tool_call_id,
+            "approval_correlation_id": self.approval_correlation_id,
+            "origin_token": self.origin_token,
+            "origin_agent": self.origin_agent,
+            "origin_generation": self.origin_generation,
+            "root_native_session_id": self.root_native_session_id,
+            "parent_native_session_id": self.parent_native_session_id,
+            "association_source_id": self.association_source_id,
+            "request_id": self.request_id,
+            "request_invocation_id": self.request_invocation_id,
+            "context_generation": self.context_generation,
+            "cwd_present": self.cwd_present,
+            "cwd": self.cwd,
+            "additional_directories_present": self.additional_directories_present,
+            "additional_directories": (
+                list(self.additional_directories)
+                if self.additional_directories is not None
+                else None
+            ),
+        }
+
+
+@dataclass
+class _PendingSessionAction:
+    action_id: str
+    event_id: str
+    generation: str
+    child: dict[str, Any]
+    event: dict[str, Any]
+    expected_type: str
+    expected_correlation: str
+    future: asyncio.Future[BaseModel]
+
+
+class SessionActionResultRequest(BaseModel):
+    """Generation and event fence around one existing inbound harness event."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    generation: str = Field(min_length=1, max_length=256)
+    event_id: str = Field(min_length=1, max_length=512)
+    result: dict[str, Any]
+
+
 class DurableAskEvent(BaseModel):
     """
     Downward ``durable_ask_pending`` / ``durable_ask_resolved`` event —
@@ -457,6 +604,34 @@ InboundEventRequest = Annotated[
 ]
 
 
+def _session_action_expected_result(event: HarnessStreamEvent) -> tuple[str, str]:
+    """Return the only inbound result variant that may settle *event*."""
+    if isinstance(event, PolicyEvaluationRequestEvent):
+        return "policy_verdict", event.evaluation_id
+    if isinstance(event, ElicitationRequestEvent):
+        return "approval", event.elicitation_id
+    if isinstance(event, OutputItemDoneEvent):
+        item = event.item
+        if (
+            item.get("type") == "function_call"
+            and item.get("status") == "action_required"
+            and isinstance(item.get("call_id"), str)
+        ):
+            return "tool_result", item["call_id"]
+    raise ValueError(f"unsupported child session action event {event.type!r}")
+
+
+def _session_action_result_correlation(event: BaseModel) -> str:
+    """Get the event's response correlation field after discriminated validation."""
+    if isinstance(event, PolicyVerdictEvent):
+        return event.evaluation_id
+    if isinstance(event, ApprovalEvent):
+        return event.elicitation_id
+    if isinstance(event, ToolResultEvent):
+        return event.call_id
+    return ""
+
+
 class TurnContext:
     """
     Per-turn interaction surface the scaffold hands to ``run_turn``.
@@ -496,6 +671,13 @@ class TurnContext:
         event_queue: asyncio.Queue[HarnessStreamEvent | None],
         cancelled: asyncio.Event,
         session_id: str | None = None,
+        *,
+        session_action_child: SessionActionChild | None = None,
+        session_action_handler: Callable[[HarnessStreamEvent], Any] | None = None,
+        session_action_agent: str | None = None,
+        session_action_origin_token: str | None = None,
+        session_action_origin_generation: str | None = None,
+        session_action_context_generation: str | None = None,
     ) -> None:
         self.session_id = session_id
         self.response_id = response_id
@@ -546,6 +728,45 @@ class TurnContext:
         # human wait is pending so the hard cap still bounds the turn.
         self._hold_idle_watchdog: Callable[[], None] | None = None
         self._has_progress = False
+        # Detached ACP child requests get a short-lived context that is not
+        # installed in HarnessApp._in_flight. Its bridge sends approval,
+        # policy, and tool events through the private action channel.
+        self._session_action_child = session_action_child
+        self._session_action_handler = session_action_handler
+        self._session_action_agent = session_action_agent
+        self._session_action_origin_token = session_action_origin_token
+        self._session_action_origin_generation = session_action_origin_generation
+        self._session_action_context_generation = session_action_context_generation
+        self._session_action_counter = 0
+
+    def session_action_correlation(self, prefix: str) -> str:
+        """Create a retry-stable event correlation id for a detached child request."""
+        child = self._session_action_child
+        if child is None:
+            return f"{prefix}_{uuid.uuid4().hex[:32]}"
+        self._session_action_counter += 1
+        material = json.dumps(
+            [
+                child.native_epoch,
+                child.native_session_id,
+                child.run_id,
+                child.request_id,
+                child.request_invocation_id,
+                self._session_action_counter,
+                prefix,
+            ],
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        suffix = hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+        return f"{prefix}_{suffix}"
+
+    async def _send_session_action(self, event: HarnessStreamEvent) -> BaseModel:
+        """Publish a child-originated existing harness event and await its result."""
+        if self._session_action_handler is None:
+            raise RuntimeError("session action bridge is unavailable")
+        return await self._session_action_handler(event)
 
     def emit(self, event: HarnessStreamEvent) -> None:
         """
@@ -595,6 +816,7 @@ class TurnContext:
         arguments: str,
         agent: str,
         *,
+        suppress_completed_mirror: bool = False,
         client_owned: bool = True,
     ) -> str:
         """
@@ -629,6 +851,8 @@ class TurnContext:
         :param agent: Agent name that invoked the tool — required
             on the function_call item per
             :class:`omnigent.entities.conversation.FunctionCallData`.
+        :param suppress_completed_mirror: Let the native observation publish
+            the completed call and output instead of emitting duplicates.
         :param client_owned: ``True`` when a real connected client (a
             human or an external system standing in for one) must
             answer this call, so the idle watchdog should not fire
@@ -665,6 +889,13 @@ class TurnContext:
             # FunctionCallData.
             "client_owned": client_owned,
         }
+        if self._session_action_handler is not None:
+            result = await self._send_session_action(
+                OutputItemDoneEvent(type="response.output_item.done", item=item)
+            )
+            if not isinstance(result, ToolResultEvent) or result.call_id != call_id:
+                raise RuntimeError("session action returned a mismatched tool result")
+            return result.output
         self.emit(OutputItemDoneEvent(type="response.output_item.done", item=item))
         # A genuinely client-owned tool parks on a human (or external system)
         # to answer, same as an elicitation reply — hold the idle window open
@@ -677,21 +908,22 @@ class TurnContext:
             self._pending_human_waits += 1
         try:
             result = await future
-            item["status"] = "completed"
-            self.emit(OutputItemDoneEvent(type="response.output_item.done", item=item))
-            self.emit(
-                OutputItemDoneEvent(
-                    type="response.output_item.done",
-                    item={
-                        "id": f"fco_{uuid.uuid4().hex[:12]}",
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": cap_tool_output(result),
-                        "arguments": arguments,
-                        "status": "completed",
-                    },
+            if not suppress_completed_mirror:
+                item["status"] = "completed"
+                self.emit(OutputItemDoneEvent(type="response.output_item.done", item=item))
+                self.emit(
+                    OutputItemDoneEvent(
+                        type="response.output_item.done",
+                        item={
+                            "id": f"fco_{uuid.uuid4().hex[:12]}",
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": cap_tool_output(result),
+                            "arguments": arguments,
+                            "status": "completed",
+                        },
+                    )
                 )
-            )
             return result
         finally:
             # Always remove — whether the Future resolved cleanly
@@ -728,6 +960,24 @@ class TurnContext:
         future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
         self._pending_elicitations[elicitation_id] = future
         self._pending_human_waits += 1
+        if self._session_action_handler is not None:
+            try:
+                response = await self._send_session_action(
+                    ElicitationRequestEvent(
+                        type="response.elicitation_request",
+                        elicitation_id=elicitation_id,
+                        params=params,
+                    )
+                )
+                if (
+                    not isinstance(response, ApprovalEvent)
+                    or response.elicitation_id != elicitation_id
+                ):
+                    raise RuntimeError("session action returned a mismatched approval")
+                return response.to_elicitation_result()
+            finally:
+                self._pending_elicitations.pop(elicitation_id, None)
+                self._pending_human_waits -= 1
         self.emit(
             ElicitationRequestEvent(
                 type="response.elicitation_request",
@@ -848,6 +1098,30 @@ class TurnContext:
         if human_gated:
             self._pending_human_waits += 1
         _logger.info("Policy evaluation %s requested (phase=%s)", evaluation_id, phase)
+        if self._session_action_handler is not None:
+            try:
+                response = await self._send_session_action(
+                    PolicyEvaluationRequestEvent(
+                        type="policy_evaluation.requested",
+                        evaluation_id=evaluation_id,
+                        phase=phase,
+                        data=data,
+                    )
+                )
+                if (
+                    not isinstance(response, PolicyVerdictEvent)
+                    or response.evaluation_id != evaluation_id
+                ):
+                    raise RuntimeError("session action returned a mismatched policy verdict")
+                return PolicyVerdictPayload(
+                    action=response.action,
+                    reason=response.reason,
+                    data=response.data,
+                )
+            finally:
+                self._pending_policy_evaluations.pop(evaluation_id, None)
+                if human_gated:
+                    self._pending_human_waits -= 1
         self.emit(
             PolicyEvaluationRequestEvent(
                 type="policy_evaluation.requested",
@@ -974,6 +1248,29 @@ def _live_mcp_failure(status_code: int, error: str) -> JSONResponse:
     return JSONResponse({"error": error}, status_code=status_code)
 
 
+def _session_report_failure(exception: BaseException) -> JSONResponse:
+    """Map report-channel failures to explicit private-control responses."""
+    if isinstance(exception, SessionReportJournalVersionMismatch):
+        return JSONResponse({"error": "report_journal_version_mismatch"}, status_code=409)
+    if isinstance(exception, SessionReportJournalFenced):
+        return JSONResponse({"error": "report_subscriber_replaced"}, status_code=409)
+    if isinstance(exception, SessionReportJournalConflict):
+        return JSONResponse({"error": "report_sequence_conflict"}, status_code=409)
+    if isinstance(exception, SessionReportJournalUnavailable):
+        return JSONResponse({"error": "report_journal_unavailable"}, status_code=404)
+    if isinstance(exception, SessionReportJournalBusy):
+        return JSONResponse({"error": "report_journal_busy"}, status_code=503)
+    if isinstance(exception, SessionReportJournalCapacity):
+        return JSONResponse({"error": "report_journal_capacity"}, status_code=507)
+    if isinstance(exception, SessionReportJournalCorrupt):
+        return JSONResponse({"error": "report_journal_corrupt"}, status_code=500)
+    if isinstance(exception, ValueError):
+        return JSONResponse({"error": "invalid_report_request"}, status_code=422)
+    if isinstance(exception, SessionReportJournalError):
+        return JSONResponse({"error": "report_journal_failure"}, status_code=500)
+    return JSONResponse({"error": "report_channel_failure"}, status_code=500)
+
+
 class HarnessApp:
     """
     Base class for harness wraps. Subclasses implement
@@ -1031,10 +1328,184 @@ class HarnessApp:
         # Lock for ``_in_flight`` / ``_active_turn_ctx`` mutations —
         # route handlers run concurrently in FastAPI's event loop.
         self._lock = asyncio.Lock()
+        self._action_lock = asyncio.Lock()
+        self._session_actions: OrderedDict[str, _PendingSessionAction] = OrderedDict()
+        self._session_action_event_index: dict[str, str] = {}
+        # (event_id, expected type, correlation id, result dump); a None result
+        # marks a cancelled action. Tombstones are retained for this harness
+        # generation, and new actions fail closed when the bound is reached.
+        self._session_action_tombstones: OrderedDict[
+            str, tuple[str, str, str, dict[str, Any] | None]
+        ] = OrderedDict()
+        self._session_action_changed = asyncio.Event()
+        self._session_action_pollers = 0
+        self._bound_conversation_id: str | None = None
         # Set by graceful-shutdown signal handlers; checked by the
         # ``message`` /events handler to refuse new turns once
         # shutdown started.
         self._shutting_down = asyncio.Event()
+
+    async def on_startup(self, conversation_id: str | None) -> None:
+        """Subclass hook invoked after the runner binds the served conversation."""
+
+    async def session_report_capabilities(self, conversation_id: str) -> dict[str, object] | None:
+        """Return private report-channel capabilities, or ``None`` when unsupported."""
+        return None
+
+    async def read_session_reports(
+        self,
+        conversation_id: str,
+        *,
+        after_sequence: int,
+        subscriber_generation: str,
+        limit: int,
+    ) -> SessionReportPage | None:
+        """Read a durable report page, or ``None`` when the channel is unsupported."""
+        return None
+
+    async def acknowledge_session_reports(
+        self,
+        conversation_id: str,
+        *,
+        through_sequence: int,
+        subscriber_generation: str,
+    ) -> int | None:
+        """Acknowledge a durable report prefix, or ``None`` when unsupported."""
+        return None
+
+    async def session_action_generation(self, conversation_id: str) -> str | None:
+        """Return the active report generation when the private action channel is enabled."""
+        return None
+
+    async def cancel_session_actions(self) -> None:
+        """Cancel parked actions while retaining bounded replay tombstones."""
+        async with self._action_lock:
+            for action_id, action in tuple(self._session_actions.items()):
+                self._session_actions.pop(action_id, None)
+                self._session_action_tombstones[action_id] = (
+                    action.event_id,
+                    action.expected_type,
+                    action.expected_correlation,
+                    None,
+                )
+                if not action.future.done():
+                    action.future.cancel()
+            self._session_action_changed.set()
+
+    async def publish_session_action(
+        self, ctx: TurnContext, event: HarnessStreamEvent
+    ) -> BaseModel:
+        """Expose one existing harness event and await its fenced inbound result."""
+        child = ctx._session_action_child
+        if child is None or ctx.session_id is None:
+            raise RuntimeError("session action has no trusted child scope")
+        generation = await self.session_action_generation(ctx.session_id)
+        if generation is None:
+            raise RuntimeError("session action channel is not enabled")
+        expected_type, expected_correlation = _session_action_expected_result(event)
+        event_dump = event.model_dump(mode="json", exclude_none=True)
+        identity = child.to_wire()
+        event_key = json.dumps(
+            {
+                "generation": generation,
+                "child": identity,
+                "request_id": child.request_id,
+                "request_invocation_id": child.request_invocation_id,
+                "event": event_dump,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        event_id = "evt_" + hashlib.sha256(event_key.encode("utf-8")).hexdigest()
+        action_id = "act_" + hashlib.sha256(f"{generation}\0{event_id}".encode()).hexdigest()
+
+        async with self._action_lock:
+            existing_id = self._session_action_event_index.get(event_id)
+            if existing_id is not None:
+                existing = self._session_actions.get(existing_id)
+                if existing is not None:
+                    if (
+                        existing.event != event_dump
+                        or existing.child != identity
+                        or existing.expected_type != expected_type
+                        or existing.expected_correlation != expected_correlation
+                    ):
+                        raise RuntimeError("session action event identity was reused")
+                    future = existing.future
+                else:
+                    tombstone = self._session_action_tombstones.get(existing_id)
+                    if tombstone is None or tombstone[3] is None:
+                        raise RuntimeError("session action was cancelled")
+                    if tombstone[1] != expected_type or tombstone[2] != expected_correlation:
+                        raise RuntimeError("session action event identity was reused")
+                    return TypeAdapter(InboundEventRequest).validate_python(tombstone[3])
+            else:
+                if len(self._session_actions) >= _MAX_PENDING_SESSION_ACTIONS:
+                    raise RuntimeError("pending session action capacity reached")
+                if (
+                    len(self._session_action_tombstones) + len(self._session_actions)
+                    >= _MAX_SESSION_ACTION_TOMBSTONES
+                ):
+                    raise RuntimeError("session action retry-record capacity reached")
+                future = asyncio.get_running_loop().create_future()
+                pending = _PendingSessionAction(
+                    action_id=action_id,
+                    event_id=event_id,
+                    generation=generation,
+                    child=identity,
+                    event=event_dump,
+                    expected_type=expected_type,
+                    expected_correlation=expected_correlation,
+                    future=future,
+                )
+                self._session_actions[action_id] = pending
+                self._session_action_event_index[event_id] = action_id
+                self._session_action_changed.set()
+        try:
+            return await future
+        except asyncio.CancelledError:
+            await self._cancel_session_action(action_id)
+            raise
+
+    async def _cancel_session_action(self, action_id: str) -> None:
+        async with self._action_lock:
+            pending = self._session_actions.pop(action_id, None)
+            if pending is None:
+                return
+            self._session_action_tombstones[action_id] = (
+                pending.event_id,
+                pending.expected_type,
+                pending.expected_correlation,
+                None,
+            )
+            if not pending.future.done():
+                pending.future.cancel()
+            self._session_action_changed.set()
+
+    def make_session_action_context(
+        self,
+        child: SessionActionChild,
+        *,
+        agent: str | None = None,
+        origin_generation: str | None = None,
+    ) -> TurnContext:
+        """Create an unregistered turn context whose waits use the action channel."""
+        queue: asyncio.Queue[HarnessStreamEvent | None] = asyncio.Queue()
+        ctx = TurnContext(
+            response_id=f"action_{uuid.uuid4().hex}",
+            event_queue=queue,
+            cancelled=asyncio.Event(),
+            session_id=self._bound_conversation_id,
+            session_action_child=child,
+            session_action_agent=agent,
+            session_action_origin_token=child.origin_token,
+            session_action_origin_generation=origin_generation,
+            session_action_context_generation=child.context_generation,
+        )
+        ctx._session_action_handler = lambda event: self.publish_session_action(ctx, event)
+        return ctx
 
     async def on_shutdown(self) -> None:
         """
@@ -1221,13 +1692,16 @@ class HarnessApp:
         cancel in-flight Futures, invoke subclass shutdown hooks, and
         drain briefly for graceful completion.
 
-        :param _app: The FastAPI app (unused — required by the
-            lifespan protocol).
+        :param _app: The FastAPI app carrying the runner-bound
+            conversation id.
         """
         try:
+            self._bound_conversation_id = getattr(_app.state, "conversation_id", None)
+            await self.on_startup(getattr(_app.state, "conversation_id", None))
             yield
         finally:
             self._on_shutdown_signal()
+            await self.cancel_session_actions()
             await self.on_shutdown()
             await self._drain_for_shutdown()
 
@@ -1310,7 +1784,329 @@ class HarnessApp:
             methods=["POST"],
             response_model=None,
         )
+        router.add_api_route(
+            "/sessions/{conversation_id}/reports/capabilities",
+            self._get_session_report_capabilities,
+            methods=["GET"],
+            response_model=None,
+        )
+        router.add_api_route(
+            "/sessions/{conversation_id}/reports",
+            self._get_session_reports,
+            methods=["GET"],
+            response_model=None,
+        )
+        router.add_api_route(
+            "/sessions/{conversation_id}/reports/ack",
+            self._post_session_reports_ack,
+            methods=["POST"],
+            response_model=None,
+        )
+        router.add_api_route(
+            "/sessions/{conversation_id}/actions",
+            self._get_session_actions,
+            methods=["GET"],
+            response_model=None,
+        )
+        router.add_api_route(
+            "/sessions/{conversation_id}/actions/{action_id}/result",
+            self._post_session_action_result,
+            methods=["POST"],
+            response_model=None,
+        )
         return router
+
+    async def _session_actions_request_error(
+        self, request: Request, conversation_id: str, generation: str
+    ) -> Response | None:
+        """Authenticate and bind an ephemeral action-channel request."""
+        if not getattr(request.app.state, "harness_auth_token", None):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        try:
+            active_generation = await self.session_action_generation(conversation_id)
+        except (SessionReportJournalError, ValueError) as exc:
+            return _session_report_failure(exc)
+        if active_generation is None:
+            return JSONResponse(
+                {"error": "unsupported", "detail": "Session actions are not enabled."},
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        if not hmac.compare_digest(active_generation, generation):
+            return JSONResponse(
+                {"error": "stale_generation", "detail": "Session action generation is stale."},
+                status_code=status.HTTP_409_CONFLICT,
+            )
+        return None
+
+    async def _get_session_actions(
+        self,
+        conversation_id: str,
+        request: Request,
+        generation: str = Query(min_length=1, max_length=256),
+        wait_ms: int = Query(default=0, ge=0, le=_SESSION_ACTION_POLL_WAIT_MS),
+    ) -> Response:
+        """Return pending child actions, optionally waiting for new work."""
+        refused = await self._session_actions_request_error(request, conversation_id, generation)
+        if refused is not None:
+            return refused
+        if self._session_action_pollers >= _MAX_SESSION_ACTION_POLLS:
+            return JSONResponse(
+                {"error": "busy", "detail": "Too many concurrent action polls."},
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+        self._session_action_pollers += 1
+        try:
+            deadline = asyncio.get_running_loop().time() + wait_ms / 1000
+            while not self._session_actions and asyncio.get_running_loop().time() < deadline:
+                self._session_action_changed.clear()
+                if self._session_actions:
+                    break
+                remaining = deadline - asyncio.get_running_loop().time()
+                try:
+                    await asyncio.wait_for(self._session_action_changed.wait(), timeout=remaining)
+                except TimeoutError:
+                    break
+            actions = list(self._session_actions.values())[:_SESSION_ACTION_POLL_LIMIT]
+            return JSONResponse(
+                {
+                    "protocol": _SESSION_ACTION_PROTOCOL,
+                    "version": _SESSION_ACTION_VERSION,
+                    "features": sorted(_SESSION_ACTION_FEATURES),
+                    "generation": generation,
+                    "actions": [
+                        {
+                            "action_id": action.action_id,
+                            "event_id": action.event_id,
+                            "child": action.child,
+                            "event": action.event,
+                        }
+                        for action in actions
+                    ],
+                }
+            )
+        finally:
+            self._session_action_pollers -= 1
+
+    async def _post_session_action_result(
+        self,
+        conversation_id: str,
+        action_id: str,
+        body: SessionActionResultRequest,
+        request: Request,
+    ) -> Response:
+        """Deliver one generation-fenced existing inbound event to its child request."""
+        refused = await self._session_actions_request_error(
+            request, conversation_id, body.generation
+        )
+        if refused is not None:
+            return refused
+        try:
+            result = TypeAdapter(InboundEventRequest).validate_python(body.result)
+        except Exception as exc:
+            return JSONResponse(
+                {"error": "invalid_result", "detail": str(exc)},
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        if not isinstance(result, (ApprovalEvent, PolicyVerdictEvent, ToolResultEvent)):
+            return JSONResponse(
+                {"error": "invalid_result", "detail": "Unsupported session action result type."},
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+        result_dump = result.model_dump(mode="json", exclude_none=True)
+        async with self._action_lock:
+            pending = self._session_actions.get(action_id)
+            if pending is None:
+                tombstone = self._session_action_tombstones.get(action_id)
+                if tombstone is None:
+                    return JSONResponse(
+                        {
+                            "error": "action_not_found",
+                            "detail": "Session action is no longer pending.",
+                        },
+                        status_code=status.HTTP_409_CONFLICT,
+                    )
+                expected_event_id, _expected_type, _expected_correlation, prior = tombstone
+                if body.event_id != expected_event_id:
+                    return JSONResponse(
+                        {"error": "event_mismatch", "detail": "Action event id does not match."},
+                        status_code=status.HTTP_409_CONFLICT,
+                    )
+                if prior is None:
+                    return JSONResponse(
+                        {"error": "action_cancelled", "detail": "Session action was cancelled."},
+                        status_code=status.HTTP_409_CONFLICT,
+                    )
+                if prior != result_dump:
+                    return JSONResponse(
+                        {
+                            "error": "conflicting_result",
+                            "detail": "Action already has a different result.",
+                        },
+                        status_code=status.HTTP_409_CONFLICT,
+                    )
+                return JSONResponse({"accepted": True, "duplicate": True})
+
+            if body.event_id != pending.event_id:
+                return JSONResponse(
+                    {"error": "event_mismatch", "detail": "Action event id does not match."},
+                    status_code=status.HTTP_409_CONFLICT,
+                )
+            correlation = _session_action_result_correlation(result)
+            if result.type != pending.expected_type or correlation != pending.expected_correlation:
+                return JSONResponse(
+                    {
+                        "error": "result_mismatch",
+                        "detail": "Result does not match the pending action.",
+                    },
+                    status_code=status.HTTP_409_CONFLICT,
+                )
+            if len(self._session_action_tombstones) >= _MAX_SESSION_ACTION_TOMBSTONES:
+                return JSONResponse(
+                    {"error": "capacity", "detail": "Session action retry records are full."},
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            self._session_actions.pop(action_id, None)
+            self._session_action_tombstones[action_id] = (
+                pending.event_id,
+                pending.expected_type,
+                pending.expected_correlation,
+                result_dump,
+            )
+            if not pending.future.done():
+                pending.future.set_result(result)
+            self._session_action_changed.set()
+        return JSONResponse({"accepted": True, "duplicate": False})
+
+    def _session_reports_request_error(
+        self, request: Request, conversation_id: str
+    ) -> Response | None:
+        """Authenticate and bind every private report-channel request."""
+        # Unlike legacy harness routes, report data is private and these
+        # endpoints must fail closed even when the runner did not configure
+        # its per-spawn bearer token.
+        if not getattr(request.app.state, "harness_auth_token", None):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        return None
+
+    async def _get_session_report_capabilities(
+        self, conversation_id: str, request: Request
+    ) -> Response:
+        """Return the negotiated private report protocol for this harness session."""
+        refused = self._session_reports_request_error(request, conversation_id)
+        if refused is not None:
+            return refused
+        try:
+            capabilities = await self.session_report_capabilities(conversation_id)
+        except (SessionReportJournalError, ValueError) as exc:
+            return _session_report_failure(exc)
+        if capabilities is None:
+            return JSONResponse(
+                {"error": "unsupported", "detail": "Session reports are not enabled."},
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        return JSONResponse(capabilities)
+
+    async def _get_session_reports(
+        self,
+        conversation_id: str,
+        request: Request,
+        after: int = Query(default=0, ge=0),
+        subscriber_generation: str = Query(min_length=1, max_length=256),
+        limit: int = Query(default=100, ge=1, le=1000),
+        wait_ms: int = Query(default=0, ge=0, le=25_000),
+    ) -> Response:
+        """Read ordered reports with an optional bounded long poll."""
+        refused = self._session_reports_request_error(request, conversation_id)
+        if refused is not None:
+            return refused
+        deadline = asyncio.get_running_loop().time() + wait_ms / 1000
+        while True:
+            try:
+                page = await self.read_session_reports(
+                    conversation_id,
+                    after_sequence=after,
+                    subscriber_generation=subscriber_generation,
+                    limit=limit,
+                )
+            except (SessionReportJournalError, ValueError) as exc:
+                return _session_report_failure(exc)
+            if page is None:
+                return JSONResponse(
+                    {"error": "unsupported", "detail": "Session reports are not enabled."},
+                    status_code=status.HTTP_404_NOT_FOUND,
+                )
+            if (
+                page.records
+                or (page.source_status is not None and page.source_status.state == "failed")
+                or asyncio.get_running_loop().time() >= deadline
+            ):
+                break
+            await asyncio.sleep(min(0.1, max(0.0, deadline - asyncio.get_running_loop().time())))
+        return JSONResponse(
+            {
+                "protocol": "acp-session-reports",
+                "version": 3,
+                "features": list(SESSION_REPORT_FEATURES),
+                "subscriber_generation": subscriber_generation,
+                "records": [
+                    {
+                        "sequence": record.sequence,
+                        "journal_id": record.journal_id,
+                        "epoch_ordinal": record.epoch_ordinal,
+                        "native_epoch": record.native_epoch,
+                        "ingress_sequence": record.ingress_sequence,
+                        "source_id": record.source_id,
+                        "kind": record.kind,
+                        "data": record.data,
+                    }
+                    for record in page.records
+                ],
+                "highest_sequence": page.highest_sequence,
+                "exposed_through": page.exposed_through,
+                "more": page.more,
+                "source_status": (
+                    None
+                    if page.source_status is None
+                    else {
+                        "state": page.source_status.state,
+                        "error": page.source_status.error,
+                    }
+                ),
+            }
+        )
+
+    async def _post_session_reports_ack(
+        self,
+        conversation_id: str,
+        body: SessionReportAckRequest,
+        request: Request,
+    ) -> Response:
+        """Acknowledge a contiguous report prefix after durable forwarding."""
+        refused = self._session_reports_request_error(request, conversation_id)
+        if refused is not None:
+            return refused
+        try:
+            acknowledged = await self.acknowledge_session_reports(
+                conversation_id,
+                through_sequence=body.through_sequence,
+                subscriber_generation=body.subscriber_generation,
+            )
+        except (SessionReportJournalError, ValueError) as exc:
+            return _session_report_failure(exc)
+        if acknowledged is None:
+            return JSONResponse(
+                {"error": "unsupported", "detail": "Session reports are not enabled."},
+                status_code=status.HTTP_404_NOT_FOUND,
+            )
+        return JSONResponse({"acknowledged_sequence": acknowledged})
 
     def _live_mcp_request_error(self, request: Request, conversation_id: str) -> Response | None:
         """Authorize a live-MCP request; refuse one this harness cannot answer."""
@@ -1677,6 +2473,9 @@ class HarnessApp:
                 event_queue=event_queue,
                 cancelled=cancelled,
                 session_id=session_id,
+                session_action_origin_token=request._session_action_origin_token,
+                session_action_origin_generation=request._session_action_origin_generation,
+                session_action_context_generation=request._session_action_context_generation,
             )
             self._in_flight[response_id] = ctx
             self._active_turn_ctx = ctx

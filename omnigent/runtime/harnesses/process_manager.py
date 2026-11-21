@@ -44,7 +44,12 @@ from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task, close_subprocess_transport
 from omnigent.inner.agent_env import strip_desktop_session_env
 from omnigent.native.owner_claim import owner_is_gone, read_owner_claim, write_owner_claim
-from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.process_logging import data_dir
+from omnigent.runner.identity import (
+    HARNESS_AUTH_TOKEN_ENV_VAR,
+    HARNESS_SESSION_REPORT_ENV_VARS,
+    strip_runner_auth_secrets,
+)
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._harness_zygote_client import (
     HarnessZygoteClient,
@@ -100,13 +105,18 @@ class _HarnessHttpClient(httpx.AsyncClient):
 _TMP_PARENT_ENV_VAR = HARNESS_TMP_PARENT_ENV_VAR
 
 # S1 (security): env var carrying the per-spawn bearer token for the harness
-# control channel. The parent generates a fresh token per subprocess, ships it
-# here (private to the parent/child pair), and presents it on every ``/v1``
-# request; the harness scaffold's auth middleware compares against it. This is
-# the access boundary on Windows, where the IPC is a loopback TCP listener
-# reachable by any local process; on POSIX (uid-isolated UDS) it is defence in
-# depth.
-_HARNESS_AUTH_TOKEN_ENV = "OMNIGENT_HARNESS_AUTH_TOKEN"
+# control channel. The parent generates a fresh token for Windows children and
+# report-enabled ACP children, ships it here (private to the parent/child pair),
+# and presents it on every ``/v1`` request; the harness scaffold compares it.
+# This is the access boundary on Windows and protects the private report channel
+# on POSIX (where the UDS is already uid-isolated).
+_HARNESS_AUTH_TOKEN_ENV = HARNESS_AUTH_TOKEN_ENV_VAR
+_SESSION_REPORT_PROTOCOL_ENV = "OMNIGENT_ACP_SESSION_REPORT_PROTOCOL"
+_SESSION_REPORT_SERVER_IDENTITY_ENV = "OMNIGENT_ACP_SESSION_REPORT_SERVER_IDENTITY"
+_SESSION_REPORT_GENERATION_ENV = "OMNIGENT_ACP_SESSION_REPORT_SUBSCRIBER_GENERATION"
+_SESSION_REPORT_ROOT_ENV = "OMNIGENT_ACP_SESSION_REPORT_ROOT"
+_SESSION_REPORT_PROTOCOL = "acp-session-reports/3"
+_SESSION_REPORT_ENV_VARS = HARNESS_SESSION_REPORT_ENV_VARS
 
 # Sentinel each instance writes into its subdir on boot; the orphan sweep uses it
 # to tell a still-running sibling from a crashed one (kill children, remove dir).
@@ -130,6 +140,14 @@ _SOCKET_MODE = 0o600
 # deployment-level capacity knob — operators may tune; specs MUST
 # NOT depend on a specific value.
 _DEFAULT_IDLE_TIMEOUT_S = 60 * 60  # 1 hour
+
+# A session-owned ACP child keeps its parent harness process alive after the
+# parent turn ends. The runner clears the lease only after the terminal report
+# has been forwarded and acknowledged.
+_MAX_BACKGROUND_ACTIVITIES_PER_SESSION = 10_000
+_MAX_BACKGROUND_ACTIVITY_ID_LENGTH = 512
+_PROCESS_EXIT_CALLBACK_TIMEOUT_S = 60.0
+_PROCESS_TREE_REFRESH_INTERVAL_S = 1.0
 
 # How often the idle reaper wakes up to check for stale entries.
 # Picking 1/30th of the timeout keeps reaping reasonably prompt
@@ -487,6 +505,8 @@ class _SubprocessEntry:
         :data:`_LIVE_MODEL_CONFIG_HARNESSES` and explicitly curated ACP agents
         apply it in-process.
     :param acp_config: ACP startup options, excluding the live model selection.
+    :param session_report_subscriber_generation: Generation minted for the
+        private session-report channel, or ``None`` for non-reporting harnesses.
     """
 
     def __init__(
@@ -497,6 +517,9 @@ class _SubprocessEntry:
         harness: str,
         model: str | None = None,
         acp_config: dict[str, str] | None = None,
+        session_report_subscriber_generation: str | None = None,
+        session_report_runtime_incarnation: int | None = None,
+        session_report_enabled: bool = False,
     ) -> None:
         self.process = process
         self.client = client
@@ -504,7 +527,12 @@ class _SubprocessEntry:
         self.harness = harness
         self.model = model
         self.acp_config = acp_config or {}
+        self.session_report_subscriber_generation = session_report_subscriber_generation
+        self.session_report_runtime_incarnation = session_report_runtime_incarnation
+        self.session_report_enabled = session_report_enabled
         self.last_used_at: float = 0.0
+        self.process_exit_watcher: asyncio.Task[None] | None = None
+        self.process_exit_expected = False
 
 
 def _model_env_key(harness: str) -> str:
@@ -607,6 +635,8 @@ class HarnessProcessManager:
         # spawn's readiness latency relative to it (harness boot vs manager boot).
         self._started_at: float | None = None
         self._entries: dict[str, _SubprocessEntry] = {}
+        self._session_report_opt_in: dict[str, bool] = {}
+        self._session_report_runtime_incarnations: dict[str, int] = {}
         # Per-conversation in-flight harness response_id. The runner's
         # ``proxy_stream`` populates it via :meth:`mark_in_flight` when
         # the harness emits ``response.created`` and clears it via
@@ -619,6 +649,10 @@ class HarnessProcessManager:
         # and the idle reaper skips any conversation present here so an
         # actively-streaming turn is never reaped mid-flight.
         self._in_flight_response_ids: dict[str, str] = {}
+        # Session-owned activity is independent of the parent's current turn.
+        # One activity id per active child/source lets shell and ACP workers
+        # overlap without one source clearing another's lease.
+        self._background_activities: dict[str, set[str]] = {}
         # Per-conversation spawn lock — see §Process management:
         # Spawn lock. The lock guards the lazy-init window in
         # ``get_client``; uncontested after the first spawn for a
@@ -650,6 +684,7 @@ class HarnessProcessManager:
         # Only fires when the replaced process had an in-flight response; invoked
         # outside the spawn lock so the callback can re-enter get_client without deadlock.
         self._on_harness_respawn: Callable[[str, str, str], Awaitable[None]] | None = None
+        self._on_process_exit: Callable[[str, str, int | None], Awaitable[None]] | None = None
 
     def set_respawn_hook(self, hook: Callable[[str, str, str], Awaitable[None]] | None) -> None:
         """Register the runner-side respawn→resync hook.
@@ -665,6 +700,104 @@ class HarnessProcessManager:
             runner is wired).
         """
         self._on_harness_respawn = hook
+
+    def set_process_exit_hook(
+        self,
+        hook: Callable[[str, str, int | None], Awaitable[None]] | None,
+    ) -> None:
+        """Register runner recovery for confirmed exits of report-enabled harnesses.
+
+        The hook receives the conversation id, that spawn's subscriber generation,
+        and the process return code. It runs without the manager's registry or spawn
+        lock held so it can replace the dead harness through :meth:`get_client`.
+        """
+        self._on_process_exit = hook
+        if hook is None:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Normal setup installs the hook before the first spawn. If an
+            # embedding installs it later, the next get_client starts watchers.
+            return
+        for conversation_id, entry in tuple(self._entries.items()):
+            self._start_process_exit_watcher(conversation_id, entry)
+
+    async def set_session_report_opt_in(self, conversation_id: str, enabled: bool) -> None:
+        """Select optional ACP reporting before the conversation harness is started."""
+        if not isinstance(enabled, bool):
+            raise ValueError("session report opt-in must be boolean")
+        async with self._registry_lock:
+            self._session_report_opt_in[conversation_id] = enabled
+
+    def _start_process_exit_watcher(self, conversation_id: str, entry: _SubprocessEntry) -> None:
+        """Watch only report-enabled process entries after registration."""
+        if (
+            self._on_process_exit is None
+            or entry.session_report_subscriber_generation is None
+            or entry.process_exit_expected
+            or entry.process_exit_watcher is not None
+        ):
+            return
+        entry.process_exit_watcher = asyncio.create_task(
+            self._watch_process_exit(conversation_id, entry),
+            name=f"harness-exit:{conversation_id}:{entry.session_report_subscriber_generation}",
+        )
+
+    async def _watch_process_exit(self, conversation_id: str, entry: _SubprocessEntry) -> None:
+        """Notify the runner after this exact owned process is confirmed dead."""
+        wait_task = asyncio.create_task(entry.process.wait())
+        try:
+            while not wait_task.done():
+                done, _ = await asyncio.wait({wait_task}, timeout=_PROCESS_TREE_REFRESH_INTERVAL_S)
+                if not done:
+                    _proc.refresh_process_tree(entry.process)
+            returncode = wait_task.result()
+        except asyncio.CancelledError:
+            wait_task.cancel()
+            return
+        except Exception:
+            _logger.exception(
+                "failed waiting for report-enabled harness process %s to exit",
+                conversation_id,
+            )
+            return
+        if returncode is None:
+            return
+
+        retry_delay_s = 1.0
+        generation = entry.session_report_subscriber_generation
+        if generation is None:
+            return
+        while True:
+            async with self._registry_lock:
+                if (
+                    self._shutting_down
+                    or entry.process_exit_expected
+                    or self._entries.get(conversation_id) is not entry
+                ):
+                    return
+                hook = self._on_process_exit
+            if hook is None:
+                return
+            try:
+                # Keep recovery in this task: the hook may respawn the harness,
+                # causing _close_entry() to inspect and cancel this watcher. A
+                # wait_for wrapper would move the hook into a child task, so that
+                # teardown would cancel the watcher and its recovery callback.
+                async with asyncio.timeout(_PROCESS_EXIT_CALLBACK_TIMEOUT_S):
+                    await hook(conversation_id, generation, returncode)
+                return
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                _logger.exception(
+                    "runner recovery hook failed for exited harness %s generation %s; retrying",
+                    conversation_id,
+                    generation,
+                )
+                await asyncio.sleep(retry_delay_s)
+                retry_delay_s = min(retry_delay_s * 2, 30.0)
 
     @property
     def instance_dir(self) -> Path:
@@ -806,6 +939,19 @@ class HarnessProcessManager:
                     "while get_client waited"
                 )
             entry = self._entries.get(conversation_id)
+            report_opt_in = self._session_report_opt_in.get(conversation_id, False) and (
+                harness == "acp" or harness.startswith("acp:")
+            )
+            if (
+                entry is not None
+                and harness != "any"
+                and entry.session_report_enabled != report_opt_in
+            ):
+                replaced_response_id = self._in_flight_response_ids.get(conversation_id)
+                await self._close_entry(entry)
+                self._in_flight_response_ids.pop(conversation_id, None)
+                entry = None
+                respawn_reason = "harness_respawn_session_report_capability"
             # "any" control callers may hold an established connection past the
             # unlink; don't kill the turn they're interrupting. Concrete-harness
             # (new-turn) callers reconnect via the pathname and own recovery.
@@ -945,6 +1091,7 @@ class HarnessProcessManager:
                         f"conversation {conversation_id!r}"
                     )
                 self._entries[conversation_id] = entry
+                self._start_process_exit_watcher(conversation_id, entry)
             # Use ``time.monotonic()`` directly rather than
             # ``asyncio.get_running_loop().time()`` so the value is
             # comparable across event loops. ``get_client`` may be
@@ -993,6 +1140,24 @@ class HarnessProcessManager:
                     exc_info=True,
                 )
         return client
+
+    def get_session_report_subscriber_generation(self, conversation_id: str) -> str | None:
+        """Return the generation minted for this live report-enabled harness.
+
+        The generation belongs to an actual subprocess spawn, not to the
+        per-turn workflow env. A missing entry or a non-reporting harness
+        returns ``None``.
+
+        :param conversation_id: Parent runner conversation id.
+        :returns: The live harness's subscriber generation, or ``None``.
+        """
+        entry = self._entries.get(conversation_id)
+        return entry.session_report_subscriber_generation if entry is not None else None
+
+    def get_session_report_runtime_incarnation(self, conversation_id: str) -> int | None:
+        """Return the report-owner incarnation allocated to this live process."""
+        entry = self._entries.get(conversation_id)
+        return entry.session_report_runtime_incarnation if entry is not None else None
 
     async def forward_cancel(
         self,
@@ -1107,6 +1272,56 @@ class HarnessProcessManager:
             registered.
         """
         return conversation_id in self._in_flight_response_ids
+
+    async def register_background_activity(self, parent_id: str, activity_id: str) -> bool:
+        """Lease the parent harness while one session-owned activity is live.
+
+        Duplicate registration is idempotent. ``False`` means the parent no
+        longer has a live harness process (or the manager is shutting down),
+        so the caller must not acknowledge a new child start.
+        """
+        if (
+            not isinstance(activity_id, str)
+            or not activity_id
+            or len(activity_id) > _MAX_BACKGROUND_ACTIVITY_ID_LENGTH
+        ):
+            raise ValueError("background activity id must be a non-empty bounded string")
+        if not isinstance(parent_id, str) or not parent_id:
+            raise ValueError("background activity parent id must be a non-empty string")
+        async with self._registry_lock:
+            if self._shutting_down:
+                return False
+            entry = self._entries.get(parent_id)
+            if entry is None or entry.process.returncode is not None:
+                return False
+            activities = self._background_activities.setdefault(parent_id, set())
+            if (
+                activity_id not in activities
+                and len(activities) >= _MAX_BACKGROUND_ACTIVITIES_PER_SESSION
+            ):
+                return False
+            activities.add(activity_id)
+            entry.last_used_at = time.monotonic()
+            return True
+
+    async def clear_background_activity(self, parent_id: str, activity_id: str) -> None:
+        """Clear one source activity after its terminal report is settled."""
+        async with self._registry_lock:
+            activities = self._background_activities.get(parent_id)
+            if activities is None:
+                return
+            activities.discard(activity_id)
+            if not activities:
+                self._background_activities.pop(parent_id, None)
+            entry = self._entries.get(parent_id)
+            if entry is not None:
+                # Give the completed session a full idle window from its final
+                # forwarded report before considering its harness for reaping.
+                entry.last_used_at = time.monotonic()
+
+    def has_active_background_activity(self, parent_id: str) -> bool:
+        """Return whether the parent has any live session-owned work."""
+        return bool(self._background_activities.get(parent_id))
 
     def note_activity(self, conversation_id: str) -> None:
         """Refresh the idle lease for an existing harness subprocess.
@@ -1225,6 +1440,7 @@ class HarnessProcessManager:
                         current is None
                         or current.last_used_at > only_if_idle_cutoff
                         or conversation_id in self._in_flight_response_ids
+                        or self.has_active_background_activity(conversation_id)
                     ):
                         _logger.info(
                             "skipping idle reap for conversation %s: entry became "
@@ -1237,6 +1453,7 @@ class HarnessProcessManager:
                 )
                 entry = self._entries.pop(conversation_id, None)
                 self._in_flight_response_ids.pop(conversation_id, None)
+                self._background_activities.pop(conversation_id, None)
                 # NOTE: ``_spawn_locks[conversation_id]`` intentionally
                 # NOT popped — see this method's docstring for the
                 # per-conv lock-identity invariant rationale.
@@ -1328,6 +1545,56 @@ class HarnessProcessManager:
             ``_SPAWN_READY_TIMEOUT_S``.
         """
         module_path = _resolve_module_path(harness)
+        # Always build an explicit env dict (never ``None``): the subprocess
+        # inherits AP's env plus caller overrides, with runner-private values
+        # stripped. Report scope and its bearer are added below from trusted
+        # runner state, never from the per-session executor config.
+        effective_env: dict[str, str] = _build_harness_spawn_env(env)
+        # Defensive clearing also covers env names accidentally added to the
+        # auth-secret filter in an older/newer runtime mix.
+        effective_env.pop(_HARNESS_AUTH_TOKEN_ENV, None)
+        for name in _SESSION_REPORT_ENV_VARS:
+            effective_env.pop(name, None)
+
+        report_generation: str | None = None
+        report_runtime_incarnation: int | None = None
+        reports_session_activity = self._session_report_opt_in.get(conversation_id, False) and (
+            harness == "acp" or harness.startswith("acp:")
+        )
+        if reports_session_activity:
+            report_runtime_incarnation = (
+                self._session_report_runtime_incarnations.get(conversation_id, 0) + 1
+            )
+            if report_runtime_incarnation > 2**63 - 1:
+                raise RuntimeError("ACP report runtime incarnation limit reached")
+            self._session_report_runtime_incarnations[conversation_id] = report_runtime_incarnation
+            # The server URL comes from the runner's own environment. Never
+            # accept identity, generation, or root from the executor config.
+            server_identity = os.environ.get("RUNNER_SERVER_URL", "").strip().rstrip("/")
+            if not server_identity:
+                raise RuntimeError(
+                    "standard ACP session reports require RUNNER_SERVER_URL to identify the server"
+                )
+            report_generation = secrets.token_urlsafe(32)
+            effective_env.update(
+                {
+                    _SESSION_REPORT_PROTOCOL_ENV: _SESSION_REPORT_PROTOCOL,
+                    _SESSION_REPORT_SERVER_IDENTITY_ENV: server_identity,
+                    _SESSION_REPORT_GENERATION_ENV: report_generation,
+                    _SESSION_REPORT_ROOT_ENV: str(data_dir() / "acp-subagent-reports"),
+                }
+            )
+
+        # S1 (security): on Windows the harness IPC is a loopback-TCP listener
+        # reachable by any local process. Session-report requests also require
+        # bearer auth on POSIX, where their durable journal contains private
+        # activity. Mint one fresh token per actual child spawn and use that
+        # same value for the harness env and the parent HTTP client.
+        auth_token: str | None = None
+        if IS_WINDOWS or reports_session_activity:
+            auth_token = secrets.token_urlsafe(32)
+            effective_env[_HARNESS_AUTH_TOKEN_ENV] = auth_token
+
         preparation = asyncio.create_task(asyncio.to_thread(self._ensure_instance_dir))
         try:
             await asyncio.shield(preparation)
@@ -1342,24 +1609,6 @@ class HarnessProcessManager:
         # (released but not cleaned up because of an OS quirk)
         # would block uvicorn binding. Best-effort delete (UDS only).
         endpoint.cleanup()
-
-        # Always build an explicit env dict (never ``None``): the
-        # subprocess inherits AP's env (PATH, HOME, PYTHONPATH, provider
-        # creds) plus any caller overrides, but the runner's
-        # control-plane auth secret is stripped first so the agent
-        # payload running in the harness can't impersonate the runner.
-        # See ``_build_harness_spawn_env``.
-        effective_env: dict[str, str] = _build_harness_spawn_env(env)
-        # S1 (security): on Windows the harness IPC is a loopback-TCP listener
-        # reachable by any local process, so mint a fresh per-spawn bearer token
-        # as the access boundary the uid-isolated UDS provides on POSIX. This is
-        # Windows-only: POSIX keeps the UDS and sets no token, leaving the
-        # scaffold's auth gate inert. The token is delivered via the harness's
-        # private env and presented by our client (below) on every /v1 request.
-        auth_token: str | None = None
-        if IS_WINDOWS:
-            auth_token = secrets.token_urlsafe(32)
-            effective_env[_HARNESS_AUTH_TOKEN_ENV] = auth_token
 
         parent_pid = os.getpid()
 
@@ -1386,6 +1635,7 @@ class HarnessProcessManager:
         ]
         spawn_started_at = time.monotonic()
         process = await self._spawn_harness_process(runner_argv, effective_env)
+        _proc.remember_process_group(process)
         try:
             await _wait_for_bind(process, endpoint, harness, conversation_id)
             # The harness process has bound its socket and is ready to serve —
@@ -1422,10 +1672,8 @@ class HarnessProcessManager:
             client = _HarnessHttpClient(
                 transport=endpoint.make_transport(),
                 base_url=endpoint.base_url,
-                # S1 (security): present the per-spawn bearer token (Windows only)
-                # so the harness scaffold accepts this client and rejects any
-                # unauthenticated local peer on the loopback-TCP channel. Empty on
-                # POSIX, where the uid-isolated UDS is the access boundary.
+                # Present the per-spawn bearer token when Windows transport or
+                # the private report channel requires it.
                 headers=({"Authorization": f"Bearer {auth_token}"} if auth_token else {}),
                 # See the comment above the constant for rationale.
                 # Connect/write/pool keep the 5s default so a vanished
@@ -1444,6 +1692,9 @@ class HarnessProcessManager:
                 # process env var, not re-read per turn.
                 model=(env or {}).get(_model_env_key(harness)),
                 acp_config=_acp_startup_config(env) if harness == "acp" else None,
+                session_report_subscriber_generation=report_generation,
+                session_report_runtime_incarnation=report_runtime_incarnation,
+                session_report_enabled=reports_session_activity,
             )
         except BaseException:
             # From spawn onward the process must have exactly one owner:
@@ -1505,6 +1756,7 @@ class HarnessProcessManager:
             stdout=None,
             stderr=None,
             env=effective_env,
+            **_proc.spawn_kwargs(),
         )
 
     async def _close_entry(self, entry: _SubprocessEntry) -> None:
@@ -1524,6 +1776,10 @@ class HarnessProcessManager:
 
         :param entry: The bookkeeping record to tear down.
         """
+        entry.process_exit_expected = True
+        watcher = entry.process_exit_watcher
+        if watcher is not None and watcher is not asyncio.current_task():
+            watcher.cancel()
         cancellation: asyncio.CancelledError | None = None
         try:
             await entry.client.aclose()
@@ -1535,36 +1791,42 @@ class HarnessProcessManager:
 
         async def _force_kill_and_wait() -> None:
             _proc.kill_tree(entry.process)
-            await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
+            if entry.process.returncode is None:
+                await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
 
         try:
-            if entry.process.returncode is None:
-                try:
-                    # Tree-aware backstop: this process parents the sandbox
-                    # launcher, which forks the real agent. Signalling only the
-                    # handle strands both when an executor close() never runs.
-                    _proc.terminate_tree(entry.process)
+            try:
+                # Tree-aware backstop: this process parents the sandbox
+                # launcher, which forks the real agent. The process helper
+                # retains identity-checked descendants so it can reap them
+                # even after an unexpected leader exit.
+                _proc.terminate_tree(entry.process)
+                if entry.process.returncode is None:
                     await asyncio.wait_for(entry.process.wait(), timeout=_RELEASE_GRACE_S)
+                # Let surviving descendants handle SIGTERM, then force-kill
+                # only identities remembered for this owned process tree.
+                await asyncio.sleep(0.1)
+                _proc.kill_tree(entry.process)
+            except asyncio.CancelledError as exc:
+                # Cancellation during either wait must not abandon the child.
+                cancellation = exc
+                try:
+                    await _force_kill_and_wait()
                 except asyncio.CancelledError as exc:
-                    # Cancellation during either wait must not abandon the child.
                     cancellation = exc
-                    try:
-                        await _force_kill_and_wait()
-                    except asyncio.CancelledError as exc:
-                        cancellation = exc
-                    except Exception:
-                        pass
                 except Exception:
-                    # Graceful SIGTERM didn't complete — it timed out, or
-                    # send_signal/wait raised (e.g. the process vanished
-                    # mid-teardown). Force-kill best-effort; a process that
-                    # is already gone is already done.
-                    try:
-                        await _force_kill_and_wait()
-                    except asyncio.CancelledError as exc:
-                        cancellation = exc
-                    except Exception:
-                        pass
+                    pass
+            except Exception:
+                # Graceful SIGTERM didn't complete — it timed out, or
+                # send_signal/wait raised (e.g. the process vanished
+                # mid-teardown). Force-kill best-effort; a process that
+                # is already gone may still have remembered descendants.
+                try:
+                    await _force_kill_and_wait()
+                except asyncio.CancelledError as exc:
+                    cancellation = exc
+                except Exception:
+                    pass
         finally:
             with contextlib.suppress(Exception):
                 close_subprocess_transport(entry.process)
@@ -1636,6 +1898,8 @@ class HarnessProcessManager:
                     if entry.last_used_at > cutoff:
                         continue
                     if conv_id in self._in_flight_response_ids:
+                        continue
+                    if self.has_active_background_activity(conv_id):
                         continue
                     stale.append(conv_id)
             for conv_id in stale:

@@ -20,6 +20,8 @@ import type {
 } from "./blocks";
 import { BlockStream } from "./blockStream";
 import type { StreamEvent } from "./events";
+import type { ConversationItem } from "./conversationItems";
+import { itemsToBlocks } from "./itemsToBlocks";
 import { parseEvent } from "./sse";
 import type { Response } from "./types";
 
@@ -70,6 +72,77 @@ describe("BlockStream — response_start", () => {
     if (start && start.type === "response_start") {
       expect(start.conversationId).toBeNull();
     }
+  });
+});
+
+describe("BlockStream — standard ACP item metadata", () => {
+  it("keeps directed participants and unknown provenance on the live message block", () => {
+    const directed = {
+      kind: "directed",
+      sender_session_id: "native-child",
+      recipient_session_id: "native-parent",
+      sender_conversation_id: "conv_child",
+      recipient_conversation_id: "conv_parent",
+    };
+    const done = parseEvent("response.output_item.done", {
+      item: {
+        id: "item_child_message",
+        type: "message",
+        response_id: "resp_child",
+        content: [{ type: "output_text", text: "A result for the parent." }],
+        acp_session_message: directed,
+        acp_agent_identity: "unknown",
+      },
+    });
+    if (done === null) throw new Error("expected an assistant output item");
+
+    const blocks = reduce([
+      {
+        type: "response_created",
+        response: makeResponse({ responseId: "resp_child", model: "parent-model" }),
+      },
+      done,
+      {
+        type: "response_completed",
+        response: makeResponse({ responseId: "resp_child", model: "parent-model" }),
+      },
+    ]);
+    const message = blocks.find((block): block is TextDone => block.type === "text_done");
+
+    expect(message).toMatchObject({
+      type: "text_done",
+      fullText: "A result for the parent.",
+      acpSessionMessage: directed,
+      ctx: { agent: null },
+    });
+  });
+
+  it("keeps resolved child references on the live tool execution", () => {
+    const references = [
+      { native_session_id: "worker:α", conversation_id: "conv_worker" },
+      { native_session_id: "unresolved-worker" },
+    ];
+    const call = parseEvent("response.output_item.done", {
+      item: {
+        id: "item_parent_call",
+        type: "function_call",
+        response_id: "resp_parent",
+        call_id: "call_parent",
+        name: "delegate",
+        arguments: "{}",
+        acp_session_references: references,
+      },
+    });
+    if (call === null) throw new Error("expected a tool call output item");
+
+    const blocks = reduce([
+      { type: "response_created", response: makeResponse({ responseId: "resp_parent" }) },
+      call,
+      { type: "response_completed", response: makeResponse({ responseId: "resp_parent" }) },
+    ]);
+    const tool = blocks.find((block): block is ToolGroup => block.type === "tool_group");
+
+    expect(tool?.executions[0]).toHaveProperty("acpSessionReferences", references);
   });
 });
 
@@ -1329,6 +1402,82 @@ describe("BlockStream — out-of-band response ids", () => {
     expect(results[1]!.name).toBe("run_check");
     const groups = blocks.filter((b): b is ToolGroup => b.type === "tool_group");
     expect(groups[1]!.executions[0]!.output).toBe("B-output");
+  });
+});
+
+describe("BlockStream — replaced tool output", () => {
+  it("streams replacements and an explicit clear with the same history result", () => {
+    const itemId = "fco_child_output";
+    const blocks = reduce([
+      {
+        type: "tool_call",
+        name: "inspect_child",
+        arguments: {},
+        callId: "child-call",
+        status: "completed",
+        agentName: "",
+        itemId: "fc_child_call",
+        responseId: "resp_child",
+      },
+      {
+        type: "tool_result",
+        callId: "child-call",
+        output: "A",
+        itemId,
+        responseId: "resp_child",
+      },
+      {
+        type: "tool_result",
+        callId: "child-call",
+        output: "B",
+        itemId,
+        responseId: "resp_child",
+      },
+      {
+        type: "tool_result",
+        callId: "child-call",
+        output: "B",
+        itemId,
+        responseId: "resp_child",
+      },
+      {
+        type: "tool_result",
+        callId: "child-call",
+        output: null,
+        itemId,
+        responseId: "resp_child",
+      },
+    ]);
+    const liveResults = blocks.filter(
+      (block): block is ToolResultBlock => block.type === "tool_result",
+    );
+
+    expect(liveResults.map((result) => result.output)).toEqual(["A", "B", null]);
+    expect(liveResults.map((result) => result.ctx.itemId)).toEqual([itemId, itemId, itemId]);
+
+    const history: ConversationItem[] = [
+      {
+        id: "fc_child_call",
+        response_id: "resp_child",
+        type: "function_call",
+        status: "completed",
+        name: "inspect_child",
+        arguments: "{}",
+        call_id: "child-call",
+      },
+      {
+        id: itemId,
+        response_id: "resp_child",
+        type: "function_call_output",
+        status: "completed",
+        call_id: "child-call",
+        output: null,
+      },
+    ];
+    const historyCall = itemsToBlocks(history).find(
+      (block): block is ToolGroup => block.type === "tool_group",
+    );
+    expect(historyCall?.executions[0]?.output).toBe(liveResults.at(-1)?.output);
   });
 });
 

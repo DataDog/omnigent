@@ -28,16 +28,20 @@ def test_sqlite_writers_preserve_policy_and_plan(tmp_path, monkeypatch):
     store = store_module.SqlAlchemyConversationStore(f"sqlite:///{tmp_path / 'concurrent.db'}")
     conv = store.create_conversation(title="Concurrent Plan fixture")
     entered = [threading.Event(), threading.Event()]
-    release, decode = threading.Event(), store_module._decode_session_state
+    release, decode = threading.Event(), store_module._decode_session_state_private
 
-    def coordinated_decode(value: str | None) -> tuple[dict[str, object], list[dict[str, object]]]:
-        state, todos = decode(value)
+    def coordinated_decode(
+        value: str | None,
+    ) -> tuple[dict[str, object], list[dict[str, object]], dict[str, dict[str, object]]]:
+        state, todos, origins = decode(value)
         writer = int(threading.current_thread().name.rsplit("_", 1)[1])
         entered[writer].set()
         assert writer != 0 or release.wait(10)
-        return state, todos
+        return state, todos, origins
 
-    monkeypatch.setattr(store_module, "_decode_session_state", coordinated_decode)
+    # State and todos writes now share the private decoder so they can preserve
+    # private session-action origins in the same metadata snapshot.
+    monkeypatch.setattr(store_module, "_decode_session_state_private", coordinated_decode)
 
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="writer") as executor:
         policy_write = executor.submit(store.set_session_state, conv.id, {"policy_counter": 1})
@@ -48,7 +52,7 @@ def test_sqlite_writers_preserve_policy_and_plan(tmp_path, monkeypatch):
         assert blocked
         assert policy_write.result(timeout=10) is None and plan_write.result(timeout=10)
 
-    monkeypatch.setattr(store_module, "_decode_session_state", decode)
+    monkeypatch.setattr(store_module, "_decode_session_state_private", decode)
     reloaded = store.get_conversation(conv.id)
     assert reloaded and reloaded.session_state == {"policy_counter": 1}
     assert reloaded.session_todos == TODOS

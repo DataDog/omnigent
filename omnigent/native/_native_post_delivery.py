@@ -180,6 +180,8 @@ async def post_external_session_status(
     failure_detail: str | None = None,
     failure_context: object = None,
     turn_completed: bool | None = None,
+    turn_outcome: str | None = None,
+    require_durable: bool = False,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
 
@@ -236,11 +238,19 @@ async def post_external_session_status(
         data["response_id"] = response_id
     if turn_completed is not None:
         data["turn_completed"] = turn_completed
+    if turn_outcome is not None:
+        data["turn_outcome"] = turn_outcome
+    if require_durable:
+        data["require_durable"] = True
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": data},
     )
     resp.raise_for_status()
+    if require_durable:
+        payload = resp.json()
+        if not isinstance(payload, dict) or payload.get("durable") is not True:
+            raise RuntimeError("external session status was not durably acknowledged")
 
 
 async def post_session_event_with_retry(

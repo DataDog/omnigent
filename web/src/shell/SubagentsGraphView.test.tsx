@@ -219,6 +219,125 @@ describe("childActivity", () => {
   });
 });
 
+describe("childStatus for standard ACP mirrors", () => {
+  const acpLabels = { "omnigent.acp.subagent_id": "native-child-1" };
+
+  it("uses only a current running observation even when legacy status is idle", () => {
+    const result = childStatus(
+      childInfo({
+        id: "acp-running",
+        labels: acpLabels,
+        busy: false,
+        current_task_status: "completed",
+        acp_session_observation: {
+          source_current: true,
+          state: { present: true, value: { state: "running" } },
+          transport: { state: "connected" },
+        },
+      }),
+    );
+
+    expect(result).toEqual({ activity: "working", label: "Working" });
+  });
+
+  it("keeps current idle distinct from successful completion and exposes its stop reason", () => {
+    const result = childStatus(
+      childInfo({
+        id: "acp-idle",
+        labels: acpLabels,
+        busy: true,
+        current_task_status: "in_progress",
+        acp_session_observation: {
+          source_current: true,
+          state: {
+            present: true,
+            value: { state: "idle", stopReason: "future opaque reason" },
+          },
+          transport: { state: "connected" },
+        },
+      }),
+    );
+
+    expect(result).toEqual({
+      activity: "idle",
+      label: "Idle",
+      details: "Stop reason: future opaque reason",
+    });
+  });
+
+  it("maps requires_action to awaiting response", () => {
+    const result = childStatus(
+      childInfo({
+        id: "acp-awaiting",
+        labels: acpLabels,
+        acp_session_observation: {
+          source_current: true,
+          state: { present: true, value: { state: "requires_action" } },
+          transport: { state: "connected" },
+        },
+      }),
+    );
+
+    expect(result).toEqual({ activity: "awaiting", label: "Needs response" });
+  });
+
+  it.each([
+    ["missing observation", null],
+    [
+      "historical observation",
+      { source_current: false, state: { present: true, value: "running" } },
+    ],
+    ["sparse observation", { source_current: true }],
+    ["absent state", { source_current: true, state: { present: false } }],
+    ["null state", { source_current: true, state: { present: true, value: null } }],
+    [
+      "future state",
+      { source_current: true, state: { present: true, value: { state: "future" } } },
+    ],
+  ] as const)("shows %s as unconfirmed", (_caseName, observation) => {
+    const result = childStatus(
+      childInfo({
+        id: "acp-unconfirmed",
+        labels: acpLabels,
+        busy: true,
+        current_task_status: "completed",
+        acp_session_observation: observation,
+      }),
+    );
+
+    expect(result.activity).toBe("unconfirmed");
+    expect(result.label).toBe("Unconfirmed");
+  });
+
+  it("prioritizes disconnected transport over a retained running state", () => {
+    const result = childStatus(
+      childInfo({
+        id: "acp-disconnected",
+        labels: acpLabels,
+        busy: true,
+        current_task_status: "in_progress",
+        acp_session_observation: {
+          source_current: true,
+          state: { present: true, value: { state: "running" } },
+          transport: { state: "disconnected", reason: "stdout closed" },
+        },
+      }),
+    );
+
+    expect(result).toEqual({
+      activity: "disconnected",
+      label: "Disconnected",
+      details: "stdout closed",
+    });
+  });
+
+  it("preserves legacy status classification for non-ACP children", () => {
+    expect(
+      childStatus(childInfo({ id: "ordinary-child", current_task_status: "completed" })),
+    ).toEqual({ activity: "done", label: "Done" });
+  });
+});
+
 // ===========================================================================
 // Unit tests: shared dot palette (list ⇄ graph parity)
 // ===========================================================================
