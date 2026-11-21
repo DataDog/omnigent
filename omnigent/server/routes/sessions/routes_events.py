@@ -12,6 +12,7 @@ import json
 import secrets
 import time
 import weakref
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Never, cast
@@ -69,7 +70,13 @@ from omnigent.inner.acp_standard_subagents import (
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.native.input_diagnostics import input_attributes
-from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.onboarding.sandboxes.context import managed_sandbox_context_scope
+from omnigent.onboarding.sandboxes.types import ManagedIdentityRequirement
+from omnigent.runner.identity import (
+    ORCHESTRATION_SOURCE_HEADER,
+    RUNNER_TUNNEL_TOKEN_HEADER,
+    token_bound_runner_id,
+)
 from omnigent.runner.launch_failure import (
     CODEX_COMPACTION_MODEL_FAILED,
     CODEX_PROVIDER_AUTH_FAILED,
@@ -89,6 +96,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession
 from omnigent.runtime import (
     inflight_text,
+    pending_client_tool_calls,
     pending_elicitations,
     pending_inputs,
     session_stream,
@@ -125,9 +133,23 @@ from omnigent.server.failed_status_diagnostics import (
     bound_runner_connection,
     failed_status_intake_attributes,
 )
+from omnigent.server.feature_usage_metrics import (
+    FailureReason,
+    UsageOutcome,
+    classify_feature_usage_exception,
+    get_feature_usage_recorder,
+)
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
+from omnigent.server.managed_sandbox_identity import (
+    ManagedSandboxIdentityNotSupported,
+    ManagedSandboxIdentityUnavailable,
+    context_for_managed_sandbox_operation,
+)
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
+)
+from omnigent.server.routes._auth_helpers import (
+    get_session_owner_id as _get_session_owner_id,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -153,6 +175,8 @@ from omnigent.server.routes._sessions.common import (
     _CLEAR_TYPE,
     _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
     _COMPACT_TYPE,
+    _DURABLE_ASK_CONSUMED_TYPE,
+    _DURABLE_ASK_TYPE,
     _EXTERNAL_ACP_REPORT_CONNECTION_ADMIT_TYPE,
     _EXTERNAL_ACP_REPORT_EPOCH_ACTIVATE_TYPE,
     _EXTERNAL_ACP_REPORT_OWNER_ADMIT_TYPE,
@@ -974,7 +998,8 @@ class _RunnerEventContext:
     headers: Headers
     user_id: str | None
     runner_id: str
-    server_connection: RunnerSession
+    # Server-initiated recovery events have no originating tunnel connection.
+    server_connection: RunnerSession | None = None
 
 
 _RUNNER_EVENT_TYPES = frozenset(
@@ -1071,6 +1096,8 @@ def register_events_routes(
     runner_tunnel_tokens: frozenset[str] | None = None,
     register_runner_ingest: Callable[[Callable[..., Awaitable[EventAckFrame]]], None]
     | None = None,
+    register_recovery_ingest: Callable[[Callable[..., Awaitable[dict[str, bool | str]]]], None]
+    | None = None,
     register_startup_dispatch: Callable[[StartupDispatch], None] | None = None,
     clear_session_into_fresh_session: Callable[
         [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
@@ -1085,6 +1112,47 @@ def register_events_routes(
     """
 
     event_router = APIRouter(route_class=_SessionEventBodyLimitRoute)
+    external_compaction_terminal_seen: OrderedDict[str, None] = OrderedDict()
+
+    def _claim_external_compaction_terminal(session_id: str) -> bool:
+        """Claim one terminal native compaction frame per session."""
+        if session_id in external_compaction_terminal_seen:
+            return False
+        external_compaction_terminal_seen[session_id] = None
+        if len(external_compaction_terminal_seen) > 4096:
+            external_compaction_terminal_seen.popitem(last=False)
+        return True
+
+    async def _usage_identity(session_id: str, user_id: str | None) -> tuple[str, str | None]:
+        try:
+            owner_id = await asyncio.to_thread(_get_session_owner_id, session_id, permission_store)
+        except Exception:
+            owner_id = None
+        return user_id or owner_id or "local", owner_id
+
+    def _record_terminal_usage(
+        *,
+        feature_name: str,
+        operation: str,
+        actor_user_id: str,
+        session_owner_id: str | None,
+        outcome: UsageOutcome,
+        failure_reason: FailureReason | None = None,
+        attributes: dict[str, str] | None = None,
+    ) -> None:
+        """Record a best-effort terminal metric without affecting event delivery."""
+        try:
+            usage = get_feature_usage_recorder().operation(
+                feature_name=feature_name,
+                operation=operation,
+                actor_user_id=actor_user_id,
+                session_owner_id=session_owner_id,
+            )
+            for key, value in (attributes or {}).items():
+                usage.set_attribute(key, value)
+            usage.finish(outcome, failure_reason=failure_reason)
+        except Exception:
+            return
 
     def _has_bound_runner_authority(
         request: Request | _RunnerEventContext | StartupInputContext, conv: Any
@@ -1483,6 +1551,31 @@ def register_events_routes(
     if register_runner_ingest is not None:
         register_runner_ingest(ingest_runner_batch)
 
+    async def post_recovery_session_event(
+        *,
+        app: Any,
+        runner_id: str,
+        owner: str | None,
+        session_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, bool | str]:
+        """Apply one server-initiated recovery event through the HTTP event logic.
+
+        The durable-ask recovery sweep (server-side, on runner connect)
+        uses this to persist + relay the continuation wake with the same
+        authentication shape and persistence path as a runner-originated
+        event — one code path for "start a turn from committed history".
+        """
+        request = _RunnerEventContext(app, Headers(), owner, runner_id)
+        return await _post_event_impl(
+            request,
+            session_id,
+            SessionEventInput.model_validate(payload),
+        )
+
+    if register_recovery_ingest is not None:
+        register_recovery_ingest(post_recovery_session_event)
+
     pull_request_store = server_prs.open_store(conversation_store)
 
     async def _store_reported_pull_requests(session_id: str, body: SessionEventInput) -> None:
@@ -1793,6 +1886,8 @@ def register_events_routes(
         if body.type not in (
             _INTERRUPT_TYPE,
             _APPROVAL_TYPE,
+            _DURABLE_ASK_TYPE,
+            _DURABLE_ASK_CONSUMED_TYPE,
             _MCP_ELICITATION_TYPE,
             _COMPACT_TYPE,
             _CLEAR_TYPE,
@@ -2538,7 +2633,15 @@ def register_events_routes(
                 )
                 if approval_conv is None:
                     raise _session_not_found()
-            await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
+            metric_actor, metric_owner = await _usage_identity(session_id, user_id)
+            await _resolve_elicitation(
+                session_id,
+                body.data,
+                runner_router,
+                conversation_store,
+                actor_user_id=metric_actor,
+                session_owner_id=metric_owner,
+            )
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) on the runner-owning session.
             await _apply_pending_policy_ask_writes(
@@ -2575,6 +2678,14 @@ def register_events_routes(
             from omnigent.server.routes import sessions as _sessions_facade
 
             _sessions_facade.session_stream.publish(session_id, _mcp_elicit_payload)
+            metric_actor, metric_owner = await _usage_identity(session_id, user_id)
+            _record_terminal_usage(
+                feature_name="approval",
+                operation="request",
+                actor_user_id=metric_actor,
+                session_owner_id=metric_owner,
+                outcome="success",
+            )
             # Mirror the prompt into ancestor streams so a sub-agent MCP
             # elicitation surfaces in the parent (polly) chat with a
             # ``target_session_id`` pointing back at this child. The
@@ -2588,6 +2699,100 @@ def register_events_routes(
                 _mcp_elicit_payload,
             )
             return {"queued": False, "elicitation_id": elicit_id}
+        if body.type == _DURABLE_ASK_TYPE:
+            # The runner's sys_ask_user intercept registers a DURABLE
+            # question: persist BEFORE publishing so a crash between
+            # publish and answer leaves an answerable pending row (the
+            # snapshot replays it after a cold server start). The answer
+            # arrives via ``type: "approval"`` → ``_resolve_elicitation``'s
+            # durable branch, which validates against the persisted schema
+            # and commits atomically before forwarding to the runner.
+            from omnigent.runtime.durable_ask_user import (
+                DurableAskUserUnavailable,
+                pending_event_for_record,
+                register_durable_question,
+            )
+            from omnigent.stores.durable_elicitation_store import (
+                DuplicateRegistrationError,
+            )
+
+            ask_data = body.data or {}
+            ask_arguments = ask_data.get("arguments")
+            if not isinstance(ask_arguments, dict):
+                return {"queued": False, "error": "arguments must be an object"}
+            invocation_id = ask_data.get("invocation_id")
+            if not isinstance(invocation_id, str) or not invocation_id:
+                return {"queued": False, "error": "invocation_id is required"}
+            target_conversation_id = ask_data.get("target_conversation_id")
+            if not isinstance(target_conversation_id, str) or not target_conversation_id:
+                target_conversation_id = None
+            # Production child routing: a question asked by a child session
+            # presents on its user-facing parent, so ancestor cold snapshots
+            # replay it (target_conversation_id) and parent-view answers
+            # resolve the child's parked call.
+            if target_conversation_id is None and conv.parent_conversation_id:
+                target_conversation_id = conv.parent_conversation_id
+            paused_call = ask_data.get("paused_call")
+            if not isinstance(paused_call, dict):
+                paused_call = None
+            try:
+                record, _created = await asyncio.to_thread(
+                    register_durable_question,
+                    conversation_id=session_id,
+                    invocation_id=invocation_id,
+                    arguments=ask_arguments,
+                    target_conversation_id=target_conversation_id,
+                    paused_call=paused_call,
+                )
+            except DurableAskUserUnavailable:
+                return {"queued": False, "error": "durable elicitation store unavailable"}
+            except ValueError as exc:
+                return {"queued": False, "error": str(exc)}
+            except DuplicateRegistrationError as exc:
+                # A replayed registration under the same invocation identity
+                # with a different payload: surface the existing question's
+                # id rather than silently asking a different thing.
+                return {
+                    "queued": False,
+                    "error": "invocation_id already registered with a different question",
+                    "elicitation_id": exc.existing.id if exc.existing else "",
+                }
+            ask_payload = pending_event_for_record(record)
+            from omnigent.server.routes import sessions as _sessions_facade
+
+            _sessions_facade.session_stream.publish(session_id, ask_payload)
+            metric_actor, metric_owner = await _usage_identity(session_id, user_id)
+            _record_terminal_usage(
+                feature_name="approval",
+                operation="request",
+                actor_user_id=metric_actor,
+                session_owner_id=metric_owner,
+                outcome="success",
+            )
+            await asyncio.to_thread(
+                _publish_elicitation_request_to_ancestors,
+                conversation_store,
+                session_id,
+                ask_payload,
+            )
+            return {"queued": False, "elicitation_id": record.id}
+        if body.type == _DURABLE_ASK_CONSUMED_TYPE:
+            # The runner delivered the tool_result for a durable ask and
+            # now acknowledges consumption. The store's claimed gate makes
+            # this exactly-once: retries after a lost ack are idempotent
+            # no-ops, never a second continuation.
+            from omnigent.runtime.durable_ask_user import durable_store
+
+            store = durable_store()
+            consumed_data = body.data or {}
+            consumed_id = consumed_data.get("elicitation_id")
+            if store is None or not isinstance(consumed_id, str) or not consumed_id:
+                return {"queued": False, "consumed": False}
+            try:
+                _record, consumed = await asyncio.to_thread(store.mark_consumed, consumed_id)
+            except (KeyError, ValueError):
+                consumed = False
+            return {"queued": False, "consumed": consumed}
         if body.type == _COMPACT_TYPE:
             # Unified control dispatch (designs/CLAUDE_NATIVE.md
             # "Control events dispatch on the runner"): forward /compact
@@ -2609,6 +2814,15 @@ def register_events_routes(
             if runner_result is not None and runner_result.status_code == 200:
                 return {"queued": False}
             if runner_result is not None and runner_result.status_code != 204:
+                metric_actor, metric_owner = await _usage_identity(session_id, user_id)
+                _record_terminal_usage(
+                    feature_name="context",
+                    operation="compact",
+                    actor_user_id=metric_actor,
+                    session_owner_id=metric_owner,
+                    outcome="failed",
+                    failure_reason="backend",
+                )
                 raise OmnigentError(
                     f"Compaction failed: runner returned {runner_result.status_code}",
                     code=ErrorCode.INTERNAL_ERROR,
@@ -3267,11 +3481,31 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             if compaction_status == "in_progress":
+                external_compaction_terminal_seen.pop(session_id, None)
                 _publish_compaction_in_progress(session_id)
             elif compaction_status == "completed":
                 _publish_compaction_completed(session_id, None)
+                if _claim_external_compaction_terminal(session_id):
+                    metric_actor, metric_owner = await _usage_identity(session_id, user_id)
+                    _record_terminal_usage(
+                        feature_name="context",
+                        operation="compact",
+                        actor_user_id=metric_actor,
+                        session_owner_id=metric_owner,
+                        outcome="success",
+                    )
             else:
                 _publish_compaction_failed(session_id)
+                if _claim_external_compaction_terminal(session_id):
+                    metric_actor, metric_owner = await _usage_identity(session_id, user_id)
+                    _record_terminal_usage(
+                        feature_name="context",
+                        operation="compact",
+                        actor_user_id=metric_actor,
+                        session_owner_id=metric_owner,
+                        outcome="failed",
+                        failure_reason="backend",
+                    )
             return {"queued": False}
         if body.type == _EXTERNAL_MCP_STARTUP_TYPE:
             # Harness MCP-server startup progress (codex-native forwarder):
@@ -4199,6 +4433,13 @@ def register_events_routes(
                     "Failed to deliver the tool result to the session runner.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 ) from exc
+            # Drain the pending-client-tool-call index eagerly, on the first
+            # accepted answer, rather than waiting for the completed
+            # function_call to round-trip back through the stream. This is
+            # what makes a second client's reconnect snapshot reflect an
+            # answer immediately, and makes a duplicate answer harmless
+            # (resolve() on an already-drained call_id is a no-op).
+            pending_client_tool_calls.resolve(session_id, body.data["call_id"])
             return {"queued": True, "item_id": body.data["call_id"]}
         start_fire_stage("runner_start", session_id=session_id)
         # Whether the runner was initially unavailable or was woken below. In
@@ -5390,12 +5631,47 @@ def register_events_routes(
         if conv.host_id is not None and host_store_for_managed is not None:
             from omnigent.server.managed_hosts import release_session_managed_host
 
-            await release_session_managed_host(
-                conv.host_id,
-                host_store_for_managed,
-                getattr(request.app.state, "sandbox_config", None),
-                capture_logs=capture_logs,
+            sandbox_config = getattr(request.app.state, "sandbox_config", None)
+            bound_host = await asyncio.to_thread(
+                host_store_for_managed.get_host, conv.host_id, include_deleted=True
             )
+            if bound_host is not None and bound_host.sandbox_provider is not None:
+                requirement = (
+                    sandbox_config.managed_identity_requirement(
+                        bound_host.sandbox_provider, "terminate"
+                    )
+                    if sandbox_config is not None
+                    else ManagedIdentityRequirement.NONE
+                )
+                try:
+                    cleanup_context = context_for_managed_sandbox_operation(
+                        request,
+                        auth_provider,
+                        session_id=session_id,
+                        owner=bound_host.user_id,
+                        requirement=requirement,
+                    )
+                except (ManagedSandboxIdentityNotSupported, ManagedSandboxIdentityUnavailable):
+                    _logger.warning(
+                        "Managed sandbox cleanup has no owner identity for host %s; "
+                        "falling back to provider background cleanup",
+                        bound_host.host_id,
+                    )
+                    await release_session_managed_host(
+                        conv.host_id,
+                        host_store_for_managed,
+                        sandbox_config,
+                        capture_logs=capture_logs,
+                    )
+                else:
+                    with managed_sandbox_context_scope(cleanup_context):
+                        await release_session_managed_host(
+                            conv.host_id,
+                            host_store_for_managed,
+                            sandbox_config,
+                            capture_logs=capture_logs,
+                            use_reaper_identity=False,
+                        )
         try:
             import time as _time
 

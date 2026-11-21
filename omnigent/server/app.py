@@ -87,6 +87,7 @@ from omnigent.server import (
 )
 from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
+    AuthPreparationMiddleware,
     AuthProvider,
     SharingMode,
     auth_mode,
@@ -319,6 +320,20 @@ class ServerInfoResponse(BaseModel):
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.
     request_managed_sandbox_host_id: bool = True
+    # GET /v1/sessions/{id} carries SessionResponse.pending_client_tool_calls
+    # (outstanding action_required client-tool calls survive a client
+    # disconnect/reconnect); older servers never populate the field, so a
+    # client should keep its own reconnect workaround when this is False.
+    pending_client_tool_calls: bool = True
+    # A parked client-owned tool call (action_required) holds the harness
+    # idle watchdog open instead of counting toward HARNESS_TURN_TIMEOUT_S,
+    # so a slow human answer alone never fails the turn (the absolute
+    # per-turn ceiling still bounds it). Independent of
+    # ``pending_client_tool_calls`` above: a client can hold off a
+    # reconnect-driven interrupt-and-nudge on this flag alone, without
+    # needing the snapshot field too. Older servers omit this flag and
+    # may fail a long-parked call via the idle watchdog.
+    client_tool_wait_exempt_from_idle_watchdog: bool = True
     # A managed fork accepts ``workspaces``; older servers reject the field.
     session_fork_workspaces: bool = True
     # A multipart create's metadata accepts ``model_override``; older servers
@@ -2447,6 +2462,9 @@ def create_app(
             f"{_provider.name}_client",
             _provider.client_factory(_cfg) if _on else None,
         )
+    # Managed operations capture the authenticated request's OIDC authority
+    # before background work starts; host rows never retain login-session ids.
+    app.state.auth_provider = auth_provider
     # Managed-sandbox owner identity: a launcher that acts as the host's owner
     # (e.g. the `databricks` provider) resolves that user's
     # connected credential through these, keyed by connection provider.
@@ -2663,6 +2681,7 @@ def create_app(
     app.state.managed_launches = ManagedLaunchTracker()
     app.state.server_metrics = server_metrics
     app.state.server_metrics_otel = server_metrics_otel
+    app.add_middleware(AuthPreparationMiddleware, auth_provider=auth_provider)
     app.add_middleware(_WebSocketMetricsMiddleware, metrics=server_metrics)
     # CSWSH guard: reject cross-origin WebSocket handshakes before any
     # route accepts them. Added after the metrics middleware so it is the
@@ -2685,6 +2704,27 @@ def create_app(
     # run-completion hook (persist_scheduled_run_completion) fired from
     # _publish_status when a fired conversation's turn reaches terminal.
     session_live_state.configure(conversation_store, scheduled_task_store)
+    # Durable sys_ask_user questions: wire the store from the permission
+    # store's database (same physical DB every store-backed deployment
+    # uses). None (no permission_store — tests / minimal servers) keeps
+    # the durable surface off and every sys_ask_user call fails clean.
+    from omnigent.runtime.durable_ask_user import configure_durable_elicitation_store
+
+    if permission_store is not None:
+        try:
+            from omnigent.stores.durable_elicitation_store import (
+                SqlAlchemyDurableElicitationStore,
+            )
+
+            configure_durable_elicitation_store(
+                SqlAlchemyDurableElicitationStore(permission_store.storage_location)
+            )
+        except Exception:
+            _logger.warning(
+                "durable elicitation store unavailable; sys_ask_user is disabled",
+                exc_info=True,
+            )
+            configure_durable_elicitation_store(None)
     # Extend a managed sandbox while its runner tunnel is live (the managed-path
     # caller for SandboxHostLauncher.keep_alive); no-op without a sandbox config.
     managed_host_keepalive.configure(conversation_store, host_store, sandbox_config)
@@ -3744,6 +3784,8 @@ def create_app(
                 "session_list_scoped_archives": True,
                 "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
                 "request_managed_sandbox_host_id": True,
+                "pending_client_tool_calls": True,
+                "client_tool_wait_exempt_from_idle_watchdog": True,
                 "session_fork_workspaces": True,
                 "session_bundle_model_override": True,
                 "agent_install": agent_store.supports_user_agents,
@@ -3904,6 +3946,9 @@ def create_app(
             ),
             register_runner_ingest=lambda handler: setattr(
                 app.state, "runner_event_ingest", handler
+            ),
+            register_recovery_ingest=lambda handler: setattr(
+                app.state, "runner_recovery_ingest", handler
             ),
         ),
         prefix="/v1",
@@ -4713,6 +4758,120 @@ def create_app(
             fail_idle_top_level=not runner_ran,
         )
 
+    async def _recover_durable_asks_for_runner(
+        *,
+        runner_id: str,
+        owner: str | None,
+        conversation_ids: set[str],
+    ) -> None:
+        """Continue dead parked sys_ask_user executions for a reconnecting runner.
+
+        See the durable-ask recovery comment in :func:`_on_runner_connect`.
+        Best-effort: a failed wake leaves a stuck turn (visible), never a
+        duplicate continuation.
+        """
+        from omnigent.runtime.durable_ask_user import (
+            continuation_wake_text,
+            durable_store,
+        )
+        from omnigent.tools.builtins.sys_ask_user import format_tool_result
+
+        store = durable_store()
+        ingest = getattr(app.state, "runner_recovery_ingest", None)
+        if store is None or ingest is None or not conversation_ids:
+            return
+        for conversation_id in conversation_ids:
+            try:
+                rows = await asyncio.to_thread(store.list_for_conversation, conversation_id)
+            except Exception:
+                _logger.exception(
+                    "Durable ask recovery scan failed", extra={"session_id": conversation_id}
+                )
+                continue
+            for row in rows:
+                # Only answered/declined rows carry a delivery obligation.
+                # "canceled" is EXPLICIT user cancellation (interrupt/stop):
+                # the parked turn is dead by intent — recovery must never
+                # wake a canceled question, or an interrupt would resurrect
+                # the execution it stopped.
+                if row.state not in {"answered", "declined"}:
+                    continue
+                if row.consumed_at is not None:
+                    continue
+                try:
+                    await asyncio.to_thread(store.mark_consumed, row.id)
+                except (KeyError, ValueError):
+                    continue  # raced another claim — exactly-once holds
+                action = row.answer_action or "decline"
+                tool_output = format_tool_result(
+                    action=action,
+                    answer=(
+                        row.answer_content.get("answer")
+                        if action == "accept" and isinstance(row.answer_content, dict)
+                        else None
+                    ),
+                )
+                wake_text = continuation_wake_text(
+                    action=action, content=row.answer_content, tool_output=tool_output
+                )
+                paused_call = row.paused_call
+                if paused_call and isinstance(paused_call.get("call_id"), str):
+                    # Persist the tool result against the dangling call so
+                    # the committed history is structurally complete (call +
+                    # output) before the continuation turn starts.
+                    try:
+                        await ingest(
+                            app=app,
+                            runner_id=runner_id,
+                            owner=owner,
+                            session_id=conversation_id,
+                            payload={
+                                "type": "external_conversation_item",
+                                "data": {
+                                    "item_type": "function_call_output",
+                                    "item_data": {
+                                        "call_id": paused_call["call_id"],
+                                        "output": tool_output,
+                                    },
+                                    "response_id": paused_call.get("response_id")
+                                    or f"resp_durable_{row.id[:12]}",
+                                },
+                            },
+                        )
+                    except Exception:
+                        _logger.exception(
+                            "Durable ask tool-result persistence failed",
+                            extra={"session_id": conversation_id, "elicitation_id": row.id},
+                        )
+                try:
+                    await ingest(
+                        app=app,
+                        runner_id=runner_id,
+                        owner=owner,
+                        session_id=conversation_id,
+                        payload={
+                            "type": "message",
+                            "data": {
+                                "role": "user",
+                                "is_meta": True,
+                                "content": [{"type": "input_text", "text": wake_text}],
+                            },
+                        },
+                    )
+                    _logger.info(
+                        "Recovered durable sys_ask_user answer after runner "
+                        "restart; continuation wake delivered",
+                        extra={
+                            "session_id": conversation_id,
+                            "elicitation_id": row.id,
+                        },
+                    )
+                except Exception:
+                    _logger.exception(
+                        "Durable ask continuation wake failed; the session turn is stuck",
+                        extra={"session_id": conversation_id, "elicitation_id": row.id},
+                    )
+
     async def _on_runner_connect(runner_id: str, connection: RunnerSession) -> None:
         """Attach bound streams, then recover independent session trees concurrently."""
         from omnigent.entities import Conversation
@@ -4752,6 +4911,20 @@ def create_app(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
         bound_ids = {conv.id for conv in convs}
+
+        # Durable sys_ask_user recovery: answers that committed while this
+        # runner (or a previous one) was down left their parked harness turn
+        # dead. Claim each answered-but-unconsumed question exactly-once and
+        # post ONE hidden meta message so the session starts a continuation
+        # turn over its committed history — the original prompt and prior
+        # tool results are already stored, so nothing replays. The consume
+        # claim makes duplicate sweeps (double connect, overlapping hooks)
+        # no-ops: a lost continuation is a stuck turn, never a duplicate.
+        await _recover_durable_asks_for_runner(
+            runner_id=runner_id,
+            owner=getattr(connection, "owner", None),
+            conversation_ids=bound_ids,
+        )
 
         def is_independent(conv: Conversation) -> bool:
             return not (
@@ -5277,6 +5450,7 @@ def create_app(
 
             device_grant_store = DeviceGrantStore(permission_store.storage_location)
             auth_provider.set_grant_revocation_check(device_grant_store.is_revoked)
+            auth_provider.set_device_grant_store(device_grant_store)
 
         if (
             isinstance(auth_provider, UnifiedAuthProvider)
@@ -5331,6 +5505,7 @@ def create_app(
                     oidc_account_store,
                     allowed_domains=frozenset(allowed_domains or ()) or None,
                     device_grant_store=device_grant_store,
+                    oidc_session_store=getattr(auth_provider, "_oidc_session_store", None),
                 ),
                 prefix="/auth",
                 tags=["auth"],

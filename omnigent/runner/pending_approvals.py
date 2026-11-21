@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from omnigent.runtime.tool_call_deadline import pause_tool_call_deadline
 
@@ -71,6 +71,12 @@ class Verdict:
 
     approved: bool
     content: ElicitContent | None = None
+    # The raw MCP action behind the verdict ("accept"/"decline"/"cancel") so
+    # a durable ask can distinguish a decline from a cancel — both are
+    # approved=False, but only decline is a real answer to the model.
+    # Provenance metadata only: excluded from equality so existing verdict
+    # comparisons (approved + content identity) are unaffected.
+    action: str | None = field(default=None, compare=False)
 
 
 # Module-global registry: elicitation_id → asyncio.Future[Verdict].
@@ -217,6 +223,7 @@ def resolve(
     elicitation_id: str,
     approved: bool,
     content: ElicitContent | None = None,
+    action: str | None = None,
 ) -> bool:
     """
     Set the verdict on a registered Future.
@@ -232,6 +239,9 @@ def resolve(
     :param content: The ``content`` map the resolver sent, when the
         prompt asked for more than consent. ``None`` for a bare
         approve/reject.
+    :param action: The raw MCP action ("accept"/"decline"/"cancel") when
+        known, carried on the Verdict so durable asks can tell a decline
+        from a cancel.
     :returns: ``True`` if the Future was unresolved and was set;
         ``False`` if no Future was registered or it was already
         completed (e.g. timed out before the verdict arrived).
@@ -241,7 +251,9 @@ def resolve(
         return False
     # A refusal is not an answer, so nothing the form collected travels with
     # it. Normalising here means no consumer has to remember to drop it.
-    fut.set_result(Verdict(approved=approved, content=content if approved else None))
+    fut.set_result(
+        Verdict(approved=approved, content=content if approved else None, action=action)
+    )
     return True
 
 

@@ -18,7 +18,12 @@ import httpx
 import pytest
 
 from omnigent.runner.session_init_protocol import SESSION_INIT_PAYLOAD_KEY
+from omnigent.server.feature_usage_metrics import (
+    FeatureUsageRecorder,
+    set_feature_usage_recorder_for_testing,
+)
 from tests._helpers.session import post_session_bundle
+from tests.server.feature_usage_helpers import RecordingMeter
 from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -71,6 +76,42 @@ async def test_patch_model_override_round_trips_through_snapshot(
     get = await client.get(f"/v1/sessions/{sid}")
     assert get.status_code == 200
     assert get.json()["model_override"] == "claude-opus-4-7"
+
+
+async def test_explicit_model_switch_records_once_but_silent_or_terminal_echo_does_not(
+    client: httpx.AsyncClient,
+) -> None:
+    """Only an explicit picker switch emits, not its silent or native echo."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    meter = RecordingMeter()
+    set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
+    try:
+        explicit = await client.patch(
+            f"/v1/sessions/{session['id']}", json={"model_override": "claude-opus-4-7"}
+        )
+        silent = await client.patch(
+            f"/v1/sessions/{session['id']}",
+            json={"model_override": "claude-sonnet-4-6", "silent": True},
+        )
+        echo = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": "external_model_change", "data": {"model": "claude-sonnet-4-6"}},
+        )
+    finally:
+        set_feature_usage_recorder_for_testing(None)
+
+    assert explicit.status_code == 200
+    assert silent.status_code == 200
+    assert echo.status_code == 202
+    assert meter.counter.records == [
+        {
+            "omnigent.feature.name": "model",
+            "omnigent.feature.operation": "switch",
+            "omnigent.feature.outcome": "success",
+            "omnigent.actor.user_id": "local",
+        }
+    ]
 
 
 async def test_patch_model_override_clear_alias_resets(

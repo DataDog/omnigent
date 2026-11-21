@@ -24,6 +24,11 @@ import asyncio
 import httpx
 import pytest
 
+from omnigent.server.feature_usage_metrics import (
+    FeatureUsageRecorder,
+    set_feature_usage_recorder_for_testing,
+)
+from tests.server.feature_usage_helpers import RecordingMeter
 from tests.server.helpers import create_test_agent
 
 # Re-use the hook-parking helpers from the sibling module so we don't
@@ -204,6 +209,57 @@ async def test_post_resolve_already_resolved_is_idempotent(
             hook_task.cancel()
             await asyncio.gather(hook_task, return_exceptions=True)
         pending_elicitations.reset_for_tests()
+
+
+async def test_generic_and_resolve_url_submit_one_approval_resolution_metric(
+    client: httpx.AsyncClient,
+) -> None:
+    """The two resolution endpoints share one terminal usage edge."""
+    from omnigent.runtime import pending_elicitations
+
+    agent = await create_test_agent(client, "test-cross-route-resolve-metric")
+    session_id = await _create_session(client, agent["id"])
+    hook_task, elicitation_id = await _park_permission_hook(client, session_id)
+    meter = RecordingMeter()
+    set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
+    try:
+        generic = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "approval",
+                "data": {"elicitation_id": elicitation_id, "action": "accept"},
+            },
+        )
+        assert generic.status_code == 202, generic.text
+        async with asyncio.timeout(5):
+            await hook_task
+
+        resolve_url_retry = await client.post(
+            f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+            json={"action": "decline"},
+        )
+        assert resolve_url_retry.status_code == 202, resolve_url_retry.text
+        resolutions = [
+            record
+            for record in meter.counter.records
+            if record["omnigent.feature.name"] == "approval"
+            and record["omnigent.feature.operation"] == "resolve"
+        ]
+        assert resolutions == [
+            {
+                "omnigent.feature.name": "approval",
+                "omnigent.feature.operation": "resolve",
+                "omnigent.feature.outcome": "success",
+                "omnigent.actor.user_id": "local",
+                "omnigent.approval.decision": "accept",
+            }
+        ]
+    finally:
+        if not hook_task.done():
+            hook_task.cancel()
+            await asyncio.gather(hook_task, return_exceptions=True)
+        pending_elicitations.reset_for_tests()
+        set_feature_usage_recorder_for_testing(None)
 
 
 async def test_post_resolve_nonexistent_elicitation_on_valid_session(

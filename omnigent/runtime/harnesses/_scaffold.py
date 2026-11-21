@@ -563,13 +563,43 @@ class SessionActionResultRequest(BaseModel):
     result: dict[str, Any]
 
 
+class DurableAskEvent(BaseModel):
+    """
+    Downward ``durable_ask_pending`` / ``durable_ask_resolved`` event —
+    bracket a durable human wait (``sys_ask_user``) on the in-flight
+    turn.
+
+    While a durable ask is pending, the turn's idle AND absolute
+    watchdogs are suspended: the human may answer hours later, after a
+    client disconnect and reconnect. Ordinary human waits (policy ASKs,
+    tool-permission elicitations) only hold the idle window open — the
+    absolute ceiling still bounds them; only a durable, persisted
+    question justifies pausing the ceiling.
+
+    Loose semantics — stale ``call_id`` entries silently no-op, same as
+    :class:`ToolResultEvent`.
+
+    :param type: Event discriminator; ``"durable_ask_pending"`` or
+        ``"durable_ask_resolved"``.
+    :param call_id: The tool call id the durable ask is parked under.
+    """
+
+    type: Literal["durable_ask_pending", "durable_ask_resolved"]
+    call_id: str
+
+
 # Discriminated union of every downward event the harness accepts on
 # ``POST /v1/sessions/{conversation_id}/events``. FastAPI / Pydantic
 # v2 dispatches by the ``type`` field at request-validation time;
 # unknown values raise 422 (fail-loud per
 # ``designs/DESIGN_PRINCIPLES.md``).
 InboundEventRequest = Annotated[
-    MessageEvent | InterruptEvent | ToolResultEvent | ApprovalEvent | PolicyVerdictEvent,
+    MessageEvent
+    | InterruptEvent
+    | ToolResultEvent
+    | ApprovalEvent
+    | PolicyVerdictEvent
+    | DurableAskEvent,
     Field(discriminator="type"),
 ]
 
@@ -663,10 +693,15 @@ class TurnContext:
         # resolved by the ``approval`` /events handler.
         self._pending_elicitations: dict[str, asyncio.Future[ElicitationResult]] = {}
         # Human-approval waits in flight (elicitation replies, policy
-        # verdicts). While > 0 heartbeats hold the idle window open so an
-        # unanswered approval isn't failed as a wedged turn; the absolute
-        # ceiling still applies.
+        # verdicts, client-tool call results). While > 0 heartbeats hold
+        # the idle window open so an unanswered wait isn't failed as a
+        # wedged turn; the absolute ceiling still applies.
         self._pending_human_waits = 0
+        # Durable human waits in flight (``sys_ask_user``). Unlike ordinary
+        # human waits these suspend BOTH watchdogs — idle and absolute —
+        # while > 0: the question is persisted server-side and the human
+        # may answer hours later, after a disconnect/reconnect.
+        self._durable_human_waits = 0
         # Layer 3 per-policy-evaluation state:
         # ``evaluation_id`` → Future[PolicyVerdictPayload].
         # Populated by ``evaluate_policy``; resolved by the
@@ -768,7 +803,9 @@ class TurnContext:
                 self._has_progress = True
             if self._reset_idle_watchdog is not None:
                 self._reset_idle_watchdog()
-        elif self._pending_human_waits > 0 and self._hold_idle_watchdog is not None:
+        elif (self._pending_human_waits > 0 or self._durable_human_waits > 0) and (
+            self._hold_idle_watchdog is not None
+        ):
             self._hold_idle_watchdog()
         self._event_queue.put_nowait(event)
 
@@ -780,6 +817,7 @@ class TurnContext:
         agent: str,
         *,
         suppress_completed_mirror: bool = False,
+        client_owned: bool = True,
     ) -> str:
         """
         Emit a server-dispatched tool call and park until the result.
@@ -790,6 +828,17 @@ class TurnContext:
         the parked Future when Omnigent delivers an event carrying the
         matching ``call_id``. See §How Omnigent resolves action_required
         tool calls in the design doc.
+
+        ``client_owned`` gates whether the wait counts toward the idle
+        watchdog's human-approval hold (see ``_pending_human_waits``): a
+        genuine client-side tool can legitimately wait on a person far
+        longer than any in-turn LLM step, so heartbeats hold the idle
+        window open for as long as it is outstanding. A server-executed
+        call (e.g. the ``sys_os_*`` host-tool bridge) is answered by
+        Omnigent's own machinery, not a person, so a wedge there must
+        still trip the idle watchdog like any other stalled tool call;
+        callers pass ``client_owned=False`` for those. The absolute
+        ceiling bounds the turn either way.
 
         :param call_id: Unique identifier for this tool call,
             e.g. ``"call_abc123"``. Omnigent echoes it back in the
@@ -804,6 +853,13 @@ class TurnContext:
             :class:`omnigent.entities.conversation.FunctionCallData`.
         :param suppress_completed_mirror: Let the native observation publish
             the completed call and output instead of emitting duplicates.
+        :param client_owned: ``True`` when a real connected client (a
+            human or an external system standing in for one) must
+            answer this call, so the idle watchdog should not fire
+            merely because the answer is slow. ``False`` for a call
+            Omnigent's own server-side machinery executes and answers,
+            which must still be treated as a normal tool step for
+            watchdog purposes.
         :returns: The tool's output string from
             :class:`omnigent.server.schemas.ToolResult`.
         :raises asyncio.CancelledError: If the turn is cancelled
@@ -824,6 +880,14 @@ class TurnContext:
             "arguments": arguments,
             "call_id": call_id,
             "agent": agent,
+            # Additive marker, not part of the OpenAI function_call shape:
+            # lets omnigent.runtime.pending_client_tool_calls exclude a
+            # server-executed dispatch from the reconnect snapshot —
+            # a reconnecting client has nothing to answer for a call it
+            # never owned. Pydantic ignores unknown keys by default, so
+            # this is safe even if the item is later parsed as
+            # FunctionCallData.
+            "client_owned": client_owned,
         }
         if self._session_action_handler is not None:
             result = await self._send_session_action(
@@ -833,6 +897,15 @@ class TurnContext:
                 raise RuntimeError("session action returned a mismatched tool result")
             return result.output
         self.emit(OutputItemDoneEvent(type="response.output_item.done", item=item))
+        # A genuinely client-owned tool parks on a human (or external system)
+        # to answer, same as an elicitation reply — hold the idle window open
+        # on heartbeats while it waits so an unanswered call doesn't trip the
+        # idle watchdog mid-wait. The absolute ceiling still bounds the turn.
+        # A server-executed call (``client_owned=False``) gets no such hold:
+        # nothing is waiting on a person, so a wedge there must still fail
+        # the turn like any other stalled tool call.
+        if client_owned:
+            self._pending_human_waits += 1
         try:
             result = await future
             if not suppress_completed_mirror:
@@ -855,8 +928,12 @@ class TurnContext:
         finally:
             # Always remove — whether the Future resolved cleanly
             # or was cancelled, holding it in the dict would
-            # leak memory across turns.
+            # leak memory across turns. The hold decrement mirrors
+            # whichever branch incremented it above, on every exit path
+            # (answer, cancel, or an unexpected exception from ``future``).
             self._pending_tool_calls.pop(call_id, None)
+            if client_owned:
+                self._pending_human_waits -= 1
 
     async def elicit(
         self, elicitation_id: str, params: ElicitationRequestParams
@@ -2206,6 +2283,8 @@ class HarnessApp:
             )
         if isinstance(body, PolicyVerdictEvent):
             return await self._handle_policy_verdict_event(body)
+        if isinstance(body, DurableAskEvent):
+            return self._handle_durable_ask_event(body)
         # Pydantic's discriminated-union validator should reject
         # unknown variants before we reach this branch; if it ever
         # falls through, fail loud rather than silently no-op.
@@ -2259,6 +2338,29 @@ class HarnessApp:
         """
         for ctx in self._in_flight.values():
             if ctx._complete_tool(body.call_id, body.output):
+                break
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    def _handle_durable_ask_event(self, body: DurableAskEvent) -> Response:
+        """
+        Bracket a durable human wait on the in-flight turn.
+
+        ``durable_ask_pending`` increments the turn's durable-wait counter
+        (suspending the idle and absolute watchdogs); ``durable_ask_resolved``
+        decrements it (restoring normal budgets). Loose semantics — stale
+        ``call_id`` entries silently no-op, same as tool_result.
+
+        :param body: The decoded :class:`DurableAskEvent`.
+        :returns: 204 No Content.
+        """
+        for ctx in self._in_flight.values():
+            if body.call_id in ctx._pending_tool_calls or (
+                body.type == "durable_ask_resolved" and ctx._durable_human_waits > 0
+            ):
+                if body.type == "durable_ask_pending":
+                    ctx._durable_human_waits += 1
+                else:
+                    ctx._durable_human_waits = max(0, ctx._durable_human_waits - 1)
                 break
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -2636,8 +2738,16 @@ class HarnessApp:
                             # ONLY the idle deadline, never the absolute
                             # ceiling — an approval that is never answered
                             # must still terminate at the hard cap.
+                            # EXCEPTION: a durable human wait
+                            # (``sys_ask_user``) suspends the absolute
+                            # ceiling too — the question is persisted
+                            # server-side and the answer may arrive hours
+                            # later, after a client disconnect/reconnect.
+                            ctx_durable = getattr(ctx, "_durable_human_waits", 0)
                             if not idle_wd.expired():
                                 idle_wd.reschedule(loop.time() + idle_timeout)
+                            if ctx_durable > 0 and not absolute_wd.expired():
+                                absolute_wd.reschedule(loop.time() + idle_timeout)
 
                         ctx._reset_idle_watchdog = _reset
                         ctx._hold_idle_watchdog = _hold_idle

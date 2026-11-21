@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TypedDict
+import functools
+from collections.abc import Callable
+from typing import Any, TypedDict
 
 from fastapi import (
     APIRouter,
@@ -30,13 +32,19 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
+    LEVEL_EDIT,
     LEVEL_MANAGE,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
     AuthProvider,
     SharingMode,
     workspace_sharing_blocked,
+)
+from omnigent.server.feature_usage_metrics import (
+    classify_feature_usage_exception,
+    get_feature_usage_recorder,
 )
 from omnigent.server.routes._auth_helpers import (
     get_session_owner_id as _get_session_owner_id,
@@ -87,11 +95,96 @@ def register_permissions_routes(
 ) -> None:
     """Register the permissions routes on router."""
 
+    def _access_level(level: int) -> str:
+        return {
+            LEVEL_READ: "read",
+            LEVEL_EDIT: "edit",
+            LEVEL_MANAGE: "manage",
+            LEVEL_OWNER: "owner",
+        }.get(level, "unknown")
+
+    async def _owner_id(session_id: str) -> str | None:
+        try:
+            return await asyncio.to_thread(_get_session_owner_id, session_id, permission_store)
+        except Exception:
+            return None
+
+    def _instrument_grant(handler: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(handler)
+        async def wrapped(
+            request: Request,
+            session_id: str,
+            body: GrantPermissionRequest,
+        ) -> PermissionObject:
+            actor = _require_user(request, auth_provider) or RESERVED_USER_LOCAL
+            target = (
+                await asyncio.to_thread(permission_store.get_user, body.user_id)
+                if permission_store is not None
+                else None
+            )
+            # Pin the target before the telemetry lookup can yield to account deletion.
+            request.state.sharing_target_generation = target.account_generation if target else None
+            operation = "grant"
+            try:
+                if (
+                    permission_store is not None
+                    and await asyncio.to_thread(permission_store.get, body.user_id, session_id)
+                    is not None
+                ):
+                    operation = "update"
+            except Exception:
+                pass
+            async with get_feature_usage_recorder().operation(
+                feature_name="sharing",
+                operation=operation,
+                actor_user_id=actor,
+                session_owner_id=await _owner_id(session_id),
+            ) as usage:
+                usage.set_attribute(
+                    "omnigent.sharing.target_type",
+                    "public" if body.user_id == RESERVED_USER_PUBLIC else "user",
+                )
+                usage.set_attribute("omnigent.sharing.access_level", _access_level(body.level))
+                try:
+                    return await handler(request, session_id, body)  # type: ignore[operator]
+                except OmnigentError as exc:
+                    outcome, reason = classify_feature_usage_exception(exc)
+                    usage.finish(outcome, failure_reason=reason)
+                    raise
+
+        return wrapped
+
+    def _instrument_revoke(handler: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(handler)
+        async def wrapped(request: Request, session_id: str, target_user_id: str) -> Response:
+            actor = _require_user(request, auth_provider) or RESERVED_USER_LOCAL
+            async with get_feature_usage_recorder().operation(
+                feature_name="sharing",
+                operation="revoke",
+                actor_user_id=actor,
+                session_owner_id=await _owner_id(session_id),
+            ) as usage:
+                usage.set_attribute(
+                    "omnigent.sharing.target_type",
+                    "public" if target_user_id == RESERVED_USER_PUBLIC else "user",
+                )
+                try:
+                    return await handler(  # type: ignore[operator]
+                        request, session_id, target_user_id
+                    )
+                except OmnigentError as exc:
+                    outcome, reason = classify_feature_usage_exception(exc)
+                    usage.finish(outcome, failure_reason=reason)
+                    raise
+
+        return wrapped
+
     @router.put(
         "/sessions/{session_id}/permissions",
         response_model=None,
         responses={200: {"model": PermissionObject}},
     )
+    @_instrument_grant
     async def grant_permission(
         request: Request,
         session_id: str,
@@ -175,8 +268,7 @@ def register_permissions_routes(
                     f"Public access is limited to {ceiling.value} (level {ceiling.level})",
                     code=ErrorCode.INVALID_INPUT,
                 )
-        target = await asyncio.to_thread(permission_store.get_user, body.user_id)
-        with target_account_scope(body.user_id, target.account_generation if target else None):
+        with target_account_scope(body.user_id, request.state.sharing_target_generation):
             existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
             if existing is not None and existing.level == LEVEL_OWNER:
                 raise OmnigentError(
@@ -202,6 +294,7 @@ def register_permissions_routes(
         status_code=204,
         response_model=None,
     )
+    @_instrument_revoke
     async def revoke_permission(
         request: Request,
         session_id: str,

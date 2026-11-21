@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.script import ScriptDirectory
@@ -37,6 +38,40 @@ def test_single_alembic_head() -> None:
     assert len(heads) == 1, f"expected a single head, got {heads!r}"
 
 
+@pytest.mark.parametrize(
+    "revision",
+    [
+        "r6a8c0e2f4b6",
+        "m016dd0930a",
+        "mm1a2b3c4d5e",
+        "7b915a1fce74",
+        "a7d4c2e9f610",
+        "ab13c7d9e026",
+        "m022dd1118a",
+    ],
+)
+def test_upgrade_from_datadog_oidc_revision_to_merged_head(tmp_path: Path, revision: str) -> None:
+    uri = f"sqlite:///{tmp_path / 'datadog-oidc.db'}"
+    engine = sa.create_engine(uri)
+
+    _upgrade(uri, engine, revision)
+    _upgrade(uri, engine, "head")
+
+    with engine.connect() as conn:
+        versions = set(conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalars())
+    assert versions == {"m023dd1121a"}
+    assert {"durable_elicitations", "acp_session_report_receipts"} <= set(
+        sa.inspect(engine).get_table_names()
+    )
+    assert "inference_snapshot" in {
+        column["name"]
+        for column in sa.inspect(engine).get_columns("omnigent_conversation_metadata")
+    }
+
+    engine.dispose()
+    clear_engine_cache()
+
+
 def test_upgrade_creates_table_downgrade_drops_it(tmp_path: Path) -> None:
     uri = f"sqlite:///{tmp_path / 'connections.db'}"
     engine = sa.create_engine(uri)
@@ -60,8 +95,30 @@ def test_upgrade_creates_table_downgrade_drops_it(tmp_path: Path) -> None:
     pk = set(inspector.get_pk_constraint("connections")["constrained_columns"])
     assert pk == {"workspace_id", "user_id", "provider", "account_id"}
 
+    oidc_columns = {column["name"] for column in inspector.get_columns("oidc_sessions")}
+    assert {
+        "workspace_id",
+        "id",
+        "handle_digest",
+        "credential_ciphertext",
+        "credential_version",
+        "refresh_lease_id",
+        "refresh_lease_expires_at",
+        "absolute_expiry",
+    } <= oidc_columns
+    oidc_indexes = {index["name"] for index in inspector.get_indexes("oidc_sessions")}
+    assert {"ix_oidc_sessions_user_id", "ix_oidc_sessions_expiry_id"} <= oidc_indexes
+    oidc_constraints = {
+        constraint["name"] for constraint in inspector.get_unique_constraints("oidc_sessions")
+    }
+    assert "uq_oidc_sessions_handle_digest" in oidc_constraints
+    assert "oidc_session_id" in {
+        column["name"] for column in inspector.get_columns("device_grants")
+    }
+
     _downgrade(uri, engine, "za2b3c4d5e6f")
     assert "connections" not in sa.inspect(engine).get_table_names()
+    assert "oidc_sessions" not in sa.inspect(engine).get_table_names()
 
     engine.dispose()
     clear_engine_cache()

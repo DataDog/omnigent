@@ -166,6 +166,9 @@ jobs:
     # runners rather than xdist workers sharing one runner's CPUs.
     needs: setup
     if: needs.setup.outputs.matrix != '{"include":[]}' && (needs.setup.outputs.ui == 'full' || needs.setup.outputs.ui == 'dependency')
+    # ubuntu-latest now resolves to ubuntu 26.04, which the pinned Playwright
+    # (uv.lock, 1.60.0) has no chromium build for; pin to 24.04 like
+    # ui-snapshot.yml.
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
@@ -272,6 +275,7 @@ jobs:
     name: E2E UI Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
     # Skip before matrix expansion: GitHub rejects an empty include list.
     needs: [setup, build-sidecar]
+    # Same ubuntu 26.04 / Playwright 1.60.0 incompatibility as browser-contract.
     if: needs.setup.outputs.matrix != '{"include":[]}'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -361,12 +365,12 @@ jobs:
       # native render-parity tests boot a real Claude Code / Codex CLI. The
       # rest of the e2e-ui suite (openai-agents) ignores them.
       - name: Install Claude Code CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+        uses: DataDog/omnigent/.github/actions/setup-harness-cli@d14dff2752dd339e8ecce2803cc63c69e766c8f4
         with:
           harness: claude
 
       - name: Install Codex CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+        uses: DataDog/omnigent/.github/actions/setup-harness-cli@d14dff2752dd339e8ecce2803cc63c69e766c8f4
         with:
           harness: codex
 
@@ -398,6 +402,9 @@ jobs:
           # uses this instead of running cargo build. Absolute path: the
           # fixture runs with cwd at the repo root but be explicit.
           CODEX_PARITY_SIDECAR_BIN: ${{ github.workspace }}/.tmp-codex-parity-target/debug/codex-parity-sidecar
+          # The OIDC login fixture starts a server with encrypted provider
+          # credentials; use a deterministic test-only 32-byte key.
+          OMNIGENT_OIDC_CREDENTIAL_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
         run: |
           # Always exclude @visual: the UI diff snapshot runs in its own
           # pinned-runner gate (ui-snapshot.yml) so its baseline matches the

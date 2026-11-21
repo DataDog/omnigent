@@ -5456,6 +5456,27 @@ def inject_interrupt(
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
 
 
+_PLAN_DIALOG_MARKER = "Yes, and use auto mode"
+_PLAN_VERDICT_KEYS = {"auto": "1", "manual": "2", "reject": "Escape"}
+
+
+def inject_plan_verdict(
+    bridge_dir: Path,
+    *,
+    verdict: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> bool:
+    """Answer Claude Code's plan-review dialog by keystroke when it is visible."""
+    key = _PLAN_VERDICT_KEYS.get(verdict)
+    if key is None:
+        raise ValueError(f"unknown plan verdict {verdict!r}")
+    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    if _PLAN_DIALOG_MARKER not in _capture_pane(info["socket_path"], info["tmux_target"]):
+        return False
+    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], key)
+    return True
+
+
 def kill_session(
     bridge_dir: Path,
     *,

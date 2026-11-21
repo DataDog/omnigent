@@ -3951,23 +3951,37 @@ async def test_offline_sweep_preserves_cause_when_session_rebound_mid_sweep(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("snapshot_age", "current_age", "transferred"),
+    ("snapshot_age", "current_age", "own_age", "transferred"),
     [
-        (60, 0, True),
-        (None, 0, True),
-        (0, 0, False),
-        (3600, 1800, False),
-        (60, None, False),
+        (60, 0, None, True),
+        (None, 0, None, True),
+        (0, 0, None, False),
+        (3600, 1800, None, False),
+        (60, None, None, False),
+        (None, 0, 0, False),
+        (60, 0, 0, False),
+        (60, 0, 1, True),
     ],
-    ids=["renewed", "first-heartbeat", "unchanged", "expired-renewal", "cleared"],
+    ids=[
+        "renewed",
+        "first-heartbeat",
+        "unchanged",
+        "expired-renewal",
+        "cleared",
+        "own-first-heartbeat",
+        "own-renewal",
+        "newer-than-own-heartbeat",
+    ],
 )
 async def test_offline_sweep_preserves_runner_renewed_on_another_replica(
     db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
     snapshot_age: int | None,
     current_age: int | None,
+    own_age: int | None,
     transferred: bool,
 ) -> None:
-    """A fresh heartbeat after the sweep snapshot belongs to the adopting replica."""
+    """Only a fresh heartbeat newer than this replica's own proves adoption."""
     import time
 
     from omnigent.runtime import session_stream
@@ -3984,7 +3998,7 @@ async def test_offline_sweep_preserves_runner_renewed_on_another_replica(
         store.touch_runner_liveness([runner_id], now=now - snapshot_age)
     snapshot = store.get_conversation(conv.id)
     assert snapshot is not None
-    # Another replica's connection leaves this replica's caches unchanged.
+    # Persistence can land after the snapshot for either replica's heartbeat.
     if current_age is None:
         store.clear_runner_liveness(runner_id)
     else:
@@ -3992,6 +4006,11 @@ async def test_offline_sweep_preserves_runner_renewed_on_another_replica(
     sessions_module._session_status_cache[conv.id] = "running"
     sessions_module._session_active_response_cache[conv.id] = "response-remote-renewal"
     session_live_state.configure(store)
+    monkeypatch.setattr(
+        session_live_state,
+        "last_liveness_stamp",
+        lambda _runner_id: None if own_age is None else now - own_age,
+    )
     try:
         with capture_debug_rows("server") as rows:
             await sessions_module._mark_runner_sessions_offline(

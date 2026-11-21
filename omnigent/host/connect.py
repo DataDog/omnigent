@@ -321,6 +321,10 @@ HARNESS_LOGIN_COMPLETION_TIMEOUT_S = 15 * 60.0
 # 5s cadence re-uses the cached verdict for free. Matches the full-refresh
 # cadence so quick-probe staleness never exceeds a full-refresh window.
 HARNESS_READINESS_QUICK_PROBE_CACHE_TTL_S = 60.0
+# A freshly bootstrapped CLI can briefly fail a probe racing startup work.
+# Do not turn that false negative into terminal harness_not_configured.
+HARNESS_LAUNCH_READINESS_GRACE_S = 2.0
+HARNESS_LAUNCH_READINESS_POLL_INTERVAL_S = 0.1
 _quick_probe_cache: dict[str, float] = {}
 _quick_probe_cached: dict[str, bool] = {}
 
@@ -352,6 +356,25 @@ def _unavailable_harness_became_ready(
         and _harness_now_configured(harness)
         for harness, availability in previous.items()
     )
+
+
+async def _wait_for_harness_configured(harness: str) -> bool:
+    """Wait briefly for the exact requested harness to become launchable."""
+    deadline = time.monotonic() + HARNESS_LAUNCH_READINESS_GRACE_S
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            ready = await asyncio.wait_for(
+                asyncio.to_thread(harness_is_configured, harness),
+                timeout=remaining,
+            )
+        except TimeoutError:
+            return False
+        if ready:
+            return True
+        await asyncio.sleep(min(HARNESS_LAUNCH_READINESS_POLL_INTERVAL_S, remaining))
 
 
 def _runner_log_dir() -> Path:
@@ -598,6 +621,13 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "DBUS_SESSION_BUS_ADDRESS",
         "XDG_RUNTIME_DIR",
         "PYTHON_KEYRING_BACKEND",
+        # pass/ddtool GPG-home selector. Datadog workspaces keep the password
+        # store keyring outside ~/.gnupg and point gpg at it with this option.
+        # Dropping it at the host -> runner boundary makes a managed Claude
+        # apiKeyHelper resolve the wrong keyring and fail with "No secret key".
+        # This is configuration (normally ``--homedir <path>``), not key
+        # material; the encrypted store and private keys remain on disk.
+        "PASSWORD_STORE_GPG_OPTS",
         "TZ",
         "TERM",
         "TERMINFO",
@@ -2099,8 +2129,8 @@ class HostProcess:
             )
             harness_ready = missing is None
         else:
-            harness_ready = frame.harness is None or await asyncio.to_thread(
-                harness_is_configured, frame.harness
+            harness_ready = frame.harness is None or await _wait_for_harness_configured(
+                frame.harness
             )
         if frame.harness in {"pi", "pi-native"}:
             from omnigent.harnesses.pi_native.main import (

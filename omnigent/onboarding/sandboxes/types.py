@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
@@ -26,6 +27,13 @@ class SandboxConfigError(SandboxError):
 
 class SandboxAuthError(SandboxError):
     """Provider credentials or local tooling are missing/invalid."""
+
+
+class ManagedIdentityRequirement(StrEnum):
+    """Caller authority required by one managed sandbox operation."""
+
+    NONE = "none"
+    OIDC_USER = "oidc_user"
 
 
 class SandboxCommandError(SandboxError):
@@ -94,6 +102,16 @@ class SandboxCapabilities:
         handed a multi-repo request; providers opt in explicitly.
     :param git_clone_options: Provider honors ``RepoWorkspace.git_clone``
         when creating checkouts. Custom materializers must opt in.
+    :param managed_create_identity: Caller identity needed to create a managed
+        sandbox.
+    :param managed_resume_identity: Caller identity needed to resume a managed
+        sandbox.
+    :param managed_relaunch_identity: Caller identity needed to relaunch a
+        managed sandbox generation.
+    :param managed_terminate_identity: Caller identity needed to terminate a
+        managed sandbox generation. Providers that authorize deletion as the
+        resource owner must declare it so request-time cleanup preserves the
+        owner's renewable identity.
     :param resume_preserves_host: Resuming a stopped sandbox brings back the
         running ``omnigent host`` process itself, still holding its launch
         token, so the wake path keeps that token and does not restart the host
@@ -115,6 +133,10 @@ class SandboxCapabilities:
     snapshot_restore: bool = False
     multi_repo: bool = False
     git_clone_options: bool = False
+    managed_create_identity: ManagedIdentityRequirement = ManagedIdentityRequirement.NONE
+    managed_resume_identity: ManagedIdentityRequirement = ManagedIdentityRequirement.NONE
+    managed_relaunch_identity: ManagedIdentityRequirement = ManagedIdentityRequirement.NONE
+    managed_terminate_identity: ManagedIdentityRequirement = ManagedIdentityRequirement.NONE
     resume_preserves_host: bool = False
 
 

@@ -2,7 +2,8 @@
 # Decides whether a PR's diff should be put through the Security Scan.
 # Called by security-gate.yml for CI access and security-scan.yml for scanning.
 #
-# We scan UNTRUSTED authors and skip trusted ones. "Trusted" is GitHub's
+# Same-repository PRs come from writers who can already push to this repo.
+# Scan fork PRs from untrusted authors. "Trusted" is GitHub's
 # native author_association: OWNER / MEMBER / COLLABORATOR -- people with a
 # direct relationship to the repo/org -- OR an author in the MAINTAINERS list.
 # The list covers maintainers whose org membership is PRIVATE: GitHub only
@@ -38,6 +39,7 @@
 #
 # Env in:  EVENT_NAME          (github.event_name)
 #          AUTHOR_ASSOCIATION  (github.event.pull_request.author_association)
+#          HEAD_REPO           (github.event.pull_request.head.repo.full_name)
 #          PR_AUTHOR           (github.event.pull_request.user.login; trusted-CI-bot
 #                               allowlist, checked without an API call so the gate
 #                               pollers short-circuit too)
@@ -106,6 +108,14 @@ if [[ "${PR_AUTHOR:-}" == 'dependabot[bot]' ]]; then
     echo "dependabot=false" >> "$GITHUB_OUTPUT"
     emit true "unverified Dependabot identity or fork; requires Security Scan"
   fi
+  exit 0
+fi
+
+# GitHub sets the head repository from the actual source of the PR. Only
+# repository writers can create a same-repository branch; missing metadata
+# fails closed and leaves the contributor scan in place.
+if [[ -n "${HEAD_REPO:-}" && -n "${REPO:-}" && "${HEAD_REPO,,}" == "${REPO,,}" ]]; then
+  emit false "same-repository PR ($HEAD_REPO)"
   exit 0
 fi
 

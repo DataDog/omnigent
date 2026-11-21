@@ -29,6 +29,7 @@ def test_preferences_migration_round_trip_and_copy_failures(
     if engine.dialect.name == "cockroachdb":
         pytest.skip("CockroachDB transaction restarts are covered in test_cockroachdb.py")
 
+    _initialize_or_verify_schema(engine, db_uri)
     # Reflect the original destination type before recreating an interrupted migration.
     _downgrade(engine, db_uri, "jj1a2b3c4d5e")
     preferences = sa.Table("preferences", sa.MetaData(), autoload_with=engine)

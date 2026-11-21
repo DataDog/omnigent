@@ -20,6 +20,7 @@ from uuid import uuid4
 import pytest
 import sqlalchemy as sa
 from alembic import command
+from alembic.runtime.migration import MigrationContext
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
@@ -716,6 +717,9 @@ def test_dispatch_downgrade_refuses_out_of_range_timestamps(
             )
         )
     config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    with engine.connect() as conn:
+        expected_revisions = set(MigrationContext.configure(conn).get_current_heads())
+    assert _DISPATCH_REVISION in expected_revisions
     for table, fields in (
         (tasks, ("created_at", "last_run_at", "updated_at")),
         (runs, ("scheduled_at", "fired_at", "finished_at")),
@@ -732,8 +736,7 @@ def test_dispatch_downgrade_refuses_out_of_range_timestamps(
             with engine.begin() as conn:
                 assert conn.execute(sa.select(table.c[field])).scalar_one() == timestamp
                 assert (
-                    conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
-                    == _DISPATCH_REVISION
+                    set(MigrationContext.configure(conn).get_current_heads()) == expected_revisions
                 )
                 conn.execute(table.update().values(**{field: 1}))
             assert "next_run_at" in {
@@ -768,15 +771,15 @@ def test_dispatch_downgrade_refuses_starting_runs(dispatch_migration_engine: Eng
             )
         )
     config = _build_alembic_config(db_engine.url.render_as_string(hide_password=False))
+    with db_engine.connect() as conn:
+        expected_revisions = set(MigrationContext.configure(conn).get_current_heads())
+    assert _DISPATCH_REVISION in expected_revisions
     with pytest.raises(RuntimeError, match="Reconcile starting"), db_engine.begin() as conn:
         config.attributes["connection"] = conn
         command.downgrade(config, _DISPATCH_PREVIOUS)
     with db_engine.connect() as conn:
         assert conn.execute(sa.select(runs.c.status)).scalar_one() == 6
-        assert (
-            conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
-            == _DISPATCH_REVISION
-        )
+        assert set(MigrationContext.configure(conn).get_current_heads()) == expected_revisions
     assert "trigger_key" in {
         c["name"] for c in sa.inspect(db_engine).get_columns("scheduled_task_runs")
     }
@@ -837,14 +840,14 @@ def test_completed_state_migration_round_trips(dispatch_migration_engine: Engine
     with engine.begin() as conn:
         conn.execute(tasks.insert().values(id=b"a" * 16, state=4, **values))
         conn.execute(tasks.insert().values(id=b"b" * 16, state=2, **values))
+    with engine.connect() as conn:
+        expected_revisions = set(MigrationContext.configure(conn).get_current_heads())
+    assert _COMPLETED_STATE_REVISION in expected_revisions
     with pytest.raises(RuntimeError, match="Reconcile completed"), engine.begin() as conn:
         config.attributes["connection"] = conn
         command.downgrade(config, _DISPATCH_REVISION)
     with engine.connect() as conn:
-        assert (
-            conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
-            == _COMPLETED_STATE_REVISION
-        )
+        assert set(MigrationContext.configure(conn).get_current_heads()) == expected_revisions
     # After reconciling, the downgrade restores the narrower check.
     with engine.begin() as conn:
         conn.execute(tasks.update().where(tasks.c.state == 4).values(state=1, next_run_at=None))
@@ -988,9 +991,12 @@ def test_mcp_services_migration_keeps_existing_tasks_and_round_trips(
 def test_merge_reconciles_mcp_services_and_comment_anchor_branches(
     dispatch_migration_engine: Engine, starting_revision: str
 ) -> None:
-    """A database on either branch, or neither, gains both columns and one head."""
+    """Merge both upstream branches while preserving any independent branch heads."""
     engine = dispatch_migration_engine
     config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    with engine.connect() as conn:
+        independent_revisions = set(MigrationContext.configure(conn).get_current_heads())
+    independent_revisions.remove(_DISPATCH_REVISION)
     command.upgrade(config, starting_revision)
     command.upgrade(config, _MCP_SERVICES_MERGE_REVISION)
 
@@ -998,13 +1004,15 @@ def test_merge_reconciles_mcp_services_and_comment_anchor_branches(
     assert "mcp_services" in {c["name"] for c in inspector.get_columns("scheduled_tasks")}
     assert "anchor_metadata" in {c["name"] for c in inspector.get_columns("comments")}
     with engine.connect() as conn:
-        assert conn.execute(
-            sa.text("SELECT version_num FROM alembic_version")
-        ).scalars().all() == [_MCP_SERVICES_MERGE_REVISION]
+        assert set(MigrationContext.configure(conn).get_current_heads()) == {
+            _MCP_SERVICES_MERGE_REVISION,
+            *independent_revisions,
+        }
 
     command.downgrade(config, _MCP_SERVICES_REVISION)
     with engine.connect() as conn:
-        assert set(conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalars()) == {
+        assert set(MigrationContext.configure(conn).get_current_heads()) == {
             _MCP_SERVICES_REVISION,
             _COMMENT_ANCHOR_REVISION,
+            *independent_revisions,
         }

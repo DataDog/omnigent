@@ -1144,6 +1144,7 @@ async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
         conversation_store: Any,
         elicitation_id: str | None = None,
         target_session_id: str | None = None,
+        actor_user_id: str | None = None,
     ) -> bool:
         """
         Stand-in for ``_hold_native_ask_gate`` that simulates accept.
@@ -1162,6 +1163,7 @@ async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
             checkpoint so a sibling's rebuild observes it.
         :param result: The composed ASK result carrying ``state_updates``.
         :param conversation_store: Conversation store (unused by the stub).
+        :param actor_user_id: Authenticated actor (unused by the stub).
         :returns: ``True`` (accept) for every entrant.
         """
         nonlocal entries

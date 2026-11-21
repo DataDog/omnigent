@@ -70,6 +70,7 @@ from omnigent.tools.builtins.spawn import (
     SysSessionSendTool,
     SysSessionShareTool,
 )
+from omnigent.tools.builtins.sys_ask_user import SysAskUserTool
 from omnigent.tools.builtins.timer import (
     SysTimerCancelTool,
     SysTimerSetTool,
@@ -90,6 +91,7 @@ __all__ = [
     "SysAgentDownloadTool",
     "SysAgentGetTool",
     "SysAgentListTool",
+    "SysAskUserTool",
     "SysCallAsyncTool",
     "SysCancelAsyncTool",
     "SysListModelsTool",
@@ -302,6 +304,11 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "browser_click": None,
     "browser_type": None,
     "browser_screenshot": None,
+    # ``sys_ask_user`` is framework-owned and always auto-registered by
+    # ``ToolManager`` (single source of truth); reserved here with ``None``
+    # so user specs cannot shadow the name. Execution is runner-dispatched
+    # (``omnigent/runner/ask_user.py``) as a durable elicitation.
+    "sys_ask_user": None,
     "ui_open_file": None,
 }
 

@@ -44,6 +44,10 @@ from omnigent.runtime import set_runner_router
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.feature_usage_metrics import (
+    FeatureUsageRecorder,
+    set_feature_usage_recorder_for_testing,
+)
 from omnigent.server.routes._sessions.common import (
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
@@ -59,6 +63,7 @@ from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.budgets import budget
 from tests.server.conftest import ControllableMockClient
+from tests.server.feature_usage_helpers import RecordingMeter
 from tests.server.helpers import build_agent_bundle, create_test_agent
 from tests.server.integration.test_sessions_tunnel_three_layer import (
     _connect_runner_tunnel,
@@ -129,6 +134,28 @@ async def _create_child_session(
     resp = await client.post("/v1/sessions", json=payload)
     assert resp.status_code == 201, f"child session create failed: {resp.text}"
     return resp.json()
+
+
+async def test_only_child_session_creation_records_subagent_spawn(
+    client: httpx.AsyncClient,
+) -> None:
+    """A root session is not a spawn; a parent-linked child is exactly one."""
+    meter = RecordingMeter()
+    set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
+    try:
+        parent = await _create_parent_session(client, agent_name="metrics-parent")
+        await _create_child_session(
+            client,
+            parent_session_id=parent["id"],
+            agent_name="metrics-child",
+        )
+        assert [record["omnigent.feature.operation"] for record in meter.counter.records] == [
+            "spawn"
+        ]
+        assert meter.counter.records[0]["omnigent.feature.name"] == "sub_agent"
+        assert meter.counter.records[0]["omnigent.feature.outcome"] == "success"
+    finally:
+        set_feature_usage_recorder_for_testing(None)
 
 
 # ── Runner co-location (shared workspace) ────────────────

@@ -38,7 +38,7 @@ jobs:
         uses: ./.github/actions/setup-harness-cli
         with:
           harness: ${{ matrix.harness }}
-          cache-namespace: test-v1
+          cache-namespace: test-v1-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Remove local downloads before restore
         shell: bash
         env:
@@ -53,7 +53,7 @@ jobs:
         uses: ./.github/actions/setup-harness-cli
         with:
           harness: ${{ matrix.harness }}
-          cache-namespace: test-v1
+          cache-namespace: test-v1-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Verify CLI remains available to caller steps
         env:
           CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}

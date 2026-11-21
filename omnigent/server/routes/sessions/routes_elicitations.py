@@ -10,6 +10,7 @@ from fastapi import (
     Request,
 )
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
     pending_elicitations,
@@ -26,6 +27,9 @@ from omnigent.server._elicitation_registry import (
 from omnigent.server.auth import (
     LEVEL_EDIT,
     AuthProvider,
+)
+from omnigent.server.routes._auth_helpers import (
+    get_session_owner_id as _get_session_owner_id,
 )
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -155,7 +159,27 @@ def register_elicitations_routes(
             if approval_conv is None:
                 raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
-        await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
+        try:
+            owner_id = await asyncio.to_thread(_get_session_owner_id, session_id, permission_store)
+        except Exception:
+            owner_id = None
+        outcome = await _resolve_elicitation(
+            session_id,
+            _resolve_data,
+            runner_router,
+            conversation_store,
+            actor_user_id=user_id or owner_id or "local",
+            session_owner_id=owner_id,
+        )
+        if outcome == "conflict":
+            # A different answer was already committed for this question.
+            # Fail loud (409) rather than silently accepting a no-op so a
+            # client knows its answer did NOT stand.
+            raise OmnigentError(
+                f"Elicitation {elicitation_id} was already answered with a "
+                "different answer; the first answer stands.",
+                code=ErrorCode.CONFLICT,
+            )
         # Apply any policy writes deferred by the relay tool-call ASK gate
         # (e.g. a cost-budget checkpoint) on the runner-owning session.
         await _apply_pending_policy_ask_writes(
@@ -166,6 +190,57 @@ def register_elicitations_routes(
             _resolve_data,
         )
         return {"queued": False}
+
+    @router.get(
+        "/sessions/{session_id}/durable_elicitations/unconsumed",
+        # Internal durable-ask recovery flow — hidden from the public API
+        # reference.
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def list_unconsumed_durable_elicitations(
+        request: Request,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """
+        List answered-but-unconsumed durable questions for a session.
+
+        The runner's reconnect catch-up scan adopts these: an answer that
+        committed while the runner was down must resume the parked
+        execution (claim exactly-once + one continuation wake) instead of
+        sitting unconsumed forever.
+
+        :param request: The inbound request, used for identity extraction.
+        :param session_id: Owning session id.
+        :returns: ``{"unconsumed": [{elicitation_id, action, content}]}``.
+        :raises OmnigentError: 404 if the session does not exist.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, ELICITATION_RESOLVE_LEVEL, permission_store, conversation_store
+        )
+        from omnigent.runtime.durable_ask_user import durable_store
+
+        store = durable_store()
+        if store is None:
+            return {"unconsumed": []}
+        try:
+            rows = await asyncio.to_thread(store.list_for_conversation, session_id)
+        except Exception:
+            rows = []
+        return {
+            "unconsumed": [
+                {
+                    "elicitation_id": row.id,
+                    "action": row.answer_action,
+                    "content": row.answer_content,
+                }
+                for row in rows
+                # Explicitly canceled rows are terminal by user intent and
+                # are never adopted by recovery.
+                if row.state in {"answered", "declined"} and row.consumed_at is None
+            ]
+        }
 
     @router.get(
         "/sessions/{session_id}/elicitations/{elicitation_id}",
@@ -224,17 +299,55 @@ def register_elicitations_routes(
         lookup_session_id = owner_session_id or session_id
         found = pending_elicitations.lookup(elicitation_id, conversation_id=lookup_session_id)
         if found is None:
-            resolution = pending_elicitations.native_resolution_for(
-                lookup_session_id, elicitation_id
+            # Durable sys_ask_user questions live in the database, so they
+            # answer here even after a cold server start.
+            from omnigent.runtime.durable_ask_user import (
+                durable_store,
+                pending_event_for_record,
             )
-            return {"status": "resolved", **({"resolution": resolution} if resolution else {})}
+
+            store = durable_store()
+            # Blocking SQLite/DB access stays off the event loop: a locked
+            # database must not wedge the request loop.
+            durable_record = (
+                await asyncio.to_thread(store.get, elicitation_id) if store is not None else None
+            )
+            if durable_record is None or session_id not in {
+                durable_record.conversation_id,
+                durable_record.target_conversation_id,
+            }:
+                resolution = pending_elicitations.native_resolution_for(
+                    lookup_session_id, elicitation_id
+                )
+                return {"status": "resolved", **({"resolution": resolution} if resolution else {})}
+            if durable_record.state == "pending":
+                event = pending_event_for_record(
+                    durable_record,
+                    mirror_on=session_id,
+                )
+                params = event.get("params", {})
+                return {
+                    "status": "pending",
+                    "message": params.get("message", "Question"),
+                    "phase": "",
+                    "policy_name": "",
+                    "content_preview": "",
+                    "requestedSchema": params.get("requestedSchema"),
+                    "durable": True,
+                }
+            return {
+                "status": "resolved",
+                "action": durable_record.answer_action,
+                "content": durable_record.answer_content,
+                "durable": True,
+            }
 
         _conv_id, event = found
         params_value = event.get("params")
         params = params_value if isinstance(params_value, dict) else {}
         if params.get("target_session_id") not in (None, session_id):
             return {"status": "resolved"}
-        return {
+        payload = {
             "status": "pending",
             "message": params.get("message", "Approval required"),
             "phase": params.get("phase", ""),
@@ -246,3 +359,9 @@ def register_elicitations_routes(
                 if key in params
             },
         }
+        # A durable sys_ask_user card additionally exposes its schema so a
+        # client can answer choice questions from the standalone page.
+        if params.get("durable") and isinstance(params.get("requestedSchema"), dict):
+            payload["durable"] = True
+            payload["requestedSchema"] = params["requestedSchema"]
+        return payload

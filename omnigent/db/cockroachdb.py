@@ -109,7 +109,7 @@ def _prepare_crdb_schema_transaction(connection: Any, version: Version) -> None:
     connection.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
 
 
-def _crdb_revision_is_supported(db_uri: str, current: str, head: str) -> bool:
+def _crdb_revision_is_supported(db_uri: str, current: str | tuple[str, ...], head: str) -> bool:
     """Return whether *current* is on the supported CRDB migration segment."""
     if current == head:
         return True
@@ -120,7 +120,9 @@ def _crdb_revision_is_supported(db_uri: str, current: str, head: str) -> bool:
 
     script = ScriptDirectory.from_config(_build_alembic_config(db_uri))
     revisions = script.iterate_revisions(head, CRDB_BASELINE_REVISION)
-    return current in {revision.revision for revision in revisions} | {CRDB_BASELINE_REVISION}
+    supported = {revision.revision for revision in revisions} | {CRDB_BASELINE_REVISION}
+    current_heads = (current,) if isinstance(current, str) else current
+    return all(revision in supported for revision in current_heads)
 
 
 def _start_or_resume_crdb_bootstrap(

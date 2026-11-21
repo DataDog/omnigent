@@ -16,6 +16,7 @@ import re
 import secrets
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from typing import Any, Literal, cast
 
@@ -94,6 +95,11 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_wrapper_label,
 )
 from omnigent.onboarding.provider_config import harness_owns_its_credential
+from omnigent.onboarding.sandboxes.context import (
+    ManagedSandboxContext,
+    managed_sandbox_context_scope,
+)
+from omnigent.onboarding.sandboxes.types import ManagedIdentityRequirement
 from omnigent.policies.types import (
     ElicitationRequest,
     EvaluationContext,
@@ -164,6 +170,7 @@ from omnigent.server.bundles import (
 )
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.failed_status_diagnostics import failed_status_intake_attributes
+from omnigent.server.feature_usage_metrics import get_feature_usage_recorder
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
@@ -177,9 +184,16 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     read_managed_repo_workspaces,
 )
+from omnigent.server.managed_sandbox_identity import (
+    ManagedSandboxIdentityUnavailable,
+    context_for_managed_sandbox_operation,
+)
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
+)
+from omnigent.server.routes._auth_helpers import (
+    get_session_owner_id as _get_session_owner_id,
 )
 from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
@@ -329,6 +343,7 @@ from omnigent.server.routes._sessions.helpers import (
     _owns_host_runner,
     _parse_background_tasks,
     _parse_external_conversation_item,
+    _pending_client_tool_call_snapshot_for_session,
     _pending_elicitation_snapshot_for_session,
     _permission_level_from_grants,
     _persist_native_policy_notice,
@@ -463,6 +478,70 @@ from omnigent.util.session_lifecycle import (
 )
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION_HINT
 
+_APPROVAL_USAGE_DEDUPLICATION_CAPACITY = 4096
+_approval_usage_requests_seen: OrderedDict[tuple[str, str], None] = OrderedDict()
+_approval_usage_resolutions_seen: OrderedDict[tuple[str, str], None] = OrderedDict()
+
+
+def _claim_approval_usage(
+    seen: OrderedDict[tuple[str, str], None], session_id: str, elicitation_id: str
+) -> bool:
+    key = (session_id, elicitation_id)
+    if key in seen:
+        return False
+    seen[key] = None
+    if len(seen) > _APPROVAL_USAGE_DEDUPLICATION_CAPACITY:
+        seen.popitem(last=False)
+    return True
+
+
+async def _record_approval_request(
+    session_id: str,
+    elicitation_id: str,
+    conversation_store: ConversationStore | None,
+    actor_user_id: str | None = None,
+) -> None:
+    try:
+        owner_id = (
+            await asyncio.to_thread(conversation_store.get_session_owner, session_id)
+            if conversation_store
+            else None
+        )
+        if _claim_approval_usage(_approval_usage_requests_seen, session_id, elicitation_id):
+            get_feature_usage_recorder().operation(
+                feature_name="approval",
+                operation="request",
+                actor_user_id=actor_user_id or owner_id or "local",
+                session_owner_id=owner_id,
+            ).succeed()
+    except Exception:  # noqa: BLE001
+        return
+
+
+async def _record_approval_timeout(
+    session_id: str,
+    elicitation_id: str,
+    conversation_store: ConversationStore | None,
+    actor_user_id: str | None = None,
+) -> None:
+    try:
+        owner_id = (
+            await asyncio.to_thread(conversation_store.get_session_owner, session_id)
+            if conversation_store
+            else None
+        )
+        if _claim_approval_usage(_approval_usage_resolutions_seen, session_id, elicitation_id):
+            usage = get_feature_usage_recorder().operation(
+                feature_name="approval",
+                operation="resolve",
+                actor_user_id=actor_user_id or owner_id or "local",
+                session_owner_id=owner_id,
+            )
+            usage.set_attribute("omnigent.approval.decision", "timeout")
+            usage.succeed()
+    except Exception:  # noqa: BLE001
+        return
+
 
 def _harness_elicitation_request_fingerprint(params: ElicitationRequestParams) -> str:
     """
@@ -549,6 +628,7 @@ async def _publish_and_wait_for_harness_elicitation(
     params: ElicitationRequestParams,
     timeout_s: float,
     conversation_store: ConversationStore | None = None,
+    actor_user_id: str | None = None,
     elicitation_id: str | None = None,
     tool_name: str | None = None,
     tool_input: dict[str, Any] | None = None,
@@ -585,6 +665,8 @@ async def _publish_and_wait_for_harness_elicitation(
     :param conversation_store: Optional store used to mirror
         child-session prompts into ancestor streams. ``None`` keeps
         the prompt scoped to ``session_id`` only.
+    :param actor_user_id: Authenticated initiator when the calling route has
+        one. Background callers leave this unset and use owner/local fallback.
     :param elicitation_id: Optional precomputed correlation id, e.g.
         ``"elicit_codex_abc123"``. ``None`` mints a random id.
     :param tool_name: Gated tool name, e.g. ``"Bash"``, used to
@@ -622,6 +704,7 @@ async def _publish_and_wait_for_harness_elicitation(
     # severed wait instead defers the clear so a hook retry can re-park.
     published_request = False
     settled = False
+    timed_out = False
     # MCP verdict when a real web verdict settles the wait, so the
     # finally's resolved fan-out carries it (None = severed / terminal).
     settled_action: str | None = None
@@ -638,6 +721,12 @@ async def _publish_and_wait_for_harness_elicitation(
             params=params,
         )
         event_payload = event.model_dump()
+        await _record_approval_request(
+            session_id,
+            elicitation_id,
+            conversation_store,
+            actor_user_id,
+        )
         session_stream.publish(session_id, event_payload)
         published_request = True
         if conversation_store is not None:
@@ -659,6 +748,7 @@ async def _publish_and_wait_for_harness_elicitation(
                 timeout=timeout_s,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            timed_out = not done
         finally:
             for race_task in race_tasks:
                 if not race_task.done():
@@ -708,6 +798,10 @@ async def _publish_and_wait_for_harness_elicitation(
         if published_request and (
             not settled or (delivery is not None and settled_action is not None)
         ):
+            if timed_out:
+                await _record_approval_timeout(
+                    session_id, elicitation_id, conversation_store, actor_user_id
+                )
             # Retain the card during reconnect or native delivery. Abandoned
             # waits expire if no new hook arrives within the grace period.
             _schedule_deferred_elicitation_clear(
@@ -1666,6 +1760,10 @@ def _build_session_response(
             if pending_elicitation_events is not None
             else pending_elicitations.snapshot_for(conv.id)
         ),
+        # Replay outstanding client-tool calls into the snapshot, the same
+        # way as pending_elicitations above — a call parked before this
+        # client (re)connected would otherwise never surface as answerable.
+        pending_client_tool_calls=_pending_client_tool_call_snapshot_for_session(conv.id, items),
         # Replay un-consumed web messages on native-terminal sessions
         # so a client that posted then navigated away / rebound re-
         # hydrates the optimistic bubble. Empty for non-native sessions
@@ -2482,9 +2580,17 @@ async def _resolve_elicitation(
     data: dict[str, Any],
     runner_router: RunnerRouter | None,
     conversation_store: ConversationStore | None = None,
-) -> None:
+    *,
+    actor_user_id: str | None = None,
+    session_owner_id: str | None = None,
+) -> str | None:
     """
     Resolve one outstanding elicitation from an approval payload.
+
+    :returns: The durable resolution outcome when the id named a durable
+        question (``"resolved"`` / ``"idempotent"`` / ``"conflict"`` /
+        ``"forbidden"``), or ``None`` when the verdict was handled by the
+        legacy in-memory paths or fell through for an unknown id.
 
     Shared by the two entry points that deliver a verdict for a
     parked elicitation: the ``type == "approval"`` branch of
@@ -2526,6 +2632,10 @@ async def _resolve_elicitation(
     :param conversation_store: Optional store used to mirror the
         resolved signal into ancestor streams when ``session_id`` is
         a child session. ``None`` keeps the signal scoped locally.
+    :param actor_user_id: Authenticated resolver, when this resolution came
+        from a request. ``None`` leaves the owner/local fallback in place for
+        runner-originated terminal resolution.
+    :param session_owner_id: Owner used for background-resolution attribution.
     """
     # Empty-string default is intentional, NOT a fail-loud miss: the
     # resolve-URL caller always supplies the id (it comes from the URL
@@ -2597,10 +2707,108 @@ async def _resolve_elicitation(
                     "This command approval changed. Refresh it before remembering a rule.",
                     code=ErrorCode.INVALID_INPUT,
                 )
+    action = data.get("action")
+    pending = (
+        isinstance(elicitation_id, str)
+        and bool(elicitation_id)
+        and (pending_elicitations.lookup(elicitation_id) or (None,))[0] == owner_session_id
+    )
+    # Durable sys_ask_user questions resolve through the persisted store
+    # FIRST (commit-before-publish): the terminal state commits before any
+    # event is announced, and the answer is validated against the
+    # persisted schema so a malformed body leaves the question pending.
+    # Legacy policy/MCP elicitations never match a durable row and fall
+    # through to the in-memory paths unchanged.
+    from omnigent.runtime.durable_ask_user import (
+        CONFLICT,
+        FORBIDDEN,
+        IDEMPOTENT,
+        NOT_FOUND,
+        RESOLVED,
+        durable_store,
+        resolve_durable_question,
+    )
+
+    if (
+        durable_store() is not None
+        and isinstance(elicitation_id, str)
+        and elicitation_id
+        and action in {"accept", "decline", "cancel"}
+    ):
+        outcome, resolved_record, error = await asyncio.to_thread(
+            resolve_durable_question,
+            elicitation_id=elicitation_id,
+            session_id=session_id,
+            action=action,
+            content=(data.get("content") if isinstance(data.get("content"), dict) else None),
+        )
+        if outcome == "invalid":
+            _logger.warning(
+                "Durable elicitation %s answer rejected: %s",
+                elicitation_id,
+                error,
+            )
+            # Malformed answers fail cleanly; the question stays pending.
+            return "invalid"
+        if outcome == NOT_FOUND:
+            pass  # Not durable — fall through to the legacy paths.
+        else:
+            if outcome == CONFLICT:
+                _logger.info(
+                    "Durable elicitation %s conflicting answer ignored; first answer stands",
+                    elicitation_id,
+                )
+            elif outcome == FORBIDDEN:
+                _logger.warning(
+                    "Durable elicitation %s resolution from non-owner session %s rejected",
+                    elicitation_id,
+                    session_id,
+                )
+                return None
+            if outcome in {RESOLVED, IDEMPOTENT}:
+                # All follow-ups target the OWNING row's conversation, never
+                # the resolving view: a parent-view answer to a child's
+                # question must resolve on the child's stream (its live
+                # subscribers drop the card), mirror to the child's ancestors
+                # (which includes the parent), and forward to the runner
+                # under the child's session id — so a no-live-waiter recovery
+                # consumes the child's row and wakes the CHILD. Waking the
+                # resolving session instead would strand the child forever
+                # (row consumed, never re-adopted) and start a bogus
+                # continuation turn on the parent.
+                owner_id = resolved_record.conversation_id if resolved_record else session_id
+                _publish_elicitation_resolved(owner_id, elicitation_id, action=action)
+                if conversation_store is not None:
+                    await asyncio.to_thread(
+                        _publish_elicitation_resolved_to_ancestors,
+                        conversation_store,
+                        owner_id,
+                        elicitation_id,
+                        action,
+                    )
+                # Forward the verdict to the runner (commit already
+                # happened). The durable flag lets a runner with no live
+                # waiter (process restarted mid-question) recognize the
+                # verdict and recover from the paused-call checkpoint
+                # instead of dropping it. Delivery is retryable via the
+                # store's unconsumed reconcile when the runner is offline.
+                await _forward_approval_to_runner(
+                    owner_id,
+                    {
+                        **data,
+                        "durable": True,
+                        # Paused-call checkpoint: a runner with no live
+                        # waiter rebuilds the dangling tool call's output
+                        # item from this instead of guessing.
+                        "paused_call": (resolved_record.paused_call if resolved_record else None),
+                    },
+                    runner_router,
+                )
+            return outcome
     if isinstance(elicitation_id, str) and await _resolve_native_delivery(
         owner_session_id, elicitation_id, data, conversation_store
     ):
-        return
+        return None
     harness_future = _harness_elicitation_registry.get(elicitation_id)
     # Server-parked harness gates own their verdict end-to-end: setting this
     # Future returns the verdict to the runner's pending policy evaluation.
@@ -2714,8 +2922,28 @@ async def _resolve_elicitation(
             )
     # Runner-side elicitations (policy approvals, scaffold dispatch)
     # resolve when the canonical approval event reaches the runner.
+    if (
+        pending
+        and action in {"accept", "decline", "cancel", "timeout"}
+        and _claim_approval_usage(
+            _approval_usage_resolutions_seen, owner_session_id, elicitation_id
+        )
+    ):
+        try:
+            usage = get_feature_usage_recorder().operation(
+                feature_name="approval",
+                operation="resolve",
+                actor_user_id=actor_user_id or session_owner_id or "local",
+                session_owner_id=session_owner_id,
+            )
+            usage.set_attribute("omnigent.approval.decision", action)
+            usage.succeed()
+        except Exception:  # noqa: BLE001
+            # Approval delivery is authoritative; metrics are observational.
+            pass
     if not server_harness_owns_approval:
         await _forward_approval_to_runner(owner_session_id, data, runner_router)
+    return None
 
 
 def _spawn_native_approval_popup_forward(
@@ -2820,6 +3048,7 @@ async def _hold_native_ask_gate_impl(
     conversation_store: ConversationStore,
     elicitation_id: str | None = None,
     target_session_id: str | None = None,
+    actor_user_id: str | None = None,
 ) -> bool:
     """
     Hold a server-side ASK gate until a human resolves it.
@@ -2869,6 +3098,7 @@ async def _hold_native_ask_gate_impl(
         used by ``POST /policies/evaluate`` retries so a hook retry after
         a transient 5xx / connect-drop does not prompt the human twice.
         ``None`` mints a fresh id (the default for non-retry callers).
+    :param actor_user_id: Authenticated initiator when available.
     :returns: ``True`` iff a human accepted; ``False`` on cancel /
         timeout / disconnect (fail closed).
     :raises ElicitationDeclinedError: when the human explicitly
@@ -2903,6 +3133,7 @@ async def _hold_native_ask_gate_impl(
         timeout_s=timeout_s,
         elicitation_id=elicitation_id,
         conversation_store=conversation_store,
+        actor_user_id=actor_user_id,
         tool_name=tool_name if isinstance(tool_name, str) else None,
         tool_input=tool_input if isinstance(tool_input, dict) else None,
     )
@@ -4549,8 +4780,12 @@ async def _mark_runner_sessions_offline_once(
             continue
         if binding is None or binding[0] != conv.runner_id:
             continue
+        # Our queued heartbeat can reach storage after the sweep snapshot.
+        own_stamp = (
+            session_live_state.last_liveness_stamp(conv.runner_id) if conv.runner_id else None
+        )
         if _runner_stamp_is_live_elsewhere(
-            stamp=binding[1], reference_stamp=conv.runner_last_seen
+            stamp=binding[1], reference_stamp=max(conv.runner_last_seen or 0, own_stamp or 0)
         ):
             _relinquish_session_live_state(conv.id)
             _logger.info(
@@ -4758,6 +4993,7 @@ async def _run_managed_launch(
     provider: str | None = None,
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
+    operation_context: ManagedSandboxContext | None = None,
     host_id: str | None = None,
     sandbox_profiles: Any = None,
 ) -> None:
@@ -4882,15 +5118,16 @@ async def _run_managed_launch(
             saved_conversation.inference_snapshot,
         )
 
-    agent_name: str | None = None
-    if agent_store is not None and agent_id is not None:
-        agent_name = await asyncio.to_thread(
-            resolve_managed_agent_label,
-            agent_store,
-            agent_id,
-            session_id=session_id,
-        )
-    with runner_log_scope(session_id, None):
+    async def _provision_and_bind() -> None:
+
+        agent_name: str | None = None
+        if agent_store is not None and agent_id is not None:
+            agent_name = await asyncio.to_thread(
+                resolve_managed_agent_label,
+                agent_store,
+                agent_id,
+                session_id=session_id,
+            )
         managed = await _provision_managed_sandbox(
             session_id=session_id,
             owner=owner,
@@ -4931,6 +5168,14 @@ async def _run_managed_launch(
             sandbox_profiles=sandbox_profiles,
             sandbox_profile=profile,
         )
+
+    with (
+        runner_log_scope(session_id, None),
+        managed_sandbox_context_scope(operation_context)
+        if operation_context is not None
+        else contextlib.nullcontext(),
+    ):
+        await _provision_and_bind()
 
 
 async def _bind_and_launch_managed_runner(
@@ -5135,6 +5380,7 @@ async def _maybe_relaunch_managed_sandbox(
     conv: Conversation,
     app_state: Any,
     conversation_store: ConversationStore,
+    request: Request | None = None,
 ) -> bool:
     """
     Relaunch a dead managed sandbox for a session, if it has one.
@@ -5176,6 +5422,14 @@ async def _maybe_relaunch_managed_sandbox(
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or host.sandbox_provider is None:
         return False
+    operation_context = _managed_operation_context(
+        request=request,
+        app_state=app_state,
+        host=host,
+        session_id=session_id,
+        sandbox_config=sandbox_config,
+        operation="resume" if host_resume_supported(host, sandbox_config) else "relaunch",
+    )
     if host_is_live(host):
         host_registry = getattr(app_state, "host_registry", None)
         host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
@@ -5200,11 +5454,13 @@ async def _maybe_relaunch_managed_sandbox(
             _kick_managed_wake(
                 session_id=session_id,
                 conv=conv,
+                host=host,
                 sandbox_config=sandbox_config,
                 tracker=tracker,
                 conversation_store=conversation_store,
                 host_store=host_store,
                 app_state=app_state,
+                operation_context=operation_context,
                 provider=host.sandbox_provider,
             )
         else:
@@ -5217,6 +5473,7 @@ async def _maybe_relaunch_managed_sandbox(
                 conversation_store=conversation_store,
                 host_store=host_store,
                 app_state=app_state,
+                operation_context=operation_context,
             )
         launch = tracker.get(session_id)
     if launch is not None:
@@ -5257,6 +5514,7 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     conv: Conversation,
     app_state: Any,
     conversation_store: ConversationStore,
+    request: Request | None = None,
 ) -> bool:
     """
     Wake a resumable managed host whose persisted liveness has gone stale.
@@ -5281,6 +5539,14 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     host = await asyncio.to_thread(host_store.get_host, conv.host_id)
     if host is None or not host_resume_supported(host, sandbox_config):
         return False
+    operation_context = _managed_operation_context(
+        request=request,
+        app_state=app_state,
+        host=host,
+        session_id=session_id,
+        sandbox_config=sandbox_config,
+        operation="resume",
+    )
     host_registry = cast(HostRegistry | None, getattr(app_state, "host_registry", None))
     tunnel_registry = cast(TunnelRegistry | None, getattr(app_state, "tunnel_registry", None))
     host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
@@ -5301,7 +5567,8 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
         )
 
     host_row_online = host_is_live(host)
-    sandbox_running = await asyncio.to_thread(host_sandbox_is_running, host, sandbox_config)
+    with managed_sandbox_context_scope(operation_context):
+        sandbox_running = await asyncio.to_thread(host_sandbox_is_running, host, sandbox_config)
     if (
         sandbox_running is not False
         and host_row_online
@@ -5334,6 +5601,7 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
         conv=conv,
         app_state=app_state,
         conversation_store=conversation_store,
+        request=request,
     )
 
 
@@ -5345,6 +5613,7 @@ async def ensure_runner_connected(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     raise_host_refusal: bool = False,
+    request: Request | None = None,
 ) -> tuple[httpx.AsyncClient | None, Conversation]:
     """
     Bring a wakeable session's runner online for out-of-band resource access.
@@ -5416,6 +5685,7 @@ async def ensure_runner_connected(
         conv=conv,
         app_state=app_state,
         conversation_store=conversation_store,
+        request=request,
     ):
         conv = await _reread()
         runner_client = await _get_runner_client(
@@ -5511,6 +5781,7 @@ async def ensure_runner_connected(
             conv=conv,
             app_state=app_state,
             conversation_store=conversation_store,
+            request=request,
         ):
             conv = await _reread()
             runner_client = await _get_runner_client(
@@ -5798,6 +6069,7 @@ def _kick_managed_relaunch(
     conversation_store: ConversationStore,
     host_store: HostStore,
     app_state: Any,
+    operation_context: ManagedSandboxContext,
 ) -> None:
     """
     Register and spawn the background relaunch for a dead sandbox.
@@ -5845,8 +6117,9 @@ def _kick_managed_relaunch(
             session_id,
             extra={"session_id": session_id},
         )
-    relaunch_task = asyncio.create_task(
-        _run_managed_launch(
+
+    async def _relaunch_after_identity_resolution() -> None:
+        await _run_managed_launch(
             session_id=session_id,
             owner=host.user_id,
             sandbox_config=sandbox_config,
@@ -5859,9 +6132,11 @@ def _kick_managed_relaunch(
             relaunch_host=host,
             agent_store=agent_store,
             agent_id=conv.agent_id,
+            operation_context=operation_context,
             sandbox_profiles=getattr(app_state, "sandbox_profiles", None),
         )
-    )
+
+    relaunch_task = asyncio.create_task(_relaunch_after_identity_resolution())
     _managed_launch_tasks.add(relaunch_task)
     relaunch_task.add_done_callback(_managed_launch_tasks.discard)
 
@@ -5870,11 +6145,13 @@ def _kick_managed_wake(
     *,
     session_id: str,
     conv: Conversation,
+    host: Host,
     sandbox_config: ManagedSandboxDeployment,
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
     host_store: HostStore,
     app_state: Any,
+    operation_context: ManagedSandboxContext,
     provider: str | None = None,
 ) -> None:
     """
@@ -5888,11 +6165,13 @@ def _kick_managed_wake(
     return _facade._kick_managed_wake(
         session_id=session_id,
         conv=conv,
+        host=host,
         sandbox_config=sandbox_config,
         tracker=tracker,
         conversation_store=conversation_store,
         host_store=host_store,
         app_state=app_state,
+        operation_context=operation_context,
         provider=provider,
     )
 
@@ -5901,11 +6180,13 @@ def _kick_managed_wake_impl(
     *,
     session_id: str,
     conv: Conversation,
+    host: Host | None = None,
     sandbox_config: ManagedSandboxDeployment,
     tracker: ManagedLaunchTracker,
     conversation_store: ConversationStore,
     host_store: HostStore,
     app_state: Any,
+    operation_context: ManagedSandboxContext | None = None,
     provider: str | None = None,
 ) -> None:
     """
@@ -5928,6 +6209,7 @@ def _kick_managed_wake_impl(
     :param provider: The dormant host's sandbox provider, e.g. ``"arclet"``,
         which the seeded launch status names.
     """
+    _ = host  # identity was captured from the authenticated request by the caller.
     _logger.info(
         "Managed host %s (session %s) is dormant but resumable; waking in background",
         conv.host_id,
@@ -5946,8 +6228,9 @@ def _kick_managed_wake_impl(
             session_id,
             extra={"session_id": session_id},
         )
-    wake_task = asyncio.create_task(
-        _run_managed_wake(
+
+    async def _wake_after_identity_resolution() -> None:
+        await _run_managed_wake(
             session_id=session_id,
             conv=conv,
             sandbox_config=sandbox_config,
@@ -5956,11 +6239,13 @@ def _kick_managed_wake_impl(
             host_store=host_store,
             host_registry=getattr(app_state, "host_registry", None),
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
-            agent_store=wake_agent_store,
+            operation_context=operation_context,
+            agent_store=getattr(app_state, "agent_store", None),
             agent_id=conv.agent_id,
             sandbox_profiles=getattr(app_state, "sandbox_profiles", None),
         )
-    )
+
+    wake_task = asyncio.create_task(_wake_after_identity_resolution())
     _managed_launch_tasks.add(wake_task)
     wake_task.add_done_callback(_managed_launch_tasks.discard)
 
@@ -5975,6 +6260,7 @@ async def _run_managed_wake(
     host_store: HostStore,
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
+    operation_context: ManagedSandboxContext | None = None,
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
     sandbox_profiles: Any = None,
@@ -6079,16 +6365,21 @@ async def _run_managed_wake(
             invalid_label_fallback="waking without a repository",
         )
         try:
-            await resume_managed_host(
-                host_id,
-                host_store,
-                sandbox_config,
-                repos=repos,
-                force=True,
-                on_stage=_on_stage,
-                agent_name=agent_name,
-                slice_key_enabled=host_slice_key_enabled(conv.labels, host_id),
-            )
+            with (
+                managed_sandbox_context_scope(operation_context)
+                if operation_context is not None
+                else contextlib.nullcontext()
+            ):
+                await resume_managed_host(
+                    host_id,
+                    host_store,
+                    sandbox_config,
+                    repos=repos,
+                    force=True,
+                    on_stage=_on_stage,
+                    agent_name=agent_name,
+                    slice_key_enabled=host_slice_key_enabled(conv.labels, host_id),
+                )
         except SandboxGoneError:
             _logger.info(
                 "Managed host %s (session %s) sandbox is gone; recreating a fresh generation",
@@ -6115,6 +6406,7 @@ async def _run_managed_wake(
                 relaunch_host=host,
                 agent_store=agent_store,
                 agent_id=agent_id,
+                operation_context=operation_context,
                 sandbox_profiles=sandbox_profiles,
             )
             return
@@ -10527,6 +10819,13 @@ async def _relay_runner_stream_once(
                                 },
                             }
                     if evt_type == "response.elicitation_request":
+                        _relay_elicitation_id = event.get("elicitation_id")
+                        if isinstance(_relay_elicitation_id, str) and _relay_elicitation_id:
+                            await _record_approval_request(
+                                session_id,
+                                _relay_elicitation_id,
+                                conversation_store,
+                            )
                         session_stream.publish(session_id, event)
                         await asyncio.to_thread(
                             _publish_elicitation_request_to_ancestors,
@@ -10810,6 +11109,7 @@ async def _register_policy_elicitation(
     result: PolicyResult,
     arguments_preview: str,
     conversation_store: ConversationStore,
+    actor_user_id: str | None = None,
 ) -> str:
     """
     Publish an elicitation request event on the session stream.
@@ -10848,6 +11148,7 @@ async def _register_policy_elicitation(
     _elicit_event = build_elicitation_request_event(
         elicitation_id, elicitation, session_id=session_id
     )
+    await _record_approval_request(session_id, elicitation_id, conversation_store, actor_user_id)
     session_stream.publish(session_id, _elicit_event)
     await asyncio.to_thread(
         _publish_elicitation_request_to_ancestors,
@@ -10962,6 +11263,7 @@ async def _evaluate_tool_call_policy(
         result=result,
         arguments_preview=arguments_str,
         conversation_store=conversation_store,
+        actor_user_id=actor.get("run_as") if actor is not None else None,
     )
     # The deciding policy's writes (e.g. a cost-budget checkpoint via
     # ``state_updates``) must land ONLY on approve. This relay path returns
@@ -11123,6 +11425,7 @@ async def _evaluate_input_policy(
             engine=engine,
             result=result,
             conversation_store=conversation_store,
+            actor_user_id=actor.get("run_as") if actor is not None else None,
         )
     except ElicitationDeclinedError as exc:
         return {
@@ -12890,6 +13193,25 @@ async def _create_session_from_existing_agent(
             )
         raise
 
+    if body.parent_session_id is not None:
+        # A parent link is the durable sub-agent creation boundary.  Do not
+        # instrument ordinary root-session creates or later child dispatches.
+        try:
+            parent_owner_id = await asyncio.to_thread(
+                _get_session_owner_id, body.parent_session_id, permission_store
+            )
+            usage = get_feature_usage_recorder().operation(
+                feature_name="sub_agent",
+                operation="spawn",
+                actor_user_id=user_id or parent_owner_id or "local",
+                session_owner_id=parent_owner_id,
+            )
+            usage.succeed()
+        except Exception:  # noqa: BLE001
+            # The session has been created successfully; usage emission must
+            # not alter that result.
+            pass
+
     # The create request has no conv id in its URL, so the path-based
     # FastAPI hook can't tag it — stamp the minted id so the create span
     # joins the session's session.id group.
@@ -13769,6 +14091,7 @@ async def _handle_mcp_tools_call(
                 params=elicit_params,
                 timeout_s=300.0,
                 conversation_store=conversation_store,
+                actor_user_id=actor.get("run_as") if actor is not None else None,
             )
             if elicit_result is None:
                 elicitation_responses[eid] = {"action": "decline"}
@@ -14801,3 +15124,42 @@ __all__ = [
     "configure_subagent_block_notifier",
     "ensure_runner_connected",
 ]
+
+
+def _managed_operation_context(
+    *,
+    request: Request | None,
+    app_state: Any,
+    host: Host,
+    session_id: str,
+    sandbox_config: ManagedSandboxDeployment,
+    operation: str,
+) -> ManagedSandboxContext:
+    """Capture current-owner authority before scheduling managed work.
+
+    Durable host rows intentionally contain no reference to an OIDC/browser or
+    CLI session.  A request-less caller can still operate providers that need
+    no caller identity, but cannot accidentally perform an OBO operation.
+    """
+    requirement = sandbox_config.managed_identity_requirement(host.sandbox_provider, operation)
+    if request is None:
+        if requirement is ManagedIdentityRequirement.OIDC_USER:
+            raise OmnigentError(
+                "owner reauthentication is required before this managed sandbox can be operated",
+                code=ErrorCode.REAUTHENTICATION_REQUIRED,
+            )
+        return ManagedSandboxContext(
+            session_id=session_id,
+            user_id=host.user_id,
+            identity_token_provider=None,
+        )
+    try:
+        return context_for_managed_sandbox_operation(
+            request,
+            getattr(app_state, "auth_provider", None),
+            session_id=session_id,
+            owner=host.user_id,
+            requirement=requirement,
+        )
+    except ManagedSandboxIdentityUnavailable as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.REAUTHENTICATION_REQUIRED) from exc

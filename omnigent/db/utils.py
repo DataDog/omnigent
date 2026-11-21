@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import random
+import re
 import threading
 import time
 import uuid
@@ -14,7 +15,7 @@ from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, TypeVar
 
 from sqlalchemy import Engine, create_engine, event, inspect, text
 from sqlalchemy.engine import make_url
@@ -692,17 +693,18 @@ def run_migrations_with_retry(
             engine.dispose()
 
 
-def _get_current_db_revision(engine: Engine) -> str | None:
+def _get_current_db_revision(engine: Engine) -> str | tuple[str, ...] | None:
     """
     Return the database's current Alembic revision, or ``None``.
 
     ``None`` means the database has no ``alembic_version`` table at
     all — i.e. nothing has ever been migrated against this database.
-    A database that exists at some revision (even if not head) returns
-    that revision string.
+    A database at one revision returns that revision string. An in-progress
+    migration across branches can have multiple current revisions; those are
+    returned as a sorted tuple.
 
     :param engine: SQLAlchemy engine bound to the target database.
-    :returns: The current revision hash (e.g. ``"c9d3a1f2e4b5"``) or
+    :returns: The current revision hash, a tuple of current hashes, or
         ``None`` if the ``alembic_version`` table is absent.
     """
     from alembic.runtime.migration import MigrationContext
@@ -713,7 +715,8 @@ def _get_current_db_revision(engine: Engine) -> str | None:
             return None
         with engine.connect() as connection:
             ctx = MigrationContext.configure(connection)
-            return ctx.get_current_revision()
+            heads = tuple(sorted(ctx.get_current_heads()))
+            return heads[0] if len(heads) == 1 else heads or None
 
 
 def _get_head_db_revision(db_uri: str) -> str:
@@ -744,7 +747,7 @@ def _get_head_db_revision(db_uri: str) -> str:
 
 def _verify_db_revision_is_supported(
     db_uri: str,
-    current: str | None,
+    current: str | tuple[str, ...] | None,
     head: str,
 ) -> None:
     """Reject a database revision that is unknown to this build."""
@@ -755,14 +758,174 @@ def _verify_db_revision_is_supported(
     from alembic.util import CommandError
 
     script = ScriptDirectory.from_config(_build_alembic_config(db_uri))
+    for revision in (current,) if isinstance(current, str) else current:
+        try:
+            script.get_revision(revision)
+        except CommandError as exc:
+            raise RuntimeError(
+                "Omnigent database schema is newer than this version of Omnigent "
+                f"(found revision {revision!r}, latest supported revision {head!r}). "
+                "Upgrade Omnigent before using this database."
+            ) from exc
+
+
+# Matches the credentials segment of a connection URL, e.g. the
+# "user:password@" in "postgresql+psycopg://user:password@host/db" --
+# scrubbed from any text headed for click.echo/logs. Driver-raised
+# exceptions (DSN strings, libpq error text) can embed the same shape, so
+# this is applied to arbitrary free text, not just the URL itself.
+_CREDENTIALS_IN_URL_RE = re.compile(r"://[^/\s:@]+:[^/\s@]*@")
+
+
+def _redact_credentials(text: str) -> str:
+    """Scrub any ``scheme://user:password@`` credential pair from free text.
+
+    Defense-in-depth backstop for :func:`_check_db_revision_compatibility`'s
+    error messages: beyond redacting the URL we were given, this also
+    scrubs anything a driver's own exception text might echo back (e.g. a
+    DSN embedded in a libpq connection error).
+
+    :param text: Arbitrary text, e.g. ``str(exc)`` from a caught exception.
+    :returns: The same text with any embedded credentials replaced by
+        ``"://<redacted>@"``.
+    """
+    return _CREDENTIALS_IN_URL_RE.sub("://<redacted>@", text)
+
+
+def _safe_db_uri_for_display(db_uri: str) -> str:
+    """Render a database URL with its password redacted, for safe display.
+
+    :param db_uri: A SQLAlchemy database URL, possibly carrying a password.
+    :returns: The URL with any password replaced by SQLAlchemy's standard
+        mask, or a generic placeholder when *db_uri* cannot be parsed at
+        all (never echoes an unparseable string verbatim, since it could
+        still contain credentials).
+    """
     try:
-        script.get_revision(current)
-    except CommandError as exc:
-        raise RuntimeError(
-            "Omnigent database schema is newer than this version of Omnigent "
-            f"(found revision {current!r}, latest supported revision {head!r}). "
-            "Upgrade Omnigent before using this database."
-        ) from exc
+        return make_url(db_uri).render_as_string(hide_password=True)
+    except Exception:  # noqa: BLE001 -- any parse failure must not leak db_uri
+        return "<unparseable database URL>"
+
+
+class DbCheckResult(NamedTuple):
+    """Outcome of a read-only compatibility check between a DB and a build.
+
+    :ivar exit_code: ``0`` schema matches head; ``2`` the current revision is
+        recognized but migrations are needed; ``1`` the schema is
+        incompatible, the database is unreachable, or the candidate's own
+        migration metadata is invalid.
+    :ivar current: The database's current Alembic revision(s), or ``None``
+        when no ``alembic_version`` table exists yet.
+    :ivar head: The candidate build's head revision, or ``None`` when it
+        could not be determined (``exit_code == 1``).
+    :ivar message: A human-readable summary suitable for ``click.echo``.
+    """
+
+    exit_code: int
+    current: str | tuple[str, ...] | None
+    head: str | None
+    message: str
+
+
+def _check_db_revision_compatibility(db_uri: str) -> DbCheckResult:
+    """
+    Compare a database's current Alembic revision against this build's head.
+
+    Strictly read-only: never calls :func:`_run_migrations` or
+    :func:`_initialize_or_verify_schema` (which can trigger an automatic
+    migration), and never uses :func:`get_or_create_engine` (which also
+    triggers schema initialization and caches the engine process-wide).
+    Opens a bare, uncached engine instead, and always disposes it before
+    returning.
+
+    Powers ``omnigent debug db-check``: a release process can run this
+    against the deployed database *before* swapping in a new server image,
+    to block a roll-forward or rollback whose candidate image is
+    incompatible with the deployed schema.
+
+    :param db_uri: SQLAlchemy database URL for the deployed database, e.g.
+        ``"sqlite:////var/lib/omnigent/chat.db"`` or
+        ``"postgresql://user:pw@host/db"``.
+    :returns: A :class:`DbCheckResult` describing the outcome. Every message
+        is scrubbed of any password embedded in *db_uri* -- see
+        :func:`_safe_db_uri_for_display` and :func:`_redact_credentials` --
+        since every branch here is reachable from ``click.echo`` output that
+        can land in CI/job logs.
+    """
+    safe_uri = _safe_db_uri_for_display(db_uri)
+    try:
+        head = _get_head_db_revision(db_uri)
+    except Exception as exc:  # noqa: BLE001 -- any failure means invalid candidate metadata
+        return DbCheckResult(
+            exit_code=1,
+            current=None,
+            head=None,
+            message=(
+                "Could not determine this build's own migration head "
+                f"(invalid migration metadata): {_redact_credentials(str(exc))}"
+            ),
+        )
+
+    import sqlalchemy
+    from sqlalchemy.exc import SQLAlchemyError
+
+    # create_engine itself can raise (malformed URL, unknown dialect, missing
+    # driver module) -- it must stay inside the try so those surface as the
+    # same clean "could not connect" message instead of a raw traceback.
+    engine: Engine | None = None
+    try:
+        engine = sqlalchemy.create_engine(normalize_database_url(db_uri))
+        current = _get_current_db_revision(engine)
+    except (SQLAlchemyError, ModuleNotFoundError) as exc:
+        return DbCheckResult(
+            exit_code=1,
+            current=None,
+            head=head,
+            message=(
+                f"Could not connect to the database at {safe_uri!r}: "
+                f"{_redact_credentials(str(exc))}"
+            ),
+        )
+    finally:
+        if engine is not None:
+            engine.dispose()
+
+    if current is None:
+        # No alembic_version table -- nothing has ever been migrated against
+        # this database. Not incompatible, just unmigrated: the normal
+        # startup path (_initialize_or_verify_schema) will run migrations to
+        # head on first boot, same as it does for exit_code == 2.
+        return DbCheckResult(
+            exit_code=2,
+            current=None,
+            head=head,
+            message=(
+                "Database has no schema yet (no alembic_version table); "
+                "migrations will run on first start."
+            ),
+        )
+
+    try:
+        _verify_db_revision_is_supported(db_uri, current, head)
+    except RuntimeError as exc:
+        return DbCheckResult(exit_code=1, current=current, head=head, message=str(exc))
+
+    if current == head:
+        return DbCheckResult(
+            exit_code=0,
+            current=current,
+            head=head,
+            message=f"Database schema is up to date (revision {current!r}).",
+        )
+    return DbCheckResult(
+        exit_code=2,
+        current=current,
+        head=head,
+        message=(
+            f"Database schema is behind head but recognized by this build "
+            f"(found revision {current!r}, expected {head!r}); migrations are needed."
+        ),
+    )
 
 
 def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:

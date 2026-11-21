@@ -45,6 +45,7 @@ from omnigent.onboarding.sandboxes.registry import (
 from omnigent.onboarding.sandboxes.types import (
     GitCloneOptions,
     HostContext,
+    ManagedIdentityRequirement,
     RepoWorkspace,
     SandboxCapabilities,
     SandboxCommandError,
@@ -60,6 +61,7 @@ __all__ = [
     "DerivedWorkspace",
     "GitCloneOptions",
     "HostContext",
+    "ManagedIdentityRequirement",
     "OwnerCredentialMissingError",
     "RemoteCommandResult",
     "RemoteProcess",

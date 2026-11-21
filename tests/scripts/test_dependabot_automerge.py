@@ -1787,12 +1787,11 @@ def test_dependency_readiness_workflow_covers_evidence_and_authorization_events(
     assert events["pull_request_target"]["types"] == ["labeled", "unlabeled"]
     subscribed = set(events["workflow_run"]["workflows"])
     policy = json.loads((ROOT / ".github/dependabot-automerge.json").read_text())
-    for name in [*policy["workflow_test_jobs"], "security-scan.yml", "maintainer-approval.yml"]:
+    for name in [*policy["workflow_test_jobs"], "security-scan.yml"]:
         evidence = yaml.safe_load((ROOT / ".github/workflows" / name).read_text())
         assert evidence["name"] in subscribed
     job = workflow["jobs"]["evaluate"]
-    assert "github.event.workflow_run.event == 'pull_request_target'" in job["if"]
-    assert "github.event.workflow_run.name == 'Maintainer Approval'" in job["if"]
+    assert "github.event.workflow_run.event == 'pull_request'" in job["if"]
     for label in ["hold-automerge", "skip-security-scan"]:
         assert label in job["if"]
     steps = job["steps"]
@@ -1813,30 +1812,14 @@ def test_dependency_readiness_workflow_covers_evidence_and_authorization_events(
     dependency = next(s for s in steps if s.get("id") == "dependency")
     assert "steps.labels.outputs.dependency_required == 'true'" in dependency["if"]
     assert "parser.outcome" not in dependency["if"]
-    approval_workflow = yaml.safe_load(
-        (ROOT / ".github/workflows/maintainer-approval.yml").read_text()
-    )
-    assert approval_workflow["jobs"]["approve"]["permissions"]["statuses"] == "write"
-    approval_step = next(
-        s
-        for s in approval_workflow["jobs"]["approve"]["steps"]
-        if s.get("name") == "Require maintainer approval"
-    )
-    for parser_step in (
-        next(s for s in steps if s.get("id") == "parser"),
-        next(
-            s
-            for s in approval_workflow["jobs"]["approve"]["steps"]
-            if s.get("name") == "Install trusted policy parser"
-        ),
-    ):
-        assert parser_step["continue-on-error"]
+    parser_step = next(s for s in steps if s.get("id") == "parser")
+    assert parser_step["continue-on-error"]
     evidence_step = next(s for s in steps if s.get("id") == "dependency")
     for flag in [
         "--trusted-author 'omni-resolve-agent[bot]'",
         "--trusted-successor 'omni-resolve-agent[bot]'",
     ]:
-        assert flag in approval_step["run"] and flag in evidence_step["run"]
+        assert flag in evidence_step["run"]
 
 
 @pytest.mark.parametrize("entry", ["approval", "readiness"])

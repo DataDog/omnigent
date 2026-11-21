@@ -485,6 +485,7 @@ def _server_uvicorn_log_config(
         should_log_to_stderr,
         terminal_supports_color,
     )
+    from omnigent.runtime.telemetry import otel_log_bridge_handler
 
     access_log_format = (
         DEFAULT_LOG_PREFIX_FORMAT + '%(client_addr)s - "%(request_line)s" %(status_code)s'
@@ -540,6 +541,10 @@ def _server_uvicorn_log_config(
         }
         default_handlers: list[str] = []
         access_handlers: list[str] = []
+        if otel_log_bridge_handler() is not None:
+            handlers["server_otel"] = {"()": "omnigent.runtime.telemetry.uvicorn_otel_log_handler"}
+            default_handlers.append("server_otel")
+            access_handlers.append("server_otel")
         if mirror:
             handlers["server_terminal"] = {
                 "()": "omnigent.process_logging.terminal_stream_handler",
@@ -1390,9 +1395,10 @@ def _require_existing_sqlite_db(db_uri: str) -> None:
 
     SQLite creates a missing file on first connect (silently "upgrading" a
     brand-new empty database) and dies with a raw ``sqlite3.OperationalError:
-    unable to open database file`` when the parent directory is absent. An
-    upgrade only makes sense for an existing database, so fail fast with an
-    actionable message naming the missing path instead.
+    unable to open database file`` when the parent directory is absent. Both
+    ``db-upgrade`` and ``db-check`` only make sense against an existing
+    database, so fail fast with an actionable message naming the missing
+    path instead.
 
     No-op for non-SQLite URLs and in-memory SQLite.
 
@@ -1418,7 +1424,7 @@ def _require_existing_sqlite_db(db_uri: str) -> None:
     if not db_path.exists():
         raise click.ClickException(
             f"Database file {str(db_path)!r} does not exist. Check the path in "
-            f"the database URL — db-upgrade upgrades an existing Omnigent "
+            f"the database URL — this command operates on an existing Omnigent "
             f"database and will not create one."
         )
 
@@ -4970,7 +4976,7 @@ def server(
     # designs/OBSERVABILITY.md for the env var reference.
     from omnigent.runtime import telemetry
 
-    telemetry.init("omni-server")
+    telemetry.init(os.environ.get("OTEL_SERVICE_NAME") or "omni-server")
 
     # Read a pre-shared tunnel token from the environment if the
     # caller (e.g. _start_local_server) spawns the runner externally
@@ -5003,14 +5009,17 @@ def server(
 
     host_store = HostStore(db_uri)
 
-    # Managed sandbox hosts (host_type="managed" sessions): parse the
-    # config's `sandbox:` section up front so an operator typo stops
-    # startup instead of 502-ing the first managed session.
-    from omnigent.server.managed_hosts import parse_sandbox_config
+    # Managed sandbox hosts (host_type="managed" sessions): resolve
+    # the sandbox config up front so an operator typo or a broken
+    # external provider module stops startup instead of 502-ing the
+    # first managed session.  When OMNIGENT_SANDBOX_PROVIDER_MODULE is
+    # set, the named module supplies the config; otherwise the YAML
+    # `sandbox:` section is parsed as before.
+    from omnigent.server.managed_hosts import load_sandbox_config
 
     try:
-        sandbox_config = parse_sandbox_config(cfg.get("sandbox"))
-    except ValueError as exc:
+        sandbox_config = load_sandbox_config(cfg)
+    except (ValueError, RuntimeError) as exc:
         raise click.ClickException(str(exc)) from exc
 
     # GitHub App integration (per-user "Connect GitHub"). Enabled only
@@ -5095,7 +5104,20 @@ def server(
         )
         os.environ.setdefault("OMNIGENT_ACCOUNTS_BASE_URL", f"http://{host}:{port}")
 
-    auth_provider = create_auth_provider()
+    # OIDC mode persists provider credentials in the encrypted session
+    # store; other modes pass None and keep self-contained JWT cookies.
+    from omnigent.server.auth import resolve_auth_source
+
+    oidc_session_store = None
+    if resolve_auth_source() == "oidc":
+        from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
+        from omnigent.server.oidc_session_store import OidcSessionStore
+
+        oidc_session_store = OidcSessionStore(
+            make_managed_session_maker(get_or_create_engine(db_uri))
+        )
+
+    auth_provider = create_auth_provider(oidc_session_store=oidc_session_store)
 
     # Accounts mode: construct the AccountStore (sibling to PermissionStore)
     # here and pass it to create_app explicitly. Any deploy that doesn't run
@@ -12762,8 +12784,9 @@ def debug() -> None:
     """Internal maintenance commands.
 
     Houses operator-only database and accounts maintenance: tracking-DB
-    schema upgrades (``db-upgrade``) and the accounts→OIDC identity remap
-    (``migrate-accounts-to-oidc``).
+    schema upgrades (``db-upgrade``), a read-only pre-upgrade
+    compatibility check (``db-check``), and the accounts→OIDC identity
+    remap (``migrate-accounts-to-oidc``).
     """
 
 
@@ -12795,6 +12818,48 @@ def debug_db_upgrade(url: str) -> None:
     finally:
         engine.dispose()
     click.echo("Upgrade complete.")
+
+
+@debug.command("db-check")
+def debug_db_check() -> None:
+    """
+    Check whether this build is schema-compatible with the deployed
+    database, without migrating or writing anything.
+
+    Reads the database URL from the ``OMNIGENT_DB_URL`` environment
+    variable (the same variable Alembic's ``env.py`` honors). Intended
+    for a release process to run against the deployed database
+    *before* swapping in a candidate server image, so an incompatible
+    roll-forward or rollback can be blocked ahead of any server startup
+    — the separate, already-validated migration procedure is unaffected;
+    this command only gates on its exit code.
+
+    \b
+    Exit codes:
+      0  Database schema matches this build's head. Safe to proceed.
+      1  Incompatible: the database's current revision is unknown to
+         this build's migration graph (e.g. this build predates it),
+         the database could not be reached, or this build's own
+         migration metadata is invalid.
+      2  The database's current revision is recognized by this build
+         but is behind head — migrations are needed before/at startup.
+
+    \b
+    GUARANTEE: this command never writes to the database and never
+    runs migrations (it does not call the server's automatic-migration
+    path) — it only opens a read-only connection to inspect
+    ``alembic_version`` and compares it against this build's on-disk
+    migration graph.
+    """
+    from omnigent.db.utils import _check_db_revision_compatibility
+
+    db_url = os.environ.get("OMNIGENT_DB_URL")
+    if not db_url:
+        raise click.ClickException("OMNIGENT_DB_URL environment variable must be set.")
+    _require_existing_sqlite_db(db_url)
+    result = _check_db_revision_compatibility(db_url)
+    click.echo(result.message)
+    raise SystemExit(result.exit_code)
 
 
 @debug.command("migrate-accounts-to-oidc")

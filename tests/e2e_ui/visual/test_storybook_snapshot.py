@@ -13,6 +13,7 @@ import os
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -113,6 +114,9 @@ def test_story_matches_baseline(
 ) -> None:
     """Render one tagged story in isolation and compare its pixels."""
     page = snapshot_page
+    if story.title == "Components/Workspace/WorkspacePickerDialog":
+        # Worktree ages must not drift with the runner's calendar date.
+        page.clock.set_fixed_time(datetime(2026, 11, 1, 12, tzinfo=UTC))
     unexpected_requests: list[str] = []
 
     def reject_external_request(route: Route) -> None:

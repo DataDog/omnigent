@@ -50,3 +50,7 @@ class DeviceGrant:
     approved_at: int | None
     last_polled_at: int | None
     account_generation: str | None = None
+    # Internal binding to an encrypted OIDC credential session.  This is
+    # populated only for first-party CLI login grants; it is never an opaque
+    # browser handle and therefore cannot be used as a bearer credential.
+    oidc_session_id: str | None = None

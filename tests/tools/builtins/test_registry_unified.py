@@ -159,6 +159,7 @@ def test_builtin_names_size_matches_registry() -> None:
                 "browser_click",
                 "browser_type",
                 "browser_screenshot",
+                "sys_ask_user",
                 "ui_open_file",
             }
         )

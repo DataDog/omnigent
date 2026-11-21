@@ -565,6 +565,9 @@ async def test_handle_model_options_serves_the_claude_catalog(
         )
 
     monkeypatch.setattr(claude_native, "probe_claude_model_options", _fake_probe)
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness", lambda harness: None
+    )
     host = _make_host_process()
 
     first = await host._handle_model_options(
@@ -1477,12 +1480,14 @@ async def test_handle_launch_refuses_unconfigured_harness(
     host = _make_host_process()
     workspace = tmp_path / "project"
     workspace.mkdir()
+    probes: list[str] = []
     # Patch the symbol connect.py imported, with the real function's
     # signature; the workspace exists so ONLY the harness check can fail.
     monkeypatch.setattr(
         "omnigent.host.connect.harness_is_configured",
-        lambda harness: harness_ready,
+        lambda harness: probes.append(harness) or harness_ready,
     )
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_LAUNCH_READINESS_GRACE_S", 0.01)
 
     if selected_pi_version is not None:
         monkeypatch.setattr(
@@ -1535,6 +1540,10 @@ async def test_handle_launch_refuses_unconfigured_harness(
         assert "test-laptop" in (result.error or "")
         assert "omni setup" in (result.error or "")
     assert result.runner_id is None
+    if selected_pi_version == (0, 84, 1) and inference_bound:
+        assert probes == []  # A bound Pi version is checked before readiness.
+    else:
+        assert probes and set(probes) == {harness}
     # No runner subprocess may exist after a refusal.
     assert host._runners == {}
 
@@ -1668,6 +1677,7 @@ async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
         "omnigent.host.connect.harness_is_configured",
         lambda harness: False,
     )
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_LAUNCH_READINESS_GRACE_S", 0.01)
 
     frame = HostLaunchRunnerFrame(
         request_id="req_cursor_native",
@@ -1773,6 +1783,95 @@ async def test_handle_launch_configured_harness_proceeds_to_spawn(
         _cleanup_host(host)
         if host._capability_init_task is not None:
             await _cancel(host._capability_init_task)
+
+
+async def test_handle_launch_waits_for_requested_harness_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient startup probe miss must not reject the first runner."""
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    probes: list[str] = []
+
+    def _becomes_ready(harness: str) -> bool:
+        probes.append(harness)
+        return len(probes) >= 3
+
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", _becomes_ready)
+    monkeypatch.setattr(
+        "omnigent.host.connect.HARNESS_LAUNCH_READINESS_POLL_INTERVAL_S",
+        0.001,
+    )
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            ["sleep", "10"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_readiness_race",
+        binding_token="token_race",
+        workspace=str(workspace),
+        harness="claude-native",
+    )
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(frame)
+
+    assert result.status == "launched"
+    assert probes == ["claude-native", "claude-native", "claude-native"]
+    _cleanup_host(host)
+
+
+async def test_handle_launch_readiness_probe_is_bounded_and_nonblocking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stuck readiness probe must neither block the loop nor hang launch."""
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+    loop_progressed = asyncio.Event()
+
+    def _stuck_probe(harness: str) -> bool:
+        assert harness == "claude-native"
+        probe_started.set()
+        release_probe.wait(timeout=1.0)
+        return False
+
+    async def _mark_loop_progress() -> None:
+        await asyncio.sleep(0.005)
+        loop_progressed.set()
+
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", _stuck_probe)
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_LAUNCH_READINESS_GRACE_S", 0.02)
+    frame = HostLaunchRunnerFrame(
+        request_id="req_stuck_readiness",
+        binding_token="token_stuck",
+        workspace=str(workspace),
+        harness="claude-native",
+    )
+
+    progress_task = asyncio.create_task(_mark_loop_progress())
+    started = time.monotonic()
+    try:
+        result = await host._handle_launch(frame)
+    finally:
+        release_probe.set()
+        await progress_task
+
+    assert probe_started.is_set()
+    assert loop_progressed.is_set()
+    assert time.monotonic() - started < 0.5
+    assert result.status == "failed"
+    assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    assert host._runners == {}
 
 
 async def test_handle_launch_without_harness_skips_check(
@@ -8613,6 +8712,9 @@ async def test_handle_model_options_serves_claude_sdk_endpoint_listing(
         )
 
     monkeypatch.setattr("omnigent.models.model_catalog.list_models_for_worker", _fake_listing)
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness", lambda harness: None
+    )
     host = _make_host_process()
 
     result = await host._handle_model_options(
@@ -8653,6 +8755,9 @@ async def test_handle_model_options_claude_sdk_rides_the_probe_when_endpoints_li
         )
 
     monkeypatch.setattr("omnigent.models.model_catalog.list_models_for_worker", _fake_listing)
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness", lambda harness: None
+    )
     host = _make_host_process()
 
     async def _fake_probed() -> ModelOptionsResult:

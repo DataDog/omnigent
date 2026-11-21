@@ -130,6 +130,13 @@ overrides:
   '@tiptap/react': 3.31.4
   '@tiptap/starter-kit': 3.31.4
   express-rate-limit>ip-address: 10.7.4
+  sharp: 0.35.5
+  '@modelcontextprotocol/sdk': 1.32.1
+  prosemirror-view: 1.42.6
+  http-cache-semantics: 4.3.0
+  decode-uri-component: 0.5.1
+  'glob@>=13.0.0 <14.0.2': 14.0.2
+  'minimatch@>=9.0.0 <11.0.1': 11.0.1
 
 allowBuilds:
   '@anthropic-ai/claude-code': true

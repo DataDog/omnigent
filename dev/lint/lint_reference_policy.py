@@ -11,6 +11,7 @@ from bisect import bisect_right
 from pathlib import Path
 
 POLICY_FILES = frozenset({"dev/lint/lint_reference_policy.py"})
+UPSTREAM_BASELINE_FILE = "dev/lint/reference_policy_upstream_baseline"
 PROHIBITED_NAMES = frozenset(
     {
         "arca",
@@ -88,7 +89,77 @@ def git(root: Path, *args: str) -> bytes:
     return subprocess.run(["git", *args], cwd=root, check=True, capture_output=True).stdout
 
 
-def check(root: Path, base: str | None = None, head: str | None = None) -> list[str]:
+def _upstream_blobs(root: Path, target: str | None) -> dict[str, tuple[bytes, bytes]]:
+    """Allow unchanged imports only from the reviewed canonical-source pin."""
+    try:
+        baseline = git(root, "show", f"{target or ''}:{UPSTREAM_BASELINE_FILE}").decode().strip()
+    except subprocess.CalledProcessError:
+        return {}
+    if not re.fullmatch(r"[0-9a-f]{40}", baseline):
+        raise ValueError("invalid upstream baseline")
+    references = [target or "HEAD"]
+    if target is None:
+        try:
+            merge_head = git(root, "rev-parse", "--verify", "--quiet", "MERGE_HEAD")
+        except subprocess.CalledProcessError as error:
+            if error.returncode != 1:
+                raise
+        else:
+            references.extend(merge_head.decode().splitlines())
+    for reference in references:
+        try:
+            git(root, "merge-base", "--is-ancestor", baseline, reference)
+        except subprocess.CalledProcessError as error:
+            if error.returncode != 1:
+                raise
+        else:
+            break
+    else:
+        return {}
+    blobs = {}
+    for entry in git(root, "ls-tree", "-r", "-z", baseline).split(b"\0"):
+        if entry:
+            metadata, path = entry.split(b"\t", 1)
+            mode, _, object_id = metadata.split()
+            blobs[os.fsdecode(path)] = (mode, object_id)
+    return blobs
+
+
+def _added_lines(root: Path, before: bytes, after: bytes) -> set[int]:
+    patch = git(
+        root,
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--text",
+        "--unified=0",
+        "--inter-hunk-context=0",
+        before.decode(),
+        after.decode(),
+        "--",
+    ).decode("utf-8", errors="replace")
+    added_lines = set()
+    line_number = None
+    for line in patch.split("\n"):
+        hunk = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+        if hunk:
+            line_number = int(hunk[1])
+        elif line_number is not None and line.startswith("+"):
+            added_lines.add(line_number)
+            line_number += 1
+        elif line_number is not None and line.startswith(" "):
+            line_number += 1
+    return added_lines
+
+
+def check(
+    root: Path,
+    base: str | None = None,
+    head: str | None = None,
+    *,
+    remote: str | None = None,
+) -> list[str]:
     """Check staged changes, or the branch diff from a merge base."""
     if head and not base:
         raise ValueError("--head requires --base")
@@ -96,6 +167,24 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
     if base:
         target = head or "HEAD"
         ancestor = git(root, "merge-base", base, target).decode().strip()
+        if remote:
+            try:
+                upstream = git(
+                    root,
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    f"refs/remotes/{remote}/HEAD^{{commit}}",
+                )
+            except subprocess.CalledProcessError as error:
+                if error.returncode != 1:
+                    raise
+            else:
+                # Check the whole branch, excluding history already on the remote default.
+                # The old push tip can retain prerequisite commits from before a rebase.
+                ancestor = (
+                    git(root, "merge-base", upstream.decode().strip(), target).decode().strip()
+                )
         revisions = [ancestor, target]
     options = ["--no-ext-diff", "--no-textconv", "--no-color"]
     entries = iter(
@@ -112,6 +201,7 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
             "--",
         ).split(b"\0")
     )
+    upstream_blobs = _upstream_blobs(root, (head or "HEAD") if base else None)
     findings = []
     for metadata in entries:
         if not metadata:
@@ -122,9 +212,10 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
         path = os.fsdecode(next(entries)) if renamed else old_path
         if path in POLICY_FILES:
             continue
-        if (status == b"A" or renamed) and violates(path):
+        inherited = upstream_blobs.get(path)
+        if (status == b"A" or renamed) and not inherited and violates(path):
             findings.append(f"{path}:1: prohibited reference in new path")
-        if mode == b"160000":
+        if mode == b"160000" or (inherited and inherited[1] == object_id):
             continue
         contents = git(root, "cat-file", "blob", object_id.decode())
         if b"\0" in contents[:8000]:
@@ -135,28 +226,9 @@ def check(root: Path, base: str | None = None, head: str | None = None) -> list[
         if status == b"A" or old_mode == b"160000" or old_path in POLICY_FILES:
             added_lines = violation_lines
         else:
-            patch = git(
-                root,
-                "diff",
-                *options,
-                "--text",
-                "--unified=0",
-                "--inter-hunk-context=0",
-                old_object_id.decode(),
-                object_id.decode(),
-                "--",
-            ).decode("utf-8", errors="replace")
-            added_lines = set()
-            line_number = None
-            for line in patch.split("\n"):
-                hunk = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
-                if hunk:
-                    line_number = int(hunk[1])
-                elif line_number is not None and line.startswith("+"):
-                    added_lines.add(line_number)
-                    line_number += 1
-                elif line_number is not None and line.startswith(" "):
-                    line_number += 1
+            added_lines = _added_lines(root, old_object_id, object_id)
+        if inherited and inherited[0] != b"160000":
+            added_lines &= _added_lines(root, inherited[1], object_id)
         findings.extend(
             f"{path}:{line_number}: prohibited reference in added text"
             for line_number in sorted(violation_lines & added_lines)
@@ -178,7 +250,12 @@ def main() -> int:
     try:
         if args.pre_push and not (args.base and args.head):
             raise ValueError("--pre-push requires both --base and --head")
-        findings = check(Path.cwd(), args.base, args.head)
+        findings = check(
+            Path.cwd(),
+            args.base,
+            args.head,
+            remote=os.environ.get("PRE_COMMIT_REMOTE_NAME", "origin") if args.pre_push else None,
+        )
     except (subprocess.CalledProcessError, ValueError):
         print(
             "reference-policy: cannot determine changes; check the base/head revisions",

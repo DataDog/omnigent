@@ -26,7 +26,7 @@ import json
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 import httpx
 import jwt
@@ -35,16 +35,21 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from jwt.algorithms import ECAlgorithm, RSAAlgorithm
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+from omnigent.db.db_models import OmnigentBase, SqlOidcSession
 from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.oidc import OIDCConfig
+from omnigent.server.oidc_session_store import OidcSessionStore
 from omnigent.server.routes.auth import (
     _AUTH_STATE_COOKIE_PLAIN,
     _resolve_oidc_email,
     _validate_id_token,
     create_auth_router,
+    derive_code_challenge,
 )
 from omnigent.server.routes.device_auth import create_device_auth_router
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -67,6 +72,8 @@ def _cli_pkce_pair() -> tuple[str, str]:
 def _oidc_config(
     skip_email_verification: bool = False,
     email_claim: str = "email",
+    client_secret: str | None = "secret",
+    allow_missing_auth_time: bool = False,
     require_reauth: bool = True,
 ) -> OIDCConfig:
     """Build a generic-OIDC config over plain HTTP (so TestClient cookies stick).
@@ -84,7 +91,7 @@ def _oidc_config(
     return OIDCConfig(
         issuer=_ISSUER,
         client_id=_CLIENT_ID,
-        client_secret="secret",
+        client_secret=client_secret,
         redirect_uri="http://localhost:8000/auth/callback",
         cookie_secret=_TEST_SECRET,
         scopes="openid email profile",
@@ -99,6 +106,7 @@ def _oidc_config(
         allow_invites=False,
         skip_email_verification=skip_email_verification,
         email_claim=email_claim,
+        allow_missing_auth_time=allow_missing_auth_time,
         require_reauth=require_reauth,
     )
 
@@ -120,8 +128,13 @@ class _IdpKeys:
         jwk_dict["alg"] = "RS256"
         self.signing_key = jwt.PyJWK.from_dict(jwk_dict)
 
-    def sign_id_token(self, claims: dict[str, object]) -> str:
-        """Sign ``claims`` into an RS256 ``id_token``, filling iss/aud/exp.
+    def sign_id_token(
+        self,
+        claims: dict[str, object],
+        *,
+        algorithm: str = "RS256",
+    ) -> str:
+        """Sign ``claims`` into an ``id_token``, filling iss/aud/exp.
 
         :param claims: Claims to embed, e.g.
             ``{"email": "alice@example.com", "email_verified": True}``.
@@ -137,7 +150,7 @@ class _IdpKeys:
             "sub": "idp-subject-123",
             **claims,
         }
-        return jwt.encode(payload, self.private_key, algorithm="RS256")
+        return jwt.encode(payload, self.private_key, algorithm=algorithm)
 
 
 @pytest.fixture
@@ -173,6 +186,7 @@ def callback_client(
     # The signed id_token the mocked token endpoint will return. Each
     # test sets this before calling /auth/callback.
     pending_id_token: list[str] = [""]
+    token_requests: list[dict[str, str]] = []
 
     async def _fake_post(
         self: httpx.AsyncClient,
@@ -183,6 +197,7 @@ def callback_client(
         timeout: float | None = None,
     ) -> httpx.Response:
         """Stand in for the IdP token endpoint, returning the test's id_token."""
+        token_requests.append(dict(data or {}))
         return httpx.Response(200, json={"id_token": pending_id_token[0]})
 
     monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
@@ -201,6 +216,7 @@ def callback_client(
         prefix="/auth",
     )
     app.state.pending_id_token = pending_id_token
+    app.state.token_requests = token_requests
     app.state.auth_provider = provider
 
     with TestClient(app) as client:
@@ -238,6 +254,142 @@ def _do_callback(client: TestClient, id_token: str) -> httpx.Response:
     )
 
 
+@pytest.mark.parametrize(
+    ("redirect_uri", "cli_ticket"),
+    [
+        (None, False),
+        (None, True),
+        ("http://127.0.0.1:53682/callback", False),
+        ("ai.omnigent.ios:/oauth/callback", False),
+    ],
+    ids=["browser", "browser-cli-consent", "desktop", "ios"],
+)
+def test_callback_persists_provider_binding_in_encrypted_session(
+    tmp_path: Path,
+    db_uri: str,
+    redirect_uri: str | None,
+    cli_ticket: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Browser and native login retain the verified provider identity for Habitat."""
+    engine = create_engine(db_uri)
+    OmnigentBase.metadata.create_all(engine, tables=[SqlOidcSession.__table__])
+    store = OidcSessionStore(
+        sessionmaker(bind=engine, expire_on_commit=False),
+        credential_key=_TEST_SECRET,
+    )
+    keys = _IdpKeys()
+    config = _oidc_config()
+    provider = UnifiedAuthProvider(
+        source="oidc",
+        oidc_config=config,
+        oidc_session_store=store,
+    )
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    admins = tmp_path / "admins"
+    admins.write_text("")
+    pending_id_token: list[str] = [""]
+
+    async def _fake_post(*args, **kwargs) -> httpx.Response:
+        return httpx.Response(200, json={"id_token": pending_id_token[0]})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _fake_post)
+    monkeypatch.setattr(
+        jwt.PyJWKClient,
+        "get_signing_key_from_jwt",
+        lambda self, token: keys.signing_key,
+    )
+    app = FastAPI()
+    app.include_router(
+        create_auth_router(provider, perm_store, AdminList(admins), oidc_session_store=store),
+        prefix="/auth",
+    )
+    app.state.pending_id_token = pending_id_token
+
+    try:
+        with TestClient(app) as client:
+            token = keys.sign_id_token(
+                {
+                    "email": "alice@example.com",
+                    "email_verified": True,
+                    "auth_time": int(time.time()),
+                }
+            )
+            if redirect_uri is not None:
+                verifier = "v" * 64
+                login = client.get(
+                    "/auth/login",
+                    params={
+                        "native_redirect_uri": redirect_uri,
+                        "native_state": "desktop-state",
+                        "code_challenge": derive_code_challenge(verifier),
+                        "code_challenge_method": "S256",
+                    },
+                    follow_redirects=False,
+                )
+                state = parse_qs(urlparse(login.headers["location"]).query)["state"][0]
+                pending_id_token[0] = token
+                response = client.get(
+                    "/auth/callback",
+                    params={"code": "idp-code", "state": state},
+                    follow_redirects=False,
+                )
+            elif cli_ticket:
+                verifier, challenge = _cli_pkce_pair()
+                ticket = client.post(
+                    "/auth/cli-login",
+                    json={"code_challenge": challenge, "code_challenge_method": "S256"},
+                ).json()["ticket"]
+                login = client.get(f"/auth/login?ticket={ticket}&reauth=1", follow_redirects=False)
+                state = parse_qs(urlsplit(login.headers["location"]).query)["state"][0]
+                pending_id_token[0] = token
+                response = client.get(
+                    "/auth/callback",
+                    params={"code": "idp-code", "state": state},
+                    follow_redirects=False,
+                )
+            else:
+                response = _do_callback(client, token)
+            assert response.status_code == 302
+            if redirect_uri is not None:
+                assert "ap_session" not in response.cookies
+                code = parse_qs(urlparse(response.headers["location"]).query)["code"][0]
+                exchanged = client.post(
+                    "/auth/native-token",
+                    data={"code": code, "code_verifier": verifier, "redirect_uri": redirect_uri},
+                )
+                assert exchanged.status_code == 200
+                handle = exchanged.json()["token"]
+            else:
+                handle = response.cookies.get("ap_session")
+            if cli_ticket:
+                assert client.get(response.headers["location"]).status_code == 200
+                assert (
+                    client.get(
+                        f"/auth/cli-poll?ticket={ticket}&code_verifier={verifier}"
+                    ).status_code
+                    == 202
+                )
+                approved = client.post(
+                    "/auth/cli-approve",
+                    data={"ticket": ticket},
+                    headers={"Origin": "http://testserver"},
+                )
+                assert "Approved" in approved.text
+                redeemed = client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={verifier}")
+                assert redeemed.json()["token"] == handle
+            assert handle is not None
+            resolved = store.resolve(handle)
+            assert resolved is not None
+            credentials = store.get_refresh_credentials(resolved[1], "alice@example.com")
+            assert credentials is not None
+            assert credentials.provider_subject == "idp-subject-123"
+            assert credentials.provider_issuer == _ISSUER
+            assert credentials.provider_client_id == _CLIENT_ID
+    finally:
+        engine.dispose()
+
+
 def test_oidc_accepts_es384_id_token(monkeypatch: pytest.MonkeyPatch) -> None:
     """Accept a valid token from an IdP that only advertises ES384."""
     private_key = ec.generate_private_key(ec.SECP384R1())
@@ -268,6 +420,50 @@ def test_oidc_accepts_es384_id_token(monkeypatch: pytest.MonkeyPatch) -> None:
     claims = _validate_id_token({"id_token": token}, config)
     assert claims is not None
     assert _resolve_oidc_email(claims, config) == "Alice@Example.com"
+
+
+def test_callback_accepts_ps256_id_token(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """Ticino's PS256-signed ID tokens are accepted."""
+    client, keys = callback_client
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True},
+        algorithm="PS256",
+    )
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 302, resp.text
+    assert resp.cookies.get("ap_session") is not None
+
+
+@pytest.mark.parametrize("callback_client", [{"client_secret": None}], indirect=True)
+def test_callback_public_client_omits_client_secret(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A public client's code exchange uses PKCE without a secret field."""
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 302, resp.text
+    assert client.app.state.token_requests
+    assert "client_secret" not in client.app.state.token_requests[-1]
+
+
+def test_callback_confidential_client_sends_client_secret(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A confidential client's code exchange authenticates with its secret."""
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 302, resp.text
+    assert client.app.state.token_requests[-1]["client_secret"] == "secret"
 
 
 def test_callback_verified_email_mints_session(
@@ -596,6 +792,65 @@ def test_reauth_callback_rejects_missing_auth_time(
     assert resp.status_code == 403, resp.text
     assert "did not confirm re-authentication" in resp.json()["error"]
     assert resp.cookies.get("ap_session") is None
+
+
+@pytest.mark.parametrize(
+    "callback_client",
+    [{"allow_missing_auth_time": True}],
+    indirect=True,
+)
+def test_reauth_callback_allows_missing_auth_time_when_enabled(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A trusted OIDC token without auth_time works only with the opt-in."""
+    client, keys = callback_client
+    token = keys.sign_id_token({"email": "alice@example.com", "email_verified": True})
+
+    resp = _do_callback_reauth(client, token, reauth_at=int(time.time()))
+
+    assert resp.status_code == 302, resp.text
+    assert resp.cookies.get("ap_session") is not None
+
+
+@pytest.mark.parametrize(
+    "callback_client",
+    [{"allow_missing_auth_time": True}],
+    indirect=True,
+)
+def test_reauth_callback_still_rejects_stale_auth_time_when_enabled(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """The opt-in does not accept a known stale authentication."""
+    client, keys = callback_client
+    reauth_at = int(time.time())
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": reauth_at - 3600}
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 403, resp.text
+    assert "did not re-authenticate" in resp.json()["error"]
+
+
+@pytest.mark.parametrize(
+    "callback_client",
+    [{"allow_missing_auth_time": True}],
+    indirect=True,
+)
+def test_reauth_callback_rejects_invalid_auth_time_when_enabled(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A malformed claim is not the Ticino missing-claim compatibility case."""
+    client, keys = callback_client
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "auth_time": "invalid"}
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=int(time.time()))
+
+    assert resp.status_code == 403, resp.text
+    assert "did not confirm re-authentication" in resp.json()["error"]
 
 
 def test_reauth_callback_accepts_entra_token_expiring_on_arrival(

@@ -24,6 +24,8 @@ These routes are only mounted when ``OMNIGENT_AUTH_PROVIDER=oidc``.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import hmac
 import html
 import json
@@ -54,6 +56,7 @@ from omnigent.server.oidc import (
     derive_code_challenge,
     generate_code_verifier,
     mint_session_cookie,
+    mint_session_token,
 )
 from omnigent.server.oidc_access import OidcAdmissionPolicy, resolve_allowed_domains_path
 from omnigent.server.routes._oauth import NO_STORE_HEADERS, oauth_error
@@ -112,6 +115,7 @@ _OIDC_INVITE_TTL_SECONDS = 72 * 3600
 
 if TYPE_CHECKING:
     from omnigent.server.oidc import OIDCConfig
+    from omnigent.server.oidc_session_store import OidcSessionStore
 
 
 def _canonical_cli_origin(value: str) -> tuple[str, str, int | None] | None:
@@ -181,6 +185,8 @@ class _NativeCode:
     code_challenge: str
     redirect_uri: str
     created_at: float = field(default_factory=time.time)
+    session_credential: str | None = None
+    oidc_session_id: str | None = None
 
 
 def create_auth_router(
@@ -190,6 +196,7 @@ def create_auth_router(
     account_store: SqlAlchemyAccountStore | None = None,
     allowed_domains: frozenset[str] | None = None,
     device_grant_store: DeviceGrantStore | None = None,
+    oidc_session_store: OidcSessionStore | None = None,
 ) -> APIRouter:
     """Create an :class:`APIRouter` with OIDC login/callback/logout routes.
 
@@ -216,6 +223,10 @@ def create_auth_router(
         so hosts and CLIs can renew without a human re-running
         ``omnigent login``. ``None`` keeps the legacy
         session-JWT-only response.
+    :param oidc_session_store: When set, the callback persists the
+        IdP-issued tokens as encrypted provider sessions and issues
+        opaque ``sess_…`` handles instead of self-contained JWT
+        cookies. ``None`` keeps the legacy JWT cookie.
     :returns: A FastAPI router with ``/login``, ``/callback``,
         ``/logout``, ``/cli-login``, ``/cli-poll``, ``/native-token``,
         ``/users`` (and ``/invite`` when invites are enabled).
@@ -247,6 +258,7 @@ def create_auth_router(
     _secure = config.secure_cookies
     _session_cookie = config.session_cookie_name
     _state_cookie = _AUTH_STATE_COOKIE_SECURE if _secure else _AUTH_STATE_COOKIE_PLAIN
+    _cli_consent_cookie = "__Host-ap_cli_consent" if _secure else "ap_cli_consent"
 
     # In-memory store for CLI login tickets. Tickets are short-lived
     # (5 min) and single-use. Keyed by ticket ID.
@@ -452,7 +464,9 @@ def create_auth_router(
         # redirect at the 302 below.
         return_to = _sanitize_return_to(state_payload.get("return_to"))
 
-        # Exchange authorization code for tokens.
+        # Exchange authorization code for tokens. Public clients (PKCE
+        # without a secret, e.g. Ticino) omit client_secret; confidential
+        # clients (GitHub) always send one.
         token_data = {
             "grant_type": "authorization_code",
             "code": code,
@@ -463,6 +477,7 @@ def create_auth_router(
         if config.client_secret:
             token_data["client_secret"] = config.client_secret
 
+        oidc_claims: dict[str, object] | None = None
         async with httpx.AsyncClient() as client:
             # GitHub requires Accept: application/json to get JSON
             # response from the token endpoint.
@@ -475,11 +490,7 @@ def create_auth_router(
             )
 
             if token_resp.status_code != 200:
-                _logger.error(
-                    "Token exchange failed: %d %s",
-                    token_resp.status_code,
-                    token_resp.text,
-                )
+                _logger.error("Token exchange failed: %d", token_resp.status_code)
                 return fail(400, "Token exchange failed", "server_error")
 
             token_json = _json_object(_response_json(token_resp))
@@ -529,13 +540,21 @@ def create_auth_router(
         elif isinstance(reauth_at, int):
             auth_time = _resolve_oidc_auth_time(claims)
             if auth_time is None:
+                if not (
+                    config.allow_missing_auth_time
+                    and claims is not None
+                    and "auth_time" not in claims
+                ):
+                    _logger.warning(
+                        "Rejecting reauth login: IdP id_token has no valid auth_time claim, "
+                        "so forced re-authentication (prompt=login) cannot be verified"
+                    )
+                    return fail(403, "IdP did not confirm re-authentication")
                 _logger.warning(
-                    "Rejecting reauth login: IdP id_token has no auth_time claim, "
-                    "so forced re-authentication (prompt=login) cannot be verified; "
-                    "set OMNIGENT_OIDC_REQUIRE_REAUTH=0 if this IdP never issues it"
+                    "Accepting reauth login without IdP auth_time because "
+                    "OMNIGENT_OIDC_ALLOW_MISSING_AUTH_TIME is enabled"
                 )
-                return fail(403, "IdP did not confirm re-authentication")
-            if auth_time < reauth_at:
+            elif auth_time < reauth_at:
                 _logger.warning(
                     "Rejecting reauth login: id_token auth_time %d predates the "
                     "re-authentication demand at %d (IdP reused its session; "
@@ -547,6 +566,31 @@ def create_auth_router(
 
         # Normalize email to lowercase.
         email = email.lower()
+
+        # OIDC Core requires a stable ``sub``. Persist it with the issuer and
+        # client so refresh cannot silently switch identities that share an
+        # email address.
+        provider_subject = ""
+        provider_id_token_expiry = 0
+        oidc_session_id: str | None = None
+        if oidc_session_store is not None and config.provider_type == "oidc":
+            oidc_claims = claims
+            provider_subject_value = oidc_claims.get("sub") if oidc_claims is not None else None
+            if not isinstance(provider_subject_value, str) or not provider_subject_value:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "OIDC ID token is missing a subject"},
+                )
+            provider_subject = provider_subject_value
+            provider_expiry_value = oidc_claims.get("exp") if oidc_claims is not None else None
+            if isinstance(provider_expiry_value, bool) or not isinstance(
+                provider_expiry_value, int
+            ):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": "OIDC ID token is missing a valid expiry"},
+                )
+            provider_id_token_expiry = provider_expiry_value
 
         # Redeem an OIDC invite (if one rode along in the signed state)
         # BEFORE the admission check, so the just-bound email passes the
@@ -582,8 +626,41 @@ def create_auth_router(
             permission_store.ensure_user(email)
             promote_if_listed(admin_list, permission_store, email)
 
+        # Mint session credential. When an OIDC session store is
+        # configured, persist the provider tokens as AES-GCM ciphertext
+        # and issue an opaque sess_ handle. Otherwise fall back to the
+        # self-contained JWT cookie.
+        if oidc_session_store is not None and config.provider_type == "oidc":
+            raw_id_token = token_json.get("id_token")
+            id_token_val = raw_id_token if isinstance(raw_id_token, str) and raw_id_token else ""
+            raw_refresh = token_json.get("refresh_token")
+            refresh_token_val = (
+                raw_refresh if isinstance(raw_refresh, str) and raw_refresh else None
+            )
+            now = int(time.time())
+            created_session = await asyncio.to_thread(
+                oidc_session_store.create_with_id,
+                user_id=email,
+                provider_subject=provider_subject,
+                id_token=id_token_val,
+                refresh_token=refresh_token_val,
+                id_token_expiry=provider_id_token_expiry,
+                absolute_expiry=now + config.session_ttl_hours * 3600,
+                provider_issuer=config.issuer,
+                provider_client_id=config.client_id,
+            )
+            session_credential = created_session.handle
+            oidc_session_id = created_session.session_id
+        else:
+            session_credential = mint_session_cookie(
+                user_id=email,
+                cookie_secret=config.cookie_secret,
+                ttl_hours=config.session_ttl_hours,
+                provider=config.provider_type,
+            )
+
         # A native sign-in gets a one-time code at its redirect URI;
-        # the session is minted when the app exchanges it with its verifier.
+        # the credential is released only when it presents its verifier.
         # The browser gets no session cookie: it never asked for one.
         if native is not None:
             _evict_expired_native_codes(_native_codes)
@@ -592,6 +669,8 @@ def create_auth_router(
                 user_id=email,
                 code_challenge=native["code_challenge"],
                 redirect_uri=native["redirect_uri"],
+                session_credential=session_credential,
+                oidc_session_id=oidc_session_id,
             )
             response = _native_redirect(native, {"code": native_code})
             response.delete_cookie(
@@ -599,7 +678,7 @@ def create_auth_router(
             )
             return response
 
-        # Mint session cookie.
+        # A CLI ticket requires fresh browser authentication before consent.
         ticket_id = state_payload.get("ticket")
         authenticated_ticket = (
             ticket_id
@@ -607,28 +686,50 @@ def create_auth_router(
             and (config.provider_type == "github" or isinstance(reauth_at, int))
             else None
         )
-        session_jwt = mint_session_cookie(
-            user_id=email,
-            cookie_secret=config.cookie_secret,
-            ttl_hours=config.session_ttl_hours,
-            provider=config.provider_type,
-            cli_login_ticket=authenticated_ticket,
-        )
-
-        # Check if this callback fulfills a CLI login ticket.
-        if ticket_id and ticket_id in _cli_tickets:
+        if authenticated_ticket is not None and oidc_session_id is None:
+            session_credential = mint_session_cookie(
+                user_id=email,
+                cookie_secret=config.cookie_secret,
+                ttl_hours=config.session_ttl_hours,
+                provider=config.provider_type,
+                cli_login_ticket=authenticated_ticket,
+            )
+        if isinstance(ticket_id, str) and ticket_id in _cli_tickets:
             ticket = _cli_tickets[ticket_id]
             if time.time() - ticket.created_at <= _CLI_TICKET_TTL_SECONDS:
                 base_path = getattr(request.app.state, "base_path", "")
                 resp = RedirectResponse(
-                    url=f"{base_path}/auth/cli-consent?ticket={quote(str(ticket_id))}",
+                    url=f"{base_path}/auth/cli-consent?ticket={quote(ticket_id)}",
                     status_code=302,
                 )
             else:
                 resp = RedirectResponse(url=return_to, status_code=302)
+            if authenticated_ticket is not None and oidc_session_id is not None:
+                # Bind consent proof to the opaque browser session.
+                proof = mint_session_token(
+                    user_id=email,
+                    cookie_secret=config.cookie_secret,
+                    ttl_seconds=_CLI_TICKET_TTL_SECONDS,
+                    provider=config.provider_type,
+                    cli_login_ticket=authenticated_ticket,
+                )
+                claims = jwt.decode(proof, config.cookie_secret, algorithms=["HS256"])
+                claims["session_binding"] = hashlib.sha256(
+                    session_credential.encode("utf-8")
+                ).hexdigest()
+                proof = jwt.encode(claims, config.cookie_secret, algorithm="HS256")
+                resp.set_cookie(
+                    key=_cli_consent_cookie,
+                    value=proof,
+                    max_age=_CLI_TICKET_TTL_SECONDS,
+                    httponly=True,
+                    secure=_secure,
+                    samesite="lax",
+                    path="/",
+                )
             resp.set_cookie(
                 key=_session_cookie,
-                value=session_jwt,
+                value=session_credential,
                 max_age=config.session_ttl_hours * 3600,
                 httponly=True,
                 secure=_secure,
@@ -648,7 +749,7 @@ def create_auth_router(
         response = RedirectResponse(url=return_to, status_code=302)
         response.set_cookie(
             key=_session_cookie,
-            value=session_jwt,
+            value=session_credential,
             max_age=config.session_ttl_hours * 3600,
             httponly=True,
             secure=_secure,
@@ -720,6 +821,10 @@ def create_auth_router(
     async def logout(request: Request) -> Response:
         """Clear the session cookie and redirect.
 
+        When an OIDC session store is configured, revokes the exact
+        provider session named by the presented opaque handle and
+        erases its ciphertext before clearing the cookie.
+
         If ``OMNIGENT_OIDC_LOGOUT_REDIRECT_URI`` is configured,
         redirects to the IdP's end-session endpoint. Otherwise,
         redirects to the app root, kept under the deployment base
@@ -727,6 +832,12 @@ def create_auth_router(
 
         :returns: 302 redirect with the session cookie cleared.
         """
+        if oidc_session_store is not None:
+            token = request.cookies.get(_session_cookie)
+            if token and token.startswith("sess_"):
+                resolved = await asyncio.to_thread(oidc_session_store.resolve, token)
+                if resolved is not None:
+                    await asyncio.to_thread(oidc_session_store.revoke, resolved[1])
         base_path = getattr(request.app.state, "base_path", "")
         redirect_url = config.logout_redirect_uri or f"{base_path}/"
         response = RedirectResponse(url=redirect_url, status_code=302)
@@ -827,16 +938,26 @@ def create_auth_router(
             url += "&reauth=1"
         return RedirectResponse(url=url, status_code=302, headers=_CLI_BROWSER_HEADERS)
 
-    def _session_iat(request: Request, ticket_id: str) -> int | None:
-        token = request.cookies.get(_session_cookie)
+    def _session_iat(request: Request, ticket_id: str, user_id: str) -> int | None:
+        token = request.cookies.get(
+            _cli_consent_cookie if oidc_session_store is not None else _session_cookie
+        )
         if not token:
             return None
         try:
             payload = jwt.decode(token, config.cookie_secret, algorithms=["HS256"])
         except jwt.InvalidTokenError:
             return None
-        if payload.get("cli_login_ticket") != ticket_id:
+        if payload.get("cli_login_ticket") != ticket_id or payload.get("sub") != user_id:
             return None
+        if oidc_session_store is not None:
+            session_credential = request.cookies.get(_session_cookie)
+            if (
+                not session_credential
+                or payload.get("session_binding")
+                != hashlib.sha256(session_credential.encode("utf-8")).hexdigest()
+            ):
+                return None
         iat = payload.get("iat")
         return iat if isinstance(iat, int) else None
 
@@ -865,7 +986,7 @@ def create_auth_router(
                 headers=_CLI_BROWSER_HEADERS,
             )
 
-        session_iat = _session_iat(request, ticket_id)
+        session_iat = _session_iat(request, ticket_id, user_id)
         if session_iat is None or session_iat < int(ticket.created_at):
             return _bounce_to_login(request, ticket_id, reauth=True)
 
@@ -910,7 +1031,7 @@ def create_auth_router(
                 headers=_CLI_BROWSER_HEADERS,
             )
 
-        session_iat = _session_iat(request, ticket_id)
+        session_iat = _session_iat(request, ticket_id, user_id)
         if session_iat is None or session_iat < int(ticket.created_at):
             return HTMLResponse(
                 _cli_consent_html(
@@ -921,12 +1042,25 @@ def create_auth_router(
                 headers=_CLI_BROWSER_HEADERS,
             )
 
-        ticket.token = mint_session_cookie(
-            user_id=user_id,
-            cookie_secret=config.cookie_secret,
-            ttl_hours=config.session_ttl_hours,
-            provider=config.provider_type,
-        )
+        oidc_session_id = None
+        if oidc_session_store is not None and config.provider_type == "oidc":
+            session_credential = request.cookies.get(_session_cookie)
+            resolved = (
+                await asyncio.to_thread(oidc_session_store.resolve, session_credential)
+                if session_credential
+                else None
+            )
+            if resolved is None or resolved[0] != user_id:
+                return JSONResponse(status_code=401, content={"error": "unauthorized"})
+            ticket.token = session_credential
+            oidc_session_id = resolved[1]
+        else:
+            ticket.token = mint_session_cookie(
+                user_id=user_id,
+                cookie_secret=config.cookie_secret,
+                ttl_hours=config.session_ttl_hours,
+                provider=config.provider_type,
+            )
         ticket.user_id = user_id
         if device_grant_store is not None:
             try:
@@ -934,6 +1068,7 @@ def create_auth_router(
                     device_grant_store,
                     user_id=user_id,
                     cookie_secret=config.cookie_secret,
+                    oidc_session_id=oidc_session_id,
                 )
             except Exception:
                 _logger.exception("cli-login: refresh grant issuance failed")
@@ -962,7 +1097,7 @@ def create_auth_router(
                 status_code=200,
                 headers=_CLI_BROWSER_HEADERS,
             )
-        session_iat = _session_iat(request, ticket_id)
+        session_iat = _session_iat(request, ticket_id, user_id)
         if session_iat is None or session_iat < int(ticket.created_at):
             return HTMLResponse(
                 _cli_consent_html(error="Sign in again to deny this login."),
@@ -1107,7 +1242,8 @@ def create_auth_router(
             return oauth_error("invalid_grant")
 
         content: dict[str, object] = {
-            "token": mint_session_cookie(
+            "token": pending.session_credential
+            or mint_session_cookie(
                 user_id=pending.user_id,
                 cookie_secret=config.cookie_secret,
                 ttl_hours=config.session_ttl_hours,
@@ -1124,6 +1260,7 @@ def create_auth_router(
                     device_grant_store,
                     user_id=pending.user_id,
                     cookie_secret=config.cookie_secret,
+                    oidc_session_id=pending.oidc_session_id,
                 )
             except Exception:
                 _logger.exception("native sign-in: refresh grant issuance failed")
@@ -1497,28 +1634,12 @@ def _claim_is_verified_true(value: object) -> bool:
 
 
 def _validate_id_token(
-    token_json: dict[str, object],
-    config: OIDCConfig,
+    token_json: dict[str, object], config: OIDCConfig
 ) -> dict[str, object] | None:
-    """Validate the OIDC ``id_token`` and return its decoded claims.
-
-    Checks the JWT signature against the IdP's JWKS and verifies the
-    ``iss`` and ``aud`` claims. A valid signature proves IdP provenance
-    only — callers must still gate on individual claims (email
-    verification, ``auth_time`` freshness, …).
-
-    :param token_json: Token endpoint response JSON with ``id_token``.
-    :param config: OIDC config supplying JWKS URI, issuer, audience.
-    :returns: Decoded claims, or ``None`` if the token is
-        missing/malformed or fails validation.
-    """
+    """Validate an OIDC id token and return its decoded claims."""
     id_token = token_json.get("id_token")
-    if not isinstance(id_token, str) or not id_token:
+    if not isinstance(id_token, str) or not id_token or config.jwks_uri is None:
         return None
-    if config.jwks_uri is None:
-        _logger.warning("Rejecting id_token: OIDC configuration has no JWKS URI")
-        return None
-
     try:
         jwks_client = jwt.PyJWKClient(config.jwks_uri)
         signing_key = jwks_client.get_signing_key_from_jwt(id_token)

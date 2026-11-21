@@ -19,6 +19,7 @@ from httpx import ASGITransport, AsyncClient, MockTransport, Request, Response
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.models import model_catalog
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
@@ -139,7 +140,9 @@ async def env(
     config = ManagedSandboxConfig(
         provider="agent_sandbox",
         server_url="http://test",
-        launcher_factory=lambda: None,
+        launcher_factory=lambda: SimpleNamespace(
+            capabilities=SandboxCapabilities(managed_launch=True)
+        ),
         token_ttl_s=100,
         host_config=catalog.runtime_config,
     )

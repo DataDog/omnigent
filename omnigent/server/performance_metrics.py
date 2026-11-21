@@ -966,6 +966,7 @@ class ServerMetricsOtelPublisher:
         method: str,
         route: str,
         status_code: int | None,
+        actor_user_id: str | None = None,
     ) -> None:
         """
         Record one completed HTTP request duration.
@@ -979,6 +980,9 @@ class ServerMetricsOtelPublisher:
             ``"/v1/sessions/{session_id}"``.
         :param status_code: HTTP response status code, e.g. ``200``.
             ``None`` when no response status was available.
+        :param actor_user_id: Canonical authenticated user ID from
+            ``AuthProvider.get_user_id()``.  Omitted for ``/health``;
+            falls back to ``"anonymous"`` when absent.
         """
         attributes: dict[str, str | bool | int] = {
             "failed": failed,
@@ -987,6 +991,8 @@ class ServerMetricsOtelPublisher:
         }
         if status_code is not None:
             attributes["http.response.status_code"] = status_code
+        if route != "/health":
+            attributes["omnigent.actor.user_id"] = actor_user_id or "anonymous"
         self._request.duration.record(
             duration_seconds,
             attributes=attributes,

@@ -1,0 +1,6 @@
+vulnerabilities:
+  - id: CVE-2026-85396
+    paths:
+      - web/ios/Gemfile.lock
+    expired_at: 2026-12-31
+    statement: "fastlane 2.237.0 requires rubyzip < 3.0, so no compatible fixed rubyzip release is available."

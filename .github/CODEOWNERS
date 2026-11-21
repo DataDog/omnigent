@@ -1,6 +1,9 @@
+# Consolidated repository ownership
+* @DataDog/ai-devx-harnesses
+
 # Database migrations require approval from any one of these owners.
-/omnigent/db/migrations/ @Edwinhe03 @aravind-segu @dbczumar @bbqiu
-/omnigent/db/alembic.ini @Edwinhe03 @aravind-segu @dbczumar @bbqiu
+/omnigent/db/migrations/ @DataDog/ai-devx-harnesses @Edwinhe03 @aravind-segu @dbczumar @bbqiu
+/omnigent/db/alembic.ini @DataDog/ai-devx-harnesses @Edwinhe03 @aravind-segu @dbczumar @bbqiu
 
 # Keep changes to the approval policy subject to the same review.
-/.github/CODEOWNERS @Edwinhe03 @aravind-segu @dbczumar @bbqiu
+/.github/CODEOWNERS @DataDog/ai-devx-harnesses @Edwinhe03 @aravind-segu @dbczumar @bbqiu

@@ -7,6 +7,7 @@ import pytest
 
 from omnigent.onboarding.sandboxes.types import (
     HostContext,
+    ManagedIdentityRequirement,
     RepoWorkspace,
     SandboxCapabilities,
     SandboxCommandError,
@@ -61,6 +62,9 @@ def test_capabilities_defaults() -> None:
     # Off by default so a single-repo provider (and every out-of-tree one) is
     # never handed a multi-repo request; providers opt in explicitly.
     assert caps.multi_repo is False
+    assert caps.managed_create_identity is ManagedIdentityRequirement.NONE
+    assert caps.managed_resume_identity is ManagedIdentityRequirement.NONE
+    assert caps.managed_relaunch_identity is ManagedIdentityRequirement.NONE
     # Off by default: a wake rotates the token and restarts the host unless the
     # provider's resume brings the running host back.
     assert caps.resume_preserves_host is False
@@ -72,6 +76,17 @@ def test_capabilities_custom() -> None:
     assert caps.cli_bootstrap is True
     assert caps.foreground_exec is True
     assert caps.managed_launch is False
+
+
+def test_managed_identity_requirements_are_per_operation() -> None:
+    caps = SandboxCapabilities(
+        managed_create_identity=ManagedIdentityRequirement.OIDC_USER,
+        managed_resume_identity=ManagedIdentityRequirement.NONE,
+        managed_relaunch_identity=ManagedIdentityRequirement.OIDC_USER,
+    )
+    assert caps.managed_create_identity is ManagedIdentityRequirement.OIDC_USER
+    assert caps.managed_resume_identity is ManagedIdentityRequirement.NONE
+    assert caps.managed_relaunch_identity is ManagedIdentityRequirement.OIDC_USER
 
 
 def test_sandbox_spec_defaults() -> None:

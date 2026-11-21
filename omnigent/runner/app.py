@@ -990,11 +990,24 @@ def _schema_tool_name(schema: _JsonObject) -> str | None:
     """
     Extract a tool's function name from its OpenAI-format schema.
 
-    :param schema: A tool schema dict in nested OpenAI format, e.g.
-        ``{"type": "function", "function": {"name": "Read", ...}}``.
+    Accepts both the flat form (``{"name": "Read", ...}``, as a server-
+    discovered tool schema may arrive) and the nested/wrapped form
+    (``{"type": "function", "function": {"name": "Read", ...}}``).
+    Checking the flat form first mirrors
+    ``_executor_adapter._normalize_tool_schemas``'s own precedence, so the
+    two layers agree on which shape a given schema is. Missing this form
+    previously let a flat-form spec tool go unrecognized in
+    ``_spec_names``/``_merge_request_client_tools``'s seen-set, so a
+    client re-declaring the same tool name wasn't correctly subtracted as
+    server-owned.
+
+    :param schema: A tool schema dict, flat or nested OpenAI format.
     :returns: The tool name (e.g. ``"Read"``), or ``None`` when the
-        schema is malformed / missing the ``function.name`` field.
+        schema is malformed / missing a recognizable name field.
     """
+    if "name" in schema:
+        name = schema.get("name")
+        return name if isinstance(name, str) else None
     function = schema.get("function")
     if isinstance(function, dict):
         name = function.get("name")
@@ -1050,6 +1063,45 @@ def _merge_request_client_tools(
         seen.add(name)
         merged.append(tool)
     return merged
+
+
+def _compute_client_side_tool_names(
+    spec_tools: list[_JsonObject],
+    client_tools: list[_JsonObject],
+) -> frozenset[str]:
+    """
+    The turn's authoritative client-trusted tool-name set.
+
+    ``_merge_request_client_tools`` combines spec and client tools into
+    one list for the model to see, so by itself it no longer distinguishes
+    who owns a given call. This is the single source of truth for that
+    question: client names minus any name a spec tool already claims — a
+    collision resolves to server/spec ownership, mirroring
+    ``_merge_request_client_tools``'s own builtins-win precedence. The
+    harness/executor uses this set (propagated via
+    ``harness_body["client_side_tool_names"]``) to decide whether a parked
+    tool call counts as a human wait for the idle watchdog and whether it
+    belongs in the reconnect snapshot.
+
+    :param spec_tools: Spec-derived builtin + MCP tool schemas for this
+        turn.
+    :param client_tools: Request-supplied client-side tool schemas for
+        this turn.
+    :returns: Bare tool names the request genuinely declared as
+        client-side, excluding any name a spec tool already claims.
+    """
+    spec_names = {
+        name
+        for t in spec_tools
+        if isinstance(t, dict) and (name := _schema_tool_name(t)) is not None
+    }
+    return frozenset(
+        name
+        for t in client_tools
+        if isinstance(t, dict)
+        and (name := _schema_tool_name(t)) is not None
+        and name not in spec_names
+    )
 
 
 def _should_dispatch_tool_locally(
@@ -6119,6 +6171,13 @@ def create_runner_app(
         """
         if process_manager is None:
             return
+        # Cancel the runner-side durable-ask parks FIRST: the harness-side
+        # future alone does not unwind a runner dispatch parked on a durable
+        # human question, and its cancellation handler is what cancels the
+        # pending question server-side (an interrupt must stay stopped).
+        from omnigent.runner import ask_user as _ask_user
+
+        _ask_user.cancel_active_asks(conv_id)
         try:
             harness_client = await process_manager.get_client(conv_id, "any")
             if _turn_bind_epoch.get(conv_id, 0) != turn_epoch:
@@ -7686,18 +7745,20 @@ def create_runner_app(
         merged_tools = _merge_request_client_tools(_spec_tools, _client_tools)
         if merged_tools:
             harness_body["tools"] = merged_tools
-        _spec_names = {
-            name
-            for t in _spec_tools
-            if isinstance(t, dict) and (name := _schema_tool_name(t)) is not None
-        }
-        ctx.client_side_tool_names = frozenset(
-            name
-            for t in _client_tools
-            if isinstance(t, dict)
-            and (name := _schema_tool_name(t)) is not None
-            and name not in _spec_names
-        )
+        ctx.client_side_tool_names = _compute_client_side_tool_names(_spec_tools, _client_tools)
+        # Propagate the authoritative ownership set to the harness alongside
+        # the merged tool list: ``harness_body["tools"]`` mixes spec and
+        # client tools indistinguishably, so the harness cannot otherwise
+        # tell which of its parked calls a connected client actually owns
+        # (idle-watchdog hold, and reconnect-snapshot membership, both
+        # depend on this). Always sent explicitly, including an empty list
+        # (zero client tools, or every client name collided with a spec
+        # name) — omitting the field on an empty result would leave the
+        # harness with no explicit signal and no way to distinguish "zero
+        # client tools" from "this sender doesn't compute the set", which
+        # must fail closed, not fail open. Sorted for a stable, diffable
+        # wire value.
+        harness_body["client_side_tool_names"] = sorted(ctx.client_side_tool_names)
 
         await _ensure_native_terminal_for_turn(conv, harness_name)
 
@@ -10408,10 +10469,51 @@ def create_runner_app(
                 _data.get("elicitation_id", ""),
                 _elicit_action == "accept",
                 _elicit_content if isinstance(_elicit_content, dict) else None,
+                action=_elicit_action or None,
             )
+            if (
+                not runner_owned_approval
+                and _data.get("durable")
+                and server_client is not None
+                and _elicit_action != "cancel"
+            ):
+                # A durable sys_ask_user verdict arrived with NO live parked
+                # waiter in this runner process: the harness turn (and
+                # possibly the whole runner) died while the question was
+                # pending. Continue the same logical execution from the
+                # persisted checkpoint — claim the answer exactly-once and
+                # wake the session with one hidden meta message. The
+                # committed history already carries the original prompt and
+                # every preceding tool result, so nothing replays.
+                # EXCLUSION: action == "cancel" is explicit user cancellation
+                # (session interrupt/stop) — the parked turn is dead BY
+                # INTENT and must stay stopped; recovery must never
+                # resurrect an explicitly canceled question.
+                from omnigent.runner import ask_user as _ask_user
+
+                _recovery_task = asyncio.ensure_future(
+                    _ask_user.recover_answered_ask(
+                        elicitation_id=_data.get("elicitation_id", ""),
+                        conversation_id=conversation_id,
+                        action=_elicit_action,
+                        content=(_elicit_content if isinstance(_elicit_content, dict) else None),
+                        server_client=server_client,
+                        paused_call=(
+                            _data.get("paused_call")
+                            if isinstance(_data.get("paused_call"), dict)
+                            else None
+                        ),
+                    )
+                )
+                _background_tasks.add(_recovery_task)
+                _recovery_task.add_done_callback(_background_tasks.discard)
             # Ordinary Pi dialog rejection is an answer, not a tool denial.
             pi_dialog = str(_data.get("elicitation_id", "")).startswith("elicit_pi_")
-            if _elicit_action == "decline" and (runner_owned_approval or not pi_dialog):
+            if (
+                _elicit_action == "decline"
+                and not _data.get("durable")
+                and (runner_owned_approval or not pi_dialog)
+            ):
                 try:
                     _int_client = await process_manager.get_client(conversation_id, "any")
                     await _int_client.post(

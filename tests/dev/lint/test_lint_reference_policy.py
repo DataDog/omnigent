@@ -299,14 +299,43 @@ def test_missing_base_fails_closed(repository: Path) -> None:
 
 
 @pytest.mark.parametrize("push_context", ["flag", "hook"])
+@pytest.mark.parametrize(
+    "upstream_state", ["missing", "dangling", "rebased", "ahead", "stale", "stacked"]
+)
 def test_cli_uses_push_range_and_does_not_echo_values(
-    repository: Path, prohibited_name: str, push_context: str
+    repository: Path, prohibited_name: str, push_context: str, upstream_state: str
 ) -> None:
     script = Path(__file__).resolve().parents[3] / "dev/lint/lint_reference_policy.py"
     base = git(repository, "rev-parse", "HEAD").decode().strip()
     (repository / "notes.txt").write_text(f"{prohibited_name}\n", encoding="utf-8")
     git(repository, "add", ".")
     git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "change")
+    if upstream_state == "dangling":
+        git(repository, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    elif upstream_state != "missing":
+        old_head = git(repository, "rev-parse", "HEAD").decode().strip()
+        git(repository, "switch", "-c", "upstream", base)
+        (repository / "upstream.txt").write_text(f"{prohibited_name}\n", encoding="utf-8")
+        git(repository, "add", ".")
+        git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "upstream")
+        git(repository, "update-ref", "refs/remotes/origin/main", "HEAD")
+        git(repository, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        if upstream_state == "stacked":
+            git(repository, "switch", "-c", "rebased", old_head)
+            git(repository, "-c", "core.hooksPath=/dev/null", "merge", "--no-edit", "upstream")
+        else:
+            git(repository, "switch", "-c", "rebased")
+            git(repository, "-c", "core.hooksPath=/dev/null", "cherry-pick", old_head)
+        if upstream_state == "ahead":
+            git(repository, "switch", "upstream")
+            (repository / "later.txt").write_text("safe\n", encoding="utf-8")
+            git(repository, "add", ".")
+            git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "later")
+            git(repository, "update-ref", "refs/remotes/origin/main", "HEAD")
+            git(repository, "switch", "rebased")
+        elif upstream_state == "stale":
+            git(repository, "update-ref", "refs/remotes/origin/main", base)
+        base = old_head
     arguments = ["--pre-push"] if push_context == "flag" else []
     environment = {**os.environ, "PRE_COMMIT_FROM_REF": base, "PRE_COMMIT_TO_REF": "HEAD"}
     if push_context == "hook":
@@ -321,6 +350,7 @@ def test_cli_uses_push_range_and_does_not_echo_values(
     )
     assert result.returncode == 1
     assert "notes.txt:1: prohibited reference" in result.stdout
+    assert ("upstream.txt:1: prohibited reference" in result.stdout) == (upstream_state == "stale")
     assert prohibited_name not in result.stdout
     for missing in [
         ("PRE_COMMIT_FROM_REF",),
@@ -406,3 +436,67 @@ def test_hook_and_ci_enforce_policy(repository: Path, prohibited_name: str, base
         assert result.returncode == 1
         assert "notes.txt:1: prohibited reference" in result.stdout
         assert "upstream.txt" not in result.stdout
+
+
+@pytest.mark.parametrize("pinned", [False, True], ids=["feature-merge", "canonical-import"])
+def test_merge_import_checks_only_reviewed_baseline(
+    repository: Path, prohibited_name: str, pinned: bool
+) -> None:
+    base = git(repository, "rev-parse", "HEAD").decode().strip()
+    git(repository, "switch", "-c", "canonical-source")
+    imported_name = f"{prohibited_name}-legacy.txt"
+    imported = repository / imported_name
+    imported.write_text(f"{prohibited_name}\nkeep\n", encoding="utf-8")
+    git(repository, "add", ".")
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "source")
+    baseline = git(repository, "rev-parse", "HEAD").decode().strip()
+    git(repository, "switch", "-c", "fork", base)
+    git(repository, "-c", "core.hooksPath=/dev/null", "merge", "--no-commit", "--no-ff", baseline)
+    if pinned:
+        pin = repository / policy.UPSTREAM_BASELINE_FILE
+        pin.parent.mkdir(parents=True)
+        pin.write_text(f"{baseline}\n", encoding="utf-8")
+        # An unstaged pin cannot change what the staged-content check accepts.
+        assert check(repository)
+        git(repository, "add", policy.UPSTREAM_BASELINE_FILE)
+    inherited_findings = (
+        []
+        if pinned
+        else [
+            f"{imported_name}:1: prohibited reference in new path",
+            f"{imported_name}:1: prohibited reference in added text",
+        ]
+    )
+    assert check(repository) == inherited_findings
+    imported.write_text(f"{prohibited_name}\nkeep\nnew {prohibited_name}\n", encoding="utf-8")
+    (repository / "new.txt").write_text(f"{prohibited_name}\n", encoding="utf-8")
+    git(repository, "add", ".")
+    expected = [
+        *inherited_findings,
+        f"{imported_name}:3: prohibited reference in added text",
+        "new.txt:1: prohibited reference in added text",
+    ]
+    assert check(repository) == expected
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "merge")
+    git(
+        repository, "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-qm", "follow-up"
+    )
+    assert check(repository, base, "HEAD") == expected
+
+
+def test_unrelated_baseline_does_not_exempt_new_text(
+    repository: Path, prohibited_name: str
+) -> None:
+    base = git(repository, "rev-parse", "HEAD").decode().strip()
+    git(repository, "switch", "-c", "canonical-source")
+    (repository / "new.txt").write_text(f"{prohibited_name}\n", encoding="utf-8")
+    git(repository, "add", ".")
+    git(repository, "-c", "core.hooksPath=/dev/null", "commit", "-qm", "source")
+    baseline = git(repository, "rev-parse", "HEAD").decode().strip()
+    git(repository, "switch", "-c", "fork", base)
+    pin = repository / policy.UPSTREAM_BASELINE_FILE
+    pin.parent.mkdir(parents=True)
+    pin.write_text(f"{baseline}\n", encoding="utf-8")
+    (repository / "new.txt").write_text(f"{prohibited_name}\n", encoding="utf-8")
+    git(repository, "add", ".")
+    assert check(repository) == ["new.txt:1: prohibited reference in added text"]

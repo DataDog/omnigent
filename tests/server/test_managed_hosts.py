@@ -31,6 +31,7 @@ from omnigent.onboarding.sandboxes.base import (
     render_host_config_write_command,
 )
 from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s as blaxel_managed_token_ttl_s
+from omnigent.onboarding.sandboxes.context import ManagedSandboxContext
 from omnigent.onboarding.sandboxes.e2b import managed_token_ttl_s as e2b_managed_token_ttl_s
 from omnigent.onboarding.sandboxes.lambda_microvm import (
     managed_token_ttl_s as lambda_microvm_managed_token_ttl_s,
@@ -41,6 +42,7 @@ from omnigent.onboarding.sandboxes.registry import (
     SandboxProviderMetadata,
     reset_plugin_state_for_tests,
 )
+from omnigent.onboarding.sandboxes.types import ManagedIdentityRequirement
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
@@ -94,6 +96,7 @@ from tests.server.helpers import (
 pytestmark = pytest.mark.asyncio
 
 _OWNER = "alice@example.com"
+_TEST_CREDENTIAL_SESSION_ID = "1b8852c73c0448a8a9ab7b159722f6c1"
 
 
 def _injected_config(
@@ -3586,6 +3589,24 @@ async def test_launch_entrypoint_provider_cleans_up_on_launch_failure(db_uri: st
 # ── relaunch_managed_host ───────────────────────────────────
 
 
+def test_managed_host_persists_provider_resource_binding(db_uri: str) -> None:
+    """Restart recovery retains the provider resource, not request authority."""
+    HostStore(db_uri).register_managed_host(
+        host_id="f2a2b3c4d5e6f708192a3b4c5d6e7f80",
+        name="managed-lifecycle",
+        user_id=_OWNER,
+        token="launch-token-not-persisted",
+        provider="hab",
+        sandbox_id="hab-exact-uuid",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+    recovered = HostStore(db_uri).get_host("f2a2b3c4d5e6f708192a3b4c5d6e7f80")
+    assert recovered is not None
+    assert recovered.sandbox_provider == "hab"
+    assert recovered.sandbox_id == "hab-exact-uuid"
+
+
 class _ReusedIdFakeLauncher(FakeSandboxLauncher):
     provider: ClassVar[str] = "blaxel"
 
@@ -5017,15 +5038,17 @@ async def test_terminate_managed_host_cleans_active_and_pending_generations(db_u
         sandbox_id="sb-term-old",
         expected_updated_at=original.updated_at,
     )
-    replaced = host_store.replace_managed_host_sandbox(
-        host_id=host_id,
-        user_id=_OWNER,
-        token="tok-term-new",
-        provider="modal",
-        sandbox_id="sb-term-new",
-        token_expires_at=now_epoch() + 3600,
+    assert (
+        host_store.replace_managed_host_sandbox(
+            host_id=host_id,
+            user_id=_OWNER,
+            token="tok-term-new",
+            provider="modal",
+            sandbox_id="sb-term-new",
+            token_expires_at=now_epoch() + 3600,
+        )
+        is not None
     )
-    assert replaced is not None
     host = host_store.get_host(host_id)
     assert host is not None
 
@@ -5048,15 +5071,17 @@ async def test_terminate_managed_host_targets_latest_registered_generation(db_ur
         sandbox_id="sb-term-old",
         token_expires_at=now_epoch() + 3600,
     )
-    updated = host_store.replace_managed_host_sandbox(
-        host_id=stale.host_id,
-        user_id=stale.user_id,
-        token="tok-term-new",
-        provider="modal",
-        sandbox_id="sb-term-new",
-        token_expires_at=now_epoch() + 3600,
+    assert (
+        host_store.replace_managed_host_sandbox(
+            host_id=stale.host_id,
+            user_id=stale.user_id,
+            token="tok-term-new",
+            provider="modal",
+            sandbox_id="sb-term-new",
+            token_expires_at=now_epoch() + 3600,
+        )
+        is not None
     )
-    assert updated is not None
 
     await terminate_managed_host(stale, host_store, _injected_config(fake))
 
@@ -5065,8 +5090,7 @@ async def test_terminate_managed_host_targets_latest_registered_generation(db_ur
 
 
 async def test_terminate_managed_host_deletes_row_before_provider_call(
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Provider teardown runs only after the host can no longer be relaunched."""
     fake = FakeSandboxLauncher()
@@ -5086,18 +5110,32 @@ async def test_terminate_managed_host_deletes_row_before_provider_call(
         fake.terminated.append(sandbox_id)
 
     monkeypatch.setattr(fake, "terminate", _terminate)
-
     await terminate_managed_host(host, host_store, _injected_config(fake))
-
     assert fake.terminated == ["sb-delete-first"]
 
 
-async def test_terminate_managed_host_retries_tombstone_after_terminate_fails(
+def _managed_tombstone(host_store: HostStore, host_id: str) -> Host:
+    """Find an internal managed-cleanup row, including a logical deletion."""
+    row = next(
+        (
+            host
+            for _, host in host_store.list_current_managed_sandbox_hosts_page(
+                after=None, limit=100
+            )
+            if host.host_id == host_id
+        ),
+        None,
+    )
+    assert row is not None
+    return row
+
+
+async def test_terminate_managed_host_retains_cleanup_tombstone_when_terminate_fails(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    A provider failure does not block logical deletion, and the persisted
-    sandbox id is retried by the existing reaper.
+    A provider termination failure revokes local authorization but keeps the
+    exact resource binding as a cleanup-pending tombstone.
     """
     fake = FakeSandboxLauncher()
     original_terminate = fake.terminate
@@ -5251,6 +5289,7 @@ async def test_terminate_managed_host_skips_mismatched_provider(db_uri: str) -> 
     assert host_store.get_host("b114bf90a8fd155ce6007c3bb262aa79") is None
 
 
+# ── persisted managed-cleanup reconciliation ────────────────
 def test_parse_modal_secrets_thread_to_launcher(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     ``sandbox.modal.secrets`` names reach the launcher constructor —
@@ -5860,7 +5899,10 @@ async def test_kick_managed_relaunch_defers_the_classifier_to_the_launch_task(
         tracker=tracker,
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
-        app_state=SimpleNamespace(agent_store=store),
+        app_state=SimpleNamespace(
+            agent_store=store,
+        ),
+        operation_context=ManagedSandboxContext("conv_1", _OWNER, None),
     )
     scheduled = set(orchestration._managed_launch_tasks) - before
     assert scheduled, "the claim was taken but no task was scheduled to settle it"
@@ -5913,6 +5955,7 @@ async def test_relaunch_claim_and_launch_task_are_one_synchronous_step(
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
         app_state=SimpleNamespace(agent_store=_StubAgentStore()),
+        operation_context=ManagedSandboxContext("conv_1", _OWNER, None),
     )
     scheduled = set(orchestration._managed_launch_tasks) - before
     assert scheduled, "the claim was taken but no task was scheduled to settle it"
@@ -5946,6 +5989,7 @@ async def test_kick_managed_relaunch_without_agent_store_threads_none(
         conversation_store=SimpleNamespace(),
         host_store=SimpleNamespace(),
         app_state=SimpleNamespace(),
+        operation_context=ManagedSandboxContext("conv_1", _OWNER, None),
     )
     scheduled = set(orchestration._managed_launch_tasks) - before
     await asyncio.gather(*scheduled)
@@ -5980,7 +6024,10 @@ async def test_run_managed_launch_leaves_the_runner_unclassified(
     await orchestration._run_managed_launch(
         session_id="conv_1",
         owner=_OWNER,
-        sandbox_config=SimpleNamespace(configs=()),
+        sandbox_config=SimpleNamespace(
+            configs=(),
+            managed_identity_requirement=lambda *_args: ManagedIdentityRequirement.NONE,
+        ),
         repos=[],
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(get_conversation=lambda _sid: None),
@@ -6155,6 +6202,7 @@ async def test_relaunch_and_wake_seed_the_launch_status_with_the_host_provider(
         "conversation_store": SimpleNamespace(),
         "host_store": SimpleNamespace(),
         "app_state": SimpleNamespace(agent_store=_StubAgentStore()),
+        "operation_context": ManagedSandboxContext("conv_launch_status", _OWNER, None),
     }
     before = set(orchestration._managed_launch_tasks)
     orchestration._kick_managed_relaunch(
@@ -6490,11 +6538,17 @@ async def test_concurrent_relaunch_messages_kick_a_single_launch(
         session_id=None,
     )
     dead_host = SimpleNamespace(
-        sandbox_provider="modal", user_id=_OWNER, status="offline", updated_at=0
+        sandbox_provider="modal",
+        user_id=_OWNER,
+        status="offline",
+        updated_at=0,
     )
     app_state = SimpleNamespace(
         host_store=SimpleNamespace(get_host=lambda _hid: dead_host, is_online=lambda _hid: False),
-        sandbox_config=SimpleNamespace(configs=()),
+        sandbox_config=SimpleNamespace(
+            configs=(),
+            managed_identity_requirement=lambda *_args: ManagedIdentityRequirement.NONE,
+        ),
         managed_launches=tracker,
         agent_store=_StubAgentStore({builtin.id: builtin}),
         host_registry=None,

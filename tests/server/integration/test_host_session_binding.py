@@ -665,7 +665,16 @@ async def test_managed_session_create_end_to_end(
     # The hosts row carries the sandbox backing and is owned by the
     # caller — no auth provider on this app → the reserved local user,
     # same as a directly-connected host would be.
-    host = env.host_store.get_host(conv.host_id)
+    host = next(
+        (
+            candidate
+            for _, candidate in env.host_store.list_current_managed_sandbox_hosts_page(
+                after=None, limit=100
+            )
+            if candidate.host_id == conv.host_id
+        ),
+        None,
+    )
     assert host is not None
     assert host.user_id == RESERVED_USER_LOCAL
     assert host.status == "online"
@@ -1544,6 +1553,14 @@ async def test_message_relaunches_dead_managed_sandbox(
     assert len(fake.host_starts) == 2
     assert fake.host_starts[1].host_id == conv.host_id
     assert fake.host_starts[1].token != fake.host_starts[0].token
+    # Await the generation-2 tunnel before checking the host and session binding.
+    second_tunnel = await host_futures[1]
+    deadline = loop.time() + 10.0
+    while loop.time() < deadline and (
+        host_registry.get(conv.host_id) is None or not env.host_store.is_online(conv.host_id)
+    ):
+        await asyncio.sleep(0.05)
+    assert host_registry.get(conv.host_id) is not None
     # The relaunch keeps the keying the session's create chose.
     slice_key = render_host_config_write_command({"host": {"slice_key_enabled": True}})
     assert fake.commands.count(slice_key) == (2 if requested_host_id else 0)
@@ -1557,7 +1574,6 @@ async def test_message_relaunches_dead_managed_sandbox(
     assert rebound.runner_id != gen1_runner_id
     # Release the generation-2 tunnel (and the consumed generation-1
     # communicator) only after the assertions.
-    second_tunnel = await host_futures[1]
     del first_tunnel, second_tunnel
 
 
@@ -2356,9 +2372,13 @@ async def test_delete_managed_session_forwards_capture_logs(
     teardowns: list[bool] = []
 
     async def record_teardown(
-        *args: object, keep_if_bound: bool = False, capture_logs: bool = False
+        *args: object,
+        keep_if_bound: bool = False,
+        capture_logs: bool = False,
+        use_reaper_identity: bool = True,
     ) -> None:
         assert keep_if_bound
+        assert use_reaper_identity is False
         teardowns.append(capture_logs)
 
     monkeypatch.setattr(managed_hosts, "terminate_managed_host", record_teardown)

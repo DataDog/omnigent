@@ -365,7 +365,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     from omnigent.runtime import telemetry
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.runtime.caps import RuntimeCaps
-    from omnigent.server.managed_hosts import parse_sandbox_config
+    from omnigent.server.managed_hosts import load_sandbox_config
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.comment_store.sqlalchemy_store import (
         SqlAlchemyCommentStore,
@@ -395,10 +395,13 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     policy_store = SqlAlchemyPolicyStore(database_url)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(database_url)
     project_store = SqlAlchemyProjectStore(database_url)
-    # Fail startup loud on a malformed `sandbox:` section (an operator
-    # typo should not surface as a runtime 502 on the first managed
-    # session); the startup catch-all below logs it.
-    sandbox_config = parse_sandbox_config(cfg.get("sandbox"))
+    # Fail startup loud on a malformed `sandbox:` section or a broken
+    # external provider module (an operator typo should not surface as a
+    # runtime 502 on the first managed session); the startup catch-all
+    # below logs it.  When OMNIGENT_SANDBOX_PROVIDER_MODULE is set, the
+    # named module supplies the config; otherwise the YAML `sandbox:`
+    # section is parsed as before.
+    sandbox_config = load_sandbox_config(cfg)
     artifact_store = _select_artifact_store(resolved_config)
 
     agent_cache = AgentCache(
@@ -438,9 +441,20 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     # None for non-accounts deploys (matching the structural
     # contract used on the hosted product).
     from omnigent.server.auth import UnifiedAuthProvider as _UAP
-    from omnigent.server.auth import create_auth_provider
+    from omnigent.server.auth import create_auth_provider, resolve_auth_source
 
-    auth_provider = create_auth_provider()
+    # OIDC mode persists provider credentials in the encrypted session
+    # store; other modes pass None and keep self-contained JWT cookies.
+    oidc_session_store = None
+    if resolve_auth_source() == "oidc":
+        from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
+        from omnigent.server.oidc_session_store import OidcSessionStore
+
+        oidc_session_store = OidcSessionStore(
+            make_managed_session_maker(get_or_create_engine(database_url))
+        )
+
+    auth_provider = create_auth_provider(oidc_session_store=oidc_session_store)
     account_store = None
     if isinstance(auth_provider, _UAP) and auth_provider._source == "accounts":
         from omnigent.server.accounts_store import SqlAlchemyAccountStore

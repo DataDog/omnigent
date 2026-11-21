@@ -1,8 +1,7 @@
 """Tests for ``.github/scripts/dependency_floor_approval.py``.
 
-A young-dependency-floor waiver is a comment anyone can write, so the Maintainer
-Approval job also requires a maintainer, the author included, to add the label
-whenever a PR introduces a waiver its merge base does not have.
+The standalone approval helper validates maintainer labels for new waivers.
+The fork enforces the dependency-floor lint through the required pre-commit job.
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import dev.lint.custom_lint as custom_lint
 import dev.lint.lint_young_dependency_floor as lint
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -166,20 +166,14 @@ def test_evaluate_fails_when_the_head_moved_since_the_event(approval) -> None:
 
 def test_rule_name_matches_the_lint_and_runs_in_the_required_check(approval) -> None:
     assert approval.RULE_NAME == lint.RULE_NAME
-    job = yaml.safe_load((ROOT / ".github/workflows/maintainer-approval.yml").read_text())["jobs"][
-        "approve"
-    ]
-    checkout = job["steps"][0]
-    assert checkout["with"]["ref"] == "main"
-    assert checkout["with"]["persist-credentials"] is False
-    for source in [
-        "dependency_floor_approval.py",
-        "maintainer_approval.py",
-        "dev/lint/_framework.py",
-    ]:
-        assert source in checkout["with"]["sparse-checkout"]
-    step = next(s for s in job["steps"] if s.get("name") == "Require dependency floor approval")
-    assert step["if"] == "${{ !cancelled() }}"
-    assert step["env"]["PYTHONPATH"] == "${{ github.workspace }}"
-    assert step["env"]["EXPECTED_HEAD"] == "${{ github.event.pull_request.head.sha }}"
-    assert '--expected-head "$EXPECTED_HEAD"' in step["run"]
+    assert any(
+        rule.name == lint.RULE_NAME and rule.check is lint.check for rule in custom_lint.RULES
+    )
+    config = yaml.safe_load((ROOT / ".pre-commit-config.yaml").read_text())
+    hook = next(
+        hook for repo in config["repos"] for hook in repo["hooks"] if hook["id"] == "custom-lint"
+    )
+    assert "-m dev.lint.custom_lint" in hook["entry"]
+    workflow = yaml.safe_load((ROOT / ".github/workflows/lint.yml").read_text())
+    job = workflow["jobs"]["pre-commit"]
+    assert any("pre-commit run --all-files" in step.get("run", "") for step in job["steps"])

@@ -16,9 +16,9 @@ name: Security Scan
 # / uv sync / test). Detectors run fail-fast -- the first finding fails the job,
 # so a clean PR must pass every one.
 #
-# Trust tiers (should-scan.sh): trusted (OWNER/MEMBER/COLLABORATOR, or an author
-# in the MAINTAINERS list -- covers maintainers with private org membership) and
-# non-PR events aren't scanned; returning contributors are; first-timers are held
+# Trust tiers (should-scan.sh): same-repository PRs and trusted authors
+# (OWNER/MEMBER/COLLABORATOR, or an author in the MAINTAINERS list) are
+# not scanned; returning fork contributors are, and first-timers are held
 # by GitHub's native fork-approval gate first.
 
 on:
@@ -73,6 +73,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           # Trusted-CI-bot allowlist in should-scan.sh (GitHub-set, not PR-controlled).
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
@@ -96,12 +97,15 @@ jobs:
       - name: Fetch PR diff
         if: ${{ steps.gate.outputs.scan == 'true' }}
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          gh pr diff "$PR" --repo "$REPO" > "$GITHUB_WORKSPACE/pr.diff"
-          gh pr diff "$PR" --repo "$REPO" --name-only > "$GITHUB_WORKSPACE/changed.txt"
+          # GitHub's PR diff API rejects changesets over 300 files. Fetch the
+          # two immutable PR commits and compute the same tree-to-tree diff
+          # locally so large upstream-sync PRs receive the full security scan.
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" "$HEAD_SHA"
+          git --no-pager diff --no-ext-diff "$BASE_SHA" "$HEAD_SHA" > "$GITHUB_WORKSPACE/pr.diff"
+          git --no-pager diff --no-ext-diff --name-only "$BASE_SHA" "$HEAD_SHA" > "$GITHUB_WORKSPACE/changed.txt"
           echo "Changed files:"; cat "$GITHUB_WORKSPACE/changed.txt"
 
       - name: Install trusted policy parser

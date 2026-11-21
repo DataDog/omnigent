@@ -40,6 +40,10 @@ from omnigent.server.auth import (
     LEVEL_READ,
     UnifiedAuthProvider,
 )
+from omnigent.server.feature_usage_metrics import (
+    FeatureUsageRecorder,
+    set_feature_usage_recorder_for_testing,
+)
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
@@ -48,6 +52,7 @@ from omnigent.stores.host_store import HostStore
 from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
 from tests.debug_log_helpers import capture_debug_rows
+from tests.server.feature_usage_helpers import RecordingMeter
 from tests.server.routes.test_shell_permission_gate import _StubPermissionStore
 
 
@@ -2318,6 +2323,34 @@ async def test_upload_and_list_session_files(
     assert list_resp.status_code == 200
     ids = [f["id"] for f in list_resp.json()["data"]]
     assert file_id in ids
+
+
+@pytest.mark.asyncio
+async def test_upload_records_normalized_attachment_usage(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """A code MIME type is emitted only as a bounded text attachment category."""
+    meter = RecordingMeter()
+    set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
+    try:
+        resp = await file_client.post(
+            "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/files",
+            files={"file": ("main.go", b"package main", "application/octet-stream")},
+        )
+    finally:
+        set_feature_usage_recorder_for_testing(None)
+
+    assert resp.status_code == 201
+    assert meter.counter.records == [
+        {
+            "omnigent.feature.name": "attachment",
+            "omnigent.feature.operation": "upload",
+            "omnigent.feature.outcome": "success",
+            "omnigent.actor.user_id": "local",
+            "omnigent.attachment.category": "text",
+            "omnigent.attachment.size_bucket": "lt_1mib",
+        }
+    ]
 
 
 @pytest.mark.asyncio

@@ -65,13 +65,14 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, WebSocketExceptio
 from starlette import status
 
 from omnigent.debug_logging import debug_event
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.dictation import (
     DictationEngine,
     DictationStreamHandle,
     get_engine,
     max_streams,
 )
+from omnigent.server.feature_usage_metrics import get_feature_usage_recorder
 
 _logger = logging.getLogger(__name__)
 
@@ -109,11 +110,17 @@ def create_dictation_router(
     @router.websocket("/dictation/stream")
     async def dictation_stream(websocket: WebSocket) -> None:
         """Transcribe one dictation take (see module docstring)."""
-        if auth_provider is not None and auth_provider.get_user_id(websocket) is None:
+        user_id = auth_provider.get_user_id(websocket) if auth_provider is not None else None
+        if auth_provider is not None and user_id is None:
             raise WebSocketException(
                 code=status.WS_1008_POLICY_VIOLATION,
                 reason="authentication required",
             )
+        usage = get_feature_usage_recorder().operation(
+            feature_name="dictation",
+            operation="take",
+            actor_user_id=user_id or RESERVED_USER_LOCAL,
+        )
         await websocket.accept()
         _logger.info(
             "dictation stream connected",
@@ -121,6 +128,7 @@ def create_dictation_router(
         )
 
         if slots.locked():
+            usage.reject("capacity")
             await websocket.close(
                 code=_WS_CLOSE_TRY_AGAIN_LATER,
                 reason="dictation is at capacity; try again shortly",
@@ -133,7 +141,9 @@ def create_dictation_router(
             try:
                 engine = await asyncio.to_thread(resolve_engine)
                 handle: DictationStreamHandle = await asyncio.to_thread(engine.create_stream)
+                usage.set_attribute("omnigent.dictation.engine", _dictation_engine_name(engine))
             except Exception:
+                usage.fail("backend")
                 _logger.exception(
                     "dictation engine failed to initialize",
                     extra=debug_event("dictation_stream", phase="error", stage="engine_init"),
@@ -150,7 +160,16 @@ def create_dictation_router(
             # close on the way out is enough.
             try:
                 await websocket.send_text(json.dumps({"type": "ready"}))
-                await _pump_dictation(websocket, handle)
+                stopped = await _pump_dictation(websocket, handle)
+                if stopped is True:
+                    usage.succeed()
+                elif stopped is False:
+                    usage.abandon()
+                else:
+                    usage.fail("backend")
+            except Exception:
+                usage.fail("backend")
+                raise
             finally:
                 _logger.info(
                     "dictation stream disconnected",
@@ -175,7 +194,19 @@ def create_dictation_router(
     return router
 
 
-async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -> None:
+def _dictation_engine_name(engine: DictationEngine) -> str:
+    """Return a bounded engine family label for feature telemetry."""
+    name = type(engine).__name__.lower()
+    if "remote" in name:
+        return "remote"
+    if "whisper" in name:
+        return "whisper"
+    if "sherpa" in name:
+        return "sherpa"
+    return "other"
+
+
+async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -> bool | None:
     """Shuttle audio in and transcript events out until stop/disconnect.
 
     :param websocket: The accepted browser-facing WebSocket.
@@ -187,7 +218,7 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
         while True:
             message = await websocket.receive()
             if message.get("type") == "websocket.disconnect":
-                return
+                return False
 
             data = message.get("bytes")
             if data is not None:
@@ -221,10 +252,10 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
                 tail = await asyncio.to_thread(handle.finish)
                 await websocket.send_text(json.dumps({"type": "stopped", "text": tail}))
                 await websocket.close()
-                return
+                return True
             # Unknown control messages are ignored for forward compat.
     except WebSocketDisconnect:
-        return
+        return False
     except Exception:
         _logger.exception(
             "dictation stream failed",
@@ -233,3 +264,4 @@ async def _pump_dictation(websocket: WebSocket, handle: DictationStreamHandle) -
         with contextlib.suppress(RuntimeError):
             await websocket.send_text(json.dumps({"type": "error", "message": "dictation failed"}))
             await websocket.close(code=_WS_CLOSE_INTERNAL_ERROR)
+        return None

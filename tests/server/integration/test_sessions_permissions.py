@@ -39,6 +39,10 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import presence
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_OWNER, LEVEL_READ
+from omnigent.server.feature_usage_metrics import (
+    FeatureUsageRecorder,
+    set_feature_usage_recorder_for_testing,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -51,6 +55,7 @@ from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
 from tests.server.conftest import ControllableMockClient
+from tests.server.feature_usage_helpers import RecordingMeter
 from tests.server.helpers import (
     build_agent_bundle,
     create_test_agent,
@@ -410,6 +415,33 @@ async def _leave_session(
     :returns: The raw httpx response.
     """
     return await _revoke_permission(client, session_id, revoker=user, target_user=user)
+
+
+async def test_grant_records_bounded_sharing_usage(auth_client: httpx.AsyncClient) -> None:
+    """A grant exposes access level and target kind without the grantee ID."""
+    agent = await create_test_agent(auth_client, user="owner@example.com")
+    session = await _create_session_as(auth_client, agent["id"], "owner@example.com")
+    meter = RecordingMeter()
+    set_feature_usage_recorder_for_testing(FeatureUsageRecorder(meter))
+    try:
+        response = await _grant_permission(
+            auth_client,
+            session["id"],
+            granter="owner@example.com",
+            target_user="reader@example.com",
+            level=LEVEL_READ,
+        )
+    finally:
+        set_feature_usage_recorder_for_testing(None)
+
+    assert response.status_code == 200
+    attributes = meter.counter.records[0]
+    assert attributes["omnigent.feature.name"] == "sharing"
+    assert attributes["omnigent.feature.operation"] == "grant"
+    assert attributes["omnigent.actor.user_id"] == "owner@example.com"
+    assert attributes["omnigent.sharing.target_type"] == "user"
+    assert attributes["omnigent.sharing.access_level"] == "read"
+    assert "reader@example.com" not in attributes.values()
 
 
 async def _list_sessions_as(
