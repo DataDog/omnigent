@@ -279,6 +279,14 @@ def _prepare_container(
         _docker(["cp", f"{fixture}/.", f"{container}:/probe/project-fixture"])
         _docker_exec(container, "chmod", "700", "/probe/vit-runtime")
         _docker_exec(container, "cp", "-R", "/probe/project-fixture/.", str(workspace))
+        # The fixture ships its instructions as AGENTS.fixture.md; the
+        # scenario workspace expects them as AGENTS.md.
+        _docker_exec(
+            container,
+            "cp",
+            str(workspace / "AGENTS.fixture.md"),
+            str(workspace / "AGENTS.md"),
+        )
         _docker_exec(
             container, "git", "config", "--global", "--add", "safe.directory", str(workspace)
         )
@@ -497,7 +505,8 @@ def test_built_vit_runtime_reports_reused_children_through_omnigent(
     evidence.mkdir()
     workspace = (tmp_path / "stack" / "workspace").resolve()
     workspace.mkdir(parents=True)
-    for name in ("AGENTS.md", "alpha.txt", "beta.txt"):
+    shutil.copy2(fixture / "AGENTS.fixture.md", workspace / "AGENTS.md")
+    for name in ("alpha.txt", "beta.txt"):
         shutil.copy2(fixture / name, workspace / name)
 
     stack_root = tmp_path / "stack"
