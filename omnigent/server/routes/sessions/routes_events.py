@@ -2816,6 +2816,53 @@ def register_events_routes(
                     background_tasks=bg_tasks,
                     blocked_on=blocked_on,
                 )
+                # Mirror the observation onto the parent's runner as an
+                # AMBIGUOUS idle (no turn_completed flag): the runner settles
+                # no outcome for forwarder-confirmed harnesses, but an
+                # already-settled work entry still gets its pending parent
+                # delivery retried, so a lost wake does not strand the child's
+                # result forever. Best-effort: an observation must not fail
+                # the POST the forwarder would otherwise retry as permanent.
+                if (
+                    conv.kind == "sub_agent"
+                    and conv.parent_conversation_id is not None
+                    and not _is_codex_native_subagent(conv)
+                    and not _is_devin_native_subagent(conv)
+                    # A sticky ``failed`` stays terminal: do not mirror an
+                    # idle observation onto its runner work entry.
+                    and _session_status_cache.get(session_id) == "idle"
+                ):
+                    observation_body = {
+                        "type": _EXTERNAL_SESSION_STATUS_TYPE,
+                        "data": {"status": "idle"},
+                    }
+                    observation_result = await _forward_session_change_to_runner(
+                        session_id,
+                        runner_router,
+                        observation_body,
+                    )
+                    if observation_result is None or observation_result.status_code >= 400:
+                        from omnigent.server.routes import sessions as _sf
+
+                        recovered = await _sf._recover_subagent_status_forward_via_parent(
+                            conv,
+                            runner_router,
+                            getattr(request.app.state, "tunnel_registry", None),
+                            conversation_store,
+                            observation_body,
+                        )
+                        if recovered is None or recovered.status_code >= 400:
+                            _logger.warning(
+                                "subagent.status idle observation for %s could not be "
+                                "forwarded to the runner (best-effort; status=%s)",
+                                session_id,
+                                (
+                                    None
+                                    if observation_result is None
+                                    else observation_result.status_code
+                                ),
+                                extra={"session_id": session_id},
+                            )
                 return {"queued": False}
             assert isinstance(status, str)
             # A background-task ``waiting`` marks an ended turn, so deliver it

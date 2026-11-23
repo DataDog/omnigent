@@ -133,6 +133,13 @@ _MAX_SEEN_DELTA_KEYS = 5000
 # Seconds without transcript activity before reporting an idle observation.
 # This heuristic does not establish that the sub-agent has completed.
 _SUBAGENT_IDLE_THRESHOLD_S = 5.0
+# Minimum spacing between ERROR escalations for one permanently rejected
+# sub-agent status post. The watcher keeps retrying each poll, so an unthrottled
+# ERROR would spam every few seconds for the life of a credential outage.
+_PERMANENT_STATUS_ERROR_LOG_INTERVAL_S = 300.0
+# Monotonic timestamp of the last ERROR escalation per retry key; cleared when
+# the post finally lands.
+_PERMANENT_STATUS_ERROR_LOGGED_AT: dict[str, float] = {}
 
 # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
 # One per Claude Task-tool subagent; appears alongside the matching
@@ -2571,19 +2578,38 @@ async def _forward_one_subagent(
         decision = status_retry_tracker.record_failure(
             retry_key, exc, session_id=entry.child_conversation_id
         )
-        _logger.warning(
+        escalate = decision.exhausted and decision.permanent
+        if escalate:
+            now = time.monotonic()
+            last_logged = _PERMANENT_STATUS_ERROR_LOGGED_AT.get(retry_key)
+            if (
+                last_logged is not None
+                and now - last_logged < _PERMANENT_STATUS_ERROR_LOG_INTERVAL_S
+            ):
+                escalate = False
+            else:
+                _PERMANENT_STATUS_ERROR_LOGGED_AT[retry_key] = now
+        log = _logger.error if escalate else _logger.warning
+        log(
             "Failed to forward claude-native sub-agent status; child=%s status=%s "
-            "attempt=%s next_retry_s=%.3f http_status=%s",
+            "attempt=%s next_retry_s=%.3f http_status=%s%s",
             entry.child_conversation_id,
             desired_status,
             decision.attempts,
             decision.delay_s,
             _http_status_for_log(exc),
+            (
+                " — permanently rejected; the child stays busy and its result "
+                "undelivered until the credential/server issue is fixed"
+                if escalate
+                else ""
+            ),
             exc_info=True,
             extra={"session_id": parent_session_id},
         )
         return
     status_retry_tracker.clear(retry_key)
+    _PERMANENT_STATUS_ERROR_LOGGED_AT.pop(retry_key, None)
     await checkpoint.put(replace(new_entry, last_status=desired_status))
 
 
