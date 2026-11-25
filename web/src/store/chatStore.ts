@@ -109,7 +109,12 @@ import {
   type SseStreamResult,
 } from "@/lib/sse";
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
-import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import {
+  childSessionsQueryKey,
+  normalizeAcpSessionObservation,
+  refreshChildSessionRosters,
+  type ChildSessionInfo,
+} from "@/hooks/useChildSessions";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import {
@@ -9516,6 +9521,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         });
       }
       return;
+    case "session_child_sessions_invalidated":
+      if (queryClient) {
+        void refreshChildSessionRosters(queryClient).catch((error) => {
+          console.warn("Child-session roster refresh failed", error);
+        });
+      }
+      return;
     case "session_changed_files_invalidated":
       // Coarse "something changed" signal. Coalesce bursts into one
       // changed-files/root refresh, and mark expanded directory caches
@@ -9739,6 +9751,9 @@ function applyChildSessionUpdated(
   if (child.pending_elicitations_count !== undefined)
     patch.pending_elicitations_count =
       typeof child.pending_elicitations_count === "number" ? child.pending_elicitations_count : 0;
+  if (child.acp_session_observation !== undefined) {
+    patch.acp_session_observation = normalizeAcpSessionObservation(child.acp_session_observation);
+  }
 
   const idx = current.findIndex((c) => c.id === childId);
   if (idx === -1) {
@@ -9756,6 +9771,7 @@ function applyChildSessionUpdated(
       busy: patch.busy ?? false,
       last_message_preview: patch.last_message_preview ?? null,
       pending_elicitations_count: patch.pending_elicitations_count ?? 0,
+      acp_session_observation: patch.acp_session_observation ?? null,
     };
     queryClient.setQueryData<ChildSessionInfo[]>(key, [inserted, ...current]);
     return;

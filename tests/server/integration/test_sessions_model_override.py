@@ -520,7 +520,11 @@ async def test_bundled_child_runner_notify_seeds_the_requested_model(
 
     monkeypatch.setattr(helpers, "_get_runner_client", _stub)
     await helpers._notify_runner_of_bundled_child(
-        created["session_id"], created["agent_id"], None, conversation=conversation
+        created["session_id"],
+        created["agent_id"],
+        None,
+        conversation=conversation,
+        conversation_store=get_conversation_store(),
     )
 
     envelope = captured["body"][SESSION_INIT_PAYLOAD_KEY]
@@ -552,7 +556,11 @@ async def test_bundled_child_runner_notify_falls_back_to_the_id_only_body(
     monkeypatch.setattr(helpers, "_get_runner_client", _stub)
     monkeypatch.setattr(helpers, "build_runner_session_init_payload", _broken_envelope)
     await helpers._notify_runner_of_bundled_child(
-        created["session_id"], created["agent_id"], None, conversation=conversation
+        created["session_id"],
+        created["agent_id"],
+        None,
+        conversation=conversation,
+        conversation_store=get_conversation_store(),
     )
 
     assert captured["body"] == {
@@ -577,6 +585,13 @@ class _CaptureClient:
             status_code = 202
             headers: dict[str, str] = {}
             text = ""
+
+            def raise_for_status(self) -> None:
+                """A 202 acceptance never raises."""
+
+            def json(self) -> dict[str, Any]:
+                """A bodyless 202 acceptance."""
+                return {}
 
         return _Resp()
 

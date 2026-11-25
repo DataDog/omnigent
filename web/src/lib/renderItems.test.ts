@@ -11,6 +11,7 @@ import { BlockStream } from "./blockStream";
 import type { ConversationItem } from "./conversationItems";
 import type { StreamEvent } from "./events";
 import { itemsToBlocks } from "./itemsToBlocks";
+import { parseEvent } from "./sse";
 import {
   type RoutingDecisionWire,
   routingDecisionBlock,
@@ -1544,6 +1545,72 @@ describe("buildBubbles — text grouping", () => {
 });
 
 describe("buildBubbles — tool joining", () => {
+  it("renders parsed replacements and clears over a hydrated tool output", () => {
+    const callId = "call_replaced_output";
+    const responseId = "resp_replaced_output";
+    const renderedOutput = (blocks: AnyBlock[]): string | null => {
+      const assistant = buildBubbles(blocks, null).find(
+        (bubble): bubble is Extract<Bubble, { kind: "assistant" }> => bubble.kind === "assistant",
+      );
+      const tool = assistant?.items.find(
+        (item): item is Extract<RenderItem, { kind: "tool" }> => item.kind === "tool",
+      );
+      expect(tool).toBeDefined();
+      return tool?.output ?? null;
+    };
+    const parsedItem = (item: Record<string, unknown>): StreamEvent => {
+      const event = parseEvent("response.output_item.done", { item });
+      if (event === null) throw new Error("expected a parsed output item");
+      return event;
+    };
+    const hydrated = new BlockStream().reduceSync([
+      parsedItem({
+        id: "fc_replaced_output",
+        response_id: responseId,
+        type: "function_call",
+        status: "completed",
+        name: "inspect_child",
+        arguments: "{}",
+        call_id: callId,
+      }),
+      parsedItem({
+        id: "fco_replaced_output_a",
+        response_id: responseId,
+        type: "function_call_output",
+        call_id: callId,
+        output: "A",
+      }),
+    ]);
+    const hydratedGroup = hydrated.find(
+      (block): block is Extract<AnyBlock, { type: "tool_group" }> => {
+        return block.type === "tool_group";
+      },
+    );
+    expect(hydratedGroup?.executions[0]?.output).toBe("A");
+    const observed: (string | null)[] = [renderedOutput(hydrated)];
+
+    // A fresh pump represents a reloaded stream that only has the call card
+    // from history; each later result must supersede that hydrated execution.
+    const livePump = new BlockStream();
+    const liveResults: AnyBlock[] = [];
+    for (const [index, output] of (["B", null, "C"] as const).entries()) {
+      liveResults.push(
+        ...livePump.reduceSync([
+          parsedItem({
+            id: `fco_replaced_output_${index}`,
+            response_id: responseId,
+            type: "function_call_output",
+            call_id: callId,
+            output,
+          }),
+        ]),
+      );
+      observed.push(renderedOutput([...hydrated, ...liveResults]));
+    }
+
+    expect(observed).toEqual(["A", "B", null, "C"]);
+  });
+
   it("tool_group + matching tool_result by callId → tool item with output", () => {
     const blocks: AnyBlock[] = [
       {

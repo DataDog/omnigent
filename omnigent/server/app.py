@@ -119,6 +119,10 @@ from omnigent.server.performance_metrics import (
     set_request_user_agent_for_access_log,
 )
 from omnigent.server.preference_requests import DEFAULT_PREFERENCE_POLICY, PreferencePolicy
+from omnigent.server.routes._sessions.common import (
+    _EXTERNAL_BACKGROUND_WORK_TYPE,
+    _RUNNER_SESSION_EVENT_TYPES,
+)
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -344,6 +348,10 @@ class ServerInfoResponse(BaseModel):
     agent_config_edit: bool = False
     # Client event types POST /v1/sessions/{id}/events accepts; empty on older servers.
     session_event_types: list[str] = []
+    # Runner-side external_background_work events are accepted; absent/false on older servers.
+    background_work_reporting: bool = False
+    # Durable ACP sub-agent reports and source-admission controls supported by the runner.
+    acp_session_reporting_version: int = 0
     # A claude-sdk ``clear`` continues in a new session; older servers only clear native
     # sessions, so clients treat absent as unsupported.
     session_claude_sdk_clear: bool = False
@@ -1831,6 +1839,10 @@ def create_app(
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
     """
+    # The server owns the configured backend instance. Bind before creating
+    # initializers or exposing routes/capabilities that can consume ACP reports.
+    conversation_store.bind_artifact_store(artifact_store)
+
     if permission_store is not None and auth_provider is None:
         raise ValueError("auth_provider is required when permission_store is provided")
 
@@ -2065,6 +2077,7 @@ def create_app(
             conversation_store,
             runner_router,
             agent_store=agent_store,
+            agent_cache=agent_cache,
         )
 
         from omnigent.runner.resource_registry import (
@@ -3780,6 +3793,12 @@ def create_app(
                 "agent_config_edit": agent_store.supports_config_edit
                 and artifact_store is not None,
                 "session_event_types": sorted(CLIENT_SESSION_EVENT_TYPES),
+                "background_work_reporting": (
+                    _EXTERNAL_BACKGROUND_WORK_TYPE in _RUNNER_SESSION_EVENT_TYPES
+                ),
+                "acp_session_reporting_version": (
+                    3 if conversation_store.acp_session_reporting_ready else 0
+                ),
                 "session_claude_sdk_clear": True,
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,

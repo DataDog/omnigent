@@ -421,7 +421,11 @@ def history_to_input_items(
                     # Strip inline base64 image data on the way into the
                     # prompt so already-stored large-image sessions resume
                     # without overflowing the context window.
-                    "output": dedupe_tool_output_images(item.data.output),
+                    "output": (
+                        dedupe_tool_output_images(item.data.output)
+                        if item.data.output is not None
+                        else None
+                    ),
                 }
             )
 

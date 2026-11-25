@@ -114,6 +114,8 @@ class HarnessCapabilities:
     :param model_family: Which model vendors the harness accepts.
     :param auth: Where the harness's credentials come from.
     :param subagents: Whether the harness can spawn Omnigent sub-agents.
+    :param session_reports: Whether the harness can persist and expose session-owned
+        activity outside the active turn.
     :param interrupt: Whether a running turn can be cancelled mid-stream. This
         is a *declared* claim; the harness bench's interrupt probe verifies it
         live and flags drift when a harness does not honor it.
@@ -152,6 +154,7 @@ class HarnessCapabilities:
     subagents: bool
     interrupt: bool
     streaming: bool
+    session_reports: bool = False
     steering: bool | None = None
     live_queue: bool | None = None
     images: bool | None = None
@@ -173,6 +176,7 @@ class HarnessCapabilities:
             "subagents": self.subagents,
             "interrupt": self.interrupt,
             "streaming": self.streaming,
+            "session_reports": self.session_reports,
             "steering": self.steering,
             "live_queue": self.live_queue,
             "images": self.images,

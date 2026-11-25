@@ -12,7 +12,15 @@ import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 // runner dropped its tunnel or exited; the task did NOT genuinely fail, so
 // it renders a quiet, non-destructive grey dot rather than the red "Failed".
 export type AgentActivity =
-  "launching" | "working" | "awaiting" | "done" | "failed" | "disconnected" | "idle" | "other";
+  | "launching"
+  | "working"
+  | "awaiting"
+  | "done"
+  | "failed"
+  | "disconnected"
+  | "unconfirmed"
+  | "idle"
+  | "other";
 
 export interface AgentStatus {
   activity: AgentActivity;
@@ -64,6 +72,7 @@ const DOT_TONE: Record<Exclude<AgentActivity, "working" | "awaiting">, string> =
   // neutral --muted-foreground (not the shared amber --warning) so the "Needs
   // response" badge keeps its amber and the dot stays notable.
   disconnected: "bg-muted-foreground",
+  unconfirmed: "bg-muted-foreground/55",
   idle: "bg-session-active/55",
   launching: "bg-session-active/70",
   // Exception: the verbatim "other status" fallthrough stays neutral grey.
@@ -90,6 +99,81 @@ export function activityDotClassName(
  *   ``{ activity: "working", label: "Working" }``.
  */
 export function childStatus(child: ChildSessionInfo): AgentStatus {
+  const acpObservation = child.acp_session_observation;
+  const isAcpChild =
+    acpObservation != null || typeof child.labels?.["omnigent.acp.subagent_id"] === "string";
+  if (isAcpChild) {
+    const transport = acpObservation?.transport;
+    const transportRecord =
+      transport && typeof transport === "object" && !Array.isArray(transport)
+        ? (transport as Record<string, unknown>)
+        : null;
+    const transportState = transportRecord?.state;
+    const transportReason = transportRecord?.reason;
+    if (!acpObservation || acpObservation.source_current !== true) {
+      return { activity: "unconfirmed", label: "Unconfirmed" };
+    }
+    if (transportState === "disconnected") {
+      return {
+        activity: "disconnected",
+        label: "Disconnected",
+        details: typeof transportReason === "string" ? transportReason : undefined,
+      };
+    }
+    if (
+      transportRecord &&
+      Object.hasOwn(transportRecord, "state") &&
+      transportState !== "connected"
+    ) {
+      return {
+        activity: "unconfirmed",
+        label: "Unconfirmed",
+        details: typeof transportReason === "string" ? transportReason : undefined,
+      };
+    }
+    const state = acpObservation.state;
+    if (!state || typeof state !== "object" || Array.isArray(state)) {
+      return { activity: "unconfirmed", label: "Unconfirmed" };
+    }
+    const stateRecord = state as Record<string, unknown>;
+    if (stateRecord.present !== true) {
+      return { activity: "unconfirmed", label: "Unconfirmed" };
+    }
+    const value = stateRecord.value;
+    const valueRecord =
+      value && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : null;
+    const observedState = valueRecord
+      ? Object.hasOwn(valueRecord, "state")
+        ? valueRecord.state
+        : Object.hasOwn(valueRecord, "kind")
+          ? valueRecord.kind
+          : value
+      : value;
+    if (observedState === "running") return { activity: "working", label: "Working" };
+    if (observedState === "requires_action") {
+      return { activity: "awaiting", label: "Needs response" };
+    }
+    if (observedState === "idle") {
+      const stopReason = valueRecord
+        ? Object.hasOwn(valueRecord, "stopReason")
+          ? valueRecord.stopReason
+          : valueRecord.stop_reason
+        : undefined;
+      return {
+        activity: "idle",
+        label: "Idle",
+        details: typeof stopReason === "string" ? `Stop reason: ${stopReason}` : undefined,
+      };
+    }
+    return {
+      activity: "unconfirmed",
+      label: "Unconfirmed",
+      details:
+        typeof observedState === "string" ? `Observed ACP state: ${observedState}` : undefined,
+    };
+  }
   // Awaiting input outranks ``busy``: a sub-agent parked on an
   // elicitation is still "running" its turn (the future is pending),
   // so checking ``busy`` first would hide the prompt behind a generic

@@ -14,17 +14,26 @@ include ``X-Forwarded-Email`` headers to impersonate different users.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.db.db_models import SqlAcpSessionAssociation, current_workspace_id
 from omnigent.host.frames import HostHelloFrame
+from omnigent.inner.acp_standard_subagents import (
+    acp_standard_child_key,
+    acp_standard_report_source_id,
+)
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime import inflight_text, session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import presence
@@ -54,6 +63,41 @@ from tests.server.helpers import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+_PRIVATE_RUNNER_TOKEN = "private-association-inventory-runner-token"
+_PRIVATE_RUNNER_ID = token_bound_runner_id(_PRIVATE_RUNNER_TOKEN)
+
+
+def _admit_private_report_source(
+    store: SqlAlchemyConversationStore,
+    root_id: str,
+    *,
+    runner_id: str,
+    principal: str,
+    native_epoch: str,
+) -> dict[str, Any]:
+    server_connection_id = hashlib.sha256(
+        f"permission-test-connection:{root_id}".encode()
+    ).hexdigest()[:32]
+    attempt_id = store.prepare_acp_report_connection_attempt(
+        root_id, runner_id, principal, server_connection_id
+    )
+    context = SimpleNamespace(
+        runner_id=runner_id,
+        owner=principal,
+        server_connection_id=server_connection_id,
+        superseded=False,
+    )
+    store.admit_acp_report_connection(attempt_id, context)
+    journal_id = hashlib.sha256(root_id.encode()).hexdigest()[:32]
+    store.admit_acp_report_owner(root_id, attempt_id, 1, journal_id)
+    store.activate_acp_report_epoch(root_id, attempt_id, 1, journal_id, native_epoch, 1)
+    return {
+        "connection_admission_id": attempt_id,
+        "runtime_incarnation": 1,
+        "journal_id": journal_id,
+        "epoch_ordinal": 1,
+    }
 
 
 @pytest.mark.parametrize("suffix", ["", "/resources/environments/default/filesystem/README.md"])
@@ -599,6 +643,235 @@ async def test_user_without_grants_sees_no_sessions(
     )
 
 
+async def test_private_acp_association_inventory_is_runner_only_and_public_views_hide_origins(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """Private origin tokens require session access and the exact bound runner."""
+    agent = await create_test_agent(auth_client, user="bryan")
+    created = await _create_session_as(auth_client, agent["id"], "bryan", title="private-origin")
+    root_id = created["id"]
+    conversation_store = SqlAlchemyConversationStore(
+        db_uri,
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+    )
+    conversation_store.replace_runner_id(root_id, _PRIVATE_RUNNER_ID)
+    native_epoch = "native-epoch-private-permission-test"
+    root_native_session_id = "native-root-private-permission-test"
+    target_session_id = "native-child-private-permission-test"
+    context_generation = "private-permission-context"
+    action_origin_token = "a" * 32
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=root_id,
+        agent_id=agent["id"],
+        runner_id=_PRIVATE_RUNNER_ID,
+        title="worker:private-origin",
+    )
+    child_key = acp_standard_child_key(root_id, native_epoch, target_session_id)
+    conversation_store.set_labels(child.id, {"omnigent.acp.subagent_id": child_key})
+    source_id = acp_standard_report_source_id(
+        "private-permission-server", root_id, native_epoch, 1
+    )
+    operation = {
+        "session_id": target_session_id,
+        "parent_session_id": root_native_session_id,
+        "patch": {
+            "title": "worker",
+            "metadata": {"opaque": "private-association-" * 500},
+        },
+    }
+    payload_hash = hashlib.sha256(
+        json.dumps(operation, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    delivery = _admit_private_report_source(
+        conversation_store,
+        root_id,
+        runner_id=_PRIVATE_RUNNER_ID,
+        principal="bryan",
+        native_epoch=native_epoch,
+    )
+    conversation_store.apply_acp_session_report(
+        root_conversation_id=root_id,
+        **delivery,
+        journal_sequence=1,
+        native_epoch=native_epoch,
+        ingress_sequence=1,
+        source_id=source_id,
+        payload_hash=payload_hash,
+        context_generation=context_generation,
+        root_native_session_id=root_native_session_id,
+        target_session_id=target_session_id,
+        parent_session_id=root_native_session_id,
+        conversation_id=child.id,
+        kind="association.patch",
+        operation=operation,
+        action_origin={
+            "token": action_origin_token,
+            "agent": "test-agent",
+            "generation": "private-permission-generation",
+        },
+    )
+    with conversation_store._conv_session("test_private_acp_action_origin_reference") as session:
+        association = session.get(
+            SqlAcpSessionAssociation,
+            (current_workspace_id(), root_id, native_epoch, target_session_id),
+        )
+        assert association is not None
+        private_reference = json.loads(association.association_json)
+        assert set(private_reference) == {"v", "key", "length", "sha256"}
+        private_blob_key = private_reference["key"]
+
+    owner_headers = {"X-Forwarded-Email": "bryan"}
+    bound_runner_headers = {
+        **owner_headers,
+        RUNNER_TUNNEL_TOKEN_HEADER: _PRIVATE_RUNNER_TOKEN,
+    }
+    association_path = f"/v1/sessions/{root_id}/acp_session_associations"
+    first_inventory_page = await auth_client.get(
+        association_path,
+        params={"limit": 1},
+        headers=bound_runner_headers,
+    )
+    assert first_inventory_page.status_code == 200, first_inventory_page.text
+    first_page = first_inventory_page.json()
+    assert len(first_page["data"]) == 1
+    assert first_page["first_id"] == first_page["last_id"]
+    assert first_page["has_more"] is True
+    assert private_blob_key not in first_inventory_page.text
+
+    second_inventory_page = await auth_client.get(
+        association_path,
+        params={"limit": 1, "after": first_page["last_id"]},
+        headers=bound_runner_headers,
+    )
+    assert second_inventory_page.status_code == 200, second_inventory_page.text
+    second_page = second_inventory_page.json()
+    assert len(second_page["data"]) == 1
+    assert second_page["has_more"] is False
+    assert second_page["first_id"] == second_page["last_id"]
+    assert private_blob_key not in second_inventory_page.text
+    inventory_rows = first_page["data"] + second_page["data"]
+    assert any(
+        row["native_session_id"] == target_session_id
+        and row["action_origin"]["token"] == action_origin_token
+        for row in inventory_rows
+    )
+
+    child_item = {
+        "type": "external_conversation_item",
+        "data": {
+            "source_id": "owner-child:assistant-message",
+            "item_type": "message",
+            "response_id": "owner-child-response",
+            "item_data": {
+                "role": "assistant",
+                "agent": "test-agent",
+                "content": [{"type": "output_text", "text": "private child result"}],
+            },
+        },
+    }
+    owner_write = await auth_client.post(
+        f"/v1/sessions/{child.id}/events", json=child_item, headers=owner_headers
+    )
+    assert owner_write.status_code == 202, owner_write.text
+
+    owner_child = await auth_client.get(f"/v1/sessions/{child.id}", headers=owner_headers)
+    owner_child_items = await auth_client.get(
+        f"/v1/sessions/{child.id}/items", headers=owner_headers
+    )
+    owner_children = await auth_client.get(
+        f"/v1/sessions/{root_id}/child_sessions", headers=owner_headers
+    )
+    assert owner_child.status_code == 200, owner_child.text
+    assert owner_child.json()["id"] == child.id
+    assert owner_child_items.status_code == 200, owner_child_items.text
+    assert "private child result" in owner_child_items.text
+    assert owner_children.status_code == 200, owner_children.text
+    assert child.id in {row["id"] for row in owner_children.json()["data"]}
+
+    other_headers = {"X-Forwarded-Email": "user-b"}
+    other_child = await auth_client.get(f"/v1/sessions/{child.id}", headers=other_headers)
+    other_items = await auth_client.get(f"/v1/sessions/{child.id}/items", headers=other_headers)
+    other_children = await auth_client.get(
+        f"/v1/sessions/{root_id}/child_sessions", headers=other_headers
+    )
+    assert other_child.status_code == 404, other_child.text
+    assert other_items.status_code == 404, other_items.text
+    assert other_children.status_code == 404, other_children.text
+    assert all(
+        value not in response.text
+        for response in (other_child, other_items, other_children)
+        for value in (child.id, "private child result", action_origin_token, private_blob_key)
+    )
+    denied_write = await auth_client.post(
+        f"/v1/sessions/{child.id}/events",
+        json={
+            **child_item,
+            "data": {
+                **child_item["data"],
+                "source_id": "other-user:forbidden-message",
+                "response_id": "other-user-response",
+                "item_data": {
+                    **child_item["data"]["item_data"],
+                    "content": [{"type": "output_text", "text": "must not persist"}],
+                },
+            },
+        },
+        headers=other_headers,
+    )
+    assert denied_write.status_code == 404, denied_write.text
+
+    reloaded_child_items = await auth_client.get(
+        f"/v1/sessions/{child.id}/items", headers=owner_headers
+    )
+    assert reloaded_child_items.status_code == 200, reloaded_child_items.text
+    assert "private child result" in reloaded_child_items.text
+    assert "must not persist" not in reloaded_child_items.text
+
+    denied_headers = [
+        owner_headers,
+        {
+            **owner_headers,
+            RUNNER_TUNNEL_TOKEN_HEADER: "different-private-runner-token",
+        },
+        {"X-Forwarded-Email": "ungranted-user"},
+        {
+            "X-Forwarded-Email": "ungranted-user",
+            RUNNER_TUNNEL_TOKEN_HEADER: _PRIVATE_RUNNER_TOKEN,
+        },
+    ]
+    expected_denial_statuses = [403, 403, 404, 404]
+    for headers, expected_status in zip(denied_headers, expected_denial_statuses, strict=True):
+        denied = await auth_client.get(
+            association_path,
+            params={"limit": 1, "after": first_page["last_id"]},
+            headers=headers,
+        )
+        assert denied.status_code == expected_status, denied.text
+        assert action_origin_token not in denied.text
+
+    public_responses = [
+        await auth_client.get(f"/v1/sessions/{root_id}", headers=owner_headers),
+        await auth_client.get("/v1/sessions?limit=100", headers=owner_headers),
+        await auth_client.get(f"/v1/sessions/{root_id}/items", headers=owner_headers),
+        await auth_client.get(f"/v1/sessions/{root_id}/child_sessions", headers=owner_headers),
+    ]
+    assert all(response.status_code == 200 for response in public_responses), [
+        response.text for response in public_responses
+    ]
+    assert all(action_origin_token not in response.text for response in public_responses)
+    assert all(private_blob_key not in response.text for response in public_responses)
+
+    private_blob_download = await auth_client.get(
+        f"/v1/sessions/{root_id}/resources/files/{quote(private_blob_key, safe='')}/content",
+        headers=owner_headers,
+    )
+    assert private_blob_download.status_code == 404, private_blob_download.text
+    assert private_blob_key not in private_blob_download.text
+
+
 # ── Grant read: can GET but not POST events ──────────────────
 
 
@@ -909,6 +1182,126 @@ async def test_archive_requires_owner_access(
         f"If 403, the gate is wrongly raised above owner."
     )
     assert resp.json()["archived"] is True
+
+
+async def test_non_owner_cannot_interrupt_cancel_capable_acp_mirror(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native cancel capability is observational and grants no user control."""
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(auth_client, user="user-a")
+    parent = await _create_session_as(auth_client, agent["id"], "user-a")
+    runner_token = "cancel-capability-runner-token"
+    runner_id = token_bound_runner_id(runner_token)
+    store = SqlAlchemyConversationStore(
+        db_uri,
+        artifact_store=LocalArtifactStore(str(tmp_path / "artifacts")),
+    )
+    assert store.set_runner_id(parent["id"], runner_id)
+    native_epoch = "cancel-capability-native-epoch"
+    root_native_id = "cancel-capability-native-root"
+    child_native_id = "cancel-capability-native-child"
+    server_identity = "cancel-capability-server"
+    delivery = _admit_private_report_source(
+        store,
+        parent["id"],
+        runner_id=runner_id,
+        principal="user-a",
+        native_epoch=native_epoch,
+    )
+    report = {
+        "type": "external_acp_session_report",
+        "data": {
+            "sequence": 1,
+            **delivery,
+            "native_epoch": native_epoch,
+            "ingress_sequence": 1,
+            "source_id": acp_standard_report_source_id(
+                server_identity, parent["id"], native_epoch, 1
+            ),
+            "kind": "association.patch",
+            "server_identity": server_identity,
+            "root_conversation_id": parent["id"],
+            "context_generation": "cancel-capability-context",
+            "root_native_session_id": root_native_id,
+            "target_session_id": child_native_id,
+            "parent_session_id": root_native_id,
+            "operation": {
+                "session_id": child_native_id,
+                "parent_session_id": root_native_id,
+                "patch": {"title": "worker", "capabilities": {"cancel": {}}},
+            },
+        },
+    }
+    report_response = await auth_client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        headers={
+            "X-Forwarded-Email": "user-a",
+            RUNNER_TUNNEL_TOKEN_HEADER: runner_token,
+        },
+        json=report,
+    )
+    assert report_response.status_code == 202, report_response.text
+    association = store.get_acp_session_association(parent["id"], native_epoch, child_native_id)
+    assert association is not None
+    child_id = association["conversation_id"]
+    assert association["association"]["capabilities"] == {"cancel": {}}
+
+    async def unexpected_effect(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("a refused ACP mirror action reached runner work")
+
+    with monkeypatch.context() as effects:
+        for function_name in (
+            "_get_runner_client",
+            "_dispatch_session_event_to_runner",
+            "_launch_runner_on_host",
+            "ensure_runner_connected",
+            "_retry_session_single_flight",
+            "_stop_session_via_runner",
+        ):
+            effects.setattr(routes_events, function_name, unexpected_effect)
+
+        before_session = await auth_client.get(
+            f"/v1/sessions/{child_id}", headers={"X-Forwarded-Email": "user-a"}
+        )
+        before_items = await auth_client.get(
+            f"/v1/sessions/{child_id}/items", headers={"X-Forwarded-Email": "user-a"}
+        )
+        assert before_session.status_code == 200, before_session.text
+        assert before_items.status_code == 200, before_items.text
+
+        non_owner = await auth_client.post(
+            f"/v1/sessions/{child_id}/events",
+            headers={"X-Forwarded-Email": "user-b"},
+            json={"type": "interrupt"},
+        )
+        assert non_owner.status_code in {403, 404}, non_owner.text
+
+        for payload in ({"type": "interrupt"}, {"type": "stop_session"}):
+            owner = await auth_client.post(
+                f"/v1/sessions/{child_id}/events",
+                headers={"X-Forwarded-Email": "user-a"},
+                json=payload,
+            )
+            assert owner.status_code == 409, owner.text
+            assert "ACP sub-agent sessions mirror work" in owner.text
+
+        after_session = await auth_client.get(
+            f"/v1/sessions/{child_id}", headers={"X-Forwarded-Email": "user-a"}
+        )
+        after_items = await auth_client.get(
+            f"/v1/sessions/{child_id}/items", headers={"X-Forwarded-Email": "user-a"}
+        )
+
+    assert after_session.status_code == 200, after_session.text
+    assert after_items.status_code == 200, after_items.text
+    assert after_session.json()["status"] == before_session.json()["status"]
+    assert after_items.json()["data"] == before_items.json()["data"]
 
 
 async def test_cost_control_override_patch_requires_edit_access(
@@ -3170,6 +3563,86 @@ async def test_list_child_sessions_blocks_cross_user(
     assert child.id in child_ids, (
         f"owner should see the seeded child {child.id!r}, got {child_ids}"
     )
+
+
+async def test_acp_child_inherits_private_parent_access_for_reads_and_event_injection(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """An ACP child inherits its private parent's access for reads and writes."""
+    agent = await create_test_agent(auth_client, user="user-a")
+    parent = await _create_session_as(auth_client, agent["id"], "user-a")
+    owner_headers = {"X-Forwarded-Email": "user-a"}
+    other_headers = {"X-Forwarded-Email": "user-b"}
+
+    start = await auth_client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_acp_subagent_start",
+            "data": {
+                "subagent_id": "private-acp-child",
+                "title": "worker",
+                "description": "private delegated work",
+                "require_durable": True,
+            },
+        },
+        headers=owner_headers,
+    )
+    assert start.status_code == 202, start.text
+    assert start.json().get("durable") is True
+    child_id = start.json()["child_session_id"]
+
+    owner_snapshot = await auth_client.get(f"/v1/sessions/{child_id}", headers=owner_headers)
+    owner_items = await auth_client.get(f"/v1/sessions/{child_id}/items", headers=owner_headers)
+    assert owner_snapshot.status_code == 200, owner_snapshot.text
+    assert owner_items.status_code == 200, owner_items.text
+
+    hidden_snapshot = await auth_client.get(f"/v1/sessions/{child_id}", headers=other_headers)
+    hidden_items = await auth_client.get(f"/v1/sessions/{child_id}/items", headers=other_headers)
+    assert hidden_snapshot.status_code == 404, hidden_snapshot.text
+    assert hidden_items.status_code == 404, hidden_items.text
+
+    transcript = {
+        "type": "external_conversation_item",
+        "data": {
+            "source_id": "owner-acp:assistant-message",
+            "item_type": "message",
+            "response_id": "owner-acp-response",
+            "item_data": {
+                "role": "assistant",
+                "agent": "acp-test",
+                "content": [{"type": "output_text", "text": "owner-only result"}],
+            },
+        },
+    }
+    owner_write = await auth_client.post(
+        f"/v1/sessions/{child_id}/events", json=transcript, headers=owner_headers
+    )
+    assert owner_write.status_code == 202, owner_write.text
+
+    forbidden_write = await auth_client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                **transcript["data"],
+                "source_id": "other-user:forbidden-message",
+                "response_id": "other-user-response",
+                "item_data": {
+                    **transcript["data"]["item_data"],
+                    "content": [{"type": "output_text", "text": "must not persist"}],
+                },
+            },
+        },
+        headers=other_headers,
+    )
+    assert forbidden_write.status_code == 404, forbidden_write.text
+
+    reloaded = await auth_client.get(f"/v1/sessions/{child_id}/items", headers=owner_headers)
+    assert reloaded.status_code == 200, reloaded.text
+    texts = [
+        part.get("text") for item in reloaded.json()["data"] for part in item.get("content", [])
+    ]
+    assert texts == ["owner-only result"]
 
 
 @pytest.mark.parametrize("descendants", [False, True], ids=["one-level", "descendants"])

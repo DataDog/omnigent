@@ -23,6 +23,7 @@ import time
 
 import pytest
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.routes import sessions as S
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
@@ -209,7 +210,7 @@ async def test_terminal_tombstone_without_a_fingerprint_still_adopts():
 @pytest.mark.asyncio
 async def test_resolve_from_wrong_session_tombstones_nothing():
     # The ownership guard must cover the tombstone too: a foreign session's
-    # resolve may neither settle the Future nor plant a verdict for the id.
+    # resolve is refused and may neither settle the Future nor plant a verdict.
     sid = "conv_owner_session"
     eid = "elicit_codex_44444444444444444444444444444444"
     future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
@@ -217,9 +218,11 @@ async def test_resolve_from_wrong_session_tombstones_nothing():
     S._harness_elicitation_owners[eid] = sid
     S._harness_pre_resolved_elicitations.pop(eid, None)
     try:
-        await S._resolve_elicitation(
-            "conv_intruder", {"elicitation_id": eid, "action": "accept"}, None
-        )
+        with pytest.raises(OmnigentError) as refused:
+            await S._resolve_elicitation(
+                "conv_intruder", {"elicitation_id": eid, "action": "accept"}, None
+            )
+        assert refused.value.code == ErrorCode.FORBIDDEN
         assert not future.done()
         assert S._harness_pre_resolved_elicitations.get(eid) is None
     finally:

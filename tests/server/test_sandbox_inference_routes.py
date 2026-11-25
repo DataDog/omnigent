@@ -941,6 +941,12 @@ async def test_configured_rebind_rejection_restores_previous_runner(
     )
     relay = AsyncMock()
     monkeypatch.setattr(routes_core, "_ensure_runner_relay_ready", relay)
+    # The replacement runner is faked without a tunnel, so admit no report source.
+    monkeypatch.setattr(
+        env.app.state.runner_session_initializer,
+        "prepare_report_connection_attempt",
+        AsyncMock(return_value=None),
+    )
     response = await env.client.patch(
         f"/v1/sessions/{session_id}",
         json={"runner_id": "runner_replacement", "title": "Must not apply"},

@@ -30,6 +30,12 @@ export interface MessageItem extends BaseItem {
   content: MessageContentBlock[];
   /** Agent name; assistant-only. Server alias for `agent`. */
   model?: string;
+  /** Explicit marker for ACP child output whose model identity was not reported. */
+  acp_agent_identity?: "unknown";
+  /** ACP directed-message participants and server-resolved conversation links. */
+  acp_session_message?: AcpSessionMessage | null;
+  /** Opaque ACP whole-message metadata, when present. */
+  metadata?: Record<string, unknown> | null;
   /** Human author email; omitted for agent/tool/system items. */
   created_by?: string;
   /** Explicit user action, possibly server-expanded skill instructions.
@@ -43,6 +49,24 @@ export interface MessageItem extends BaseItem {
   stream_message_id?: string;
   /** Assistant-only harness label as stored, e.g. Codex `commentary`; may be newer than this client. */
   phase?: string;
+}
+
+export interface AcpSessionMessage {
+  kind: "directed";
+  /** Native ACP identities; never use these as Omnigent conversation links. */
+  sender_session_id?: string | null;
+  recipient_session_id?: string | null;
+  sender_message_id?: string | null;
+  recipient_message_id?: string | null;
+  /** Server-resolved conversation ids from validated ACP associations. */
+  sender_conversation_id?: string | null;
+  recipient_conversation_id?: string | null;
+}
+
+/** Native ACP session content reference with an optional validated UI target. */
+export interface AcpToolSessionReference {
+  native_session_id: string;
+  conversation_id?: string | null;
 }
 
 /** Codex `MessagePhase`: progress narration vs. (partial or final) answer text. */
@@ -62,12 +86,21 @@ export interface FunctionCallItem extends BaseItem {
   arguments: string;
   call_id: string;
   model?: string;
+  /** Explicit marker for an ACP child call whose model identity was not reported. */
+  acp_agent_identity?: "unknown";
+  /** Native ACP lifecycle status when available. */
+  tool_status?: string;
+  /** ACP session references and their separately resolved conversation links. */
+  acp_session_references?: AcpToolSessionReference[] | null;
 }
 
 export interface FunctionCallOutputItem extends BaseItem {
   type: "function_call_output";
   call_id: string;
-  output: string;
+  output?: string | null;
+  content?: Record<string, unknown>[] | null;
+  raw_output?: unknown;
+  acp_agent_identity?: "unknown";
 }
 
 /**
@@ -91,7 +124,9 @@ export interface ErrorItem extends BaseItem {
 
 export interface ReasoningItem extends BaseItem {
   type: "reasoning";
-  model: string;
+  model?: string;
+  /** Explicit marker for ACP child reasoning whose model identity was not reported. */
+  acp_agent_identity?: "unknown";
   summary: { type: string; text: string }[];
   content?: { type: string; text: string }[];
 }

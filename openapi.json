@@ -1,6 +1,125 @@
 {
   "components": {
     "schemas": {
+      "AcpSessionMessage": {
+        "description": "Structured ACP session-message direction and validated conversation links.\n\nACP session ids and message ids are native protocol identifiers. The\nconversation ids are added only after the server resolves a participant\nthrough its validated association registry.",
+        "properties": {
+          "kind": {
+            "const": "directed",
+            "description": "Directed ACP session-message discriminator.",
+            "title": "Kind",
+            "type": "string"
+          },
+          "recipient_conversation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Validated Omnigent conversation for the recipient.",
+            "title": "Recipient Conversation Id"
+          },
+          "recipient_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native message id of the recipient, if reported.",
+            "title": "Recipient Message Id"
+          },
+          "recipient_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native ACP session id of the recipient, if reported.",
+            "title": "Recipient Session Id"
+          },
+          "sender_conversation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Validated Omnigent conversation for the sender.",
+            "title": "Sender Conversation Id"
+          },
+          "sender_message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native message id of the sender, if reported.",
+            "title": "Sender Message Id"
+          },
+          "sender_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native ACP session id of the sender, if reported.",
+            "title": "Sender Session Id"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "AcpSessionMessage",
+        "type": "object"
+      },
+      "AcpSessionObservation": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "AcpToolSessionReference": {
+        "description": "A native ACP tool reference with an optional validated UI target.",
+        "properties": {
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Omnigent conversation id resolved by the server's immutable association mapping; absent when no safe target is available.",
+            "title": "Conversation Id"
+          },
+          "native_session_id": {
+            "description": "Opaque ACP session id carried by tool content.",
+            "title": "Native Session Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "native_session_id"
+        ],
+        "title": "AcpToolSessionReference",
+        "type": "object"
+      },
       "AddCommentRequest": {
         "description": "Request body for `POST /sessions/{id}/comments`.",
         "properties": {
@@ -1065,6 +1184,17 @@
       "ChildSessionSummary": {
         "description": "Summary of a sub-agent (child) session under a parent session.\n\nPowers `GET /v1/sessions/{id}/child_sessions`. Lets the web /\nREPL debug surface enumerate sub-agent calls spawned from a\nparent session without parsing parent `function_call_output`\nJSON handles (the legacy TUI Ctrl+O path). The endpoint is the\ncanonical \"historical truth\" source; the existing transient\n`session.created` SSE event handles live incremental updates.\n\nFields are derived from the child `Conversation` plus its\nlatest `Task` (newest by `created_at`).",
         "properties": {
+          "acp_session_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AcpSessionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Exact latest standard ACP observation for a mirrored child, including whether its source is still selected."
+          },
           "agent_id": {
             "anyOf": [
               {
@@ -1091,7 +1221,7 @@
           },
           "busy": {
             "default": false,
-            "description": "`True` when the child's session loop is live. Mirrors the algorithm used by `GET /v1/sessions/{id}` to compute `status`: read the live in-memory cache first (`\"running\"`/`\"waiting\"` \u2192 busy), and fall back to the latest task's status on cache miss (`\"queued\"` / `\"in_progress\"` \u2192 busy). For NO_DBOS sessions the tasks table is not populated during active runs, so the cache consult is what keeps the rail's \"Working\" badge correct.",
+            "description": "`True` when the child's session loop is live. Mirrors the algorithm used by `GET /v1/sessions/{id}` to compute `status`: read the live in-memory cache first (`\"running\"`/`\"waiting\"` \u2192 busy), and fall back to the latest task's status on cache miss (`\"queued\"` / `\"in_progress\"` \u2192 busy). For NO_DBOS sessions the tasks table is not populated during active runs, so the cache consult is what keeps the rail's \"Working\" badge correct. Standard ACP children use only their selected structured observation for this projection.",
             "title": "Busy",
             "type": "boolean"
           },
@@ -1122,7 +1252,7 @@
                 "type": "null"
               }
             ],
-            "description": "Status of the latest task, e.g. `\"completed\"`, `\"in_progress\"`, `\"failed\"`. `None` if no tasks exist.",
+            "description": "Status of the latest task, e.g. `\"completed\"`, `\"in_progress\"`, `\"failed\"`. `None` if no tasks exist. Standard ACP children keep exact reusable work state in `acp_session_observation` and do not map idle to completed.",
             "title": "Current Task Status"
           },
           "depth": {
@@ -3253,6 +3383,34 @@
       "FunctionCallData": {
         "description": "Data for a function_call item.\n\n**Parameters**\n\n- `agent` \u2014 Agent name. Serialized as `\"model\"` in JSON.",
         "properties": {
+          "acp_agent_identity": {
+            "anyOf": [
+              {
+                "const": "unknown",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`\"unknown\"` when ACP did not identify the child model.",
+            "title": "Acp Agent Identity"
+          },
+          "acp_session_references": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/AcpToolSessionReference"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "ACP session content references with separately resolved Omnigent conversation links.",
+            "title": "Acp Session References"
+          },
           "arguments": {
             "description": "JSON-encoded arguments string.",
             "title": "Arguments",
@@ -3264,8 +3422,15 @@
             "type": "string"
           },
           "model": {
-            "title": "Model",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "name": {
             "description": "Tool function name, e.g. `\"search.web\"`.",
@@ -3283,10 +3448,59 @@
             ],
             "description": "Tool namespace the model emitted the call under, e.g. `\"container\"`. `None` for the default namespace. Harnesses that replay history must round-trip it with the call.",
             "title": "Namespace"
+          },
+          "output": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Readable output text from an ACP tool update, when present.",
+            "title": "Output"
+          },
+          "output_content": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Original ACP output content blocks, when present.",
+            "title": "Output Content"
+          },
+          "raw_output": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque native ACP `rawOutput` value, when present.",
+            "title": "Raw Output"
+          },
+          "tool_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native tool lifecycle status when reported.",
+            "title": "Tool Status"
           }
         },
         "required": [
-          "model",
           "name",
           "arguments",
           "call_id"
@@ -3297,15 +3511,61 @@
       "FunctionCallOutputData": {
         "description": "Data for a function_call_output item.",
         "properties": {
+          "acp_agent_identity": {
+            "anyOf": [
+              {
+                "const": "unknown",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Explicit unknown child identity for ACP output.",
+            "title": "Acp Agent Identity"
+          },
           "call_id": {
             "description": "The call_id this output corresponds to, e.g. `\"call_abc123\"`.",
             "title": "Call Id",
             "type": "string"
           },
+          "content": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Original ACP content blocks when the output came from a `tool_call_update` content array.",
+            "title": "Content"
+          },
           "output": {
-            "description": "The tool's string result.",
-            "title": "Output",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The tool's string result, or `None` only for an explicitly cleared ACP output with `acp_agent_identity=\"unknown\"`.",
+            "title": "Output"
+          },
+          "raw_output": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque ACP `rawOutput` data when present.",
+            "title": "Raw Output"
           },
           "subagent_return_id": {
             "anyOf": [
@@ -3321,8 +3581,7 @@
           }
         },
         "required": [
-          "call_id",
-          "output"
+          "call_id"
         ],
         "title": "FunctionCallOutputData",
         "type": "object"
@@ -4598,6 +4857,31 @@
       "MessageData": {
         "description": "Data for a message item (user or assistant).\n\n**Parameters**\n\n- `agent` \u2014 Agent name (required for assistant messages, absent for user). Serialized as `\"model\"` in JSON.",
         "properties": {
+          "acp_agent_identity": {
+            "anyOf": [
+              {
+                "const": "unknown",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`\"unknown\"` when ACP supplies no child model identity. This is explicit provenance, not an inferred parent model.",
+            "title": "Acp Agent Identity"
+          },
+          "acp_session_message": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Structured ACP directed-message participants. Native ids remain separate from server-resolved Omnigent conversation ids."
+          },
           "content": {
             "description": "Heterogeneous content blocks, e.g. `[{\"type\": \"input_text\", \"text\": \"Hello\"}]`.",
             "items": {
@@ -4618,6 +4902,19 @@
             "description": "`True` for durable context that must be replayed to agents but hidden from user-facing transcripts, e.g. injected skill instructions. Defaults to `False` and is omitted from serialized payloads in that case.",
             "title": "Is Meta",
             "type": "boolean"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque ACP message metadata supplied on a whole-message update. Chunk metadata stays chunk-scoped and is not placed here.",
+            "title": "Metadata"
           },
           "model": {
             "anyOf": [
@@ -4693,8 +4990,7 @@
           }
         },
         "required": [
-          "role",
-          "content"
+          "role"
         ],
         "title": "MessageData",
         "type": "object"
@@ -5598,13 +5894,24 @@
       "ReasoningData": {
         "description": "Data for a reasoning item.\n\n**Parameters**\n\n- `agent` \u2014 Agent name. Serialized as `\"model\"` in JSON.",
         "properties": {
+          "acp_agent_identity": {
+            "anyOf": [
+              {
+                "const": "unknown",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`\"unknown\"` when ACP did not identify the child model.",
+            "title": "Acp Agent Identity"
+          },
           "content": {
             "anyOf": [
               {
                 "items": {
-                  "additionalProperties": {
-                    "type": "string"
-                  },
+                  "additionalProperties": true,
                   "type": "object"
                 },
                 "type": "array"
@@ -5629,8 +5936,15 @@
             "title": "Encrypted Content"
           },
           "model": {
-            "title": "Model",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "summary": {
             "description": "Summary text blocks, e.g. `[{\"type\": \"summary_text\", \"text\": \"...\"}]`.",
@@ -5645,7 +5959,6 @@
           }
         },
         "required": [
-          "model",
           "summary"
         ],
         "title": "ReasoningData",
@@ -6473,6 +6786,12 @@
             "title": "Accounts Enabled",
             "type": "boolean"
           },
+          "acp_session_reporting_version": {
+            "default": 0,
+            "format": "int64",
+            "title": "Acp Session Reporting Version",
+            "type": "integer"
+          },
           "agent_config_edit": {
             "default": false,
             "title": "Agent Config Edit",
@@ -6502,6 +6821,11 @@
           "automations_enabled": {
             "default": false,
             "title": "Automations Enabled",
+            "type": "boolean"
+          },
+          "background_work_reporting": {
+            "default": false,
+            "title": "Background Work Reporting",
             "type": "boolean"
           },
           "branding": {
@@ -6843,6 +7167,7 @@
             "session.btw_sidechat": "#/components/schemas/SessionBtwSidechatEvent",
             "session.changed_files.invalidated": "#/components/schemas/SessionChangedFilesInvalidatedEvent",
             "session.child_session.updated": "#/components/schemas/SessionChildSessionUpdatedEvent",
+            "session.child_sessions.invalidated": "#/components/schemas/SessionChildSessionsInvalidatedEvent",
             "session.codex_approval_mode": "#/components/schemas/SessionCodexApprovalModeEvent",
             "session.collaboration_mode": "#/components/schemas/SessionCollaborationModeEvent",
             "session.created": "#/components/schemas/SessionCreatedEvent",
@@ -6945,6 +7270,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionChildSessionUpdatedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionChildSessionsInvalidatedEvent"
           },
           {
             "$ref": "#/components/schemas/SessionChangedFilesInvalidatedEvent"
@@ -7284,6 +7612,39 @@
           "child"
         ],
         "title": "SessionChildSessionUpdatedEvent",
+        "type": "object"
+      },
+      "SessionChildSessionsInvalidatedEvent": {
+        "description": "The server-selected child-session observation projection may have changed.",
+        "properties": {
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.child_sessions.invalidated",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "conversation_id"
+        ],
+        "title": "SessionChildSessionsInvalidatedEvent",
         "type": "object"
       },
       "SessionCodexApprovalModeEvent": {
@@ -7919,6 +8280,32 @@
       "SessionFunctionCallItem": {
         "description": "`function_call` item: common fields plus `FunctionCallData`.",
         "properties": {
+          "acp_agent_identity": {
+            "anyOf": [
+              {
+                "const": "unknown",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Acp Agent Identity"
+          },
+          "acp_session_references": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/AcpToolSessionReference"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Acp Session References"
+          },
           "arguments": {
             "title": "Arguments",
             "type": "string"
@@ -7951,8 +8338,15 @@
             "type": "string"
           },
           "model": {
-            "title": "Model",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
           },
           "name": {
             "title": "Name",
@@ -7969,6 +8363,41 @@
             ],
             "title": "Namespace"
           },
+          "output": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output"
+          },
+          "output_content": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output Content"
+          },
+          "raw_output": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raw Output"
+          },
           "response_id": {
             "description": "ID of the task/response that produced this item.",
             "title": "Response Id",
@@ -7979,6 +8408,17 @@
             "title": "Status",
             "type": "string"
           },
+          "tool_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Status"
+          },
           "type": {
             "const": "function_call",
             "title": "Type",
@@ -7986,7 +8426,6 @@
           }
         },
         "required": [
-          "model",
           "name",
           "arguments",
           "call_id",
@@ -8002,9 +8441,36 @@
       "SessionFunctionCallOutputItem": {
         "description": "`function_call_output` item: common fields plus `FunctionCallOutputData`.",
         "properties": {
+          "acp_agent_identity": {
+            "anyOf": [
+              {
+                "const": "unknown",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Acp Agent Identity"
+          },
           "call_id": {
             "title": "Call Id",
             "type": "string"
+          },
+          "content": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Content"
           },
           "created_at": {
             "description": "Unix epoch seconds of creation.",
@@ -8030,8 +8496,24 @@
             "type": "string"
           },
           "output": {
-            "title": "Output",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Output"
+          },
+          "raw_output": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raw Output"
           },
           "response_id": {
             "description": "ID of the task/response that produced this item.",
@@ -8062,7 +8544,6 @@
         },
         "required": [
           "call_id",
-          "output",
           "id",
           "response_id",
           "status",
@@ -8958,6 +9439,31 @@
       "SessionMessageItem": {
         "description": "`message` item as returned by `GET /v1/sessions/{id}/items`.\n\nMirrors `MessageData` field for field. The entity keeps the blocks\nas free-form dicts, so this variant spells out the typed block shape\ninstead of inheriting it.",
         "properties": {
+          "acp_agent_identity": {
+            "anyOf": [
+              {
+                "const": "unknown",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`\"unknown\"` when ACP supplied no child model identity; omitted otherwise.",
+            "title": "Acp Agent Identity"
+          },
+          "acp_session_message": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Structured ACP directed-message participants."
+          },
           "content": {
             "description": "Content blocks in order.",
             "items": {
@@ -9000,6 +9506,19 @@
             "description": "`True` for durable context hidden from user-facing transcripts; omitted when `False`.",
             "title": "Is Meta",
             "type": "boolean"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque ACP whole-message metadata; omitted when unset.",
+            "title": "Metadata"
           },
           "model": {
             "anyOf": [
@@ -9098,8 +9617,7 @@
           "status",
           "created_at",
           "type",
-          "role",
-          "content"
+          "role"
         ],
         "title": "SessionMessageItem",
         "type": "object"
@@ -9699,6 +10217,19 @@
       "SessionReasoningItem": {
         "description": "`reasoning` item as returned by `GET /v1/sessions/{id}/items`.\n\nMirrors `ReasoningData` field for field, with its text blocks typed\nas `SessionContentBlock` like message content.",
         "properties": {
+          "acp_agent_identity": {
+            "anyOf": [
+              {
+                "const": "unknown",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`\"unknown\"` when ACP did not identify the child model; omitted otherwise.",
+            "title": "Acp Agent Identity"
+          },
           "content": {
             "anyOf": [
               {
@@ -9750,9 +10281,16 @@
             "type": "string"
           },
           "model": {
-            "description": "Agent name.",
-            "title": "Model",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Agent name; absent when ACP did not identify the child model.",
+            "title": "Model"
           },
           "response_id": {
             "description": "ID of the task/response that produced this item.",
@@ -9785,7 +10323,6 @@
           "status",
           "created_at",
           "type",
-          "model",
           "summary"
         ],
         "title": "SessionReasoningItem",
@@ -10120,6 +10657,17 @@
       "SessionResponse": {
         "description": "API representation of a session.\n\nReturned by `POST /v1/sessions`, `GET /v1/sessions/{id}`,\nand `PATCH /v1/sessions/{id}`.",
         "properties": {
+          "acp_session_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AcpSessionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The latest persisted standard ACP session state observation. It retains the producer's explicit `present` bit, state-specific ingress sequence/time, and the last report time. The transport is always marked unconfirmed because ACP v1 has no report heartbeat or terminal acknowledgment."
+          },
           "active_response_id": {
             "anyOf": [
               {

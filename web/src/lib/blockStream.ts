@@ -39,7 +39,7 @@ import {
   slashCommandEchoText,
   structuredErrorFields,
 } from "./blocks";
-import type { AssistantMessagePhase } from "./conversationItems";
+import type { AcpSessionMessage, AssistantMessagePhase } from "./conversationItems";
 import type { StreamEvent } from "./events";
 import { routingExtras } from "./routingDecision";
 import type { Response } from "./types";
@@ -166,6 +166,9 @@ interface ReducerState {
   // `_translate_omnigent_event`. Without this, the result panel renders
   // twice. Per-response scope, same rationale as `seenCallIds`.
   seenResultCallIds: Set<string>;
+  // Last mutable output value per response/call. Exact repeats are duplicate
+  // deliveries; changed values replace the rendered result, including null clears.
+  resultOutputsByCallId: Map<string, string | null>;
 
   agent: string | null;
   turn: number;
@@ -191,6 +194,7 @@ function createState(flushThreshold: number): ReducerState {
     toolExecutionsByCallId: new Map(),
     seenCallIds: new Set(),
     seenResultCallIds: new Set(),
+    resultOutputsByCallId: new Map(),
     agent: null,
     turn: 0,
     started: false,
@@ -202,8 +206,9 @@ function ctx(
   state: ReducerState,
   itemId: string | null = null,
   responseId: string | null = null,
+  agentOverride?: string | null,
 ): BlockContext {
-  const agent = state.agent;
+  const agent = agentOverride === undefined ? state.agent : agentOverride;
   const depth = agent ? (agent.match(/\./g)?.length ?? 0) : 0;
   return {
     agent,
@@ -266,6 +271,10 @@ function* closeText(
   state: ReducerState,
   itemId: string | null = null,
   phase?: AssistantMessagePhase,
+  metadata?: {
+    acpSessionMessage?: AcpSessionMessage | null;
+    acpAgentIdentity?: "unknown";
+  },
 ): Generator<AnyBlock> {
   if (!state.inText) return;
   if (state.accumulated) {
@@ -278,10 +287,14 @@ function* closeText(
   }
   yield {
     type: "text_done",
-    ctx: ctx(state, itemId),
+    ctx: ctx(state, itemId, null, metadata?.acpAgentIdentity === "unknown" ? null : undefined),
     fullText: state.fullText,
     hasCodeBlocks: state.fullText.includes("```"),
     ...(phase !== undefined ? { phase } : {}),
+    ...(metadata?.acpSessionMessage !== undefined
+      ? { acpSessionMessage: metadata.acpSessionMessage }
+      : {}),
+    ...(metadata?.acpAgentIdentity === "unknown" ? { acpAgentIdentity: "unknown" as const } : {}),
   } satisfies TextDone;
   state.inText = false;
   state.fullText = "";
@@ -343,6 +356,7 @@ function* beginResponse(state: ReducerState, response: Response): Generator<AnyB
   // reuse must render independently (see migration plan §4.4).
   state.seenCallIds.clear();
   state.seenResultCallIds.clear();
+  state.resultOutputsByCallId.clear();
   state.reasoningStreamed = false;
   // Bump `turn` after the first task so blocks carry their task index.
   if (state.started) state.turn += 1;
@@ -542,10 +556,17 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
           arguments: event.arguments,
           argsSummary: formatToolArgsBrief(event.name, event.arguments),
           callId: event.callId,
-          agentName: event.agentName,
+          agentName: event.acpAgentIdentity === "unknown" ? "" : event.agentName,
           executedBy: "server",
           output: null,
         };
+        if (event.acpSessionReferences !== undefined) {
+          execution.acpSessionReferences = event.acpSessionReferences;
+        }
+        if (event.acpAgentIdentity === "unknown") {
+          execution.acpAgentIdentity = "unknown";
+          execution.agentName = "";
+        }
         state.toolExecutionsByCallId.set(event.callId, execution);
         state.pendingTools.set(event.callId, execution);
         return;
@@ -560,9 +581,13 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         arguments: event.arguments,
         argsSummary: formatToolArgsBrief(event.name, event.arguments),
         callId: event.callId,
-        agentName: event.agentName,
+        agentName: event.acpAgentIdentity === "unknown" ? "" : event.agentName,
         executedBy: "server",
         output: null,
+        ...(event.acpSessionReferences !== undefined
+          ? { acpSessionReferences: event.acpSessionReferences }
+          : {}),
+        ...(event.acpAgentIdentity === "unknown" ? { acpAgentIdentity: "unknown" as const } : {}),
       };
       state.pendingTools.set(event.callId, execution);
       state.toolExecutionsByCallId.set(event.callId, execution);
@@ -571,7 +596,12 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // line but no result panel.
       yield {
         type: "tool_group",
-        ctx: ctx(state, event.itemId || null, event.responseId || null),
+        ctx: ctx(
+          state,
+          event.itemId || null,
+          event.responseId || null,
+          event.acpAgentIdentity === "unknown" ? null : undefined,
+        ),
         executions: [execution],
         iteration: 0,
       } satisfies ToolGroup;
@@ -584,7 +614,10 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       const isCurrentResponse = !event.responseId || event.responseId === state.responseId;
       // Rid-scoped key: a backdated result for a reused callId must not eat the live turn's result.
       const resultKey = `${event.responseId || state.responseId}:${event.callId}`;
-      if (state.seenResultCallIds.has(resultKey)) {
+      if (
+        state.seenResultCallIds.has(resultKey) &&
+        state.resultOutputsByCallId.get(resultKey) === event.output
+      ) {
         // Already rendered the result panel. The late
         // `response.completed` flush emission is redundant; drop it
         // so a subsequent `response_created` doesn't yield it again
@@ -610,9 +643,15 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       // Yield the result panel IMMEDIATELY so multi-tool turns don't
       // bunch result rendering at end-of-turn.
       state.seenResultCallIds.add(resultKey);
+      state.resultOutputsByCallId.set(resultKey, event.output);
       yield {
         type: "tool_result",
-        ctx: ctx(state, event.itemId || null, event.responseId || null),
+        ctx: ctx(
+          state,
+          event.itemId || null,
+          event.responseId || null,
+          event.acpAgentIdentity === "unknown" ? null : undefined,
+        ),
         name: ex?.name ?? "",
         callId: event.callId,
         agentName: ex?.agentName ?? "",
@@ -726,6 +765,16 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
           state,
           closesSameMessage ? event.itemId || null : null,
           closesSameMessage ? event.phase : undefined,
+          closesSameMessage
+            ? {
+                ...(event.acpSessionMessage !== undefined
+                  ? { acpSessionMessage: event.acpSessionMessage }
+                  : {}),
+                ...(event.acpAgentIdentity === "unknown"
+                  ? { acpAgentIdentity: "unknown" as const }
+                  : {}),
+              }
+            : undefined,
         );
       }
 
@@ -739,6 +788,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         state.toolExecutionsByCallId.clear();
         state.seenCallIds.clear();
         state.seenResultCallIds.clear();
+        state.resultOutputsByCallId.clear();
         state.reasoningStreamed = false;
       }
 
@@ -757,10 +807,19 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       if (text) {
         yield {
           type: "text_done",
-          ctx: ctx(state, event.itemId || null),
+          ctx: ctx(
+            state,
+            event.itemId || null,
+            null,
+            event.acpAgentIdentity === "unknown" ? null : undefined,
+          ),
           fullText: text,
           hasCodeBlocks: text.includes("```"),
           ...(event.phase !== undefined ? { phase: event.phase } : {}),
+          ...(event.acpSessionMessage !== undefined
+            ? { acpSessionMessage: event.acpSessionMessage }
+            : {}),
+          ...(event.acpAgentIdentity === "unknown" ? { acpAgentIdentity: "unknown" as const } : {}),
         } satisfies TextDone;
       }
       return;
@@ -790,12 +849,19 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         state.toolExecutionsByCallId.clear();
         state.seenCallIds.clear();
         state.seenResultCallIds.clear();
+        state.resultOutputsByCallId.clear();
       }
       yield {
         type: "reasoning_block",
-        ctx: ctx(state, event.itemId || null),
+        ctx: ctx(
+          state,
+          event.itemId || null,
+          null,
+          event.acpAgentIdentity === "unknown" ? null : undefined,
+        ),
         reasoningText: event.text,
         summaryText: event.summary,
+        ...(event.acpAgentIdentity === "unknown" ? { acpAgentIdentity: "unknown" as const } : {}),
       } satisfies ReasoningBlock;
       return;
     }

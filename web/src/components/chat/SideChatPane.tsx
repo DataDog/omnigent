@@ -75,7 +75,7 @@ import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useSession } from "@/hooks/useSession";
-import type { Session } from "@/lib/types";
+import type { AcpSessionObservation, Session } from "@/lib/types";
 import { useSkills } from "@/hooks/useSkills";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -104,6 +104,39 @@ const SIDE_CHAT_COPY_ID_PREFIX_LEN = 12;
 /** A `pending:` tab has no child session yet; its first send creates the fork. */
 function isPendingSideChat(id: string): boolean {
   return id.startsWith("pending:");
+}
+
+function AcpSessionActivityNotice({ observation }: { observation: AcpSessionObservation }) {
+  const state = observation.state;
+  let detail: string;
+  if (state === null || !state.present) {
+    detail = "No current activity state has been reported.";
+  } else if (state.value === null) {
+    detail = "The native activity state was cleared.";
+  } else if (
+    typeof state.value === "object" &&
+    state.value !== null &&
+    typeof (state.value as { state?: unknown }).state === "string"
+  ) {
+    detail = `Last reported state: ${(state.value as { state: string }).state}.`;
+  } else {
+    detail = "The last reported state is not recognized.";
+  }
+
+  const observedAt = observation.stateObservedAt
+    ? new Date(observation.stateObservedAt * 1000).toLocaleString()
+    : null;
+  return (
+    <div
+      data-testid="acp-activity-unconfirmed"
+      role="status"
+      className="mb-3 rounded-md border border-border bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+    >
+      <span className="font-medium text-foreground">ACP activity is unconfirmed.</span>{" "}
+      <span>{detail}</span>
+      {observedAt && <span> State observed {observedAt}.</span>}
+    </div>
+  );
 }
 
 const TEXT_INPUT_TYPES = new Set(["text", "search", "email", "url", "password", "number", "tel"]);
@@ -424,6 +457,9 @@ export function SideChatPane({
             followTail.current = node.scrollHeight - node.scrollTop - node.clientHeight < 64;
           }}
         >
+          {session?.acpSessionObservation && (
+            <AcpSessionActivityNotice observation={session.acpSessionObservation} />
+          )}
           {fullSession && state.hasMoreHistory && (
             <Button
               variant="ghost"

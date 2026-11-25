@@ -672,9 +672,12 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _EF.NONE,
         _MF.MULTI,
         _AU.OWN_AUTH,
-        subagents=False,
+        # Standard ACP subagent reporting is enabled only after the private
+        # v2 report/action channels are verified for this harness generation.
+        subagents=True,
         interrupt=True,
         streaming=True,
+        session_reports=True,
         instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "goose": _C(
@@ -1296,6 +1299,8 @@ def harness_catalog() -> list[dict[str, object]]:
             acp_row: dict[str, object] = {"id": f"acp:{agent.slug}", "label": agent.name}
             if acp_capability is not None:
                 acp_row["capabilities"] = acp_capability.as_dict()
+            if ui_setup_steps is not None:
+                acp_row["setup_steps"] = [step.as_dict() for step in ui_setup_steps("acp")]
             rows.append(acp_row)
     except Exception:  # a malformed acp: block must never break the catalog
         _logger.debug("acp catalog rows skipped", exc_info=True)

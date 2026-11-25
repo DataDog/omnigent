@@ -210,6 +210,7 @@ const SETTLED_STATE: Record<AgentActivity, boolean> = {
   // Not dimmed — a disconnected runner is something the user may want to
   // notice and act on (retry/reconnect), so it stays full-strength.
   disconnected: false,
+  unconfirmed: false,
   other: false,
   done: true,
   idle: true,
@@ -280,6 +281,7 @@ const STATUS_AVATAR_CLASS: Record<AgentActivity, string> = {
   awaiting: "bg-warning/15 text-warning",
   failed: "bg-destructive/10 text-destructive",
   disconnected: "bg-muted text-muted-foreground",
+  unconfirmed: "bg-muted text-muted-foreground",
   other: "bg-muted text-muted-foreground",
   done: "bg-success/10 text-success",
   idle: "bg-muted text-muted-foreground",
@@ -291,6 +293,7 @@ const STATUS_AVATAR_ICON: Record<AgentActivity, AgentRowIcon | null> = {
   awaiting: CircleHelpIcon,
   failed: CircleAlertIcon,
   disconnected: UnplugIcon,
+  unconfirmed: EllipsisIcon,
   other: EllipsisIcon,
   done: CheckIcon,
   idle: PauseIcon,

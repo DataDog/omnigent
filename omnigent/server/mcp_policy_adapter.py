@@ -18,7 +18,11 @@ from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._sessions.helpers import _build_actor, _load_agent_spec_for_session
 from omnigent.server.routes._sessions.orchestration import _handle_mcp_tools_call
 from omnigent.server.routes.connections_base import ConnectionError
-from omnigent.spec.types import MCPServerConfig
+from omnigent.server.session_action_origins import (
+    action_context_fields,
+    resolve_action_origin_context,
+)
+from omnigent.spec.types import AgentSpec, MCPServerConfig
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
@@ -30,6 +34,7 @@ class McpPolicyContext:
     service: McpService
     credential_user: str
     policy_actor: dict[str, str] | None
+    spec: AgentSpec
 
 
 class McpPolicyAdapter:
@@ -48,27 +53,53 @@ class McpPolicyAdapter:
         self.permission_store = permission_store
 
     async def authorize(
-        self, request: Request, session_id: str, service_id: str
+        self,
+        request: Request,
+        session_id: str,
+        service_id: str,
+        params: dict[str, Any] | None = None,
     ) -> McpPolicyContext:
         caller = require_user(request, self.auth_provider)
-        await require_access(
-            caller, session_id, LEVEL_EDIT, self.permission_store, self.conversation_store
-        )
         conv = await asyncio.to_thread(self.conversation_store.get_conversation, session_id)
         if conv is None or conv.archived:
             raise HTTPException(404, "MCP session is unavailable")
-        spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, self.agent_store)
-        config = (
-            next(
-                (
-                    c
-                    for c in spec.mcp_servers
-                    if c.transport == "registry" and c.name == service_id
-                ),
-                None,
+        action_token, action_generation = action_context_fields(params or {})
+        if action_token is not None:
+            from omnigent.runtime import get_agent_cache
+
+            _origin, action_spec, policy_actor = await asyncio.to_thread(
+                resolve_action_origin_context,
+                request,
+                conversation=conv,
+                conversation_store=self.conversation_store,
+                token=action_token,
+                generation=action_generation or "",
+                credential_principal=caller,
+                agent_cache=get_agent_cache(),
             )
-            if spec
-            else None
+            spec: AgentSpec | None = action_spec
+            await require_access(
+                policy_actor["run_as"],
+                session_id,
+                LEVEL_EDIT,
+                self.permission_store,
+                self.conversation_store,
+            )
+        else:
+            await require_access(
+                caller,
+                session_id,
+                LEVEL_EDIT,
+                self.permission_store,
+                self.conversation_store,
+            )
+            spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, self.agent_store)
+            policy_actor = mcp_policy_actor(request, conv, caller)
+        if spec is None:
+            raise HTTPException(403, "MCP service is not selected for this session")
+        config = next(
+            (c for c in spec.mcp_servers if c.transport == "registry" and c.name == service_id),
+            None,
         )
         if config is None:
             raise HTTPException(403, "MCP service is not selected for this session")
@@ -80,9 +111,7 @@ class McpPolicyAdapter:
             service = registry.service(service_id, user)
         except ConnectionError as exc:
             raise HTTPException(403, str(exc)) from None
-        return McpPolicyContext(
-            conv, config, service, user, mcp_policy_actor(request, conv, caller)
-        )
+        return McpPolicyContext(conv, config, service, user, policy_actor, spec)
 
     async def list_tools(
         self, request: Request, context: McpPolicyContext
@@ -126,4 +155,5 @@ class McpPolicyAdapter:
             credential_user=context.credential_user,
             request=request,
             execute_tool=execute,
+            resolved_spec=context.spec,
         )

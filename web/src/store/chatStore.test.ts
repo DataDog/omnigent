@@ -11263,6 +11263,7 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
           last_message_preview: "looking…",
           // Insert path defaults the count to 0 when the delta omits it.
           pending_elicitations_count: 0,
+          acp_session_observation: null,
         },
       ]);
     });
@@ -11444,6 +11445,38 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       expect(cached).toHaveLength(1);
       expect(cached?.[0].id).toBe("conv_child1");
       expect(cached?.[0].busy).toBe(true);
+    });
+
+    it("normalizes missing ACP source eligibility on a live child summary", () => {
+      const observation = {
+        state: { present: true, value: { state: "running" } },
+        state_ingress_sequence: 12,
+        transport: { state: "connected", diagnostic: { source: "pipe" } },
+      };
+
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_parent",
+        childSessionId: "conv_acp_child",
+        child: {
+          id: "conv_acp_child",
+          title: "worker:one",
+          labels: { "omnigent.acp.subagent_id": "native-child-1" },
+          current_task_status: "in_progress",
+          busy: true,
+          acp_session_observation: observation,
+        },
+      });
+
+      const row = client.getQueryData<ChildSessionInfo[]>(
+        childSessionsQueryKey("conv_parent"),
+      )?.[0];
+      expect(row?.acp_session_observation).toEqual({
+        ...observation,
+        source_current: false,
+      });
+      expect(row?.acp_session_observation?.state).toEqual(observation.state);
+      expect(row?.acp_session_observation?.transport).toEqual(observation.transport);
     });
 
     it("refetches the parent's child list when a child goes idle without a preview", () => {

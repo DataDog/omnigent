@@ -1421,8 +1421,13 @@ async def test_claude_sdk_clear_refusals_create_no_session(
     after = len((await auth_client.get("/v1/sessions", headers=headers)).json()["data"])
     assert after == before
     assert auth_live_runner.superseded == []
-    # No new session was initialized on the runner.
-    assert "/v1/sessions" not in [path for path, _body in auth_live_runner.posts[posts_before:]]
+    # No new session was initialized on the runner; the pending input may
+    # still initialize its own source session before delivery.
+    assert [
+        body.get("session_id")
+        for path, body in auth_live_runner.posts[posts_before:]
+        if path == "/v1/sessions" and body.get("session_id") != source_id
+    ] == []
     if placement != "runner":
         assert clear_requests(auth_live_runner) == []
     # A refused clear leaves the session open to messages.

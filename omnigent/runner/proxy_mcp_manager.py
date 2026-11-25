@@ -160,6 +160,10 @@ class ProxyMcpManager:
         ap_client: httpx.AsyncClient,
         publish_event: _EventPublisher | None = None,
         execution_registry: McpExecutionRegistry | None = None,
+        action_context_token: str | None = None,
+        action_context_generation: str | None = None,
+        action_caller_user_id: str | None = None,
+        on_approval_registered: Callable[[str], None] | None = None,
     ) -> None:
         """Create a proxy manager bound to one session.
 
@@ -178,6 +182,10 @@ class ProxyMcpManager:
         self._omnigent_client = ap_client
         self._publish_event = publish_event
         self._execution_registry = execution_registry
+        self._action_context_token = action_context_token
+        self._action_context_generation = action_context_generation
+        self._action_caller_user_id = action_caller_user_id
+        self._on_approval_registered = on_approval_registered
         self._registry_services: set[str] = set()
 
     @property
@@ -216,11 +224,15 @@ class ProxyMcpManager:
 
         ``None`` selects the existing session proxy for runner-local tools.
         """
+        params: _JsonObject = {} if service else {"_omnigent_skip_registry": True}
+        if self._action_context_token is not None:
+            params["_omnigent_action_context_token"] = self._action_context_token
+            params["_omnigent_action_context_generation"] = self._action_context_generation
         payload: _JsonObject = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/list",
-            "params": {} if service else {"_omnigent_skip_registry": True},
+            "params": params,
         }
         try:
             resp = await self._omnigent_client.post(
@@ -405,15 +417,21 @@ class ProxyMcpManager:
                 )
 
         def _initial_payload() -> _JsonObject:
+            params: _JsonObject = {
+                "name": wire_name,
+                "arguments": arguments,
+                MCP_OPERATION_ID_PARAM: operation_id,
+            }
+            if self._action_context_token is not None:
+                params["_omnigent_action_context_token"] = self._action_context_token
+                params["_omnigent_action_context_generation"] = self._action_context_generation
+            if self._action_caller_user_id is not None:
+                params["_omnigent_action_caller_user_id"] = self._action_caller_user_id
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "method": "tools/call",
-                "params": {
-                    "name": wire_name,
-                    "arguments": arguments,
-                    MCP_OPERATION_ID_PARAM: operation_id,
-                },
+                "params": params,
             }
 
         async def _wait_to_reattach(
@@ -575,11 +593,19 @@ class ProxyMcpManager:
                     else (lambda _s, _e: None)
                 )
                 try:
+
+                    def _mark_action_approval(
+                        _elicitation_id: str = elicitation_id,
+                    ) -> None:
+                        if self._on_approval_registered is not None:
+                            self._on_approval_registered(_elicitation_id)
+
                     verdict = await pending_approvals.wait_for_user_verdict(
                         elicitation_id=elicitation_id,
                         conversation_id=self._session_id,
                         publish_event=publisher,
                         retry_on_server_reconnect=True,
+                        on_registered=_mark_action_approval,
                     )
                 except pending_approvals.ServerReconnected:
                     # requestState and its elicitation id belong to the server
@@ -590,21 +616,29 @@ class ProxyMcpManager:
                     continue
 
                 request_id += 1
+                retry_params: _JsonObject = {
+                    "name": wire_name,
+                    "arguments": arguments,
+                    MCP_OPERATION_ID_PARAM: operation_id,
+                    "requestState": request_state,
+                    "inputResponses": {
+                        elicitation_id: _input_response(
+                            verdict, _json_object(input_requests.get(elicitation_id))
+                        ),
+                    },
+                }
+                if self._action_context_token is not None:
+                    retry_params["_omnigent_action_context_token"] = self._action_context_token
+                    retry_params["_omnigent_action_context_generation"] = (
+                        self._action_context_generation
+                    )
+                if self._action_caller_user_id is not None:
+                    retry_params["_omnigent_action_caller_user_id"] = self._action_caller_user_id
                 payload = {
                     "jsonrpc": "2.0",
                     "id": request_id,  # MRTR retry MUST use a different id
                     "method": "tools/call",
-                    "params": {
-                        "name": wire_name,
-                        "arguments": arguments,
-                        MCP_OPERATION_ID_PARAM: operation_id,
-                        "requestState": request_state,
-                        "inputResponses": {
-                            elicitation_id: _input_response(
-                                verdict, _json_object(input_requests.get(elicitation_id))
-                            ),
-                        },
-                    },
+                    "params": retry_params,
                 }
                 approval_retries += 1
                 continue

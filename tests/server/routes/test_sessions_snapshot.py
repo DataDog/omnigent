@@ -131,6 +131,11 @@ class _ConversationStore:
         self.list_items_calls: list[dict[str, object]] = []
         self._conversations = conversations
 
+    def get_acp_session_observation(self, conversation_id: str) -> dict[str, object] | None:
+        """Report no ACP observation; these sessions have no mirrored native child."""
+        del conversation_id
+        return None
+
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         if self._conversations is not None:
             return self._conversations.get(conversation_id)

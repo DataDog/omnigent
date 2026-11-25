@@ -264,6 +264,7 @@ async def wait_for_user_verdict(
     publish_event: Callable[[str, dict[str, object]], None],
     timeout_seconds: float | None = None,
     retry_on_server_reconnect: bool = False,
+    on_registered: Callable[[], None] | None = None,
 ) -> Verdict:
     """
     Park on a registered Future until the user delivers a verdict.
@@ -298,6 +299,8 @@ async def wait_for_user_verdict(
     :param retry_on_server_reconnect: Wake with :class:`ServerReconnected`
         after a tunnel reconnect so the caller can recreate server-owned
         approval state.
+    :param on_registered: Optional synchronous callback invoked after the
+        verdict waiter is registered and before this coroutine waits.
     :returns: The user's :class:`Verdict`. Declines and timeouts
         carry ``approved=False`` and no content.
     """
@@ -312,6 +315,8 @@ async def wait_for_user_verdict(
     _session_pending[conversation_id] = _session_pending.get(conversation_id, 0) + 1
     answered = False
     try:
+        if on_registered is not None:
+            on_registered()
         with pause_tool_call_deadline(effective_timeout):
             verdict = await asyncio.wait_for(fut, timeout=effective_timeout)
         answered = True

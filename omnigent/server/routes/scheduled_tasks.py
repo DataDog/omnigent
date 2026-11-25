@@ -57,7 +57,9 @@ from omnigent.server.routes._sessions.helpers import (
     _session_status_from_cache,
 )
 from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
-from omnigent.server.routes.runner_tunnel import _expected_runner_id_from_headers
+from omnigent.server.runner_tunnel_auth import (
+    expected_runner_id_from_headers as _expected_runner_id_from_headers,
+)
 from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_mode,
     validate_scheduled_permission_support,

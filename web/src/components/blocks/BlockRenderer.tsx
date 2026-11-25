@@ -20,15 +20,17 @@
 
 import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ChevronRightIcon } from "lucide-react";
+import { ChevronRightIcon, CornerDownRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
+import type { AcpSessionMessage } from "@/lib/conversationItems";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import type { RenderItem } from "@/lib/renderItems";
 import type { SessionStatus } from "@/lib/types";
 import type { ActiveResponse } from "@/store/types";
 import { cn } from "@/lib/utils";
-import { FilePathAwareMessageResponse } from "./ChatMarkdown";
+import { useSessionLabel } from "@/hooks/useSessionLabel";
+import { SessionMentionPill, FilePathAwareMessageResponse } from "./ChatMarkdown";
 import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
@@ -69,6 +71,8 @@ const FOLD_EXPAND_ANCHOR_HOLD_MS = 400;
 interface BlockRendererProps {
   items: RenderItem[];
   sessionStatus: SessionStatus;
+  /** Omnigent conversation whose transcript is being rendered. */
+  currentSessionId?: string | null;
   onRetryError?: (item: Extract<RenderItem, { kind: "error" }>) => Promise<void>;
   /**
    * Lifecycle of the turn this bubble renders (`Bubble.lifecycle`).
@@ -222,6 +226,7 @@ type ToolRunFragment =
 export function BlockRenderer({
   items,
   sessionStatus,
+  currentSessionId = null,
   turnLifecycle,
   workedForS,
   continued = false,
@@ -320,13 +325,23 @@ export function BlockRenderer({
             liveEdge: false,
             indexBase: segment.startIndex,
             onRetryError,
+            currentSessionId,
           }),
         );
         continue;
       }
       if (segment.kind === "exempt") {
         rendered.push(
-          renderItem(segment.item, segment.index, false, false, false, false, onRetryError),
+          renderItem(
+            segment.item,
+            segment.index,
+            false,
+            false,
+            false,
+            false,
+            onRetryError,
+            currentSessionId,
+          ),
         );
         continue;
       }
@@ -342,6 +357,7 @@ export function BlockRenderer({
             liveEdge: false,
             indexBase: segment.startIndex,
             onRetryError,
+            currentSessionId,
           })}
         </TurnWorkedFold>,
       );
@@ -355,6 +371,7 @@ export function BlockRenderer({
           suppressReasoningDuration: showsWorking,
           indexBase: partition.latest.startIndex,
           onRetryError,
+          currentSessionId,
         }),
       );
     }
@@ -365,6 +382,7 @@ export function BlockRenderer({
     liveEdge: isTurnLive,
     suppressReasoningDuration: showsWorking,
     onRetryError,
+    currentSessionId,
   });
 }
 
@@ -377,7 +395,13 @@ export function BlockRenderer({
  */
 function renderSequence(
   items: RenderItem[],
-  { liveEdge, suppressReasoningDuration = false, indexBase = 0, onRetryError }: TurnSequenceOptions,
+  {
+    liveEdge,
+    suppressReasoningDuration = false,
+    indexBase = 0,
+    onRetryError,
+    currentSessionId = null,
+  }: TurnSequenceOptions,
 ): ReactNode[] {
   const rendered: ReactNode[] = [];
   let previousRenderedItemWasText = false;
@@ -442,6 +466,7 @@ function renderSequence(
         suppressReasoningDuration,
         followsText,
         onRetryError,
+        currentSessionId,
       ),
     );
     previousRenderedItemWasText = item.kind === "text";
@@ -455,6 +480,7 @@ interface TurnSequenceOptions {
   suppressReasoningDuration?: boolean;
   indexBase?: number;
   onRetryError?: BlockRendererProps["onRetryError"];
+  currentSessionId?: string | null;
 }
 
 interface TurnPartition {
@@ -880,6 +906,7 @@ function renderItem(
   suppressReasoningDuration = false,
   followsText = false,
   onRetryError?: BlockRendererProps["onRetryError"],
+  currentSessionId: string | null = null,
 ): ReactNode {
   const key = keyFor(item, index);
   switch (item.kind) {
@@ -890,6 +917,12 @@ function renderItem(
           data-testid="assistant-text-section"
           className={cn("min-w-0", followsText && "mt-2")}
         >
+          {item.acpSessionMessage && (
+            <AcpSessionDirectionLine
+              message={item.acpSessionMessage}
+              currentSessionId={currentSessionId}
+            />
+          )}
           <FilePathAwareMessageResponse
             className="chat-markdown text-message"
             allowWorkspaceImages
@@ -1020,6 +1053,41 @@ function renderItem(
     case "subagent_activity":
       return <SubagentActivityMessage key={key} data={item.data} />;
   }
+}
+
+function AcpSessionDirectionLine({
+  message,
+  currentSessionId,
+}: {
+  message: AcpSessionMessage;
+  currentSessionId: string | null;
+}) {
+  const senderId = message.sender_conversation_id ?? null;
+  const recipientId = message.recipient_conversation_id ?? null;
+  const sender = useSessionLabel(senderId, currentSessionId);
+  const recipient = useSessionLabel(recipientId, currentSessionId);
+  const incoming = currentSessionId !== null && recipientId === currentSessionId;
+  const outgoing = currentSessionId !== null && senderId === currentSessionId;
+  const peerId = incoming ? senderId : outgoing ? recipientId : null;
+  const peer = incoming ? sender : outgoing ? recipient : null;
+  const direction = incoming ? "From" : outgoing ? "To" : "Inter-session message";
+
+  return (
+    <div
+      data-testid="acp-session-message-direction"
+      className="mb-1 flex items-center gap-1 text-xs text-muted-foreground"
+    >
+      <CornerDownRightIcon className="size-3 shrink-0" aria-hidden="true" />
+      <span>{direction}</span>
+      {peerId && peer ? (
+        <SessionMentionPill id={peerId} isSubagent={peer.isSubagent}>
+          @{peer.title}
+        </SessionMentionPill>
+      ) : (
+        <span>another session</span>
+      )}
+    </div>
+  );
 }
 
 // Any indent: a list item's continuation lines carry its content indent. A caret

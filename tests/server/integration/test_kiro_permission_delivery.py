@@ -329,7 +329,9 @@ async def test_kiro_child_delivery_stays_pending_in_parent_until_receipt(
         wrong_owner = await client.post(
             f"/v1/sessions/{parent}/elicitations/{eid}/resolve", json={"action": "accept"}
         )
-        assert wrong_owner.status_code == 202
+        # A live parked owner refuses a resolve from another session; once the
+        # hook is gone the misdirected resolve settles nothing.
+        assert wrong_owner.status_code == (202 if disconnected else 403)
         assert (await parent_delivery("ready"))["params"]["target_session_id"] == child
         if not disconnected:
             assert not hook.done()

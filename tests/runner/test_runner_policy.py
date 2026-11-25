@@ -123,6 +123,51 @@ async def test_success_deny_verdict_passed_through() -> None:
     assert verdict["reason"] == "blocked"
 
 
+class _CapturingPolicyServerClient:
+    """Server client that records the policy request body."""
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, dict[str, Any]]] = []
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: float) -> httpx.Response:
+        self.requests.append((url, json))
+        return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"})
+
+
+async def test_child_action_target_is_forwarded_to_server() -> None:
+    """ACP child policy requests retain the exact registered child target."""
+    server = _CapturingPolicyServerClient()
+    harness = _CapturingHarnessClient()
+    event_data = {"name": "mcp__github__merge_pull_request", "arguments": {}}
+
+    await _evaluate_policy_via_omnigent(
+        server_client=server,  # type: ignore[arg-type]
+        harness_client=harness,  # type: ignore[arg-type]
+        conversation_id="conv_parent",
+        evaluation_id="poleval_child",
+        phase="PHASE_TOOL_CALL",
+        data=event_data,
+        action_context_token="origin-token",
+        action_context_generation="generation-1",
+        action_child_key="child-key-1",
+        action_child_session_id="conv_child",
+    )
+
+    assert server.requests == [
+        (
+            "/v1/sessions/conv_parent/policies/evaluate",
+            {
+                "event": {"type": "PHASE_TOOL_CALL", "data": event_data},
+                "_omnigent_action_context_token": "origin-token",
+                "_omnigent_action_context_generation": "generation-1",
+                "_omnigent_action_child_key": "child-key-1",
+                "_omnigent_action_child_session_id": "conv_child",
+            },
+        )
+    ]
+    assert len(harness.posted) == 1
+
+
 # ── ExecutorAdapter._stable_policy_evaluator fail-closed ──────────────────
 
 

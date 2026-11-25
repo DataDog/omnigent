@@ -21,6 +21,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -36,11 +37,18 @@ from omnigent.inner.acp_executor import (
     _resolve_cwd,
     _unattended_auth_method_id,
 )
+from omnigent.inner.acp_standard_subagents import (
+    ACP_TOOL_CALL_SCOPE_METADATA_KEY,
+    ACP_TOOL_OUTPUT_METADATA_KEY,
+    REPORT_FEATURES,
+)
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
+    SessionReport,
+    SessionReportAppendResult,
     SubAgentCompleted,
     SubAgentStarted,
     SubAgentToolCall,
@@ -582,7 +590,7 @@ def test_tool_call_and_update_emit_cards() -> None:
     comp = done[0]
     assert isinstance(comp, ToolCallComplete)
     assert comp.name == "shell" and comp.status is ToolCallStatus.SUCCESS
-    assert comp.metadata == {"call_id": "c1"}
+    assert comp.metadata == {"call_id": "c1", "tool_status": "completed"}
     assert "c1" not in ex._tool_names  # popped
 
 
@@ -618,6 +626,489 @@ def test_tool_call_update_failed_maps_to_error() -> None:
         {"sessionUpdate": "tool_call_update", "toolCallId": "c2", "status": "failed"}
     )
     assert done[0].status is ToolCallStatus.ERROR
+
+
+class _TestSessionReportSink:
+    protocol_version = 3
+    features = tuple(REPORT_FEATURES)
+    server_identity = "server-root-tool-test"
+    root_conversation_id = "conv_root_tool_test"
+
+    def begin_native_epoch(self, native_epoch: str) -> None:
+        del native_epoch
+
+    def bind_native_session(self, native_epoch: str, native_session_id: str) -> None:
+        del native_epoch, native_session_id
+
+    def append(self, report: SessionReport) -> SessionReportAppendResult:
+        del report
+        raise AssertionError("the test replaces the executor report append seam")
+
+
+def _prepare_reported_root_executor(
+    *, prompt_active: bool
+) -> tuple[AcpExecutor, list[dict[str, Any]]]:
+    """Set the private report boundary for focused root-tool update tests."""
+    executor = AcpExecutor(AcpAgentConfig(command="x"))
+    executor._standard_subagents_enabled = True
+    executor._session_reports_negotiated = True
+    executor.set_session_report_sink(_TestSessionReportSink())
+    executor._session_id = "native-root-report-test"
+    executor._native_epoch = "native-epoch-report-test"
+    executor._native_context_generation = "report-context-generation"
+    executor._active_prompt_request_id = 1
+    executor._active_prompt_response_received = not prompt_active
+    if prompt_active:
+        executor.bind_session_action_origin(
+            "a" * 32,
+            "test-agent",
+            "action-generation",
+            "report-context-generation",
+            response_id="response-root-tool-test",
+        )
+    reports: list[dict[str, Any]] = []
+
+    async def append_report(identity, kind, operation, *, action_origin=None):
+        source_id = f"acp2:{len(reports) + 1:064x}"
+        reports.append(
+            {
+                "identity": identity,
+                "kind": kind,
+                "operation": dict(operation),
+                "action_origin": action_origin,
+                "source_id": source_id,
+            }
+        )
+        return source_id
+
+    executor._append_standard_report = append_report  # type: ignore[method-assign]
+    return executor, reports
+
+
+@pytest.mark.asyncio
+async def test_active_root_call_anchors_identity_and_reuses_origin_for_late_references() -> None:
+    executor, reports = _prepare_reported_root_executor(prompt_active=True)
+    call_id = "active-root-call"
+    tool_call = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": call_id,
+        "title": "worker",
+        "rawInput": {"task": "inspect"},
+    }
+    assert (
+        await executor._dispatch_session_report(
+            {
+                "method": "session/update",
+                "params": {"sessionId": executor._session_id, "update": tool_call},
+            }
+        )
+        is False
+    )
+
+    anchor = reports[0]
+    assert anchor["kind"] == "tool.references"
+    assert anchor["operation"] == {
+        "entity_id": acp_executor_module.acp_standard_tool_entity_id(call_id),
+        "call_id": call_id,
+        "response_id": "response-root-tool-test",
+    }
+    assert "references" not in anchor["operation"]
+    origin = ("a" * 32, "test-agent", "action-generation", "report-context-generation")
+    assert anchor["action_origin"] == origin
+
+    request = executor._handle_session_update(tool_call)[0]
+    assert isinstance(request, ToolCallRequest)
+    scope_metadata = request.metadata[ACP_TOOL_CALL_SCOPE_METADATA_KEY]
+    assert scope_metadata == {
+        "source_id": anchor["source_id"],
+        "native_call_id": call_id,
+        "action_origin_token": origin[0],
+        "action_origin_generation": origin[2],
+        "response_id": "response-root-tool-test",
+    }
+
+    references_update = {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": call_id,
+        "status": "in_progress",
+        "content": [{"type": "session", "sessionId": "native-child-reference"}],
+    }
+    assert (
+        await executor._dispatch_session_report(
+            {
+                "method": "session/update",
+                "params": {"sessionId": executor._session_id, "update": references_update},
+            }
+        )
+        is False
+    )
+    executor._active_prompt_response_received = True
+    late_references_update = {**references_update, "status": "completed"}
+    assert (
+        await executor._dispatch_session_report(
+            {
+                "method": "session/update",
+                "params": {"sessionId": executor._session_id, "update": late_references_update},
+            }
+        )
+        is True
+    )
+
+    reference_reports = [report for report in reports if report["kind"] == "tool.references"]
+    assert len(reference_reports) == 3
+    assert reference_reports[1]["operation"]["references"] == ["native-child-reference"]
+    assert reference_reports[2]["operation"]["references"] == ["native-child-reference"]
+    assert [report["action_origin"] for report in reference_reports] == [
+        origin,
+        None,
+        None,
+    ]
+
+    completion = executor._handle_session_update(late_references_update)[0]
+    assert isinstance(completion, ToolCallComplete)
+    assert completion.metadata[ACP_TOOL_CALL_SCOPE_METADATA_KEY] == scope_metadata
+
+
+@pytest.mark.parametrize(
+    ("status", "payload", "expected_output", "output_kind", "event_result"),
+    [
+        pytest.param(
+            "completed",
+            {"content": [{"type": "text", "text": "completed content"}]},
+            "completed content",
+            "entity.upsert",
+            [{"type": "text", "text": "completed content"}],
+            id="completed-content",
+        ),
+        pytest.param(
+            "failed",
+            {"rawOutput": "failed raw output"},
+            "failed raw output",
+            "entity.upsert",
+            "failed raw output",
+            id="failed-raw-output",
+        ),
+        pytest.param(
+            "completed",
+            {"content": None},
+            None,
+            "entity.patch",
+            None,
+            id="explicit-null-clear",
+        ),
+        pytest.param(
+            "completed",
+            {},
+            None,
+            None,
+            None,
+            id="output-absent",
+        ),
+        pytest.param(
+            "failed",
+            {"content": [], "rawOutput": "stale raw output"},
+            "",
+            "entity.upsert",
+            [],
+            id="empty-content-wins",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_initial_terminal_root_tool_call_preserves_output_presence_and_scope(
+    status: str,
+    payload: dict[str, object],
+    expected_output: str | None,
+    output_kind: str | None,
+    event_result: object,
+) -> None:
+    """A tool_call can start terminal and keeps output presence distinct from absence."""
+    executor, reports = _prepare_reported_root_executor(prompt_active=True)
+    call_id = f"initial-terminal-{status}-{len(payload)}"
+    update = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": call_id,
+        "title": "initial_terminal_tool",
+        "rawInput": {"value": "original"},
+        "status": status,
+        **payload,
+    }
+    assert (
+        await executor._dispatch_session_report(
+            {
+                "method": "session/update",
+                "params": {"sessionId": executor._session_id, "update": update},
+            }
+        )
+        is False
+    )
+
+    anchor = reports[0]
+    assert anchor["kind"] == "tool.references"
+    assert anchor["operation"] == {
+        "entity_id": acp_executor_module.acp_standard_tool_entity_id(call_id),
+        "call_id": call_id,
+        "response_id": "response-root-tool-test",
+    }
+    call_operation = next(
+        report["operation"]
+        for report in reports
+        if report["operation"].get("entity_id")
+        == acp_executor_module.acp_standard_tool_entity_id(call_id)
+        and report["kind"] == "entity.upsert"
+    )
+    assert call_operation["call_id"] == call_id
+    assert call_operation["value"]["response_id"] == "response-root-tool-test"
+    assert call_operation["value"]["item_data"]["name"] == "initial_terminal_tool"
+    assert call_operation["value"]["item_data"]["arguments"] == '{"value":"original"}'
+    assert call_operation["value"]["item_data"]["tool_status"] == status
+
+    output_entity_id = acp_executor_module.acp_standard_tool_output_entity_id(call_id)
+    output_reports = [
+        report for report in reports if report["operation"].get("entity_id") == output_entity_id
+    ]
+    if output_kind is None:
+        assert output_reports == []
+    else:
+        assert len(output_reports) == 1
+        output_report = output_reports[0]
+        assert output_report["kind"] == output_kind
+        assert output_report["operation"]["call_id"] == call_id
+        if output_kind == "entity.patch":
+            assert output_report["operation"]["patch"]["output"] is None
+            assert output_report["operation"]["patch"]["acp_agent_identity"] == "unknown"
+        else:
+            output_data = output_report["operation"]["value"]["item_data"]
+            assert output_report["operation"]["value"]["response_id"] == (
+                "response-root-tool-test"
+            )
+            assert output_data["call_id"] == call_id
+            assert output_data["output"] == expected_output
+            if payload.get("content") == []:
+                assert output_data["content"] == []
+                assert output_data["raw_output"] == "stale raw output"
+
+    events = executor._handle_session_update(update)
+    assert len(events) == 2
+    request, completion = events
+    assert isinstance(request, ToolCallRequest)
+    assert request.metadata["observed_call_completed"] is True
+    assert isinstance(completion, ToolCallComplete)
+    assert completion.status is (
+        ToolCallStatus.SUCCESS if status == "completed" else ToolCallStatus.ERROR
+    )
+    assert completion.result == event_result
+    scope = request.metadata[ACP_TOOL_CALL_SCOPE_METADATA_KEY]
+    assert scope == completion.metadata[ACP_TOOL_CALL_SCOPE_METADATA_KEY]
+    assert scope["source_id"] == anchor["source_id"]
+    assert scope["response_id"] == "response-root-tool-test"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_result", "present", "cleared", "text"),
+    [
+        pytest.param({}, None, False, False, None, id="missing-after-initial-content"),
+        pytest.param(
+            {"content": None}, None, True, True, None, id="null-clears-after-initial-content"
+        ),
+        pytest.param(
+            {"content": []}, [], True, False, "", id="empty-content-after-initial-content"
+        ),
+        pytest.param(
+            {"rawOutput": ""}, "", True, False, "", id="empty-raw-output-after-initial-content"
+        ),
+        pytest.param(
+            {
+                "content": [{"type": "text", "text": "final content"}],
+                "rawOutput": "ignored raw output",
+            },
+            [{"type": "text", "text": "final content"}],
+            True,
+            False,
+            "final content",
+            id="content-wins-when-both-are-present",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_root_tool_update_events_preserve_output_presence_after_content(
+    payload: dict[str, object],
+    expected_result: object,
+    present: bool,
+    cleared: bool,
+    text: str | None,
+) -> None:
+    """Completion events distinguish missing, cleared, and empty tool output."""
+    executor, reports = _prepare_reported_root_executor(prompt_active=True)
+    call_id = "root-output-presence"
+    initial_content = [{"type": "text", "text": "initial content"}]
+    initial_call = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": call_id,
+        "title": "worker",
+        "rawInput": {},
+    }
+    assert (
+        await executor._dispatch_session_report(
+            {
+                "method": "session/update",
+                "params": {"sessionId": executor._session_id, "update": initial_call},
+            }
+        )
+        is False
+    )
+    initial_events = executor._handle_session_update(initial_call)
+    assert len(initial_events) == 1
+    assert isinstance(initial_events[0], ToolCallRequest)
+
+    interim_update = {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": call_id,
+        "status": "in_progress",
+        "content": initial_content,
+    }
+    assert (
+        await executor._dispatch_session_report(
+            {
+                "method": "session/update",
+                "params": {"sessionId": executor._session_id, "update": interim_update},
+            }
+        )
+        is False
+    )
+    assert executor._handle_session_update(interim_update) == []
+    output_entity_id = acp_executor_module.acp_standard_tool_output_entity_id(call_id)
+    initial_output_reports = [
+        report for report in reports if report["operation"].get("entity_id") == output_entity_id
+    ]
+    assert len(initial_output_reports) == 1
+    assert initial_output_reports[0]["kind"] == "entity.upsert"
+    initial_output = initial_output_reports[0]["operation"]["value"]["item_data"]
+    assert initial_output["output"] == "initial content"
+    assert initial_output["content"] == initial_content
+
+    terminal_update = {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": call_id,
+        "status": "completed",
+        **payload,
+    }
+    report_count_before_terminal = len(reports)
+    assert (
+        await executor._dispatch_session_report(
+            {
+                "method": "session/update",
+                "params": {"sessionId": executor._session_id, "update": terminal_update},
+            }
+        )
+        is False
+    )
+    terminal_output_reports = [
+        report
+        for report in reports[report_count_before_terminal:]
+        if report["operation"].get("entity_id") == output_entity_id
+    ]
+    if not payload:
+        assert terminal_output_reports == []
+    completed_events = executor._handle_session_update(terminal_update)
+    assert len(completed_events) == 1
+    completion = completed_events[0]
+    assert isinstance(completion, ToolCallComplete)
+    assert completion.result == expected_result
+    assert completion.metadata[ACP_TOOL_OUTPUT_METADATA_KEY] == {
+        "present": present,
+        "cleared": cleared,
+        "text": text,
+        "content_present": "content" in payload,
+        "content": payload.get("content"),
+        "raw_output_present": "rawOutput" in payload,
+        "raw_output": payload.get("rawOutput"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_initial_root_tool_references_follow_identity_only_anchor() -> None:
+    """Initial native references are a separate origin-free report after the anchor."""
+    executor, reports = _prepare_reported_root_executor(prompt_active=True)
+    call_id = "initial-call-with-reference"
+    update = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": call_id,
+        "title": "worker",
+        "rawInput": {"task": "inspect"},
+        "content": [{"type": "session", "sessionId": "native-child-initial"}],
+    }
+
+    assert (
+        await executor._dispatch_session_report(
+            {
+                "method": "session/update",
+                "params": {"sessionId": executor._session_id, "update": update},
+            }
+        )
+        is False
+    )
+    reference_reports = [report for report in reports if report["kind"] == "tool.references"]
+    assert len(reference_reports) == 2
+    assert reference_reports[0]["operation"] == {
+        "entity_id": acp_executor_module.acp_standard_tool_entity_id(call_id),
+        "call_id": call_id,
+        "response_id": "response-root-tool-test",
+    }
+    assert "references" not in reference_reports[0]["operation"]
+    assert reference_reports[0]["action_origin"] is not None
+    assert reference_reports[1]["operation"]["references"] == ["native-child-initial"]
+    assert reference_reports[1]["action_origin"] is None
+    assert reports.index(reference_reports[0]) < reports.index(reference_reports[1])
+
+
+@pytest.mark.asyncio
+async def test_detached_root_call_stays_report_owned_without_new_prompt_origin() -> None:
+    executor, reports = _prepare_reported_root_executor(prompt_active=False)
+    executor._active_session_action_origin = None
+    call_id = "detached-root-call"
+    tool_call = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": call_id,
+        "title": "worker",
+        "rawInput": {"task": "continue"},
+    }
+
+    assert (
+        await executor._dispatch_session_report(
+            {
+                "method": "session/update",
+                "params": {"sessionId": executor._session_id, "update": tool_call},
+            }
+        )
+        is True
+    )
+    assert executor._root_tool_call_scopes == {}
+    assert len(reports) == 1
+    assert reports[0]["kind"] == "entity.upsert"
+    assert reports[0]["action_origin"] is None
+    assert reports[0]["operation"]["value"]["item_data"]["call_id"] == call_id
+
+    late_references_update = {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": call_id,
+        "status": "completed",
+        "content": [{"type": "session", "sessionId": "native-child-detached"}],
+    }
+    assert (
+        await executor._dispatch_session_report(
+            {
+                "method": "session/update",
+                "params": {"sessionId": executor._session_id, "update": late_references_update},
+            }
+        )
+        is True
+    )
+    reference_reports = [report for report in reports if report["kind"] == "tool.references"]
+    assert len(reference_reports) == 1
+    assert reference_reports[0]["operation"]["references"] == ["native-child-detached"]
+    assert reference_reports[0]["action_origin"] is None
+    assert executor._root_tool_call_scopes == {}
 
 
 def test_usage_update_sets_context_window() -> None:
@@ -2400,6 +2891,28 @@ def test_spawn_env_still_excludes_undeclared_secret() -> None:
     assert "UNRELATED_API_KEY" not in env
 
 
+def test_spawn_env_never_forwards_private_report_scope_to_vendor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner report scope stays private even when the vendor env allowlists it."""
+    from omnigent.runner.identity import (
+        HARNESS_AUTH_TOKEN_ENV_VAR,
+        HARNESS_SESSION_REPORT_ENV_VARS,
+    )
+
+    private_names = {HARNESS_AUTH_TOKEN_ENV_VAR, *HARNESS_SESSION_REPORT_ENV_VARS}
+    for index, name in enumerate(private_names):
+        monkeypatch.setenv(name, f"private-value-{index}")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", ",".join(sorted(private_names)))
+    executor = AcpExecutor(
+        AcpAgentConfig(command="agent stdio", env_passthrough=tuple(sorted(private_names)))
+    )
+
+    agent_env = executor._build_spawn_env()
+
+    assert private_names.isdisjoint(agent_env)
+
+
 @pytest.mark.asyncio
 async def test_handshake_timeout_reports_a_non_blank_error(tmp_path: Path) -> None:
     """An agent that never answers ``session/new`` yields a named error.
@@ -2996,3 +3509,6 @@ async def test_prompt_input_item_id_is_current_or_null(fresh_session, tail, expe
         assert prompts[0]["params"]["prompt"] == [{"type": "text", "text": ""}]
     if fresh_session and tail.get("role") == "user":
         assert "old reply" in prompts[0]["params"]["prompt"][0]["text"]
+
+
+# ---------------------------------------------------------------------------

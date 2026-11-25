@@ -27,6 +27,13 @@ _EVENTS_PATH = re.compile(r"/v1/sessions/([^/]+)/events$")
 _MAX_EVENTS = 32
 _MAX_BATCH_BYTES = 256 * 1024
 _MAX_PENDING_BATCHES = 34  # Two active workers plus 32 queued batches.
+_TUNNEL_ONLY_CONTROL_EVENTS = frozenset(
+    {
+        "external_acp_report_connection_admit",
+        "external_acp_report_owner_admit",
+        "external_acp_report_epoch_activate",
+    }
+)
 
 
 class TunnelIngestUnsupported(Exception):
@@ -287,8 +294,10 @@ class TunnelEventClient(httpx.AsyncClient):
             events = cast("list[dict[str, Any]]", value)
         else:
             return await super().post(*args, **kwargs)
+        control_events = any(event.get("type") in _TUNNEL_ONLY_CONTROL_EVENTS for event in events)
         if not all(
-            event.get("type") == "external_output_text_delta"
+            event.get("type") in _TUNNEL_ONLY_CONTROL_EVENTS
+            or event.get("type") == "external_output_text_delta"
             or (
                 event.get("type") == "external_conversation_item"
                 and isinstance(event.get("data"), dict)
@@ -314,6 +323,8 @@ class TunnelEventClient(httpx.AsyncClient):
         ):
             return await super().post(*args, **kwargs)
         if not await self._event_dispatcher.wait_for_first_ready():
+            if control_events:
+                raise RuntimeError("ACP report control requires the authenticated runner tunnel")
             return await super().post(*args, **kwargs)
         request = self.build_request("POST", url)
         try:
@@ -323,6 +334,10 @@ class TunnelEventClient(httpx.AsyncClient):
             else:
                 ack = await submit
         except TunnelIngestUnsupported:
+            if control_events:
+                raise RuntimeError(
+                    "ACP report control requires a server with runner tunnel event ingestion"
+                ) from None
             return await super().post(*args, **kwargs)
         except (ConnectionClosed, OSError):
             # Preview is best-effort. Final transcript items retain their

@@ -10,6 +10,7 @@ import { parseNativePermissionDelivery } from "./nativePermissionDelivery";
 // catch — please add an SSE-parser test when you touch this.
 
 import { assistantMessagePhase } from "./conversationItems";
+import type { AcpSessionMessage, AcpToolSessionReference } from "./conversationItems";
 import { readSubagentActivity } from "./subagentActivity";
 import type {
   BrowserActionRequestEvent,
@@ -39,6 +40,7 @@ import type {
   SessionBtwSidechatEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
+  SessionChildSessionsInvalidatedEvent,
   SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
@@ -958,6 +960,14 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       child: child as Record<string, unknown>,
     } satisfies SessionChildSessionUpdatedEvent;
   }
+  if (eventType === "session.child_sessions.invalidated") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    return {
+      type: "session_child_sessions_invalidated",
+      conversationId,
+    } satisfies SessionChildSessionsInvalidatedEvent;
+  }
   if (eventType === "session.changed_files.invalidated") {
     const sessionId = data.session_id;
     if (typeof sessionId !== "string" || !sessionId) return null;
@@ -1239,6 +1249,12 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
   const itemId = String(rec.id ?? "");
   const responseId = String(rec.response_id ?? "");
   const messageId = typeof data.message_id === "string" ? data.message_id : undefined;
+  const acpSessionReferences = Object.hasOwn(rec, "acp_session_references")
+    ? parseAcpSessionReferences(rec.acp_session_references)
+    : undefined;
+  const acpSessionMessage = Object.hasOwn(rec, "acp_session_message")
+    ? parseAcpSessionMessage(rec.acp_session_message)
+    : undefined;
 
   if (itemType === "function_call") {
     const argsStr = String(rec.arguments ?? "{}");
@@ -1257,6 +1273,8 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       agentName: String(rec.model ?? ""),
       itemId,
       responseId,
+      ...(rec.acp_agent_identity === "unknown" ? { acpAgentIdentity: "unknown" as const } : {}),
+      ...(acpSessionReferences !== undefined ? { acpSessionReferences } : {}),
     } satisfies ToolCall;
   }
 
@@ -1264,9 +1282,10 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
     return {
       type: "tool_result",
       callId: String(rec.call_id ?? ""),
-      output: String(rec.output ?? ""),
+      output: rec.output === null ? null : String(rec.output ?? ""),
       itemId,
       responseId,
+      ...(rec.acp_agent_identity === "unknown" ? { acpAgentIdentity: "unknown" as const } : {}),
     } satisfies ToolResult;
   }
 
@@ -1281,6 +1300,8 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       responseId,
       ...(messageId !== undefined ? { messageId } : {}),
       ...(phase !== undefined ? { phase } : {}),
+      ...(acpSessionMessage !== undefined ? { acpSessionMessage } : {}),
+      ...(rec.acp_agent_identity === "unknown" ? { acpAgentIdentity: "unknown" as const } : {}),
     } satisfies MessageDone;
   }
 
@@ -1298,6 +1319,7 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       summary,
       itemId,
       responseId,
+      ...(rec.acp_agent_identity === "unknown" ? { acpAgentIdentity: "unknown" as const } : {}),
     } satisfies ReasoningDone;
   }
 
@@ -1388,6 +1410,51 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
 
   // Compaction items, etc. — skip.
   return null;
+}
+
+function parseAcpSessionMessage(value: unknown): AcpSessionMessage | null | undefined {
+  if (value === null) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.kind !== "directed") return undefined;
+  const fields = [
+    "sender_session_id",
+    "recipient_session_id",
+    "sender_message_id",
+    "recipient_message_id",
+    "sender_conversation_id",
+    "recipient_conversation_id",
+  ] as const;
+  const participants: Partial<Record<(typeof fields)[number], string | null>> = {};
+  for (const field of fields) {
+    if (!Object.hasOwn(record, field)) continue;
+    const fieldValue = record[field];
+    if (fieldValue !== null && typeof fieldValue !== "string") return undefined;
+    participants[field] = fieldValue as string | null;
+  }
+  return { kind: "directed", ...participants };
+}
+
+function parseAcpSessionReferences(value: unknown): AcpToolSessionReference[] | null | undefined {
+  if (value === null) return null;
+  if (!Array.isArray(value)) return undefined;
+  const references: AcpToolSessionReference[] = [];
+  for (const candidate of value) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return undefined;
+    const record = candidate as Record<string, unknown>;
+    if (typeof record.native_session_id !== "string" || !record.native_session_id) {
+      return undefined;
+    }
+    const reference: AcpToolSessionReference = { native_session_id: record.native_session_id };
+    if (Object.hasOwn(record, "conversation_id")) {
+      if (record.conversation_id !== null && typeof record.conversation_id !== "string") {
+        return undefined;
+      }
+      reference.conversation_id = record.conversation_id as string | null;
+    }
+    references.push(reference);
+  }
+  return references;
 }
 
 /** Join `{text}` blocks the way `itemsToBlocks` does (`"\n\n"`). */

@@ -56,6 +56,7 @@ import shlex
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
@@ -64,7 +65,27 @@ from omnigent.inner import _proc
 from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
-from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentStart, read_subagent_events
+from omnigent.inner.acp_standard_subagents import (
+    ACP_TOOL_CALL_SCOPE_METADATA_KEY,
+    ACP_TOOL_OUTPUT_METADATA_KEY,
+    ACTION_FEATURES,
+    REPORT_FEATURES,
+    AcpSessionActionBinding,
+    AcpSessionActionRead,
+    AcpSessionOperation,
+    AcpSessionReportIdentity,
+    acp_standard_report_source_id,
+    acp_standard_tool_entity_id,
+    acp_standard_tool_output_entity_id,
+    read_session_tool_references,
+    read_standard_session_action,
+    read_standard_subagent_frame,
+)
+from omnigent.inner.acp_subagents import (
+    SubAgentActivity,
+    SubAgentStart,
+    read_subagent_events,
+)
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
@@ -74,6 +95,9 @@ from omnigent.inner.executor import (
     ExecutorEvent,
     Message,
     ReasoningChunk,
+    SessionReport,
+    SessionReportSink,
+    SessionReportStatus,
     SubAgentCompleted,
     SubAgentStarted,
     SubAgentToolCall,
@@ -86,11 +110,14 @@ from omnigent.inner.executor import (
     describe_exception,
 )
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
+from omnigent.inner.sandbox import reachable_roots
 from omnigent.process_logging import current_process_log_path, display_log_path
+from omnigent.runner.identity import strip_runner_auth_secrets
 
 logger = logging.getLogger(__name__)
 
 ACP_CANCEL_GRACE_SECONDS = 1.0
+_ACP_ACTION_ORIGIN_CHECK_PHASE = "ACP_ACTION_ORIGIN_CHECK"
 _ACP_TERMINATION_TIMEOUT_SECONDS = 5.0
 _ACP_CLEANUP_HEADROOM_SECONDS = 1.0
 ACP_REAP_TIMEOUT_SECONDS = (
@@ -190,6 +217,29 @@ _STDERR_QUOTED_LIMIT = 1000
 
 # ACP protocol version this executor targets (matches Goose 1.38 / Qwen).
 _PROTOCOL_VERSION = 1
+_MAX_STANDARD_SESSIONS = 50_000
+_MAX_STANDARD_REPORTS = 50_000
+_MAX_ROOT_TOOL_CALL_SCOPES = _MAX_STANDARD_REPORTS
+_MAX_DETACHED_ACP_REQUESTS = 128
+
+
+@dataclass
+class _StandardSessionAssociation:
+    parent_session_id: str | None
+    association_source_id: str
+    origin: tuple[str, str | None, str, str] | None
+    cwd_present: bool = False
+    cwd: str | None = None
+    additional_directories_present: bool = False
+    additional_directories: tuple[str, ...] | None = None
+
+
+@dataclass
+class _SessionTranslationContext:
+    tool_names: dict[str, str] = dataclass_field(default_factory=dict)
+    tool_inputs: dict[str, _AcpJsonObject] = dataclass_field(default_factory=dict)
+    response_ids: dict[tuple[str, str], str] = dataclass_field(default_factory=dict)
+    active_message_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -511,9 +561,39 @@ class AcpExecutor(Executor):
         self._rpc_id: int = 0
         self._pending: dict[int, asyncio.Future[_AcpJsonObject]] = {}
         self._active_prompt_request_id: int | None = None
+        self._active_prompt_response_received = False
         self._cancel_grace_deadline: float | None = None
 
         self._session_id: str | None = None
+        self._native_epoch: str | None = None
+        self._session_report_sink: SessionReportSink | None = None
+        self._standard_subagents_enabled = False
+        self._session_reports_negotiated = False
+        self._report_prompt_started = False
+        self._standard_associations: dict[str, _StandardSessionAssociation] = {}
+        self._session_translation_contexts: dict[str, _SessionTranslationContext] = {}
+        # Native root tool call ID -> (trusted anchor source ID, action origin,
+        # owning response ID). Each entry consumes one bounded report and is
+        # reset with the native epoch.
+        self._root_tool_call_scopes: dict[
+            str, tuple[str, tuple[str, str | None, str, str], str]
+        ] = {}
+        self._native_context_generation: str | None = None
+        self._next_ingress_sequence = 1
+        self._report_event_count = 0
+        self._active_session_action_origin: tuple[str, str | None, str, str] | None = None
+        self._active_session_action_response_id: str | None = None
+        self._report_failure: BaseException | None = None
+        self._report_failure_shutdown_task: asyncio.Task[None] | None = None
+        self._session_action_failure_task: asyncio.Task[None] | None = None
+        self._detached_request_tasks: set[asyncio.Task[None]] = set()
+        self._next_child_request_invocation_id = 0
+        # Installed by ExecutorAdapter after report v3 and action v2 capability
+        # negotiation. Child requests carry a validated immutable origin binding.
+        self._session_action_request_handler: (
+            Callable[[_AcpJsonObject, AcpSessionActionBinding], Awaitable[None]] | None
+        ) = None
+        self._session_action_failure_handler: Callable[[], Awaitable[None]] | None = None
         self._initialized: bool = False
         self._image_supported: bool = False
         # One-way latch per subprocess: set after a successful ACP
@@ -559,6 +639,118 @@ class AcpExecutor(Executor):
         # from what session/new advertised. Empty means nothing is a bridge call.
         self._bridge_tool_aliases: frozenset[str] = frozenset()
 
+    def supports_session_reports(self) -> bool:
+        """Whether this executor implements the trusted report-sink contract."""
+        return True
+
+    def enable_standard_subagents(
+        self, report_features: Sequence[str], action_features: Sequence[str]
+    ) -> None:
+        """Enable the ACP preview after report v3 and action v2 are proven."""
+        if self._initialized or self._session_id is not None:
+            raise RuntimeError("standard ACP subagents must be enabled before initialization")
+        if not set(REPORT_FEATURES).issubset(report_features):
+            raise RuntimeError("ACP report channel lacks required standard-session v3 features")
+        if not set(ACTION_FEATURES).issubset(action_features):
+            raise RuntimeError("ACP action channel lacks required standard-session v2 features")
+        self._standard_subagents_enabled = True
+
+    def bind_session_action_origin(
+        self,
+        token: str | None,
+        agent: str | None,
+        generation: str | None = None,
+        context_generation: str | None = None,
+        response_id: str | None = None,
+    ) -> None:
+        """Bind trusted request authority, turn identity, and security context."""
+        if token is None:
+            if self._standard_subagents_enabled and any(
+                session_id != self._session_id for session_id in self._standard_associations
+            ):
+                raise RuntimeError(
+                    "ACP parent turn cannot continue with owned children without a trusted context"
+                )
+            self._active_session_action_origin = None
+            self._active_session_action_response_id = None
+            return
+        if generation is None and self._session_report_sink is None:
+            generation = "unbound"
+        if context_generation is None and self._session_report_sink is None:
+            context_generation = "unbound"
+        if (
+            not token
+            or len(token) > 256
+            or not generation
+            or len(generation) > 256
+            or not context_generation
+            or len(context_generation) > 256
+        ):
+            raise ValueError("ACP session-action origin token is malformed")
+        if response_id is not None and (
+            not isinstance(response_id, str) or not response_id or len(response_id) > 64
+        ):
+            raise ValueError("ACP session-action response identity is malformed")
+        if self._standard_subagents_enabled and response_id is None:
+            raise ValueError("ACP session-action origin is missing its response identity")
+        if (
+            self._native_context_generation is not None
+            and self._native_context_generation != context_generation
+        ):
+            raise RuntimeError(
+                "ACP native session is bound to a different trusted security context"
+            )
+        self._active_session_action_origin = (token, agent, generation, context_generation)
+        self._active_session_action_response_id = response_id
+        if self._session_id is not None and self._native_context_generation is None:
+            self._native_context_generation = context_generation
+        if self._standard_subagents_enabled and self._session_id is not None:
+            root_association = self._standard_associations.get(self._session_id)
+            if root_association is not None and root_association.origin is None:
+                root_association.origin = self._active_session_action_origin
+
+    def clear_session_action_origin(self, token: str | None) -> None:
+        """Clear only the active origin installed by the ending parent turn."""
+        current = self._active_session_action_origin
+        if current is not None and current[0] == token:
+            self._active_session_action_origin = None
+            self._active_session_action_response_id = None
+
+    def set_session_report_sink(self, sink: SessionReportSink) -> None:
+        """Attach the trusted runtime journal before ACP session setup begins."""
+        if not self._standard_subagents_enabled:
+            raise RuntimeError(
+                "standard ACP reports require negotiated report v3 and action v2 channels"
+            )
+        if self._initialized or self._session_id is not None:
+            raise RuntimeError("the ACP report sink must be installed before initialization")
+        if self._session_report_sink is not None and self._session_report_sink is not sink:
+            raise RuntimeError("the ACP report sink is already bound")
+        if getattr(sink, "protocol_version", None) != 3:
+            raise RuntimeError("standard ACP reports require private report protocol v3")
+        if not set(REPORT_FEATURES).issubset(getattr(sink, "features", ())):
+            raise RuntimeError("standard ACP reports require all negotiated report features")
+        if not getattr(sink, "server_identity", None) or not getattr(
+            sink, "root_conversation_id", None
+        ):
+            raise RuntimeError("standard ACP report sink has no trusted identity scope")
+        self._session_report_sink = sink
+
+    def session_report_status(self) -> SessionReportStatus | None:
+        """Expose producer health without hiding reports already saved."""
+        if not self._standard_subagents_enabled:
+            return None
+        if self._report_failure is not None:
+            return SessionReportStatus(
+                state="failed",
+                error=describe_exception(self._report_failure),
+                prompt_started=self._report_prompt_started,
+            )
+        return SessionReportStatus(
+            state="active" if self._session_reports_negotiated else "starting",
+            prompt_started=self._report_prompt_started,
+        )
+
     # ------------------------------------------------------------------
     # Low-level ACP transport
     # ------------------------------------------------------------------
@@ -580,6 +772,8 @@ class AcpExecutor(Executor):
         # Reset handshake state: this may be a restart after the previous
         # subprocess died. ``_initialized`` is a one-way latch.
         self._initialized = False
+        self._session_reports_negotiated = False
+        self._report_prompt_started = False
         self._image_supported = False
         self._authenticated = False
         self._auth_advertisement = {}
@@ -698,9 +892,9 @@ class AcpExecutor(Executor):
     async def _read_stdout(self) -> None:
         """Continuously read NDJSON lines from the agent's stdout.
 
-        Responses (``id`` + no ``method``) resolve the matching ``_pending``
-        future; notifications and server-initiated requests go on ``_queue`` for
-        ``run_turn`` to consume.
+        Responses resolve their RPC future. Negotiated session reports are
+        durably reduced here, independently of a parent turn; other messages
+        retain the existing turn-queue path.
         """
         assert self._proc and self._proc.stdout
         try:
@@ -709,6 +903,11 @@ class AcpExecutor(Executor):
                 if not raw_line:
                     # EOF — the subprocess exited. Wake in-flight futures so
                     # run_turn fails fast instead of blocking until idle timeout.
+                    if self._session_reports_negotiated:
+                        await self._record_transport_diagnostic("disconnected", "stdout_eof")
+                        self._fail_report_delivery(
+                            EOFError("ACP subprocess exited while session reporting was active")
+                        )
                     for fut in self._pending.values():
                         if not fut.done():
                             fut.set_exception(EOFError("ACP subprocess closed stdout"))
@@ -731,6 +930,7 @@ class AcpExecutor(Executor):
                 if msg_id is not None and "method" not in msg and msg_id in self._pending:
                     fut = self._pending.pop(msg_id)
                     if msg_id == self._active_prompt_request_id:
+                        self._active_prompt_response_received = True
                         # run_turn may already be cancelled when the response arrives.
                         error = msg.get("error")
                         if isinstance(error, dict):
@@ -753,16 +953,1130 @@ class AcpExecutor(Executor):
                     if not fut.done():
                         fut.set_result(msg)
                 else:
+                    if (
+                        msg.get("method") == _CLIENT_NOTIFICATION_SESSION_UPDATE
+                        and self._session_id is not None
+                        and await self._dispatch_session_report(msg)
+                    ):
+                        continue
+                    if (
+                        isinstance(msg.get("method"), str)
+                        and msg_id is not None
+                        and await self._dispatch_session_action_request(msg)
+                    ):
+                        continue
                     await self._queue.put(msg)
         except (asyncio.CancelledError, EOFError):
             # Expected during shutdown / after the subprocess closes stdout.
             pass
         except Exception as exc:
             logger.exception("acp[%s] stdout reader error: %s", self._config.name, exc)
+            if self._session_reports_negotiated:
+                await self._record_transport_diagnostic("unconfirmed", "stdout_reader_error")
+                self._fail_report_delivery(exc)
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(exc)
             await self._queue.put({"type": "error", "message": describe_exception(exc)})
+
+    async def _record_transport_diagnostic(self, state: str, reason: str) -> None:
+        """Persist transport uncertainty without treating the last child state as current."""
+        for native_session_id, association in tuple(self._standard_associations.items()):
+            try:
+                await self._append_standard_report(
+                    self._report_identity(native_session_id, association.parent_session_id),
+                    "observation.patch",
+                    {
+                        "observation": {
+                            "state": {"present": False},
+                            "transport": {"state": state, "reason": reason},
+                        }
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "acp[%s] could not persist transport loss for native session %s",
+                    self._config.name,
+                    native_session_id,
+                )
+                return
+
+    def _schedule_report_failure_shutdown(self) -> None:
+        """Stop owned ACP work after durable report delivery becomes unsafe."""
+        if self._report_failure_shutdown_task is None:
+            self._report_failure_shutdown_task = asyncio.create_task(
+                self._shutdown_after_report_failure()
+            )
+
+    def _fail_report_delivery(self, exception: BaseException) -> None:
+        """Latch a report failure and stop the process that could emit more work."""
+        if self._report_failure is None:
+            self._report_failure = exception
+        self._cancel_detached_request_tasks()
+        failure_handler = self._session_action_failure_handler
+        if failure_handler is not None and self._session_action_failure_task is None:
+            with contextlib.suppress(RuntimeError):
+
+                async def run_failure_handler() -> None:
+                    await failure_handler()
+
+                self._session_action_failure_task = asyncio.create_task(
+                    run_failure_handler(), name=f"acp-session-action-failure:{self._config.name}"
+                )
+        self._schedule_report_failure_shutdown()
+
+    def _cancel_detached_request_tasks(self) -> None:
+        """Cancel every parked child request without touching durable reports."""
+        for task in tuple(self._detached_request_tasks):
+            task.cancel()
+
+    def _detached_request_done(self, task: asyncio.Task[None]) -> None:
+        self._detached_request_tasks.discard(task)
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is not None:
+            logger.warning(
+                "acp[%s] detached child request failed",
+                self._config.name,
+                exc_info=(type(exception), exception, exception.__traceback__),
+            )
+
+    async def _call_report_sink(self, operation: Callable[..., Any], *args: Any) -> Any:
+        """Run one synchronous journal mutation and fail closed if it fails."""
+        try:
+            return await asyncio.to_thread(operation, *args)
+        except Exception as exc:
+            self._fail_report_delivery(exc)
+            raise
+
+    async def _shutdown_after_report_failure(self) -> None:
+        """Boundedly reap the ACP process tree without waiting on the reader task."""
+        process = self._proc
+        if process is None or process.returncode is not None:
+            return
+        logger.error(
+            "acp[%s] stopping because session report delivery failed: %s",
+            self._config.name,
+            self._report_failure,
+        )
+        _proc.terminate_tree(process)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=_ACP_TERMINATION_TIMEOUT_SECONDS)
+        except TimeoutError:
+            with contextlib.suppress(Exception):
+                _proc.kill_tree(process)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(process.wait(), timeout=1.0)
+
+    async def _dispatch_session_report(self, message: _AcpJsonObject) -> bool:
+        """Persist standard ACP operations and demultiplex known child traffic."""
+        params = message.get("params")
+        if not isinstance(params, dict):
+            return False
+        update = params.get("update")
+        if not isinstance(update, dict):
+            return False
+        decoded = read_standard_subagent_frame(params)
+        if decoded.recognized:
+            if not self._standard_subagents_enabled:
+                raise RuntimeError(
+                    "standard ACP subagent traffic arrived without negotiated support"
+                )
+            self._require_standard_report_channel()
+            if decoded.error is not None:
+                raise RuntimeError(f"standard ACP subagent frame was rejected: {decoded.error}")
+            operation = decoded.operation
+            if operation is None:
+                raise RuntimeError("recognized standard ACP frame has no normalized operation")
+            parent_id = operation.parent_session_id
+            target_id = operation.target_session_id
+            if operation.kind == "association.patch":
+                self._validate_association(operation)
+                if not isinstance(parent_id, str) or not parent_id:
+                    raise RuntimeError("standard ACP association has no validated parent")
+                previous = self._standard_associations.get(target_id)
+                if previous is None and len(self._standard_associations) >= _MAX_STANDARD_SESSIONS:
+                    raise RuntimeError("standard ACP association limit reached")
+                origin = (
+                    previous.origin
+                    if previous is not None
+                    else self._association_action_origin(parent_id)
+                )
+                if origin is None:
+                    raise RuntimeError(
+                        "standard ACP association has no inherited trusted action origin"
+                    )
+                report_identity = self._report_identity(target_id, parent_id)
+                source_id = await self._append_standard_report(
+                    report_identity,
+                    operation.kind,
+                    dict(operation.operation),
+                    action_origin=origin if previous is None else None,
+                )
+                patch = operation.operation.get("patch")
+                if previous is None:
+                    self._standard_associations[target_id] = _StandardSessionAssociation(
+                        parent_session_id=parent_id,
+                        association_source_id=source_id,
+                        origin=origin,
+                        cwd=(
+                            patch.get("cwd")
+                            if isinstance(patch, dict) and isinstance(patch.get("cwd"), str)
+                            else None
+                        ),
+                        cwd_present=isinstance(patch, dict) and "cwd" in patch,
+                        additional_directories_present=(
+                            isinstance(patch, dict) and "additionalDirectories" in patch
+                        ),
+                        additional_directories=(
+                            tuple(patch.get("additionalDirectories", ()))
+                            if isinstance(patch, dict)
+                            and isinstance(patch.get("additionalDirectories"), list)
+                            else None
+                        ),
+                    )
+                    self._session_translation_contexts[target_id] = _SessionTranslationContext()
+                if previous is not None and isinstance(patch, dict):
+                    if "cwd" in patch:
+                        previous.cwd_present = True
+                        previous.cwd = patch["cwd"] if isinstance(patch["cwd"], str) else None
+                    if "additionalDirectories" in patch:
+                        previous.additional_directories_present = True
+                        directories = patch["additionalDirectories"]
+                        previous.additional_directories = (
+                            tuple(directories) if isinstance(directories, list) else None
+                        )
+                if isinstance(patch, dict) and "state" in patch:
+                    await self._append_standard_report(
+                        report_identity,
+                        "observation.patch",
+                        {"observation": {"state": {"present": True, "value": patch["state"]}}},
+                    )
+                state = patch.get("state") if isinstance(patch, dict) else None
+                state_name = state.get("state") if isinstance(state, dict) else None
+                if isinstance(state_name, str) and state_name in {
+                    "running",
+                    "requires_action",
+                    "idle",
+                    "unknown",
+                }:
+                    context = self._session_translation_contexts.get(target_id)
+                    if context is not None:
+                        context.active_message_id = None
+                return True
+
+            if target_id not in self._standard_associations:
+                raise RuntimeError("standard ACP frame targets an unannounced native session")
+            parent_id = self._standard_associations[target_id].parent_session_id
+            report_identity = self._report_identity(target_id, parent_id)
+            await self._append_standard_report(
+                report_identity, operation.kind, dict(operation.operation)
+            )
+            return True
+
+        if not self._standard_subagents_enabled:
+            return False
+        self._require_standard_report_channel()
+        outer_session_id = params.get("sessionId")
+        if not isinstance(outer_session_id, str) or not outer_session_id:
+            return False
+        if outer_session_id == self._session_id:
+            references = self._tool_reference_operation(update)
+            if self._active_prompt_request_id is None or self._active_prompt_response_received:
+                operations = self._standard_update_operations(outer_session_id, update)
+                if references is not None:
+                    operations.append(("tool.references", references))
+                call_id = update.get("toolCallId")
+                root_scope = (
+                    self._root_tool_call_scopes.get(call_id) if isinstance(call_id, str) else None
+                )
+                if root_scope is not None and isinstance(call_id, str):
+                    self._scope_root_tool_operations(
+                        operations, call_id=call_id, response_id=root_scope[2]
+                    )
+                for kind, normalized in operations:
+                    await self._append_standard_report(
+                        self._report_identity(outer_session_id, None),
+                        kind,
+                        normalized,
+                    )
+                return bool(operations)
+
+            if update.get("sessionUpdate") not in {_UPDATE_TOOL_CALL, _UPDATE_TOOL_CALL_UPDATE}:
+                return False
+            call_id = update.get("toolCallId")
+            if not isinstance(call_id, str) or not call_id:
+                raise RuntimeError("ACP root tool update has no native call id")
+            existing_scope = self._root_tool_call_scopes.get(call_id)
+            root_scope = await self._ensure_root_tool_call_scope(outer_session_id, update)
+            if root_scope is None:
+                raise RuntimeError("ACP root tool update has no trusted call scope")
+            operations = self._standard_update_operations(outer_session_id, update)
+            self._scope_root_tool_operations(
+                operations, call_id=call_id, response_id=root_scope[2]
+            )
+            if references is not None:
+                operations.append(("tool.references", references))
+            for kind, normalized in operations:
+                await self._append_standard_report(
+                    self._report_identity(outer_session_id, None),
+                    kind,
+                    normalized,
+                )
+            return (
+                existing_scope is not None
+                and root_scope[2] != self._active_session_action_response_id
+            )
+        association = self._standard_associations.get(outer_session_id)
+        if association is None:
+            raise RuntimeError("ACP update arrived for an unannounced native session")
+
+        operations = self._standard_update_operations(outer_session_id, update)
+        references = self._tool_reference_operation(update)
+        if references is not None:
+            operations.append(("tool.references", references))
+        for kind, normalized in operations:
+            await self._append_standard_report(
+                self._report_identity(outer_session_id, association.parent_session_id),
+                kind,
+                normalized,
+            )
+        return True
+
+    def _require_standard_report_channel(self) -> tuple[str, str, str]:
+        native_epoch = self._native_epoch
+        root_session_id = self._session_id
+        sink = self._session_report_sink
+        if (
+            not self._standard_subagents_enabled
+            or not self._session_reports_negotiated
+            or native_epoch is None
+            or root_session_id is None
+            or sink is None
+        ):
+            raise RuntimeError(
+                "standard ACP report arrived before the private v3 channel was ready"
+            )
+        return native_epoch, root_session_id, sink.server_identity
+
+    def _active_origin_for_report(self) -> tuple[str, str | None, str, str]:
+        origin = self._active_session_action_origin
+        if origin is None:
+            raise RuntimeError("standard ACP association has no trusted parent-turn origin")
+        if self._native_context_generation is None:
+            self._native_context_generation = origin[3]
+        if self._native_context_generation != origin[3]:
+            raise RuntimeError("standard ACP association changed trusted security context")
+        return origin
+
+    def _report_identity(
+        self, target_session_id: str, parent_session_id: str | None
+    ) -> AcpSessionReportIdentity:
+        native_epoch, root_native_session_id, server_identity = (
+            self._require_standard_report_channel()
+        )
+        context_generation = self._native_context_generation
+        if context_generation is None:
+            origin = self._active_origin_for_report()
+            context_generation = origin[3]
+        sink = self._session_report_sink
+        assert sink is not None
+        return AcpSessionReportIdentity(
+            server_identity=server_identity,
+            root_conversation_id=sink.root_conversation_id,
+            native_epoch=native_epoch,
+            context_generation=context_generation,
+            root_native_session_id=root_native_session_id,
+            target_session_id=target_session_id,
+            parent_session_id=parent_session_id,
+        )
+
+    async def _append_standard_report(
+        self,
+        identity: AcpSessionReportIdentity,
+        kind: str,
+        operation: _AcpJsonObject,
+        *,
+        action_origin: tuple[str, str | None, str, str] | None = None,
+    ) -> str:
+        sink = self._session_report_sink
+        if sink is None:
+            raise RuntimeError("standard ACP report sink is unavailable")
+        if self._report_event_count >= _MAX_STANDARD_REPORTS:
+            raise RuntimeError("standard ACP report limit reached")
+        ingress_sequence = self._next_ingress_sequence
+        if ingress_sequence >= 2**63 - 1:
+            raise RuntimeError("standard ACP ingress sequence limit reached")
+        self._next_ingress_sequence += 1
+        source_id = acp_standard_report_source_id(
+            identity.server_identity,
+            identity.root_conversation_id,
+            identity.native_epoch,
+            ingress_sequence,
+        )
+        data: _AcpJsonObject = {
+            "server_identity": identity.server_identity,
+            "root_conversation_id": identity.root_conversation_id,
+            "context_generation": identity.context_generation,
+            "root_native_session_id": identity.root_native_session_id,
+            "target_session_id": identity.target_session_id,
+            "parent_session_id": identity.parent_session_id,
+            "operation": operation,
+        }
+        if action_origin is not None:
+            data["_omnigent_action_origin"] = {
+                "token": action_origin[0],
+                "agent": action_origin[1],
+                "generation": action_origin[2],
+            }
+        await self._call_report_sink(
+            sink.append,
+            SessionReport(
+                native_epoch=identity.native_epoch,
+                ingress_sequence=ingress_sequence,
+                source_id=source_id,
+                kind=kind,
+                data=data,
+            ),
+        )
+        self._report_event_count += 1
+        return source_id
+
+    def _validate_association(self, operation: AcpSessionOperation) -> None:
+        root_session_id = self._session_id
+        target_id = operation.target_session_id
+        parent_id = operation.parent_session_id
+        if target_id in (root_session_id, parent_id):
+            raise RuntimeError("standard ACP association contains a root/self cycle")
+        if parent_id not in self._standard_associations:
+            raise RuntimeError("standard ACP association has an unannounced immediate parent")
+        existing = self._standard_associations.get(target_id)
+        if existing is not None and existing.parent_session_id != parent_id:
+            raise RuntimeError("standard ACP association attempted to reparent a native session")
+        ancestor = parent_id
+        visited = {target_id}
+        while ancestor is not None:
+            if ancestor in visited:
+                raise RuntimeError("standard ACP association contains an ownership cycle")
+            visited.add(ancestor)
+            parent = self._standard_associations.get(ancestor)
+            if parent is None:
+                raise RuntimeError("standard ACP association ancestry is incomplete")
+            ancestor = parent.parent_session_id
+
+    def _association_action_origin(
+        self, parent_session_id: str
+    ) -> tuple[str, str | None, str, str] | None:
+        """Return the immutable immediate-parent origin for a new association."""
+        parent = self._standard_associations.get(parent_session_id)
+        if parent is None:
+            raise RuntimeError("standard ACP association parent is not registered")
+        if (
+            parent_session_id == self._session_id
+            and self._active_prompt_request_id is not None
+            and not self._active_prompt_response_received
+        ):
+            origin = self._active_session_action_origin
+        else:
+            origin = parent.origin
+        if origin is None:
+            return None
+        if self._native_context_generation is None:
+            self._native_context_generation = origin[3]
+        if origin[3] != self._native_context_generation:
+            raise RuntimeError("standard ACP association origin changed security context")
+        return origin
+
+    def _association_filesystem_overrides(
+        self, target_session_id: str
+    ) -> tuple[bool, str | None, bool, tuple[str, ...] | None]:
+        """Resolve effective filesystem values before asynchronous dispatch.
+
+        ACP ``null`` values inherit the immediate parent's effective value;
+        an explicit empty directory list overrides the parent with no extras.
+        The native root starts at the executor's cwd and an empty directory set.
+        """
+        current = self._standard_associations.get(target_session_id)
+        if current is None:
+            raise RuntimeError("ACP child action target is not registered")
+        cwd = self._cwd
+        directories: tuple[str, ...] = ()
+        cwd_resolved = False
+        directories_resolved = False
+        visited: set[str] = set()
+        while current is not None:
+            if current.parent_session_id is not None:
+                if current.parent_session_id in visited:
+                    raise RuntimeError("ACP action filesystem ancestry contains a cycle")
+                visited.add(current.parent_session_id)
+            if not cwd_resolved and current.cwd is not None:
+                cwd = current.cwd
+                cwd_resolved = True
+            if not directories_resolved and current.additional_directories is not None:
+                directories = current.additional_directories
+                directories_resolved = True
+            if cwd_resolved and directories_resolved:
+                break
+            parent_id = current.parent_session_id
+            current = self._standard_associations.get(parent_id) if parent_id is not None else None
+            if parent_id is not None and current is None:
+                raise RuntimeError("ACP action filesystem ancestry is incomplete")
+        return True, cwd, True, directories
+
+    def _tool_reference_operation(self, update: _AcpJsonObject) -> _AcpJsonObject | None:
+        update_type = update.get("sessionUpdate")
+        if not isinstance(update_type, str) or update_type not in {
+            _UPDATE_TOOL_CALL,
+            _UPDATE_TOOL_CALL_UPDATE,
+        }:
+            return None
+        content = update.get("content")
+        if content is not None and not isinstance(content, list):
+            return None
+        try:
+            references = read_session_tool_references(update)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        if references is None:
+            return None
+        call_id = update.get("toolCallId")
+        if not isinstance(call_id, str) or not call_id:
+            if references:
+                raise RuntimeError("ACP session tool reference has no owning tool id")
+            return None
+        if len(call_id) > 512:
+            raise RuntimeError("ACP session tool reference tool id exceeds its size limit")
+        return {
+            "entity_id": acp_standard_tool_entity_id(call_id),
+            "call_id": call_id,
+            "references": list(references),
+        }
+
+    async def _ensure_root_tool_call_scope(
+        self,
+        root_session_id: str,
+        update: _AcpJsonObject,
+    ) -> tuple[str, tuple[str, str | None, str, str], str] | None:
+        """Persist one identity and response anchor before a root call can be routed."""
+        if not self._session_reports_negotiated:
+            return None
+        update_type = update.get("sessionUpdate")
+        if update_type not in {_UPDATE_TOOL_CALL, _UPDATE_TOOL_CALL_UPDATE}:
+            return None
+        call_id = update.get("toolCallId")
+        if not isinstance(call_id, str) or not call_id or len(call_id) > 512:
+            raise RuntimeError("ACP root tool call has no valid native call id")
+        entity_id = acp_standard_tool_entity_id(call_id)
+        existing = self._root_tool_call_scopes.get(call_id)
+        if existing is not None:
+            return existing
+        if len(self._root_tool_call_scopes) >= _MAX_ROOT_TOOL_CALL_SCOPES:
+            raise RuntimeError("ACP root tool-call scope limit reached")
+        if self._active_prompt_request_id is None or self._active_prompt_response_received:
+            raise RuntimeError("ACP root tool call first appeared outside its active prompt")
+
+        origin = self._active_origin_for_report()
+        response_id = self._active_session_action_response_id
+        if not isinstance(response_id, str) or not response_id or len(response_id) > 64:
+            raise RuntimeError("ACP root tool call has no trusted response identity")
+        anchor_operation = {
+            "entity_id": entity_id,
+            "call_id": call_id,
+            "response_id": response_id,
+        }
+        source_id = await self._append_standard_report(
+            self._report_identity(root_session_id, None),
+            "tool.references",
+            anchor_operation,
+            action_origin=origin,
+        )
+        scope = (source_id, origin, response_id)
+        self._root_tool_call_scopes[call_id] = scope
+        return scope
+
+    @staticmethod
+    def _scope_root_tool_operations(
+        operations: list[tuple[str, _AcpJsonObject]],
+        *,
+        call_id: str,
+        response_id: str,
+    ) -> None:
+        """Pin root tool entity operations to the response that owns their anchor."""
+        for kind, operation in operations:
+            if kind not in {"entity.upsert", "entity.patch"}:
+                continue
+            entity_id = operation.get("entity_id")
+            if entity_id not in {
+                acp_standard_tool_entity_id(call_id),
+                acp_standard_tool_output_entity_id(call_id),
+            }:
+                continue
+            operation["call_id"] = call_id
+            if kind != "entity.upsert":
+                continue
+            value = operation.get("value")
+            if not isinstance(value, dict) or value.get("item_type") not in {
+                "function_call",
+                "function_call_output",
+            }:
+                continue
+            value["response_id"] = response_id
+
+    def _root_tool_call_scope_metadata(self, call_id: str) -> _AcpJsonObject | None:
+        if not self._session_reports_negotiated:
+            return None
+        scope = self._root_tool_call_scopes.get(call_id)
+        if scope is None:
+            raise RuntimeError("ACP root tool call has no persisted identity anchor")
+        source_id, origin, response_id = scope
+        return {
+            "source_id": source_id,
+            "native_call_id": call_id,
+            "action_origin_token": origin[0],
+            "action_origin_generation": origin[2],
+            "response_id": response_id,
+        }
+
+    def _standard_update_operations(
+        self, session_id: str, update: _AcpJsonObject
+    ) -> list[tuple[str, _AcpJsonObject]]:
+        update_type = update.get("sessionUpdate")
+        context = self._session_translation_contexts.setdefault(
+            session_id, _SessionTranslationContext()
+        )
+        if update_type == _UPDATE_AGENT_MESSAGE_CHUNK:
+            content = update.get("content")
+            if not isinstance(content, dict):
+                raise RuntimeError("ACP child message chunk has invalid content")
+            native_message_id = update.get("messageId")
+            if native_message_id is not None:
+                if (
+                    not isinstance(native_message_id, str)
+                    or not native_message_id
+                    or len(native_message_id) > 512
+                ):
+                    raise RuntimeError("ACP child message chunk has an invalid messageId")
+                entity_id = native_message_id
+                context.active_message_id = None
+            else:
+                if context.active_message_id is None:
+                    context.active_message_id = f"acp2m_{secrets.token_urlsafe(16)}"
+                entity_id = context.active_message_id
+
+            response_key = ("message", entity_id)
+            is_new_message = response_key not in context.response_ids
+            response_id = self._standard_response_id(context, *response_key)
+            operations: list[tuple[str, _AcpJsonObject]] = []
+            if is_new_message:
+                operations.append(
+                    (
+                        "entity.upsert",
+                        {
+                            "entity_type": "message",
+                            "entity_id": entity_id,
+                            "value": {
+                                "item_type": "message",
+                                "item_data": {
+                                    "role": "assistant",
+                                    "content": [],
+                                    "acp_agent_identity": "unknown",
+                                },
+                                "response_id": response_id,
+                            },
+                        },
+                    )
+                )
+            operations.append(
+                (
+                    "entity.append",
+                    {
+                        "entity_type": "message",
+                        "entity_id": entity_id,
+                        "content": [dict(content)],
+                    },
+                )
+            )
+            return operations
+        if update_type == _UPDATE_AGENT_THOUGHT_CHUNK:
+            content = update.get("content")
+            if not isinstance(content, dict):
+                raise RuntimeError("ACP child reasoning chunk has invalid content")
+            entity_id = f"acp2i_{secrets.token_urlsafe(16)}"
+            text = self._standard_content_text(content)
+            return [
+                (
+                    "entity.upsert",
+                    {
+                        "entity_type": "item",
+                        "entity_id": entity_id,
+                        "value": {
+                            "item_type": "reasoning",
+                            "item_data": {
+                                "acp_agent_identity": "unknown",
+                                "summary": [{"type": "summary_text", "text": text}],
+                                "content": [{"type": "reasoning_text", "text": text}],
+                            },
+                            "response_id": self._standard_response_id(context, "item", entity_id),
+                        },
+                    },
+                )
+            ]
+        if update_type == _UPDATE_TOOL_CALL:
+            call_id = update.get("toolCallId")
+            if not isinstance(call_id, str) or not call_id or len(call_id) > 512:
+                raise RuntimeError("ACP child tool call has no toolCallId")
+            name = update.get("title") or update.get("kind") or "tool"
+            raw_input = update.get("rawInput")
+            args = raw_input if isinstance(raw_input, dict) else {}
+            status = update.get("status")
+            if status in {_TOOL_STATUS_COMPLETED, _TOOL_STATUS_FAILED}:
+                context.tool_names.pop(call_id, None)
+                context.tool_inputs.pop(call_id, None)
+            else:
+                context.tool_names[call_id] = str(name)
+                context.tool_inputs[call_id] = dict(args)
+            context.active_message_id = None
+            response_id = self._standard_response_id(context, "tool", call_id)
+            operations = [
+                (
+                    "entity.upsert",
+                    {
+                        "entity_type": "item",
+                        "entity_id": acp_standard_tool_entity_id(call_id),
+                        "call_id": call_id,
+                        "value": {
+                            "item_type": "function_call",
+                            "item_data": {
+                                "acp_agent_identity": "unknown",
+                                "call_id": call_id,
+                                "name": str(name),
+                                "arguments": json.dumps(
+                                    args, ensure_ascii=False, separators=(",", ":")
+                                ),
+                                "tool_status": update.get("status", "in_progress"),
+                            },
+                            "response_id": response_id,
+                        },
+                    },
+                )
+            ]
+            has_output_update = "content" in update or "rawOutput" in update
+            if has_output_update:
+                content = update.get("content")
+                if content is not None and (
+                    not isinstance(content, list)
+                    or any(not isinstance(block, dict) for block in content)
+                ):
+                    raise RuntimeError("ACP child tool call has invalid content")
+                output = content if "content" in update else update.get("rawOutput")
+                output_entity_id = acp_standard_tool_output_entity_id(call_id)
+                if output is None:
+                    operations.append(
+                        (
+                            "entity.patch",
+                            {
+                                "entity_type": "item",
+                                "entity_id": output_entity_id,
+                                "call_id": call_id,
+                                "patch": {
+                                    "output": None,
+                                    "content": None,
+                                    "raw_output": update.get("rawOutput"),
+                                    "acp_agent_identity": "unknown",
+                                },
+                            },
+                        )
+                    )
+                else:
+                    output_data: _AcpJsonObject = {
+                        "call_id": call_id,
+                        "output": self._standard_content_text(output),
+                        "acp_agent_identity": "unknown",
+                    }
+                    if "content" in update:
+                        output_data["content"] = content
+                    if "rawOutput" in update:
+                        output_data["raw_output"] = update["rawOutput"]
+                    operations.append(
+                        (
+                            "entity.upsert",
+                            {
+                                "entity_type": "item",
+                                "entity_id": output_entity_id,
+                                "call_id": call_id,
+                                "value": {
+                                    "item_type": "function_call_output",
+                                    "item_data": output_data,
+                                    "response_id": response_id,
+                                },
+                            },
+                        )
+                    )
+            return operations
+        if update_type == _UPDATE_TOOL_CALL_UPDATE:
+            call_id = update.get("toolCallId")
+            if not isinstance(call_id, str) or not call_id or len(call_id) > 512:
+                raise RuntimeError("ACP child tool update has no toolCallId")
+            patch: _AcpJsonObject = {}
+            if "status" in update:
+                patch["tool_status"] = update["status"]
+            has_output_update = "content" in update or "rawOutput" in update
+            output = update.get("content") if "content" in update else update.get("rawOutput")
+            if has_output_update:
+                patch["output"] = None if output is None else self._standard_content_text(output)
+            if "content" in update:
+                content = update["content"]
+                if content is not None and (
+                    not isinstance(content, list)
+                    or any(not isinstance(block, dict) for block in content)
+                ):
+                    raise RuntimeError("ACP child tool update has invalid content")
+                patch["output_content"] = content
+            if "rawOutput" in update:
+                patch["raw_output"] = update["rawOutput"]
+            if "title" in update:
+                title = update["title"]
+                if isinstance(title, str):
+                    patch["name"] = title
+            if "rawInput" in update:
+                raw_input = update["rawInput"]
+                if raw_input is None:
+                    patch["arguments"] = "null"
+                elif isinstance(raw_input, dict):
+                    patch["arguments"] = json.dumps(
+                        raw_input, ensure_ascii=False, separators=(",", ":")
+                    )
+                else:
+                    raise RuntimeError("ACP child tool update has invalid rawInput")
+            status = update.get("status")
+            if isinstance(status, str) and status in {
+                _TOOL_STATUS_COMPLETED,
+                _TOOL_STATUS_FAILED,
+            }:
+                context.tool_names.pop(call_id, None)
+                context.tool_inputs.pop(call_id, None)
+            context.active_message_id = None
+            operations = (
+                [
+                    (
+                        "entity.patch",
+                        {
+                            "entity_type": "item",
+                            "entity_id": acp_standard_tool_entity_id(call_id),
+                            "call_id": call_id,
+                            "patch": patch,
+                        },
+                    )
+                ]
+                if patch
+                else []
+            )
+            if has_output_update:
+                output_entity_id = acp_standard_tool_output_entity_id(call_id)
+                if output is None:
+                    operations.append(
+                        (
+                            "entity.patch",
+                            {
+                                "entity_type": "item",
+                                "entity_id": output_entity_id,
+                                "call_id": call_id,
+                                "patch": {
+                                    "output": None,
+                                    "content": None,
+                                    "raw_output": update.get("rawOutput"),
+                                    "acp_agent_identity": "unknown",
+                                },
+                            },
+                        )
+                    )
+                else:
+                    output_data: _AcpJsonObject = {
+                        "call_id": call_id,
+                        "output": self._standard_content_text(output),
+                        "acp_agent_identity": "unknown",
+                    }
+                    if isinstance(update.get("content"), list) or "content" in update:
+                        output_data["content"] = update["content"]
+                    if "rawOutput" in update:
+                        output_data["raw_output"] = update["rawOutput"]
+                    operations.append(
+                        (
+                            "entity.upsert",
+                            {
+                                "entity_type": "item",
+                                "entity_id": output_entity_id,
+                                "call_id": call_id,
+                                "value": {
+                                    "item_type": "function_call_output",
+                                    "item_data": output_data,
+                                    "response_id": self._standard_response_id(
+                                        context, "tool", call_id
+                                    ),
+                                },
+                            },
+                        )
+                    )
+            return operations
+        if update_type == _UPDATE_USAGE:
+            observation = {key: value for key, value in update.items() if key != "sessionUpdate"}
+            return [("observation.patch", {"observation": {"usage": observation}})]
+        if update_type == _UPDATE_CONFIG_OPTION:
+            return [
+                (
+                    "observation.patch",
+                    {"observation": {"config_options": update.get("configOptions")}},
+                )
+            ]
+        if update_type == "session_info_update":
+            session_info = {key: value for key, value in update.items() if key != "sessionUpdate"}
+            return [
+                (
+                    "observation.patch",
+                    {"observation": {"session_info": session_info}},
+                )
+            ]
+        if update_type == "current_mode_update":
+            mode = {key: value for key, value in update.items() if key != "sessionUpdate"}
+            return [
+                (
+                    "observation.patch",
+                    {"observation": {"mode": mode}},
+                )
+            ]
+        if update_type in {"plan", "plan_update"}:
+            return [
+                (
+                    "observation.patch",
+                    {
+                        "observation": {
+                            "plan": {
+                                key: value
+                                for key, value in update.items()
+                                if key != "sessionUpdate"
+                            }
+                        }
+                    },
+                )
+            ]
+        if update_type == "plan_removed":
+            return [("observation.patch", {"observation": {"plan": None}})]
+        if update_type == "session_state_update":
+            if "state" not in update:
+                return [("observation.patch", {"observation": {"state": {"present": False}}})]
+            state = update["state"]
+            state_name = state.get("state") if isinstance(state, dict) else None
+            if isinstance(state_name, str) and state_name in {
+                "running",
+                "requires_action",
+                "idle",
+                "unknown",
+            }:
+                context.active_message_id = None
+            return [
+                (
+                    "observation.patch",
+                    {"observation": {"state": {"present": True, "value": state}}},
+                )
+            ]
+        if isinstance(update_type, str):
+            opaque = {key: value for key, value in update.items() if key != "sessionUpdate"}
+            return [
+                (
+                    "observation.patch",
+                    {"observation": {"protocol_extensions": {update_type: opaque}}},
+                )
+            ]
+        return []
+
+    @staticmethod
+    def _standard_response_id(
+        context: _SessionTranslationContext, entity_type: str, entity_id: str
+    ) -> str:
+        """Return a stable per-entity response id within the native session."""
+        key = (entity_type, entity_id)
+        response_id = context.response_ids.get(key)
+        if response_id is None:
+            response_id = f"acp2r_{secrets.token_urlsafe(16)}"
+            context.response_ids[key] = response_id
+        return response_id
+
+    @staticmethod
+    def _standard_content_text(content: Any) -> str:
+        """Make ACP content readable while retaining the original payload separately."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list) and any(
+            isinstance(item, dict) and item.get("type") in {"content", "diff", "terminal"}
+            for item in content
+        ):
+            # The ToolCallContent union renders like the non-standard tool path.
+            from omnigent.runtime.harnesses._executor_adapter import _stringify_tool_payload
+
+            return _stringify_tool_payload(content)
+        if isinstance(content, dict):
+            text = content.get("text")
+            if isinstance(text, str):
+                return text
+            return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+        if isinstance(content, list):
+            return "\n".join(AcpExecutor._standard_content_text(item) for item in content)
+        return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+
+    def _standard_tool_output_metadata(self, update: _AcpJsonObject) -> _AcpJsonObject:
+        """Retain output field presence and normalized text for the standard adapter."""
+        present = "content" in update or "rawOutput" in update
+        output = update.get("content") if "content" in update else update.get("rawOutput")
+        cleared = present and output is None
+        return {
+            "present": present,
+            "cleared": cleared,
+            "text": self._standard_content_text(output) if present and not cleared else None,
+            "content_present": "content" in update,
+            "content": update.get("content"),
+            "raw_output_present": "rawOutput" in update,
+            "raw_output": update.get("rawOutput"),
+        }
+
+    async def _dispatch_session_action_request(self, request: _AcpJsonObject) -> bool:
+        """Route an ACP child request using its immutable validated owner binding."""
+        decoded: AcpSessionActionRead = read_standard_session_action(request)
+        if decoded.recognized:
+            if decoded.error is not None or decoded.identity is None:
+                await self._send_agent_request_error(
+                    request,
+                    -32603,
+                    decoded.error or "omnigent: ACP request identity is incomplete",
+                )
+                return True
+            identity = decoded.identity
+            if not self._standard_subagents_enabled:
+                if identity.target_session_id != self._session_id:
+                    await self._send_agent_request_error(
+                        request,
+                        -32603,
+                        "omnigent: ACP child requests require negotiated standard-session support",
+                    )
+                    return True
+                return False
+            native_epoch = self._native_epoch
+            root_native_session_id = self._session_id
+            association = self._standard_associations.get(identity.target_session_id)
+            if identity.target_session_id == root_native_session_id:
+                return False
+            if self._next_child_request_invocation_id >= (2**63 - 1):
+                await self._send_agent_request_error(
+                    request,
+                    -32000,
+                    "omnigent: ACP child request invocation capacity reached",
+                )
+                return True
+            self._next_child_request_invocation_id += 1
+            if (
+                self._report_failure is not None
+                or native_epoch is None
+                or root_native_session_id is None
+                or association is None
+            ):
+                await self._send_agent_request_error(
+                    request,
+                    -32603,
+                    "omnigent: ACP request does not belong to an associated native session",
+                )
+                return True
+            if not association.association_source_id:
+                await self._send_agent_request_error(
+                    request,
+                    -32603,
+                    "omnigent: ACP child request has no acknowledged association source",
+                )
+                return True
+            if not association.parent_session_id:
+                await self._send_agent_request_error(
+                    request, -32603, "omnigent: ACP child has no validated immediate parent"
+                )
+                return True
+            trusted_origin = association.origin
+            if (
+                trusted_origin is None
+                or not trusted_origin[0]
+                or not trusted_origin[2]
+                or trusted_origin[3] != self._native_context_generation
+            ):
+                await self._send_agent_request_error(
+                    request,
+                    -32603,
+                    "omnigent: ACP child request has no matching trusted security context",
+                )
+                return True
+            if self._session_report_sink is None:
+                await self._send_agent_request_error(
+                    request,
+                    -32603,
+                    "omnigent: ACP child action channel is unavailable",
+                )
+                return True
+            cwd_present, cwd, directories_present, directories = (
+                self._association_filesystem_overrides(identity.target_session_id)
+            )
+            binding = AcpSessionActionBinding(
+                root_conversation_id=self._session_report_sink.root_conversation_id,
+                native_epoch=native_epoch,
+                context_generation=trusted_origin[3],
+                root_native_session_id=root_native_session_id,
+                target_session_id=identity.target_session_id,
+                parent_session_id=association.parent_session_id,
+                association_source_id=association.association_source_id,
+                origin_token=trusted_origin[0],
+                origin_agent=trusted_origin[1],
+                origin_generation=trusted_origin[2],
+                request_id=identity.request_id,
+                method=identity.method,
+                request_invocation_id=self._next_child_request_invocation_id,
+                cwd_present=cwd_present,
+                cwd=cwd,
+                additional_directories_present=directories_present,
+                additional_directories=directories,
+            )
+            handler = self._session_action_request_handler
+            if handler is None:
+                await self._send_agent_request_error(
+                    request, -32603, "omnigent: ACP child action bridge is unavailable"
+                )
+                return True
+            if len(self._detached_request_tasks) >= _MAX_DETACHED_ACP_REQUESTS:
+                await self._send_agent_request_error(
+                    request, -32000, "omnigent: too many ACP child requests are pending"
+                )
+                return True
+
+            async def handle_detached_request() -> None:
+                await handler(request, binding)
+
+            task = asyncio.create_task(
+                handle_detached_request(),
+                name=(
+                    f"acp-child-request:{identity.target_session_id}:"
+                    f"{self._next_child_request_invocation_id}"
+                ),
+            )
+            self._detached_request_tasks.add(task)
+            task.add_done_callback(self._detached_request_done)
+            return True
+        return False
+
+    async def _send_agent_request_error(
+        self, request: _AcpJsonObject, code: int, message: str
+    ) -> None:
+        """Reply to a rejected server-initiated ACP request."""
+        await self._send(
+            {
+                "jsonrpc": "2.0",
+                "id": request.get("id"),
+                "error": {"code": code, "message": message},
+            }
+        )
 
     async def _send(self, msg: _AcpJsonObject) -> None:
         """Write one newline-terminated JSON message to the agent's stdin."""
@@ -816,13 +2130,15 @@ class AcpExecutor(Executor):
         read defensively rather than assumed present.
         """
         config = getattr(self, "_config", None)
-        return clean_agent_env(
-            allow_prefixes=(),
-            extra_allowed=(
-                *getattr(config, "env_passthrough", ()),
-                *declared_passthrough(self._os_env),
-            ),
-            deny_exact=getattr(config, "env_unset", ()),
+        return strip_runner_auth_secrets(
+            clean_agent_env(
+                allow_prefixes=(),
+                extra_allowed=(
+                    *getattr(config, "env_passthrough", ()),
+                    *declared_passthrough(self._os_env),
+                ),
+                deny_exact=getattr(config, "env_unset", ()),
+            )
         )
 
     def _warn_initialize_failed(self, reason: str) -> None:
@@ -848,19 +2164,24 @@ class AcpExecutor(Executor):
         """Perform the ``initialize`` handshake if not already done."""
         if self._initialized:
             return
+        if self._standard_subagents_enabled and self._session_report_sink is None:
+            raise RuntimeError("standard ACP reporting requires the trusted private v3 channels")
+        client_capabilities: _AcpJsonObject = {
+            "fs": {
+                "readTextFile": self._fs_delegation,
+                "writeTextFile": self._fs_delegation,
+            },
+            "terminal": False,
+        }
+        if self._standard_subagents_enabled:
+            client_capabilities["subagents"] = {}
         try:
             resp = await self._rpc(
                 _AGENT_METHOD_INITIALIZE,
                 {
                     "protocolVersion": _PROTOCOL_VERSION,
                     "clientInfo": {"name": "omnigent", "version": "1.0"},
-                    "clientCapabilities": {
-                        "fs": {
-                            "readTextFile": self._fs_delegation,
-                            "writeTextFile": self._fs_delegation,
-                        },
-                        "terminal": False,
-                    },
+                    "clientCapabilities": client_capabilities,
                 },
                 timeout=_INIT_TIMEOUT_SECONDS,
             )
@@ -873,9 +2194,10 @@ class AcpExecutor(Executor):
             self._warn_initialize_failed(str(message))
             raise RuntimeError(f"ACP initialize failed: {message}")
         result = resp.get("result") or {}
+        agent_capabilities = result.get("agentCapabilities") if isinstance(result, dict) else None
         prompt_caps = (
-            result.get("agentCapabilities", {}).get("promptCapabilities", {})
-            if isinstance(result, dict)
+            agent_capabilities.get("promptCapabilities", {})
+            if isinstance(agent_capabilities, dict)
             else {}
         )
         self._image_supported = bool(prompt_caps.get("image"))
@@ -885,6 +2207,7 @@ class AcpExecutor(Executor):
         # already authenticated via env/disk). ``_ensure_session`` reacts
         # only when ``session/new`` actually demands authentication.
         self._auth_advertisement = result if isinstance(result, dict) else {}
+        self._session_reports_negotiated = self._standard_subagents_enabled
         self._initialized = True
 
     async def _authenticate(self, method_id: str) -> None:
@@ -906,8 +2229,8 @@ class AcpExecutor(Executor):
         self._authenticated = True
 
     async def _authenticate_and_retry_session_new(
-        self, resp: _AcpJsonObject, params: _AcpJsonObject
-    ) -> _AcpJsonObject:
+        self, resp: _AcpJsonObject, params: _AcpJsonObject, native_epoch: str | None
+    ) -> tuple[_AcpJsonObject, str | None]:
         """Authenticate with an advertised headless method and retry once.
 
         Grok Build (``grok agent stdio``) rejects ``session/new`` with
@@ -929,9 +2252,22 @@ class AcpExecutor(Executor):
                     "advertises no headless auth method (browser-only or "
                     f"malformed authMethods): {message}"
                 )
-            return resp
+            return resp, native_epoch
         await self._authenticate(method_id)
-        return await self._rpc(_AGENT_METHOD_SESSION_NEW, params, timeout=_INIT_TIMEOUT_SECONDS)
+        return await self._new_session_attempt(params)
+
+    async def _new_session_attempt(
+        self, params: _AcpJsonObject
+    ) -> tuple[_AcpJsonObject, str | None]:
+        """Persist a fresh epoch before every native ``session/new`` attempt."""
+        sink = self._session_report_sink
+        native_epoch = secrets.token_urlsafe(24) if sink is not None else None
+        if sink is not None and native_epoch is not None:
+            await self._call_report_sink(sink.begin_native_epoch, native_epoch)
+        response = await self._rpc(
+            _AGENT_METHOD_SESSION_NEW, params, timeout=_INIT_TIMEOUT_SECONDS
+        )
+        return response, native_epoch
 
     async def _ensure_session(self) -> str:
         """Create (or reuse) an ACP session, returning the session id.
@@ -957,9 +2293,11 @@ class AcpExecutor(Executor):
         if self._config.send_model_in_session_new and self._config.model:
             params["model"] = self._config.model
 
-        resp = await self._rpc(_AGENT_METHOD_SESSION_NEW, params, timeout=_INIT_TIMEOUT_SECONDS)
+        resp, native_epoch = await self._new_session_attempt(params)
         if "error" in resp and not self._authenticated and _is_auth_required_error(resp["error"]):
-            resp = await self._authenticate_and_retry_session_new(resp, params)
+            resp, native_epoch = await self._authenticate_and_retry_session_new(
+                resp, params, native_epoch
+            )
         if "error" in resp:
             raise RuntimeError(
                 f"ACP session/new failed: {resp['error'].get('message', resp['error'])}"
@@ -967,11 +2305,38 @@ class AcpExecutor(Executor):
         result = resp.get("result", {})
         server_session_id = result.get("sessionId") if isinstance(result, dict) else None
         session_id = server_session_id or client_id
-        if not session_id:
+        if not isinstance(session_id, str) or not session_id:
             raise RuntimeError(
                 "ACP session/new response missing sessionId: " + json.dumps(resp)[:200]
             )
+        if self._session_report_sink is not None:
+            if native_epoch is None:
+                raise RuntimeError("ACP report session has no durable native epoch")
+            await self._call_report_sink(
+                self._session_report_sink.bind_native_session,
+                native_epoch,
+                session_id,
+            )
+        self._native_epoch = native_epoch
         self._session_id = session_id
+        self._native_context_generation = (
+            self._active_session_action_origin[3]
+            if self._active_session_action_origin is not None
+            else None
+        )
+        self._next_ingress_sequence = 1
+        self._report_event_count = 0
+        self._next_child_request_invocation_id = 0
+        self._standard_associations.clear()
+        self._session_translation_contexts.clear()
+        self._root_tool_call_scopes.clear()
+        if self._standard_subagents_enabled:
+            self._standard_associations[session_id] = _StandardSessionAssociation(
+                parent_session_id=None,
+                association_source_id="",
+                origin=self._active_session_action_origin,
+            )
+            self._session_translation_contexts[session_id] = _SessionTranslationContext()
         # Capture the agent's advertised model from session/new's config options, so a
         # turn's usage can name it. Agents that report the model here (e.g. jcode) would
         # otherwise leave it unknown until a later config_option_update, leaving the
@@ -1044,7 +2409,14 @@ class AcpExecutor(Executor):
     # Server-initiated requests (agent → client)
     # ------------------------------------------------------------------
 
-    async def _respond_to_agent_request(self, request: _AcpJsonObject) -> None:
+    async def _respond_to_agent_request(
+        self,
+        request: _AcpJsonObject,
+        *,
+        child_cwd: str | None = None,
+        child_additional_directories: Sequence[str] | None = None,
+        detached_child_action: bool = False,
+    ) -> None:
         """Answer a server-initiated ACP request from the agent.
 
         - ``session/request_permission`` — decide via Omnigent's TOOL_CALL policy
@@ -1068,9 +2440,21 @@ class AcpExecutor(Executor):
                 allow, option_id = await self._decide_permission(params)
                 result = self._permission_outcome(params, allow=allow, option_id=option_id)
             elif method == "fs/read_text_file" and self._fs_delegation:
-                result = await self._handle_fs_read(params)
+                if detached_child_action:
+                    await self._validate_detached_action_origin()
+                result = await self._handle_fs_read(
+                    params,
+                    cwd=child_cwd,
+                    child_additional_directories=child_additional_directories,
+                )
             elif method == "fs/write_text_file" and self._fs_delegation:
-                result = await self._handle_fs_write(params)
+                if detached_child_action:
+                    await self._validate_detached_action_origin()
+                result = await self._handle_fs_write(
+                    params,
+                    cwd=child_cwd,
+                    child_additional_directories=child_additional_directories,
+                )
             else:
                 error = {
                     "code": -32601,
@@ -1089,6 +2473,21 @@ class AcpExecutor(Executor):
             reply["result"] = result
         await self._send(reply)
 
+    async def _validate_detached_action_origin(self) -> None:
+        """Revalidate the captured root and child access before detached work."""
+        evaluator = self._policy_evaluator
+        if evaluator is None:
+            raise _AcpRequestError(
+                -32603,
+                "omnigent: ACP child action validation is unavailable",
+            )
+        verdict = await evaluator(_ACP_ACTION_ORIGIN_CHECK_PHASE, {})
+        if verdict.action != "POLICY_ACTION_ALLOW":
+            raise _AcpRequestError(
+                -32603,
+                "omnigent: ACP child action origin is no longer valid",
+            )
+
     # ------------------------------------------------------------------
     # Filesystem delegation (agent → client, when fs capability advertised)
     # ------------------------------------------------------------------
@@ -1102,7 +2501,13 @@ class AcpExecutor(Executor):
             self._os_environment = env
         return self._os_environment
 
-    async def _handle_fs_read(self, params: _AcpJsonObject) -> _AcpJsonObject:
+    async def _handle_fs_read(
+        self,
+        params: _AcpJsonObject,
+        *,
+        cwd: str | None = None,
+        child_additional_directories: Sequence[str] | None = None,
+    ) -> _AcpJsonObject:
         """Serve an ACP ``fs/read_text_file`` by reading through the OSEnvironment.
 
         ACP params ``{path, line?, limit?}`` (1-based start line, max line count;
@@ -1111,12 +2516,22 @@ class AcpExecutor(Executor):
         path = params.get("path")
         if not isinstance(path, str) or not path:
             raise _AcpRequestError(-32602, "fs/read_text_file requires a string 'path'")
+        if not Path(path).is_absolute():
+            path = str(Path(cwd or self._cwd) / path)
         line = params.get("line")
         limit = params.get("limit")
         offset = line if isinstance(line, int) and line >= 1 else 1
         read_limit = limit if isinstance(limit, int) and limit >= 1 else None
 
         env = await self._ensure_os_environment()
+        if cwd is not None:
+            self._assert_detached_fs_path_allowed(
+                env,
+                path,
+                cwd=cwd,
+                additional_directories=child_additional_directories,
+                need_write=False,
+            )
         result = await env.read(path, offset=offset, limit=read_limit)
         if "error" in result:
             message = str(result["error"])
@@ -1126,7 +2541,13 @@ class AcpExecutor(Executor):
             raise _AcpRequestError(-32603, f"{path}: not a UTF-8 text file")
         return {"content": result.get("content", "")}
 
-    async def _handle_fs_write(self, params: _AcpJsonObject) -> _AcpJsonObject:
+    async def _handle_fs_write(
+        self,
+        params: _AcpJsonObject,
+        *,
+        cwd: str | None = None,
+        child_additional_directories: Sequence[str] | None = None,
+    ) -> _AcpJsonObject:
         """Serve an ACP ``fs/write_text_file`` by writing through the OSEnvironment.
 
         ACP params ``{path, content}``; the write goes through the helper so the
@@ -1138,12 +2559,52 @@ class AcpExecutor(Executor):
             raise _AcpRequestError(-32602, "fs/write_text_file requires a string 'path'")
         if not isinstance(content, str):
             raise _AcpRequestError(-32602, "fs/write_text_file requires string 'content'")
+        if not Path(path).is_absolute():
+            path = str(Path(cwd or self._cwd) / path)
 
         env = await self._ensure_os_environment()
+        if cwd is not None:
+            self._assert_detached_fs_path_allowed(
+                env,
+                path,
+                cwd=cwd,
+                additional_directories=child_additional_directories,
+                need_write=True,
+            )
         result = await env.write(path, content)
         if "error" in result:
             raise _AcpRequestError(-32603, str(result["error"]))
         return {}
+
+    @staticmethod
+    def _assert_detached_fs_path_allowed(
+        env: OSEnvironment,
+        path: str,
+        *,
+        cwd: str | None,
+        additional_directories: Sequence[str] | None,
+        need_write: bool,
+    ) -> None:
+        """Narrow trusted host file grants to the inherited child directories."""
+        sandbox = getattr(env, "sandbox", None)
+        if sandbox is None:
+            raise _AcpRequestError(-32603, "omnigent: child filesystem policy is unavailable")
+        candidate = Path(path).expanduser().resolve(strict=False)
+        child_roots = [Path(cwd or env.cwd).expanduser().resolve(strict=False)]
+        child_roots.extend(
+            Path(directory).expanduser().resolve(strict=False)
+            for directory in (additional_directories or ())
+        )
+        if not any(candidate == root or root in candidate.parents for root in child_roots):
+            raise _AcpRequestError(
+                -32603,
+                f"{path}: blocked by the ACP child filesystem boundary",
+            )
+        if not any(
+            (not need_write or root.access == "write") and root.contains(candidate)
+            for root in reachable_roots(env.cwd, sandbox)
+        ):
+            raise _AcpRequestError(-32603, f"{path}: blocked by the host filesystem policy")
 
     # ------------------------------------------------------------------
     # Permission (session/request_permission) → policy + elicitation
@@ -1168,16 +2629,25 @@ class AcpExecutor(Executor):
         tool_call = params.get("toolCall") or {}
         call_id = tool_call.get("toolCallId")
         call_id = call_id if isinstance(call_id, str) else None
-        name = (
-            tool_call.get("title")
-            or tool_call.get("kind")
-            or (self._tool_names.get(call_id) if call_id else None)
-            or "tool"
+        session_id = params.get("sessionId")
+        session_context = (
+            self._session_translation_contexts.get(session_id)
+            if isinstance(session_id, str)
+            else None
         )
+        cached_name = None
+        cached_args = None
+        if call_id:
+            if session_context is not None:
+                cached_name = session_context.tool_names.get(call_id)
+                cached_args = session_context.tool_inputs.get(call_id)
+            else:
+                cached_name = self._tool_names.get(call_id)
+                cached_args = self._tool_inputs.get(call_id)
+        name = tool_call.get("title") or tool_call.get("kind") or cached_name or "tool"
         args = tool_call.get("rawInput")
         if not isinstance(args, dict):
-            cached = self._tool_inputs.get(call_id) if call_id else None
-            args = cached if isinstance(cached, dict) else {}
+            args = cached_args if isinstance(cached_args, dict) else {}
         return str(name), args
 
     @property
@@ -1545,6 +3015,16 @@ class AcpExecutor(Executor):
     def _reset_session_state(self) -> None:
         """Forget state that is only valid for the current ACP session."""
         self._session_id = None
+        self._active_prompt_request_id = None
+        self._active_prompt_response_received = False
+        self._native_epoch = None
+        self._native_context_generation = None
+        self._next_ingress_sequence = 1
+        self._report_event_count = 0
+        self._next_child_request_invocation_id = 0
+        self._standard_associations.clear()
+        self._session_translation_contexts.clear()
+        self._root_tool_call_scopes.clear()
         self._initial_model = None
         self._system_prompt_sent = False
         self._tool_names.clear()
@@ -1607,15 +3087,50 @@ class AcpExecutor(Executor):
             raw_input = update.get("rawInput")
             args = raw_input if isinstance(raw_input, dict) else {}
             if isinstance(call_id, str) and call_id:
+                status = update.get("status")
+                terminal = status in {_TOOL_STATUS_COMPLETED, _TOOL_STATUS_FAILED}
                 self._tool_names[call_id] = str(name)
                 self._tool_inputs[call_id] = args
                 metadata: _AcpJsonObject = {"call_id": call_id}
+                scope_metadata = self._root_tool_call_scope_metadata(call_id)
+                if scope_metadata is not None:
+                    metadata[ACP_TOOL_CALL_SCOPE_METADATA_KEY] = scope_metadata
                 # An agent-native tool ran inside the agent's own loop and never
                 # round-trips Omnigent dispatch. Leaving its id in the correlation
                 # queue would mis-pair the next bridge completion.
                 if not self._is_bridge_tool_call(str(name), update):
                     metadata["internally_executed"] = True
+                if isinstance(status, str):
+                    metadata["tool_status"] = status
+                if terminal:
+                    metadata["observed_call_completed"] = True
+                    self._tool_names.pop(call_id, None)
+                    self._tool_inputs.pop(call_id, None)
                 events.append(ToolCallRequest(name=str(name), args=args, metadata=metadata))
+                if terminal:
+                    completion_metadata: _AcpJsonObject = {"call_id": call_id}
+                    if scope_metadata is not None:
+                        completion_metadata[ACP_TOOL_CALL_SCOPE_METADATA_KEY] = scope_metadata
+                    completion_metadata["tool_status"] = status
+                    if self._standard_subagents_enabled:
+                        completion_metadata[ACP_TOOL_OUTPUT_METADATA_KEY] = (
+                            self._standard_tool_output_metadata(update)
+                        )
+                    result = (
+                        update.get("content") if "content" in update else update.get("rawOutput")
+                    )
+                    events.append(
+                        ToolCallComplete(
+                            name=str(name),
+                            status=(
+                                ToolCallStatus.SUCCESS
+                                if status == _TOOL_STATUS_COMPLETED
+                                else ToolCallStatus.ERROR
+                            ),
+                            result=result,
+                            metadata=completion_metadata,
+                        )
+                    )
         elif update_type == _UPDATE_TOOL_CALL_UPDATE:
             call_id = update.get("toolCallId")
             status = update.get("status")
@@ -1625,6 +3140,15 @@ class AcpExecutor(Executor):
             ):
                 name = self._tool_names.pop(call_id, "tool")
                 self._tool_inputs.pop(call_id, None)
+                metadata: _AcpJsonObject = {"call_id": call_id}
+                scope_metadata = self._root_tool_call_scope_metadata(call_id)
+                if scope_metadata is not None:
+                    metadata[ACP_TOOL_CALL_SCOPE_METADATA_KEY] = scope_metadata
+                metadata["tool_status"] = status
+                if self._standard_subagents_enabled:
+                    metadata[ACP_TOOL_OUTPUT_METADATA_KEY] = self._standard_tool_output_metadata(
+                        update
+                    )
                 events.append(
                     ToolCallComplete(
                         name=name,
@@ -1633,8 +3157,12 @@ class AcpExecutor(Executor):
                             if status == _TOOL_STATUS_COMPLETED
                             else ToolCallStatus.ERROR
                         ),
-                        result=update.get("content") or update.get("rawOutput"),
-                        metadata={"call_id": call_id},
+                        result=(
+                            update.get("content")
+                            if "content" in update
+                            else update.get("rawOutput")
+                        ),
+                        metadata=metadata,
                     )
                 )
         elif update_type == _UPDATE_USAGE:
@@ -1875,6 +3403,15 @@ class AcpExecutor(Executor):
         When ``omnigent_mcp`` is ``False`` the relay is disabled, so the schemas
         serve no purpose and are discarded immediately rather than stored.
         """
+        if self._report_failure is not None:
+            yield ExecutorError(
+                message=(
+                    "ACP session reporting stopped after a durable delivery failure: "
+                    f"{describe_exception(self._report_failure)}"
+                ),
+                retryable=False,
+            )
+            return
         # Only keep builtin tools when the relay is enabled — they exist solely
         # to back the MCP relay. Storing them when the relay is disabled would
         # let stale data accidentally reach the session/prompt path (#4917).
@@ -1974,6 +3511,7 @@ class AcpExecutor(Executor):
         fut: asyncio.Future[_AcpJsonObject] = loop.create_future()
         self._pending[req_id] = fut
         self._active_prompt_request_id = req_id
+        self._active_prompt_response_received = False
         self._cancel_grace_deadline = None
 
         await self._send(
@@ -1988,6 +3526,7 @@ class AcpExecutor(Executor):
                 },
             }
         )
+        self._report_prompt_started = True
 
         deadline = loop.time() + _PROMPT_TIMEOUT_SECONDS
         accumulated_text: list[str] = []
@@ -2012,10 +3551,16 @@ class AcpExecutor(Executor):
                     error_msg = response["error"].get("message", "Unknown ACP error")
                     if "Session not found" in error_msg:
                         self._reset_session_state()
+                    elif self._active_prompt_request_id == req_id:
+                        self._active_prompt_request_id = None
+                        self._active_prompt_response_received = False
                     yield ExecutorError(message=error_msg, retryable=True)
                     return
                 result = response.get("result", {}) if isinstance(response, dict) else {}
                 usage = self._usage_with_active_model(result) if isinstance(result, dict) else None
+                if self._active_prompt_request_id == req_id:
+                    self._active_prompt_request_id = None
+                    self._active_prompt_response_received = False
                 yield TurnComplete(response="".join(accumulated_text), usage=usage)
                 return
 
@@ -2028,6 +3573,15 @@ class AcpExecutor(Executor):
 
             method = notification.get("method", "")
             params = notification.get("params", {})
+
+            if notification.get("type") == "error":
+                yield ExecutorError(
+                    message=(
+                        f"ACP stdout reader failed: {notification.get('message', 'unknown error')}"
+                    ),
+                    retryable=False,
+                )
+                return
 
             if method == _CLIENT_NOTIFICATION_SESSION_UPDATE:
                 update = params.get("update", {})
@@ -2093,6 +3647,18 @@ class AcpExecutor(Executor):
                     )
         self._cancel_grace_deadline = None
         self._active_prompt_request_id = None
+        self._active_prompt_response_received = False
+        self._cancel_detached_request_tasks()
+        detached = tuple(self._detached_request_tasks)
+        if detached:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*detached, return_exceptions=True), timeout=1.0
+                )
+            except TimeoutError:
+                for task in detached:
+                    task.cancel()
+            self._detached_request_tasks.clear()
         self._reset_session_state()
         # Tear down the Omnigent MCP relay HTTP server + its bridge dir first.
         with contextlib.suppress(Exception):

@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient, type Query, type QueryClient } from "@tanstack/react-query";
 import { useCallback, useSyncExternalStore } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { setSessionParent } from "@/lib/sessionHost";
@@ -15,6 +15,22 @@ export const MAX_TREE_DEPTH = 3;
 export interface ChildSessionError {
   code: string;
   message: string;
+}
+
+/** Exact standard ACP observation plus server-selected source eligibility. */
+export interface AcpSessionObservation {
+  source_current: boolean;
+  state?: unknown;
+  transport?: unknown;
+  transport_unconfirmed?: boolean;
+  [key: string]: unknown;
+}
+
+/** Preserve native observation data while failing closed on missing eligibility. */
+export function normalizeAcpSessionObservation(value: unknown): AcpSessionObservation | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  return { ...record, source_current: record.source_current === true };
 }
 
 /**
@@ -62,6 +78,8 @@ export interface ChildSessionInfo {
    * not routed (routing off, or a server that predates the field).
    */
   routed_model?: string | null;
+  /** Exact standard ACP activity observation for mirrored children. */
+  acp_session_observation?: AcpSessionObservation | null;
 }
 
 /**
@@ -82,6 +100,7 @@ interface ChildSessionWire {
   last_message_preview?: string | null;
   pending_elicitations_count?: number;
   routed_model?: string | null;
+  acp_session_observation?: unknown;
 }
 
 interface ChildSessionsResponse {
@@ -102,6 +121,62 @@ export function childSessionsQueryKey(conversationId: string): readonly unknown[
 /** True for any key built by ``childSessionsQueryKey``. */
 function isChildSessionsQueryKey(key: readonly unknown[]): boolean {
   return key.length === 3 && key[0] === "conversation" && key[2] === "child_sessions";
+}
+
+interface ChildRosterRefreshState {
+  cancelPromise?: Promise<void>;
+  rerun: boolean;
+  promise: Promise<void>;
+}
+
+const childRosterRefreshes = new WeakMap<QueryClient, ChildRosterRefreshState>();
+
+/** Cancel and refresh every resident child roster after a source-selection change. */
+export function refreshChildSessionRosters(queryClient: QueryClient): Promise<void> {
+  const predicate = (query: Query) => isChildSessionsQueryKey(query.queryKey);
+  const pending = childRosterRefreshes.get(queryClient);
+  if (pending) {
+    pending.rerun = true;
+    // Cancel an older refetch immediately. Waiting until the current pass ends
+    // could let a response from the previous selector commit before the rerun.
+    const cancellation = queryClient.cancelQueries({ predicate });
+    pending.cancelPromise = pending.cancelPromise
+      ? Promise.all([pending.cancelPromise, cancellation]).then(() => undefined)
+      : cancellation;
+    return pending.promise;
+  }
+
+  const state: ChildRosterRefreshState = { rerun: true, promise: Promise.resolve() };
+  childRosterRefreshes.set(queryClient, state);
+  const waitForPendingCancellations = async (): Promise<void> => {
+    const cancellation = state.cancelPromise;
+    if (cancellation) {
+      state.cancelPromise = undefined;
+      await cancellation;
+      await waitForPendingCancellations();
+    }
+  };
+  const refresh = async (): Promise<void> => {
+    state.rerun = false;
+    await waitForPendingCancellations();
+    await Promise.all(
+      queryClient
+        .getQueryCache()
+        .findAll({ predicate })
+        .map(async (query) => {
+          const filters = { queryKey: query.queryKey, exact: true };
+          await queryClient.cancelQueries(filters);
+          await queryClient.invalidateQueries({ ...filters, refetchType: "all" });
+        }),
+    );
+    if (state.rerun) return refresh();
+  };
+  state.promise = refresh().finally(() => {
+    if (childRosterRefreshes.get(queryClient) === state) {
+      childRosterRefreshes.delete(queryClient);
+    }
+  });
+  return state.promise;
 }
 
 /**
@@ -203,9 +278,13 @@ interface UseChildSessionsResult {
  * Exported for unit testing of the HTTP-shape contract; production
  * code should call ``useChildSessions``.
  */
-export async function fetchChildSessions(sessionId: string): Promise<ChildSessionInfo[]> {
+export async function fetchChildSessions(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<ChildSessionInfo[]> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions`,
+    signal ? { signal } : undefined,
   );
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as ChildSessionsResponse;
@@ -226,6 +305,7 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
     last_message_preview: row.last_message_preview ?? null,
     pending_elicitations_count: row.pending_elicitations_count ?? 0,
     routed_model: row.routed_model ?? null,
+    acp_session_observation: normalizeAcpSessionObservation(row.acp_session_observation),
   }));
 }
 
@@ -255,11 +335,11 @@ export function useChildSessions(
       sessionId === null
         ? ["conversation", null, "child_sessions"]
         : childSessionsQueryKey(sessionId),
-    queryFn: () => fetchChildSessions(sessionId as string),
+    queryFn: ({ signal }) => fetchChildSessions(sessionId as string, signal),
     enabled: sessionId !== null,
     staleTime: 60_000,
     retry: false,
-    refetchOnMount: false,
+    refetchOnMount: true,
     refetchInterval: pollMs ?? false,
   });
   return {

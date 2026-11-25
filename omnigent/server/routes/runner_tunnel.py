@@ -21,8 +21,7 @@ import json
 import logging
 import time
 import weakref
-from collections.abc import Awaitable, Callable, Mapping
-from ipaddress import ip_address
+from collections.abc import Awaitable, Callable
 from typing import cast
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
@@ -57,6 +56,10 @@ from omnigent.server import managed_host_keepalive, session_live_state, shutdown
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.runner_tunnel_auth import (
+    expected_runner_id_for_peer,
+    is_loopback_peer_host,
+)
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
 
 _logger = logging.getLogger(__name__)
@@ -141,17 +144,7 @@ def _is_loopback_websocket_client(ws: WebSocket) -> bool:
     :returns: ``True`` when the peer host is loopback, otherwise
         ``False``.
     """
-    if ws.client is None:
-        return False
-    host = ws.client.host
-    if host == "localhost":
-        return True
-    try:
-        addr = ip_address(host)
-    except ValueError:
-        return False
-    mapped_ipv4 = getattr(addr, "ipv4_mapped", None)
-    return addr.is_loopback or (mapped_ipv4 is not None and mapped_ipv4.is_loopback)
+    return ws.client is not None and is_loopback_peer_host(ws.client.host)
 
 
 def _resolve_tunnel_owner(
@@ -189,41 +182,6 @@ def _resolve_tunnel_owner(
         # checks work uniformly in single-user mode.
         owner = RESERVED_USER_LOCAL
     return owner
-
-
-def _expected_runner_id_from_headers(
-    headers: Mapping[str, str],
-    *,
-    allowed_tunnel_tokens: frozenset[str] | None = None,
-) -> str | None:
-    """Return the runner id authorized by WebSocket tunnel headers.
-
-    Servers with an allow-list require the token to be present in that
-    allow-list and may use stable runner ids. Servers without an
-    allow-list accept token-bound runner ids, while loopback clients
-    may omit the token for legacy local development flows.
-
-    :param headers: WebSocket handshake headers.
-    :param allowed_tunnel_tokens: Optional set of accepted binding
-        tokens, e.g. ``frozenset({"uA6Zz..."})``.
-    :returns: Expected token-bound runner id, or ``None`` when the
-        token directly authorizes the path runner id.
-    :raises ValueError: If the tunnel token header is missing when
-        required, present but empty, or not authorized.
-    """
-    token = headers.get(RUNNER_TUNNEL_TOKEN_HEADER)
-    if token is None:
-        if allowed_tunnel_tokens is not None:
-            raise ValueError("runner tunnel token is required")
-        return None
-    stripped = token.strip()
-    if not stripped:
-        raise ValueError("runner tunnel token must not be empty")
-    if allowed_tunnel_tokens is not None:
-        if stripped not in allowed_tunnel_tokens:
-            raise ValueError("runner tunnel token is not authorized")
-        return None
-    return token_bound_runner_id(stripped)
 
 
 def create_runner_tunnel_router(
@@ -446,31 +404,16 @@ def create_runner_tunnel_router(
         """
         is_loopback = _is_loopback_websocket_client(ws)
         try:
-            expected_runner_id = _expected_runner_id_from_headers(
+            expected_runner_id = expected_runner_id_for_peer(
                 ws.headers,
                 allowed_tunnel_tokens=allowed_tunnel_tokens,
+                is_loopback=is_loopback,
             )
         except ValueError as exc:
-            if not is_loopback:
-                await ws.accept()
-                await ws.close(
-                    code=RUNNER_ID_MISMATCH_CLOSE_CODE,
-                    reason=str(exc),
-                )
-                return
-            # Loopback fallback: the token wasn't in the server's
-            # allow-list (external ``run --server`` runner). Retry
-            # without the allow-list so token-bound ID derivation
-            # kicks in instead of rejecting.
-            expected_runner_id = _expected_runner_id_from_headers(
-                ws.headers,
-                allowed_tunnel_tokens=None,
-            )
-        if expected_runner_id is None and allowed_tunnel_tokens is None and not is_loopback:
             await ws.accept()
             await ws.close(
                 code=RUNNER_ID_MISMATCH_CLOSE_CODE,
-                reason="runner tunnel token is required",
+                reason=str(exc),
             )
             return
         if expected_runner_id is not None and runner_id != expected_runner_id:
@@ -926,18 +869,23 @@ async def _receive_loop(
 
     async def process(batch: EventBatchFrame) -> None:
         try:
-            if registry.get(runner_id) is not session or not callable(ingest):
+            if (
+                registry.get(runner_id) is not session
+                or session.superseded
+                or not callable(ingest)
+            ):
                 return
             # A malicious/buggy runner may send multiple frames for the same
             # session despite the client-side FIFO. Preserve apply order here.
             async with session_locks.setdefault(batch.session_id, asyncio.Lock()):
-                if registry.get(runner_id) is not session:
+                if registry.get(runner_id) is not session or session.superseded:
                     return
                 ack = await ingest(
                     app=ws.app,
                     headers=ws.headers,
                     owner=session.owner,
                     runner_id=runner_id,
+                    server_connection=session,
                     batch=batch,
                 )
         except Exception as exc:

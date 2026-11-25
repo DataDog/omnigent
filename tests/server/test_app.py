@@ -70,6 +70,51 @@ async def test_version_returns_source_of_truth_version(
     )
 
 
+@pytest.mark.asyncio
+async def test_legacy_conversation_store_does_not_advertise_acp_reporting(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """A custom store's default-false capability survives app artifact wiring."""
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    class LegacyConversationStore:
+        def __init__(self, delegate: SqlAlchemyConversationStore) -> None:
+            self._delegate = delegate
+
+        @property
+        def acp_session_reporting_ready(self) -> bool:
+            return False
+
+        def bind_artifact_store(self, _artifact_store: LocalArtifactStore) -> None:
+            pass
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._delegate, name)
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    legacy_store = LegacyConversationStore(SqlAlchemyConversationStore(db_uri))
+    app = server_app.create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=legacy_store,  # type: ignore[arg-type]
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(
+            artifact_store=artifact_store,
+            cache_dir=tmp_path / "cache",
+        ),
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as legacy_client:
+        response = await legacy_client.get("/v1/info")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["acp_session_reporting_version"] == 0
+
+
 def test_server_version_reads_version_constant() -> None:
     """The server version is the shared ``omnigent.version.VERSION`` constant."""
     from omnigent.version import VERSION

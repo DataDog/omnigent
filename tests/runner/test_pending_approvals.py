@@ -180,6 +180,35 @@ async def test_wait_for_user_approval_returns_true_on_accept() -> None:
 
 
 @pytest.mark.asyncio
+async def test_wait_for_user_verdict_notifies_after_registration() -> None:
+    """The callback can route a child approval before the waiter blocks."""
+    registered: list[bool] = []
+    publishes: list[tuple[str, dict[str, Any]]] = []
+
+    def _publish(conv_id: str, event: dict[str, Any]) -> None:
+        publishes.append((conv_id, event))
+
+    def _on_registered() -> None:
+        registered.append("elicit_child" in pending_approvals._pending)
+
+    wait_task = asyncio.create_task(
+        pending_approvals.wait_for_user_verdict(
+            elicitation_id="elicit_child",
+            conversation_id="conv_child",
+            publish_event=_publish,
+            timeout_seconds=5.0,
+            on_registered=_on_registered,
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert registered == [True]
+    assert pending_approvals.resolve("elicit_child", True)
+    assert (await wait_task).approved is True
+    assert publishes[0][0] == "conv_child"
+
+
+@pytest.mark.asyncio
 async def test_wait_for_user_approval_returns_false_on_timeout() -> None:
     """Timeout collapses to False, AND still publishes the resolved event.
 

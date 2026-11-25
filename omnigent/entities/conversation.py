@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.inner.native_attachments import (
@@ -353,6 +353,43 @@ class StartupInputOptions(BaseModel):
     scheduled_run: ScheduledRunLogContext | None = None
 
 
+class AcpSessionMessage(BaseModel):
+    """Structured ACP session-message direction and validated conversation links.
+
+    ACP session ids and message ids are native protocol identifiers. The
+    conversation ids are added only after the server resolves a participant
+    through its validated association registry.
+
+    :param kind: Directed ACP session-message discriminator.
+    :param sender_session_id: Native ACP session id of the sender, if reported.
+    :param recipient_session_id: Native ACP session id of the recipient, if reported.
+    :param sender_message_id: Native message id of the sender, if reported.
+    :param recipient_message_id: Native message id of the recipient, if reported.
+    :param sender_conversation_id: Validated Omnigent conversation for the sender.
+    :param recipient_conversation_id: Validated Omnigent conversation for the recipient.
+    """
+
+    kind: Literal["directed"]
+    sender_session_id: str | None = None
+    recipient_session_id: str | None = None
+    sender_message_id: str | None = None
+    recipient_message_id: str | None = None
+    sender_conversation_id: str | None = None
+    recipient_conversation_id: str | None = None
+
+
+class AcpToolSessionReference(BaseModel):
+    """A native ACP tool reference with an optional validated UI target.
+
+    :param native_session_id: Opaque ACP session id carried by tool content.
+    :param conversation_id: Omnigent conversation id resolved by the server's
+        immutable association mapping; absent when no safe target is available.
+    """
+
+    native_session_id: str
+    conversation_id: str | None = None
+
+
 # Longest harness message phase kept, e.g. Codex ``"partial_answer"``.
 _MAX_MESSAGE_PHASE_LENGTH = 64
 
@@ -387,18 +424,33 @@ class MessageData(BaseModel):
         ``"commentary"`` (progress), ``"partial_answer"`` or ``"final_answer"``.
         Stored as given so clients can act on values added later; ``None``
         when unset, not a string, or longer than 64 characters.
+    :param acp_session_message: Structured ACP directed-message participants.
+        Native ids remain separate from server-resolved Omnigent conversation ids.
+    :param acp_agent_identity: ``"unknown"`` when ACP supplies no child model
+        identity. This is explicit provenance, not an inferred parent model.
+    :param metadata: Opaque ACP message metadata supplied on a whole-message
+        update. Chunk metadata stays chunk-scoped and is not placed here.
     """
 
     role: Literal["user", "assistant"]
     # Heterogeneous content blocks (input_text, output_text, input_image, etc.)
-    content: list[dict[str, Any]]
-    agent: str | None = Field(default=None, serialization_alias="model")
+    content: list[dict[str, Any]] = Field(default_factory=list)
+    agent: str | None = Field(
+        default=None,
+        serialization_alias="model",
+        exclude_if=lambda value: value is None,
+    )
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
     user_authored: bool = Field(default=False, exclude_if=lambda value: value is False)
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
     phase: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    metadata: dict[str, Any] | None = None
+    acp_session_message: AcpSessionMessage | None = None
+    acp_agent_identity: Literal["unknown"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     startup_options: StartupInputOptions | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -417,6 +469,15 @@ class MessageData(BaseModel):
             return phase
         return None
 
+    @field_serializer("acp_session_message")
+    def preserve_explicit_acp_participants(
+        self, value: AcpSessionMessage | None
+    ) -> dict[str, Any] | None:
+        """Retain explicit null participants while omitting absent fields."""
+        if value is None:
+            return None
+        return value.model_dump(exclude_unset=True)
+
     @model_validator(mode="after")
     def check_agent_for_assistant(self) -> MessageData:
         """
@@ -427,10 +488,18 @@ class MessageData(BaseModel):
         :raises ValueError: If an assistant message is missing
             ``agent`` or a user message carries ``phase``.
         """
-        if self.role == "assistant" and self.agent is None:
+        if (
+            self.role == "assistant"
+            and self.agent is None
+            and self.acp_agent_identity != "unknown"
+        ):
             raise ValueError("assistant messages require 'agent'")
         if self.role == "user" and self.phase is not None:
             raise ValueError("user messages cannot carry 'phase'")
+        if "content" not in self.model_fields_set and self.acp_agent_identity != "unknown":
+            raise ValueError("messages require 'content'")
+        if self.acp_session_message is not None and self.role != "assistant":
+            raise ValueError("ACP directed session messages must use the assistant role")
         return self
 
 
@@ -484,16 +553,45 @@ class FunctionCallData(BaseModel):
     :param arguments: JSON-encoded arguments string.
     :param call_id: Unique call identifier from the LLM,
         e.g. ``"call_abc123"``.
+    :param tool_status: Native tool lifecycle status when reported.
+    :param acp_agent_identity: ``"unknown"`` when ACP did not identify the child model.
+    :param output: Readable output text from an ACP tool update, when present.
+    :param output_content: Original ACP output content blocks, when present.
+    :param raw_output: Opaque native ACP ``rawOutput`` value, when present.
+    :param acp_session_references: ACP session content references with separately
+        resolved Omnigent conversation links.
     :param namespace: Tool namespace the model emitted the call under,
         e.g. ``"container"``. ``None`` for the default namespace. Harnesses
         that replay history must round-trip it with the call.
     """
 
-    agent: str = Field(serialization_alias="model")
+    agent: str | None = Field(
+        default=None,
+        serialization_alias="model",
+        exclude_if=lambda value: value is None,
+    )
     name: str
     arguments: str
     call_id: str
+    tool_status: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    acp_agent_identity: Literal["unknown"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    output: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    output_content: list[dict[str, Any]] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    raw_output: Any | None = Field(default=None, exclude_if=lambda value: value is None)
+    acp_session_references: list[AcpToolSessionReference] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     namespace: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="after")
+    def check_agent_identity(self) -> FunctionCallData:
+        if self.agent is None and self.acp_agent_identity != "unknown":
+            raise ValueError("function calls require 'agent' or explicit unknown ACP identity")
+        return self
 
 
 class FunctionCallOutputData(BaseModel):
@@ -502,13 +600,31 @@ class FunctionCallOutputData(BaseModel):
 
     :param call_id: The call_id this output corresponds to,
         e.g. ``"call_abc123"``.
-    :param output: The tool's string result.
+    :param output: The tool's string result, or ``None`` only for an explicitly
+        cleared ACP output with ``acp_agent_identity="unknown"``.
+    :param content: Original ACP content blocks when the output came from a
+        ``tool_call_update`` content array.
+    :param raw_output: Opaque ACP ``rawOutput`` data when present.
+    :param acp_agent_identity: Explicit unknown child identity for ACP output.
     :param subagent_return_id: Native task id of an explicitly completed child.
     """
 
     call_id: str
-    output: str
+    output: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    content: list[dict[str, Any]] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    raw_output: Any | None = Field(default=None, exclude_if=lambda value: value is None)
+    acp_agent_identity: Literal["unknown"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="after")
+    def check_acp_output(self) -> FunctionCallOutputData:
+        if self.output is None and self.acp_agent_identity != "unknown":
+            raise ValueError("function call outputs require 'output'")
+        return self
 
 
 class ErrorData(BaseModel):
@@ -573,14 +689,28 @@ class ReasoningData(BaseModel):
         redacted.
     :param encrypted_content: Encrypted reasoning content, or
         ``None``.
+    :param acp_agent_identity: ``"unknown"`` when ACP did not identify the child model.
     """
 
-    agent: str = Field(serialization_alias="model")
+    agent: str | None = Field(
+        default=None,
+        serialization_alias="model",
+        exclude_if=lambda value: value is None,
+    )
+    acp_agent_identity: Literal["unknown"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     # Summary text blocks, e.g. [{"type": "summary_text", "text": "..."}]
     summary: list[dict[str, str]]
     # Raw reasoning content blocks; nullable (may be redacted).
-    content: list[dict[str, str]] | None = None
+    content: list[dict[str, Any]] | None = None
     encrypted_content: str | None = None
+
+    @model_validator(mode="after")
+    def check_agent_identity(self) -> ReasoningData:
+        if self.agent is None and self.acp_agent_identity != "unknown":
+            raise ValueError("reasoning requires 'agent' or explicit unknown ACP identity")
+        return self
 
 
 def _binary_payload_omitted(media_type: str, _payload_length: int) -> str:

@@ -327,6 +327,20 @@ class _FakeProcessManager:
         self._sessions.add(conversation_id)
         return self._client
 
+    def get_session_report_subscriber_generation(self, conversation_id: str) -> str | None:
+        """Return no generation because this fake has no report-enabled harness."""
+        del conversation_id
+        return None
+
+    async def set_session_report_opt_in(self, conversation_id: str, enabled: bool) -> None:
+        """Accept the opt-in; this fake never starts a report-enabled harness."""
+        del conversation_id, enabled
+
+    def get_session_report_runtime_incarnation(self, conversation_id: str) -> int | None:
+        """Return no incarnation because this fake has no report-enabled harness."""
+        del conversation_id
+        return None
+
     def has_session(self, conversation_id: str) -> bool:
         """Check if a session was registered via :meth:`get_client`."""
         return conversation_id in self._sessions
